@@ -31,7 +31,6 @@
                  [fulcrologic/fulcro-spec "2.1.3" :scope "test"]]
 
   :uberjar-name "cawala.jar"
-  :main cawala.server-main
 
   :source-paths ["src/main"]
   :test-paths ["src/test"]
