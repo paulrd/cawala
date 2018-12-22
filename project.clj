@@ -34,7 +34,6 @@
 
   :source-paths ["src/main"]
   :test-paths ["src/test"]
-  :main cawala.server-main
 
   :test-refresh {:report       fulcro-spec.reporters.terminal/fulcro-report
                  :with-repl    true
@@ -45,7 +44,11 @@
                           :jar-exclusions [#"public/js/test" #"public/js/workspaces" #"public/workspaces.html"]
                           :prep-tasks     ["clean" ["clean"]
                                            "compile" ["with-profile" "cljs" "run" "-m" "shadow.cljs.devtools.cli" "release" "main"]]}
-             :production {}
+             :production {:main cawala.server-main
+                          :prep-tasks ["compile"
+                                       ["with-profile" "cljs" "run" "-m"
+                                        "shadow.cljs.devtools.cli" "release"
+                                        "main"]]}
              :cljs       {:source-paths ["src/main" "src/test" "src/workspaces"]
                           :dependencies [[binaryage/devtools "0.9.10"]
                                          [org.clojure/clojurescript "1.10.439"]
