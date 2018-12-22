@@ -34,6 +34,7 @@
 
   :source-paths ["src/main"]
   :test-paths ["src/test"]
+  :main cawala.server-main
 
   :test-refresh {:report       fulcro-spec.reporters.terminal/fulcro-report
                  :with-repl    true
