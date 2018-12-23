@@ -11,7 +11,7 @@
                     {:db/id id :person/name name :person/age age})}
   (dom/li
    (dom/h5 (str name "(age: " age ")")
-           (dom/button {:onClick #(onDelete id)} "B")
+           (dom/button {:onClick #(onDelete id)} "X")
            (dom/button {:onClick #(df/refresh! this)} "Refresh"))))
 
 (def ui-person (prim/factory Person {:keyfn :person/name}))
