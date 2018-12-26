@@ -35,7 +35,7 @@
                       {:target [:person-list/by-id :friends :person-list/people]}))
            :networking
            {:remote (net/fulcro-http-remote
-                         {:url "/api"
+                         {:url "/bank/api"
                           :request-middleware secured-request-middleware})}))
   (start))
 
