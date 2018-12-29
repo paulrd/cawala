@@ -35,12 +35,13 @@
                       {:target [:person-list/by-id :friends :person-list/people]}))
            :networking
            {:remote (net/fulcro-http-remote
-                         {:url "/bank/api"
+                     {:url (str (-> js/window .-location .-href) "api")
                           :request-middleware secured-request-middleware})}))
   (start))
 
 (comment
   (js/alert "hi")
+  (-> js/window .-location .-href type)
   (println "hi")
   (doc 'cawala.client)
   (cljs.repl/dir cljs.repl)

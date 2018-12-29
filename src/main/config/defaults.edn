@@ -3,7 +3,8 @@
  ;; Legal Origins for API request.
  :legal-origins #{"localhost" "dev.lvh.me"}
 
- ;; The ssl-redirect defaulted to off, but for security should probably be on in production.
+ ;; The ssl-redirect defaulted to off, but for security should probably be on in
+ ;; production.
  :ring.middleware/defaults-config
                 {:params    {:keywordize true
                              :multipart  true
