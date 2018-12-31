@@ -13,6 +13,8 @@
                  [mount "0.1.15"]
                  [hiccup "1.0.5"]
 
+                 [factual/geo "2.1.1"]
+
                  [http-kit "2.3.0"]
                  [ring/ring-core "1.7.1"]
                  [bk/ring-gzip "0.3.0"]
