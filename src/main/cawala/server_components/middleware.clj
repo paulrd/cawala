@@ -102,7 +102,7 @@
       (wrap-api "/api")
       server/wrap-transit-params
       server/wrap-transit-response
-      #_(server/wrap-protect-origins {:allow-when-origin-missing? false
+      (server/wrap-protect-origins {:allow-when-origin-missing? true
                                     :legal-origins              legal-origins})
       (wrap-html-routes)
       ;; If you want to set something like session store, you'd do it against
