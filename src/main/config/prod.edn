@@ -5,5 +5,5 @@
 
  ;; You probably want these set to true in real production:
  :ring.middleware/defaults-config
-                {:proxy    false
+                {:proxy    true
                  :security {:ssl-redirect false}}}
