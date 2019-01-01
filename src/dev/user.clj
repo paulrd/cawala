@@ -30,12 +30,13 @@
   (stop)
   (tools-ns/refresh :after 'user/start))
 
-;; Run (start-server-tests) in a REPL to start a runner that can render results in a browser
-;; See fulcro-spec documentation for more information. NOTE: `specification` is really just
-;; a `deftest` underneath, so you can use "Run all tests in this namespace" with your
-;; editor/IDE and it should work that way too.  You can also use the fulcro-spec functions
-;; like `assertions` and `when-mocking` in a regular `deftest` if you'd rather do that (which
-;; gives a slight better REPL integration, while still leveraging some of the helpers).
+;; Run (start-server-tests) in a REPL to start a runner that can render results
+;; in a browser See fulcro-spec documentation for more information. NOTE:
+;; `specification` is really just a `deftest` underneath, so you can use "Run
+;; all tests in this namespace" with your editor/IDE and it should work that way
+;; too. You can also use the fulcro-spec functions like `assertions` and
+;; `when-mocking` in a regular `deftest` if you'd rather do that (which gives a
+;; slight better REPL integration, while still leveraging some of the helpers).
 (suite/def-test-suite start-server-tests
   {:config       {:port 8888}
    :test-paths   ["src/test"]

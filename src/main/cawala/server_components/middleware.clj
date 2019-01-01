@@ -24,6 +24,7 @@
 ;; Pathom.
 ;; ================================================================================
 (def server-parser (server/fulcro-parser))
+#_(def server-parser )
 
 (defn wrap-api [handler uri]
   (fn [request]
@@ -59,9 +60,11 @@
       [:script "cawala.client.init();"]]]))
 
 ;; ================================================================================
-;; Workspaces can be accessed via shadow's http server on http://localhost:8023/workspaces.html
+;; Workspaces can be accessed via shadow's http server on
+;; http://localhost:8023/workspaces.html
 ;; but that will not allow full-stack fulcro cards to talk to your server. This
-;; page embeds the CSRF token, and is at `/wslive.html` on your server (i.e. port 3000).
+;; page embeds the CSRF token, and is at `/wslive.html` on your server
+;; (i.e. port 3000).
 ;; ================================================================================
 (defn wslive [csrf-token]
   (html5
