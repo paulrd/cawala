@@ -7,14 +7,6 @@
 (def product->brand {1 "Taylor"})
 (def brand->id {"Taylor" 44151})
 
-;; Define one or more resolvers
-#_(pc/defresolver person-resolver [{:keys [database] :as env} {:keys [person/id]}]
-  {::pc/input #{:person/id}
-   ::pc/output [:person/first-name :person/age]}
-  (let [person (my-database/get-person database id)]
-    {:person/age        (:age person)
-     :person/first-name (:first-name person)}))
-
 (pc/defresolver latest-product [_ _]
   {::pc/output [{::latest-product [:product/id :product/title :product/price]}]}
   {::latest-product {:product/id    1
@@ -61,54 +53,52 @@
   (let [{:keys [user/id] :as new-user}
         (-> user
             (select-keys [:user/name :user/email])
-
             (merge {:user/id (java.util.UUID/randomUUID)
-                    :user/created-at (js/Date.)}))]
+                    :user/created-at (.toString (java.time.Instant/now))}))]
     (swap! db assoc-in [:users id] new-user)
     {:user/id id}))
 
+(pc/defresolver user-data [{::keys [db]} {:keys [user/id]}]
+  {::pc/input  #{:user/id}
+   ::pc/output [:user/id :user/name :user/email :user/created-at]}
+  (get-in @db [:users id]))
+
+(pc/defresolver all-users [{::keys [db]} _]
+  {::pc/output [{:user/all [:user/id :user/name :user/email :user/created-at]}]}
+  (vals (get db :users)))
+
+(pc/defmutation user-create [{::keys [db]} user]
+  {::pc/sym    'user/createAs
+   ::pc/params [:user/name :user/email]
+   ::pc/output [:user/id]}
+  (let [{:keys [user/id] :as new-user}
+        (-> user
+            (select-keys [:user/name :user/email])
+            (merge {:user/id (java.util.UUID/randomUUID)
+                    :user/created-at (.toString (java.time.Instant/now))}))]
+    (swap! db assoc-in [:users id] new-user)
+    {:user/id       id
+     :app/id-remaps {(:user/id user) id}}))
+
 ;; resolvers are just maps, we can compose many using sequences
 (def app-registry [latest-product product-brand brand-id-from-name list-things
-                   slow-resolver send-message])
+                   slow-resolver send-message create-user user-data all-users
+                   user-create])
 
 ;; Create a parser that uses the resolvers:
-#_(def parser
+(def parser
   (p/parallel-parser
-    {::p/env     {::p/reader               [p/map-reader
-                                            pc/parallel-reader
-                                            pc/open-ident-reader
-                                            p/env-placeholder-reader]
-                  ::p/placeholder-prefixes #{">"}}
+    {::p/env     {::p/reader [p/map-reader pc/parallel-reader pc/open-ident-reader
+                              p/env-placeholder-reader]
+                  ::pc/mutation-join-globals [:app/id-remaps]
+                  ::p/placeholder-prefixes #{">"}
+                  }
      ::p/mutate  pc/mutate-async
      ;; setup connect and use our resolvers
      ::p/plugins [(pc/connect-plugin {::pc/register app-registry})
                   p/error-handler-plugin
                   p/request-cache-plugin
                   p/trace-plugin]}))
-
-(def parser
-  (p/parallel-parser
-   {::p/env     {::p/reader [p/map-reader
-                             pc/parallel-reader
-                             pc/open-ident-reader]}
-    ::p/mutate  pc/mutate-async
-    ::p/plugins [(pc/connect-plugin {::pc/register app-registry})
-                 p/error-handler-plugin
-                 p/request-cache-plugin
-                 p/trace-plugin]}))
-
-#_(def parser
-  (p/async-parser
-   {::p/env     {::p/reader [p/map-reader
-                             pc/async-reader2
-                             pc/open-ident-reader]
-                 ::p/process-error (fn [env error]
-                                     (p/error-str error))}
-    ::p/mutate  pc/mutate-async
-    ::p/plugins [(pc/connect-plugin {::pc/register app-registry})
-                 p/error-handler-plugin
-                 p/request-cache-plugin
-                 p/trace-plugin]}))
 
 ;; note the parallel parser call will return a channel, you must read the value
 ;; on it to get the parser results
@@ -122,8 +112,11 @@
                                                  :customer/last-name "Bar"}})
            [:customer/full-name]}])
   (def q [{:items [:number-added]}])
-  (a/<!! (parser {} q))
   (def q '[(send-message {:message/text "Hello Clojurist!"})])
+  (def q '[{(user/create {:user/name "Rick Sanches" :user/email "rick@morty.com"})
+            [:user/id :user/name :user/created-at]}])
+  (def q '[{(user/create {:user/id "TMP_ID" :user/name "Rick Sanches"
+                          :user/email "rick@morty.com"})
+            [:user/id :user/name :user/created-at]}])
   (a/<!! (parser {} q))
-  (java.time.Instant.)
 )

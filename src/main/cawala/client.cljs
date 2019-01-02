@@ -36,7 +36,7 @@
            :networking
            {:remote (net/fulcro-http-remote
                      {:url (str (-> js/window .-location .-href) "api")
-                          :request-middleware secured-request-middleware})}))
+                      :request-middleware secured-request-middleware})}))
   (start))
 
 (comment

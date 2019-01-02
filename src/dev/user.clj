@@ -48,4 +48,6 @@
   (start)
   (restart)
   (stop)
+  (tools-ns/refresh)
+  (clojure.tools.namespace.repl/refresh)
   )

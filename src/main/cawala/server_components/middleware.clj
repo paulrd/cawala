@@ -1,8 +1,9 @@
 (ns cawala.server-components.middleware
   (:require
     [cawala.server-components.config :refer [config]]
-    [cawala.api.read]
+    [cawala.api.read :as r]
     [cawala.api.mutations]
+    [clojure.core.async :as a]
     [mount.core :refer [defstate]]
     [fulcro.server :as server]
     [ring.middleware.defaults :refer [wrap-defaults]]
@@ -23,8 +24,8 @@
 ;; defined in the book, but you'll have a much better time parsing queries with
 ;; Pathom.
 ;; ================================================================================
-(def server-parser (server/fulcro-parser))
-#_(def server-parser )
+#_(def server-parser (server/fulcro-parser))
+(def server-parser #(a/<!! (r/parser % %2)))
 
 (defn wrap-api [handler uri]
   (fn [request]
