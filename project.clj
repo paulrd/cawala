@@ -5,8 +5,8 @@
 
   :dependencies [[org.clojure/clojure "1.10.0"]
                  [thheller/shadow-cljs "2.7.9"]
-                 [fulcrologic/fulcro "2.6.18"]
-                 [com.wsscode/pathom "2.2.2"]
+                 [fulcrologic/fulcro "2.7.0"]
+                 [com.wsscode/pathom "2.2.5"]
                  [ring/ring-defaults "0.3.2"]
                  [org.clojure/core.async "0.4.490"]
                  [garden "1.3.6"]
@@ -16,11 +16,13 @@
                  ;; my code
                  [factual/geo "2.1.1"]
                  [com.wsscode/pathom "2.2.5"]
+                 [buddy/buddy-auth "2.1.0"]
+                 ;; buddy may be using an outdated version of cheshire
+                 [cheshire "5.8.1"]
 
                  [http-kit "2.3.0"]
                  [ring/ring-core "1.7.1"]
                  [bk/ring-gzip "0.3.0"]
-                 [bidi "2.1.4"]
 
                  ;; the following 3 are not used directly, but are pinned to
                  ;; ensure consistency.

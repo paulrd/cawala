@@ -10,6 +10,7 @@
     [ring.middleware.gzip :refer [wrap-gzip]]
     [ring.util.response :refer [response file-response resource-response]]
     [ring.util.response :as resp]
+    [cawala.server-components.hbank :as hbank]
     [hiccup.page :refer [html5]]))
 
 (def ^:private not-found-handler
@@ -47,10 +48,10 @@
   (html5
     [:html {:lang "en"}
      [:head {:lang "en"}
-      [:title "Application"]
+      [:title "Cawala - A Community Bank"]
       [:meta {:charset "utf-8"}]
       [:meta {:name "viewport"
-              :content "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"}]
+              :content "width=device-width, initial-scale=1, maximum-scale=1"}]
       [:link {:href "https://cdnjs.cloudflare.com/ajax/libs/semantic-ui/2.4.1/semantic.min.css"
               :rel  "stylesheet"}]
       [:link {:rel "shortcut icon" :href "data:image/x-icon;," :type "image/x-icon"}]
@@ -65,7 +66,7 @@
 ;; http://localhost:8023/workspaces.html
 ;; but that will not allow full-stack fulcro cards to talk to your server. This
 ;; page embeds the CSRF token, and is at `/wslive.html` on your server
-;; (i.e. port 3000).
+;; (i.e. port 3000)
 ;; ================================================================================
 (defn wslive [csrf-token]
   (html5
@@ -95,6 +96,10 @@
       (-> (resp/response (wslive anti-forgery-token))
         (resp/content-type "text/html"))
 
+      (#{"/hbank.html"} uri)
+      (-> (resp/response (hbank/page anti-forgery-token))
+          (resp/content-type "text/html"))
+
       :else
       (ring-handler req))))
 
@@ -117,17 +122,4 @@
       wrap-gzip)))
 
 (comment
-  (html5
-   [:html {:lang "en"}
-    [:head {:lang "en"}
-     [:title "devcards"]
-     [:meta {:charset "utf-8"}]
-     [:meta {:name "viewport" :content "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"}]
-     [:link {:href "https://cdnjs.cloudflare.com/ajax/libs/semantic-ui/2.4.1/semantic.min.css"
-             :rel  "stylesheet"}]
-     [:link {:rel "shortcut icon" :href "data:image/x-icon;," :type "image/x-icon"}]
-     ]
-    [:body
-     [:div#app]
-     [:script {:src "js/workspaces/main.js"}]]])
   )

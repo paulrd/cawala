@@ -2,6 +2,7 @@
   (:require [com.wsscode.pathom.connect :as pc]
             [com.wsscode.pathom.core :as p]
             [taoensso.timbre :as timbre]
+            #_[cawala.api.mutations :as m :refer [delete-person]]
             [clojure.core.async :as a]))
 
 (def people-db (atom
