@@ -2,7 +2,7 @@
   (:require [com.wsscode.pathom.connect :as pc]
             [com.wsscode.pathom.core :as p]
             [taoensso.timbre :as timbre]
-            #_[cawala.api.mutations :as m :refer [delete-person]]
+            [cawala.api.mutations :as m]
             [clojure.core.async :as a]))
 
 (def people-db (atom
@@ -48,7 +48,7 @@
       nil))
 
 (def app-registry [current-user my-friends my-enemies person-resolver
-                   delete-person])
+                   m/delete-person])
 
 (def parser
   (p/parallel-parser
