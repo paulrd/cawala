@@ -4,7 +4,7 @@
    [com.wsscode.pathom.core :as p]
    [com.wsscode.pathom.connect :as pc]
    [cawala.api.read :as r]
-   [fulcro.server :refer [defmutation]]))
+   #_[fulcro.server :refer [defmutation]]))
 
 ;; Place your server mutations here
 #_(defmutation delete-person
