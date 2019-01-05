@@ -5,25 +5,25 @@
             [cawala.api.db :as db]
             [clojure.core.async :as a]))
 
-(defn get-people [kind]
-  (->> @db/people-db
+(defn get-people [db kind]
+  (->> @db
        vals
        (filter #(= kind (:person/relation %)))
        vec))
 
-(pc/defresolver current-user [_ _]
+(pc/defresolver current-user [{::db/keys [db]} _]
   {::pc/output [{:current-user [:db/id :perosn/age :person/name]}]}
-  {:current-user (get @db/people-db 99)})
+  {:current-user (get @db 99)})
 
-(pc/defresolver my-friends [_ _]
+(pc/defresolver my-friends [{::db/keys [db]} _]
   {::pc/output [{:my-friends [:db/id :perosn/age :person/name]}]}
-  {:my-friends (get-people :friend)})
+  {:my-friends (get-people db :friend)})
 
-(pc/defresolver my-enemies [_ _]
+(pc/defresolver my-enemies [{::db/keys [db]} _]
   {::pc/output [{:my-enemies [:db/id :perosn/age :person/name]}]}
-  {:my-enemies (get-people :enemy)})
+  {:my-enemies (get-people db :enemy)})
 
-(pc/defresolver person-resolver [_ {:keys [person/by-id]}]
+(pc/defresolver person-resolver [{::db/keys [db]} {:keys [person/by-id]}]
   {::pc/input #{:person/by-id}
    ::pc/output [:db/id :person/name :person/age]}
-  (update (get @db/people-db by-id) :person/name str " (refreshed)"))
+  (update (get @db by-id) :person/name str " (refreshed)"))
