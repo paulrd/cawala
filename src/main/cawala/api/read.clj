@@ -2,6 +2,8 @@
   (:require [com.wsscode.pathom.connect :as pc]
             #_[com.wsscode.pathom.core :as p]
             [taoensso.timbre :as timbre]
+            ;; this dependency is just for namespaced keys I'm getting the db
+            ;; from the parser environment.
             [cawala.api.db :as db]
             [clojure.core.async :as a]))
 
