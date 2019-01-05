@@ -1,7 +1,7 @@
 (ns cawala.server-components.middleware
   (:require
     [cawala.server-components.config :refer [config]]
-    [cawala.api.read :as r]
+    [cawala.api.pathom :as p]
     [cawala.api.mutations]
     [clojure.core.async :as a]
     [mount.core :refer [defstate]]
@@ -26,7 +26,7 @@
 ;; Pathom.
 ;; ================================================================================
 #_(def server-parser (server/fulcro-parser))
-(def server-parser #(a/<!! (r/parser % %2)))
+(def server-parser #(a/<!! (p/parser % %2)))
 
 (defn wrap-api [handler uri]
   (fn [request]

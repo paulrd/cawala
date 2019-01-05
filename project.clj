@@ -6,7 +6,7 @@
   :dependencies [[org.clojure/clojure "1.10.0"]
                  [thheller/shadow-cljs "2.7.9"]
                  [fulcrologic/fulcro "2.7.0"]
-                 [com.wsscode/pathom "2.2.5"]
+                 [com.wsscode/pathom "2.2.6"]
                  [ring/ring-defaults "0.3.2"]
                  [org.clojure/core.async "0.4.490"]
                  [garden "1.3.6"]
@@ -15,7 +15,6 @@
 
                  ;; my code
                  [factual/geo "2.1.1"]
-                 [com.wsscode/pathom "2.2.5"]
                  [buddy/buddy-auth "2.1.0"]
                  ;; buddy may be using an outdated version of cheshire
                  [cheshire "5.8.1"]
