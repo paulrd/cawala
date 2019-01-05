@@ -2,6 +2,7 @@
   (:require [com.wsscode.pathom.connect :as pc]
             [com.wsscode.pathom.core :as p]
             [cawala.api.mutations :as m]
+            [clojure.core.async :as a]
             [cawala.api.read :as r]))
 
 (def people-db (atom
@@ -22,6 +23,12 @@
   (p/parallel-parser
    {::p/env     {::p/reader [p/map-reader pc/parallel-reader pc/open-ident-reader
                              p/env-placeholder-reader]
+                 ::p/proces-error
+                 (fn [_ err]
+                   ;; print stack trace
+                   (.printStackTrace err)
+                   ;; return error str
+                   (p/error-str err))
                  ::pc/mutation-join-globals [:app/id-remaps]
                  ::db `people-db
                  ::p/placeholder-prefixes #{">"}}
@@ -31,3 +38,10 @@
                  p/error-handler-plugin
                  p/request-cache-plugin
                  p/trace-plugin]}))
+
+(comment
+  (def q [{[:person/by-id 2] [:db/id :person/name :person/age]}])
+  (def q `[(m/delete-person {:list-id 1 :person-id 1})])
+  (a/<!! (parser {} q))
+  @people-db
+  )
