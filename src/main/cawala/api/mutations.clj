@@ -19,7 +19,6 @@
 (pc/defmutation delete-person [{::keys [db]} {:keys [person-id]}]
     {::pc/params [:person-id]
      ::pc/sym 'cawala.api.mutations/delete-person}
-    (do
-      (timbre/info "Server deleting person" person-id)
-      (swap! db dissoc person-id)
-      nil))
+  (timbre/info "Server deleting person" person-id)
+  (swap! db dissoc person-id)
+  nil)

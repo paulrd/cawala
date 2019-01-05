@@ -33,11 +33,3 @@
   (timbre/info "Server deleting person" person-id)
   (swap! db dissoc person-id)
   )
-
-(comment
-  (def q [{[:person/by-id 2] [:db/id :person/name :person/age]}])
-  (def q `[(delete-jaba {:list-id 1 :person-id 1})])
-  (def q `[(delete-person {:list-id 1 :person-id 1})])
-  (a/<!! (parser {} q))
-  @db/people-db
-  )

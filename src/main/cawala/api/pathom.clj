@@ -30,7 +30,7 @@
                    ;; return error str
                    (p/error-str err))
                  ::pc/mutation-join-globals [:app/id-remaps]
-                 ::db `people-db
+                 ::db people-db
                  ::p/placeholder-prefixes #{">"}}
     ::p/mutate  pc/mutate-async
     ;; setup connect and use our resolvers

@@ -18,7 +18,8 @@
   new app-state."
   [state-map field]
   (let [friend-idents (get-in state-map
-                              [:person-list/by-id :friends :person-list/people] [])
+                              [:person-list/by-id :friends
+                               :person-list/people] [])
         friends (map (fn [friend-ident]
                        (get-in state-map friend-ident)) friend-idents)
         sorted-friends (sort-by field friends)
