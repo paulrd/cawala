@@ -2,34 +2,28 @@
   (:require [com.wsscode.pathom.connect :as pc]
             #_[com.wsscode.pathom.core :as p]
             [taoensso.timbre :as timbre]
+            [cawala.api.db :as db]
             [clojure.core.async :as a]))
 
-(defn get-people [db kind]
-  (->> @db
+(defn get-people [kind]
+  (->> @db/people-db
        vals
        (filter #(= kind (:person/relation %)))
        vec))
 
-(pc/defresolver current-user [{::keys [db]} _]
+(pc/defresolver current-user [_ _]
   {::pc/output [{:current-user [:db/id :perosn/age :person/name]}]}
-  {:current-user (get @db 99)})
+  {:current-user (get @db/people-db 99)})
 
-(pc/defresolver my-friends [{::keys [db]} _]
+(pc/defresolver my-friends [_ _]
   {::pc/output [{:my-friends [:db/id :perosn/age :person/name]}]}
-  {:my-friends (get-people db :friend)})
+  {:my-friends (get-people :friend)})
 
-(pc/defresolver my-enemies [{::keys [db]} _]
+(pc/defresolver my-enemies [_ _]
   {::pc/output [{:my-enemies [:db/id :perosn/age :person/name]}]}
-  {:my-enemies (get-people db :enemy)})
+  {:my-enemies (get-people :enemy)})
 
-(pc/defresolver person-resolver [{::keys [db]} {:keys [person/by-id]}]
+(pc/defresolver person-resolver [_ {:keys [person/by-id]}]
   {::pc/input #{:person/by-id}
    ::pc/output [:db/id :person/name :person/age]}
-  (update (get @db by-id) :person/name str " (refreshed)"))
-
-#_(pc/defmutation delete-person [{::keys [db]} {:keys [person-id]}]
-  {::pc/params [:person-id]
-   ::pc/sym 'cawala.api.mutations/delete-person}
-  (timbre/info "Server deleting person" person-id)
-  (swap! db dissoc person-id)
-  )
+  (update (get @db/people-db by-id) :person/name str " (refreshed)"))
