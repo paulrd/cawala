@@ -2,9 +2,8 @@
   (:require [com.wsscode.pathom.connect :as pc]
             [com.wsscode.pathom.core :as p]
             [cawala.api.mutations :as m]
-            [clojure.core.async :as a]
-            [cawala.api.db :as db]
-            [cawala.api.read :as r]))
+            [cawala.api.read :as r]
+            [cawala.api.db :as db]))
 
 (def app-registry [r/current-user r/my-friends r/my-enemies r/person-resolver
                    m/delete-person])

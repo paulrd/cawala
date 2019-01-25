@@ -7,6 +7,7 @@
             [fulcro.client.network :as net]))
 
 (defonce app (atom nil))
+(def token-store (atom "No token"))
 
 (defn mount []
   (reset! app (fc/mount @app root/Root "app")))
@@ -14,11 +15,19 @@
 (defn start []
   (mount))
 
-(def secured-request-middleware
-  ;; The CSRF token is embedded in the server_components/html.clj
-  (->
-    (net/wrap-csrf-token (or js/fulcro_network_csrf_token "TOKEN-NOT-IN-HTML!"))
-    (net/wrap-fulcro-request)))
+(defn wrap-auth-token [handler]
+  (fn [req]
+    (handler (assoc-in req [:headers "Authorization"] @token-store))))
+
+(def request-middleware
+  (-> (net/wrap-csrf-token (or js/fulcro_network_csrf_token "TOKEN-NOT-IN-HTML!"))
+      net/wrap-fulcro-request wrap-auth-token))
+
+(defn wrap-remember-token [res]
+  (when-let [new-token (-> res :body :user/whoami :app/token)]
+      ;;(println (str "found token: " new-token))
+      (reset! token-store (str "Token " new-token)))
+    res)
 
 (defn ^:export init []
   (reset! app
@@ -36,7 +45,9 @@
            :networking
            {:remote (net/fulcro-http-remote
                      {:url (str (-> js/window .-location .-href) "api")
-                      :request-middleware secured-request-middleware})}))
+                      :request-middleware request-middleware
+                      :response-middleware (net/wrap-fulcro-response
+                                            wrap-remember-token)})}))
   (start))
 
 (comment
