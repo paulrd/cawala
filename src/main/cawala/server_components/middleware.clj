@@ -89,12 +89,12 @@
     (cond
       (#{"/" "/index.html"} uri)
       (-> (resp/response (index anti-forgery-token))
-        (resp/content-type "text/html"))
+          (resp/content-type "text/html"))
 
       ;; See note above on the `wslive` function.
       (#{"/wslive.html"} uri)
       (-> (resp/response (wslive anti-forgery-token))
-        (resp/content-type "text/html"))
+          (resp/content-type "text/html"))
 
       (#{"/hbank.html"} uri)
       (-> (resp/response (hbank/page anti-forgery-token))
@@ -112,7 +112,7 @@
       server/wrap-transit-params
       server/wrap-transit-response
       (server/wrap-protect-origins {:allow-when-origin-missing? true
-                                    :legal-origins              legal-origins})
+                                    :legal-origins legal-origins})
       (wrap-html-routes)
       ;; If you want to set something like session store, you'd do it against
       ;; the defaults-config here (which comes from an EDN file, so it can't have
