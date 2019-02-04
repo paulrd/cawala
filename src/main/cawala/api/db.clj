@@ -10,3 +10,9 @@
                  4  {:db/id 4 :person/name "Zoe" :person/age 32
                      :person/relation :friend}
                  99 {:db/id 99 :person/name "Me" :person/role "admin"}}))
+
+(def user-db (atom
+              {1 {:db/id 1 :user/email "paul@unstate.ca"
+                  :user/encrypted-password "floggoll"
+                  :user/password-salt "mamama"
+                  :user/password-iterations 22}}))

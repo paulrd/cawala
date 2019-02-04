@@ -5,6 +5,7 @@
   "private": true,
   "dependencies": {
     "highlight.js": "^9.13.1",
+    "npm": "^6.7.0",
     "react-grid-layout": "^0.16.6",
     "react-icons": "^3.2.2",
     "reakit": "^0.15.13",
@@ -17,7 +18,7 @@
     "karma-cljs-test": "^0.1.0",
     "react": "^16.7.0",
     "react-dom": "^16.7.0",
-    "shadow-cljs": "^2.7.13",
+    "shadow-cljs": "^2.7.17",
     "showdown": "^1.9.0"
   },
   "author": "",

@@ -51,4 +51,16 @@
   (stop)
   (tools-ns/refresh)
   (clojure.tools.namespace.repl/refresh)
+  (defmulti foo (fn [c s] (class c)))
+  (defmethod foo String [_] :a-string)
+  (defmethod foo String [_ s]
+    s
+    )
+  (foo "hi" "Hello")
+  (defmulti tt (fn [c s] (class c)))
+  (defmethod tt String [c s]
+    (str c s)
+    )
+  (tt "hi" "hello")
+
   )

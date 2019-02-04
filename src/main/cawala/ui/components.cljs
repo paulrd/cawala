@@ -2,10 +2,18 @@
   (:require [fulcro.client.primitives :as prim :refer [defsc]]
             [fulcro.client.data-fetch :as df]
             [fulcro.client.dom :as dom]
+            #_[taoensso.timbre :as log]
+            [cawala.auth :as auth]
             [cawala.api.mutations :as api]))
 
+(defsc User [this props]
+  {:query [:db/id :user/email :user/first-name
+           :user/last-name :firm-id :jwt]
+   :ident (fn [] [:user/current-user :singleton])
+   :initial-state (fn [_] {:jwt (auth/get-token)})})
+
 (defsc Person [this {:keys [db/id person/name person/age]} {:keys [onDelete]}]
-  {:query         [:db/id :person/name :person/age]
+  {:query [:db/id :person/name :person/age]
    :ident [:person/by-id :db/id]
    :initial-state (fn [{:keys [id name age]}]
                     {:db/id id :person/name name :person/age age})}
@@ -42,3 +50,4 @@
   (println "yes?")
   (meta (prim/get-query PersonList))
   )
+
