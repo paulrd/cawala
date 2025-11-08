@@ -1,0 +1,19 @@
+{:paths ["src" "resources"]
+ :deps
+ {org.clojure/clojure {:mvn/version "1.12.3"}
+  org.pushing-pixels/radiance-theming {:mvn/version "8.0.0"}
+  mount/mount {:mvn/version "0.1.23"}
+  seesaw/seesaw {:mvn/version "1.5.0"}}
+ :aliases
+ {:build {:deps {slipset/deps-deploy {:mvn/version "0.2.2"}
+                 io.github.clojure/tools.build {:mvn/version "0.10.11"}}
+          :ns-default build}
+  :dev {:classpath-overrides {org.clojure/clojure nil}
+        :extra-deps
+        {com.github.flow-storm/clojure {:mvn/version "1.12.3-4"}
+         com.github.flow-storm/flow-storm-dbg {:mvn/version "4.5.9"}}
+        :extra-paths ["dev"]
+        :jvm-opts ["-Dclojure.storm.instrumentEnable=true"
+                   "--add-opens=javafx.graphics/javafx.scene.paint=ALL-UNNAMED"
+                   "-Dclojure.storm.instrumentOnlyPrefixes=ca.cawala"]}}
+ }
