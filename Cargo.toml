@@ -1,0 +1,5 @@
+[workspace]
+members = ["crates/proto", "crates/node", "crates/client-wasm"]
+# resolver 3 keeps tokio's `net` feature from unifying across targets, so the
+# wasm32 build does not try to compile mio (which hard-errors on wasm).
+resolver = "3"

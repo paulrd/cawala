@@ -1,0 +1,27 @@
+[package]
+name = "cawala-client"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# cdylib for the wasm-bindgen .wasm output, rlib so native tooling/tests can
+# link it too.
+crate-type = ["cdylib", "rlib"]
+
+# Pins mirror the n0 browser-echo blueprint exactly (iroh pinned to 1.0.3 as
+# the rest of Cawala does). getrandom 0.3 needs BOTH the `wasm_js` feature and
+# the `getrandom_backend="wasm_js"` cfg set in .cargo/config.toml; iroh 1.0.3
+# pulls getrandom 0.4 with its own `wasm_js` feature.
+[dependencies]
+console_error_panic_hook = "0.1.7"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring"] }
+n0-future = "0.3"
+proto = { package = "cawala-proto", path = "../proto" }
+serde = "1.0.217"
+tokio = { version = "1.43.0", default-features = false, features = ["sync", "io-util"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+tracing-subscriber-wasm = "0.1.0"
+wasm-bindgen = "=0.2.122"
+wasm-bindgen-futures = "0.4.50"

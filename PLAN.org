@@ -78,9 +78,17 @@
   - Accepted tradeoff: subtree-level pseudonymity, not transaction privacy.
 
 * Milestones (risk-sequenced)
-  1. *M0 - WASM spike*: wasm-bindgen wrapper crate <-> Rust node message
-     round-trip over relay, hosted on GitHub Pages. De-risks the biggest
-     unknown first. Pin all versions.
+  1. *M0 - WASM spike* (DONE 2026-08-21): wasm-bindgen wrapper crate <-> Rust
+     node message round-trip over relay, hosted on GitHub Pages. De-risks the
+     biggest unknown first. Pin all versions.
+     - Verified end-to-end: node relay ping/pong test, wasm compile + glue,
+       vite build, and a Node.js smoke test driving the wasm module against a
+       live node over the N0 relay (round-trip OK).
+     - Env requirements for local wasm builds: wasm32 target, wasm-bindgen-cli
+       0.2.122, and clang (ring needs a C compiler on wasm32).
+     - To finish: enable GitHub Pages -> "GitHub Actions" in repo settings
+       (workflow in .github/workflows/pages.yml); then confirm in a real
+       browser (web/README.md has the manual checklist).
   2. *M1 - Topology & addressing*: octal address scheme, node
      identity/persistence, local-only split rule, moved-pointers.
      Property-test split/join storms.

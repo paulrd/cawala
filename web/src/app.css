@@ -1,0 +1,58 @@
+:root {
+  --bg: #f5f6f8;
+  --card: #ffffff;
+  --fg: #1b1e23;
+  --border: #d6dae0;
+  --muted: #6a7280;
+  --ok: #0a7d33;
+  --error: #c62828;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono",
+    monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.5;
+}
+
+main {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+}
+
+h1 {
+  font-size: 1.35rem;
+  margin: 0 0 4px;
+}
+
+h2 {
+  font-size: 1rem;
+  margin: 0 0 10px;
+}
+
+.tagline {
+  margin: 0 0 20px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.card--error {
+  border-color: var(--error);
+}

@@ -1,0 +1,62 @@
+# Deploys the Cawala M0 web app (Svelte + wasm client) to GitHub Pages.
+
+# NOTE: the repository owner must enable Pages deployment from Actions:
+#   Settings → Pages → Source: "GitHub Actions"
+# Without that, the deploy job below will be skipped/fail.
+
+name: Deploy web app to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen-cli 0.2.122
+        run: cargo install wasm-bindgen-cli --version 0.2.122
+
+      - name: Install npm dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build web app (wasm + vite)
+        working-directory: web
+        run: npm run build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

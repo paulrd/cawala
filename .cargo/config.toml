@@ -1,0 +1,5 @@
+# Mirror of n0 browser-echo blueprint: selects the wasm_js getrandom backend
+# for wasm32-unknown-unknown (getrandom 0.3 requires BOTH this cfg and the
+# `wasm_js` crate feature; getrandom 0.4, used by iroh 1.0.3, uses the feature).
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

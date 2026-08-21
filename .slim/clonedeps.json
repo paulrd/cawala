@@ -1,0 +1,24 @@
+{
+  "version": "1.0.0",
+  "updatedAt": "2026-08-21T00:00:00.000Z",
+  "dependencies": [
+    {
+      "name": "iroh-examples",
+      "resolvedVersion": "main (6a8cfcdccc6a633c5608cb25e776cb52fd509dd3)",
+      "repoUrl": "https://github.com/n0-computer/iroh-examples.git",
+      "ref": "main",
+      "path": ".slim/clonedeps/repos/n0-computer__iroh-examples",
+      "packagePath": "browser-echo",
+      "reason": "Canonical n0 example of the M0 stack: Rust node + wasm-bindgen wrapper + browser client over a relay"
+    },
+    {
+      "name": "iroh",
+      "resolvedVersion": "1.0.3",
+      "repoUrl": "https://github.com/n0-computer/iroh.git",
+      "ref": "v1.0.3",
+      "path": ".slim/clonedeps/repos/n0-computer__iroh",
+      "packagePath": null,
+      "reason": "Pinned source of the exact iroh version Cawala builds against; API signature reference"
+    }
+  ]
+}
