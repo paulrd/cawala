@@ -69,6 +69,15 @@ node scripts/smoke.mjs <node-EndpointId> "hello from wasm"
 Spawn-only check (proves the wasm endpoint binds + registers on the relay,
 without a peer): `node scripts/smoke.mjs`.
 
+Tab-to-tab equivalent (two wasm endpoints in one process — proves a browser
+tab can both answer and initiate pings):
+
+```sh
+cd web
+node scripts/smoke-tabs.mjs
+# expected: "[smoke-tabs] round-trip OK"
+```
+
 ### Production build / preview
 
 ```sh
