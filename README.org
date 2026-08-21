@@ -1,1 +1,59 @@
-Initial Commit
+* Project Overview
+  *Cawala* is a modernized Hawala alternative. Value is transmitted, created and
+   destroyed by sending messages to other sovereign nodes that are organized
+   into a hierarchical network based primarily on geographical region.
+
+* Goals and Non-Goals
+** Goals
+  - Use decentralized technology (Iroh) to allow users to easily deploy their
+    own nodes and to allow web clients and nodes to communicate securely.
+  - Mitigate risks by only communicating with a small number of connected nodes
+    and make it easy for nodes to join, leave or move based on trust and
+    reliability.
+  - Re-use the hierarchical nature of the network and communal control of nodes
+    to encourage communication and coordination between communities at varying
+    population and geographical scales.
+  - Provide some level of anonymity via restricting the kind of data that gets
+    transmitted between nodes.
+  - Users will interact with node primarily through web clients that has Iroh
+    WASM modules.
+  - Nodes will be regular Iroh nodes written in the rust language.
+** Non-Goals
+  - Cawala nodes do not provide Zero Trust computing and as such each node can
+    see data that it holds.
+  - Cawala doesn't support running nodes on phones.
+* Target Users
+  Cawala replaces the private for-profit banking system with an community-owned
+  alternative. Use this software if you want to be your own bank.
+* Features / Functional Requirements
+  - deploy a web client with WASM Iroh module as a static PWA on github pages
+  - nodes are built using the Rust language and Iroh.
+  - project is open-source MIT License.
+  - each node is small and light-weight instance of an Iroh node
+  - each node only communicates with its parent node or up to 8 child nodes.
+  - web clients only communicate with leaf nodes
+  - leaf nodes can have up to 8 users
+  - one child node (the most senior) is selected to control its parent node
+  - the web client allows a user to control more than one node but only
+    indirectly intermediate child nodes - not directly.
+  - more than one node can be deployed to the same server
+  - nodes can be deployed on almost any device
+  - each node and user will have an octal address that will allow their position
+    in the tree to be known so that payments or messages can be routed.
+  - a separate SQLITE database can be queried that can suggest the appropriate
+    octal address for a given user's location.
+  - A node holds an account for each of its child nodes / users.
+  - A node administrator can arbitrarily increase or decrease the value of an
+    account.
+* Constraints
+  - tech stack is Iroh, Rust, Typescript, Virtual Private Servers
+* Open Questions
+  - What javascript frontend framework should I use (Vue, Svelt, etc).
+  - How do new users join the network?
+  - How do new users query the SQLITE database to get their ideal octal address?
+  - How do we allow nodes to split so that an already full node can get a new
+    user or child node?
+  - What other out-of-band services might be required? Some of these might be:
+    - How do people learn about Cawala?
+    - How does a Cawala user introduce a new user to the network so they can
+      receive or send a payment?

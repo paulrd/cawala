@@ -1,0 +1,126 @@
+* Cawala - Project Plan
+
+  Status: Draft v2 (2026-08-21) - decisions resolved. Research sources: Iroh
+  docs/crates (2026-07), architecture design memo from technical review.
+
+* What We Are Building
+  A community-owned, hierarchical value-transfer network: Rust/Iroh nodes
+  forming a geographic tree, browser clients (Iroh WASM) talking only to leaf
+  nodes, value created/destroyed/transferred via signed messages between
+  "sovereign" nodes. Each node holds accounts for its children/users; senior
+  children control their parent.
+
+** Load-Bearing Architecture Decisions
+  These two decisions make the rest of the design work:
+  1. *Subtree moves only happen within a parent* - makes splits, addressing,
+     and routing locally scoped, with no global renumbering.
+  2. *Operator keys != ledger keys* - makes "senior child controls parent"
+     survivable: control grants operational power, never the ability to forge
+     another node's ledger.
+
+* Tech Stack (verified against Iroh's current state, 2026-07)
+  | Layer           | Choice                                                              |
+  |-----------------+--------------------------------------------------------------------|
+  | Nodes           | Rust + iroh 1.0.3 (stable, API frozen since 1.0.0)                 |
+  | Node<->node msg | Custom QUIC-stream protocol - ALPN + length-prefixed postcard      |
+  |                 | framing (or irpc for RPC). NOT gossip/docs/blobs - wrong fit       |
+  | Web<->node      | Small Rust wasm-bindgen wrapper crate (no npm WASM SDK exists) -   |
+  |                 | same custom protocol over relayed e2e-encrypted connection         |
+  | Web client      | TypeScript PWA on GitHub Pages - no COOP/COEP/SharedArrayBuffer/   |
+  |                 | service worker needed (n0 browser-echo demo proves it)             |
+  | Relay           | Browser clients cannot do direct UDP - need reachable relays.      |
+  |                 | Public N0 relays for dev; self-hosted iroh-relay on VPS for        |
+  |                 | sovereignty                                                        |
+  | Persistence     | Ed25519 SecretKey persisted to file (required, or node ID changes  |
+  |                 | every run); ledger store via redb-backed iroh stores               |
+  | Location DB     | Separate small SQLite service - hint only, never authority; leaf   |
+  |                 | validates and issues final address                                 |
+
+* Architecture Summary
+** Addresses
+  - Dot-separated octal digits, one per tree level. Nodes at depth d have
+    d+1 digits; users = leaf address + 1 digit.
+  - Identity = immutable Iroh NodeId; address is a routable position that may
+    change.
+  - Routing = longest-prefix match with O(8) routing tables. Cap depth <= 6.
+** Splits
+  - Full node walks up to nearest ancestor with a free slot, spawns a sibling,
+    moves some children.
+  - Only local parties update; ancestors untouched.
+  - Moved-node keeps a signed moved_pointer (TTL) for in-flight messages.
+  - Strict 8-cap applies at every level, including the root. If every ancestor
+    down to the root is full, run a rare, coordinated renumbering event
+    (decision 2).
+** Trust
+  - Seniority = lowest address digit among children (verifiable by all
+    siblings).
+  - Control = approve joins, trigger splits, config, per-child credit limits.
+  - Every balance mutation is signed + append-only + visible to all children;
+    any child can exit/detach.
+  - Failed parent replaced via foster parent from signed state commitments.
+** Settlement
+  - Cross-subtree payments settle at the least common ancestor (LCA) between
+    prefunded settlement accounts - prefunded only, no overdraw (decision 5).
+  - Periodic netting reconciles balances.
+  - Value creation/destruction = signed issue/burn entries propagated with
+    ledger commitments.
+** Accepted Risks (cannot be guaranteed in this model)
+  - Payment-time double-spend prevention across subtrees (detectable at
+    netting instead).
+  - Defense against colluding parent + senior child.
+  - Privacy from routing-path nodes.
+  - Nodes are intentionally not zero-trust.
+** Anonymity
+  - Transmit only: addresses, NodeIds, amounts, coarse timestamps,
+    commitments.
+  - Never transmit: names, free-text memos (E2E-encrypted to recipient leaf
+    only if needed), full balances, IPs.
+  - Accepted tradeoff: subtree-level pseudonymity, not transaction privacy.
+
+* Milestones (risk-sequenced)
+  1. *M0 - WASM spike*: wasm-bindgen wrapper crate <-> Rust node message
+     round-trip over relay, hosted on GitHub Pages. De-risks the biggest
+     unknown first. Pin all versions.
+  2. *M1 - Topology & addressing*: octal address scheme, node
+     identity/persistence, local-only split rule, moved-pointers.
+     Property-test split/join storms.
+  3. *M2 - Ledger & settlement*: append-only signed Merkle-committed ledgers,
+     operator/ledger key separation, prefunded-only LCA settlement + netting.
+     Adversarial double-spend test harness proving detection at netting.
+  4. *M3 - Messaging/routing protocol*: ALPN framing, envelope (src, dst,
+     msg_id, type, nonce, payload, hop_chain), longest-prefix routing,
+     replay/ordering protection.
+  5. *M4 - Control & web client*: senior-child control flow, indirect
+     multi-node control, Svelte PWA + location SQLite service, join flow
+     (parent approves -> leaf issues address).
+  6. *M5 - Hardening*: exit rights, foster-parent recovery, compromise-path
+     docs, audit tooling, governance/regulatory surface (Hawala exposure is
+     real - community question, not code).
+
+* Top Risks
+  1. Iroh WASM maturity -> M0 spike before any other work.
+  2. Cross-subtree double-spend/inflation -> prefunded LCA + Merkle ledgers +
+     adversarial harness in M2.
+  3. LCA concentration (deep tree = high nodes become de-facto banks) -> depth
+     cap, proactive split of hot levels.
+  4. Senior-child abuse -> key separation, exit rights, audit trail (sole
+     senior-child admin accepted by decision 4; exit + audit are the checks).
+  5. Control-key compromise cascading up via seniority -> scoped operator
+     keys, documented compromise paths.
+  6. Address instability -> local-move rule + moved-pointers + property tests.
+  7. Scope creep (no DHTs/ZK/consensus) -> freeze v1: one credit message type,
+     one ledger format, 8-entry routing tables.
+
+* Decisions (resolved 2026-08-21)
+  1. Seniority rule: lowest address digit among children (deterministic,
+     topology-anchored, verifiable by all siblings).
+  2. Root cap: strict 8-cap at every level including root; "everything full"
+     case handled by a rare, coordinated renumbering event. Note: depth growth
+     is independent of the root cap (depth grows via local subdivision).
+  3. Currency model: single nominal unit + per-node trust limits.
+  4. Balance changes: sole senior-child admin (README's arbitrary-adjust
+     capability kept; mitigated by exit rights + audit trail + key separation).
+  5. Overdraw: prefunded only - no uncollateralized credit.
+  6. Frontend framework: Svelte (lightest, great PWA support).
+  7. Relay: public N0 relays for development; self-hosted iroh-relay on a VPS
+     before public launch.
