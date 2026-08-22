@@ -4,3 +4,6 @@
 
 # Rust build output
 target/
+
+# Local node data (identity + topology links)
+node-data/

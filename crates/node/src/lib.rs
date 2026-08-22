@@ -8,12 +8,29 @@
 use iroh::{
     Endpoint,
     endpoint::Connection,
-    protocol::{AcceptError, ProtocolHandler},
+    protocol::{AcceptError, ProtocolHandler, Router},
 };
 use std::io;
 use tracing::info;
 
 pub use proto::{PingPong, ALPN};
+
+pub mod identity;
+pub mod record;
+
+/// Bind an endpoint with the given persisted [`iroh::SecretKey`] and start the
+/// `cawala/ping/0` accept loop.
+///
+/// A key persisted via [`identity::load_or_create_secret_key`] yields a stable
+/// [`iroh::EndpointId`] across restarts.
+pub async fn spawn_with_secret_key(secret_key: iroh::SecretKey) -> anyhow::Result<Router> {
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(secret_key)
+        .alpns(vec![ALPN.to_vec()])
+        .bind()
+        .await?;
+    Ok(Router::builder(endpoint).accept(ALPN, PingHandler).spawn())
+}
 
 /// Server side of the `cawala/ping/0` protocol: accept a connection, read one
 /// framed `Ping`, reply with `Pong { seq: seq+1, payload }`, finish the send

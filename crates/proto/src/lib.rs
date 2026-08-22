@@ -5,11 +5,19 @@
 //! wasm-safe: it is compiled for `wasm32-unknown-unknown` as a dependency of
 //! the browser client, so tokio is used with `default-features = false` and
 //! only the `io-util` feature.
+//!
+//! Also carries the octal hierarchical address type [`OctAddr`] (and the
+//! topology's slot bound [`MAX_SLOT`]), which is pure `std` + `serde` and
+//! therefore wasm-safe.
 
 use std::io;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+mod addr;
+
+pub use addr::{OctAddr, ParseOctAddrError, MAX_SLOT};
 
 /// ALPN negotiated on every cawala/ping/0 connection.
 pub const ALPN: &[u8] = b"cawala/ping/0";
