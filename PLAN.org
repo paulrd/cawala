@@ -78,8 +78,9 @@
     coordinated renumbering event remains deferred with automatic
     splitting.
 ** Trust
-  - Seniority = lowest address digit among children (verifiable by all
-    siblings).
+  - Seniority = earliest date_joined among children; date_joined is recorded
+    per child by its parent, and admins may keep or reset it on moves
+    (decision 1).
   - Control = approve joins, create nodes + edit child/parent links
     (topology), config, per-child credit limits.
   - Every balance mutation is signed + append-only + visible to all children;
@@ -133,6 +134,9 @@
        EndpointId across restarts (verified); links-only record persisted to
        <data-dir>/node.json (never derived addresses); clap CLI: run / init /
        topo (show, attach-child, detach-child, set-parent, unset-parent).
+     - Seniority via date_joined (decision 1): each child entry records when
+       it first joined; CLI attach-child --date-joined keeps a moved child's
+       original date or resets to now when omitted.
      - 59 workspace tests green, including the relay ping/pong test.
   3. *M2 - Ledger & settlement*: append-only signed Merkle-committed ledgers,
      operator/ledger key separation, prefunded-only LCA settlement + netting.
@@ -166,8 +170,13 @@
      one ledger format, 8-entry routing tables.
 
 * Decisions (resolved 2026-08-21)
-  1. Seniority rule: lowest address digit among children (deterministic,
-     topology-anchored, verifiable by all siblings).
+  1. Seniority rule: the child with the earliest date_joined is the most
+     senior (date_joined = when the child first joined the network, recorded
+     by its parent). When children are moved/split, the new node's admin may
+     keep or reset each child's date_joined. Address/slot is geography-assigned
+     (location DB) and therefore does not double as seniority. Tradeoff:
+     date_joined is parent-attested (gameable by a colluding parent), unlike
+     the old topology-anchored rule.
   2. Root cap: strict 8-cap at every level including root; "everything full"
      case handled by a rare, coordinated renumbering event. Note: depth growth
      is independent of the root cap (depth grows via local subdivision).
@@ -187,7 +196,9 @@
      intermediate children, however they redistribute the old children -
      preserving geographic containment (children stay in the region of their
      parents/grandparents). Consequence: in-flight messages to just-moved
-     addresses may fail in v1 (retry via a fresh location lookup).
+     addresses may fail in v1 (retry via a fresh location lookup). Moved
+     children's date_joined is kept or reset at the new node admin's
+     discretion (decision 1).
   9. Tree depth: no hard cap on depth. Depth grows with subdivision; the only
      topology limits are the per-node 8-cap and geographic sense. Mitigate
      LCA concentration by proactively splitting hot levels (see risk 3).

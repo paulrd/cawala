@@ -30,7 +30,7 @@ pub const MAX_CHILDREN: usize = MAX_SLOT as usize + 1;
 /// {
 ///   "node_id": "<id>",
 ///   "parent": { "parent_id": "<id>", "slot": 0 },
-///   "children": [ { "child_id": "<id>", "kind": "node", "slot": 0 } ]
+///   "children": [ { "child_id": "<id>", "kind": "node", "slot": 0, "date_joined": 1700000000 } ]
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +57,10 @@ pub struct ChildEntry {
     #[serde(with = "kind_serde")]
     pub kind: ChildKind,
     pub slot: u8,
+    /// Unix seconds when the child first joined this parent. Kept when a child
+    /// is re-parented (moved) so seniority ("earliest `date_joined`") survives
+    /// address reassignment; slot/address is geography, not seniority.
+    pub date_joined: u64,
 }
 
 /// Errors raised by record validation, mutations, and (de)serialization.
@@ -193,11 +197,16 @@ impl RecordStore {
     }
 
     /// Add a child link. `slot: None` picks the lowest free slot.
+    ///
+    /// `date_joined` records when the child first joined this parent (unix
+    /// seconds). It is taken explicitly — the store never reads the clock — so
+    /// callers can preserve a moved child's original `date_joined` or reset it.
     pub fn attach_child(
         &mut self,
         child_id: impl Into<String>,
         kind: ChildKind,
         slot: Option<u8>,
+        date_joined: u64,
     ) -> Result<(), RecordError> {
         let child_id = child_id.into();
         if child_id == self.record.node_id {
@@ -230,6 +239,7 @@ impl RecordStore {
             child_id,
             kind,
             slot,
+            date_joined,
         });
         self.record.validate()?;
         Ok(())
@@ -311,13 +321,15 @@ mod tests {
         RecordStore::open(dir, "node-a").unwrap()
     }
 
+    const JOINED: u64 = 1700000000;
+
     #[test]
     fn save_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = store(dir.path());
         store.set_parent("parent-x", 3).unwrap();
-        store.attach_child("child-1", ChildKind::Node, Some(0)).unwrap();
-        store.attach_child("child-2", ChildKind::User, Some(5)).unwrap();
+        store.attach_child("child-1", ChildKind::Node, Some(0), JOINED).unwrap();
+        store.attach_child("child-2", ChildKind::User, Some(5), JOINED).unwrap();
         store.save().unwrap();
 
         let loaded = RecordStore::open(dir.path(), "node-a").unwrap();
@@ -330,10 +342,28 @@ mod tests {
     fn attach_auto_slot_picks_lowest_free() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = store(dir.path());
-        store.attach_child("c1", ChildKind::Node, Some(2)).unwrap();
-        store.attach_child("c2", ChildKind::Node, None).unwrap();
+        store.attach_child("c1", ChildKind::Node, Some(2), JOINED).unwrap();
+        store.attach_child("c2", ChildKind::Node, None, JOINED).unwrap();
         let c2 = store.record().children.iter().find(|c| c.child_id == "c2").unwrap();
         assert_eq!(c2.slot, 0); // lowest free (0 is free, 2 is taken)
+    }
+
+    #[test]
+    fn date_joined_recorded_and_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(dir.path());
+        // The store records the provided date_joined verbatim.
+        store.attach_child("c1", ChildKind::Node, Some(0), 1700000000).unwrap();
+        let c1 = store.record().children.iter().find(|c| c.child_id == "c1").unwrap();
+        assert_eq!(c1.date_joined, 1700000000);
+        // It survives a save + load round-trip, in node.json and in memory.
+        store.save().unwrap();
+        let json = std::fs::read_to_string(dir.path().join(NODE_RECORD_FILE)).unwrap();
+        assert!(json.contains("\"date_joined\": 1700000000"));
+        let loaded = RecordStore::open(dir.path(), "node-a").unwrap();
+        assert_eq!(loaded.record(), store.record());
+        let loaded_c1 = loaded.record().children.iter().find(|c| c.child_id == "c1").unwrap();
+        assert_eq!(loaded_c1.date_joined, 1700000000);
     }
 
     #[test]
@@ -342,17 +372,17 @@ mod tests {
         let mut store = store(dir.path());
         for i in 0..8 {
             store
-                .attach_child(format!("c{i}"), ChildKind::Node, None)
+                .attach_child(format!("c{i}"), ChildKind::Node, None, JOINED)
                 .unwrap();
         }
         // Auto slot: all 8 slots taken.
         assert_eq!(
-            store.attach_child("c8", ChildKind::Node, None),
+            store.attach_child("c8", ChildKind::Node, None, JOINED),
             Err(RecordError::CapExceeded)
         );
         // Explicit slot on the (full) parent is reported as taken.
         assert_eq!(
-            store.attach_child("c8", ChildKind::Node, Some(4)),
+            store.attach_child("c8", ChildKind::Node, Some(4), JOINED),
             Err(RecordError::SlotTaken(4))
         );
         assert_eq!(store.record().children.len(), 8);
@@ -362,9 +392,9 @@ mod tests {
     fn duplicate_slot_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = store(dir.path());
-        store.attach_child("c1", ChildKind::Node, Some(3)).unwrap();
+        store.attach_child("c1", ChildKind::Node, Some(3), JOINED).unwrap();
         assert_eq!(
-            store.attach_child("c2", ChildKind::Node, Some(3)),
+            store.attach_child("c2", ChildKind::Node, Some(3), JOINED),
             Err(RecordError::SlotTaken(3))
         );
     }
@@ -373,9 +403,9 @@ mod tests {
     fn duplicate_child_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = store(dir.path());
-        store.attach_child("c1", ChildKind::Node, None).unwrap();
+        store.attach_child("c1", ChildKind::Node, None, JOINED).unwrap();
         assert_eq!(
-            store.attach_child("c1", ChildKind::User, Some(1)),
+            store.attach_child("c1", ChildKind::User, Some(1), JOINED),
             Err(RecordError::DuplicateChild("c1".into()))
         );
     }
@@ -385,7 +415,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = store(dir.path());
         assert_eq!(
-            store.attach_child("c1", ChildKind::Node, Some(8)),
+            store.attach_child("c1", ChildKind::Node, Some(8), JOINED),
             Err(RecordError::SlotOutOfRange(8))
         );
         assert_eq!(
@@ -404,7 +434,7 @@ mod tests {
             Err(RecordError::SelfReference("node-a".into()))
         );
         assert_eq!(
-            store.attach_child("node-a", ChildKind::Node, None),
+            store.attach_child("node-a", ChildKind::Node, None, JOINED),
             Err(RecordError::SelfReference("node-a".into()))
         );
     }
@@ -413,7 +443,7 @@ mod tests {
     fn detach_child() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = store(dir.path());
-        store.attach_child("c1", ChildKind::Node, None).unwrap();
+        store.attach_child("c1", ChildKind::Node, None, JOINED).unwrap();
         store.detach_child("c1").unwrap();
         assert!(store.record().children.is_empty());
         assert_eq!(
@@ -427,7 +457,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = store(dir.path());
         store.set_parent("parent-x", 5).unwrap();
-        store.attach_child("c1", ChildKind::User, Some(0)).unwrap();
+        store.attach_child("c1", ChildKind::User, Some(0), JOINED).unwrap();
         store.save().unwrap();
         let json = std::fs::read_to_string(dir.path().join(NODE_RECORD_FILE)).unwrap();
         // kind is lowercase in JSON
@@ -441,7 +471,7 @@ mod tests {
     #[test]
     fn bad_kind_rejected_on_load() {
         let dir = tempfile::tempdir().unwrap();
-        let json = r#"{"node_id":"node-a","parent":null,"children":[{"child_id":"c1","kind":"bogus","slot":0}]}"#;
+        let json = r#"{"node_id":"node-a","parent":null,"children":[{"child_id":"c1","kind":"bogus","slot":0,"date_joined":0}]}"#;
         std::fs::write(dir.path().join(NODE_RECORD_FILE), json).unwrap();
         let err = RecordStore::open(dir.path(), "node-a").unwrap_err();
         assert!(matches!(err, RecordError::Corrupt { .. }));
@@ -451,7 +481,7 @@ mod tests {
     fn id_mismatch_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = store(dir.path());
-        store.attach_child("c1", ChildKind::Node, None).unwrap();
+        store.attach_child("c1", ChildKind::Node, None, JOINED).unwrap();
         store.save().unwrap();
         assert_eq!(
             RecordStore::open(dir.path(), "some-other-id").unwrap_err(),
@@ -466,7 +496,7 @@ mod tests {
     fn validate_rejects_tampered_file() {
         let dir = tempfile::tempdir().unwrap();
         // duplicate slot
-        let json = r#"{"node_id":"node-a","parent":null,"children":[{"child_id":"c1","kind":"node","slot":1},{"child_id":"c2","kind":"node","slot":1}]}"#;
+        let json = r#"{"node_id":"node-a","parent":null,"children":[{"child_id":"c1","kind":"node","slot":1,"date_joined":0},{"child_id":"c2","kind":"node","slot":1,"date_joined":0}]}"#;
         std::fs::write(dir.path().join(NODE_RECORD_FILE), json).unwrap();
         assert_eq!(
             RecordStore::open(dir.path(), "node-a").unwrap_err(),

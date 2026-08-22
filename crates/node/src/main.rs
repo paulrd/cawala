@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use cawala_node::{identity, record, spawn_with_secret_key};
@@ -48,6 +48,11 @@ enum TopoCommand {
         /// Octal slot 0..=7; omitted picks the lowest free slot.
         #[arg(long, value_name = "SLOT", value_parser = clap::value_parser!(u8).range(0..=7))]
         slot: Option<u8>,
+        /// Unix seconds the child first joined; omitted defaults to now.
+        /// Pass the child's original value when re-attaching a moved child to
+        /// keep its seniority; omit to reset it.
+        #[arg(long, value_name = "EPOCH_SECONDS")]
+        date_joined: Option<u64>,
     },
     /// Remove a child entry.
     DetachChild {
@@ -134,17 +139,22 @@ fn topo(data_dir: &std::path::Path, command: TopoCommand) -> Result<()> {
 
     match command {
         TopoCommand::Show => show(&store),
-        TopoCommand::AttachChild { child, kind, slot } => {
-            store.attach_child(&child, kind.into(), slot)?;
+        TopoCommand::AttachChild { child, kind, slot, date_joined } => {
+            let date_joined = date_joined.unwrap_or_else(now_unix_seconds);
+            store.attach_child(&child, kind.into(), slot, date_joined)?;
             store.save()?;
-            let slot = store
+            let entry = store
                 .record()
                 .children
                 .iter()
                 .find(|c| c.child_id == child)
-                .expect("just attached")
-                .slot;
-            println!("attached child {child} ({}) at slot {slot}", kind_name(kind.into()));
+                .expect("just attached");
+            println!(
+                "attached child {child} ({}) at slot {} (date_joined {})",
+                kind_name(kind.into()),
+                entry.slot,
+                entry.date_joined
+            );
         }
         TopoCommand::DetachChild { child } => {
             store.detach_child(&child)?;
@@ -178,10 +188,11 @@ fn show(store: &record::RecordStore) {
         println!("children:");
         for child in &rec.children {
             println!(
-                "  slot {}: {} {}",
+                "  slot {}: {} {} (joined {})",
                 child.slot,
                 kind_name(child.kind),
-                child.child_id
+                child.child_id,
+                child.date_joined
             );
         }
     }
@@ -192,4 +203,13 @@ fn kind_name(kind: cawala_topology::ChildKind) -> &'static str {
         cawala_topology::ChildKind::Node => "node",
         cawala_topology::ChildKind::User => "user",
     }
+}
+
+/// Current time as unix seconds (the default `date_joined` when the admin
+/// does not supply one).
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

@@ -33,7 +33,7 @@ async fn init_is_idempotent() {
     let store1 = record::RecordStore::open(dir.path(), &id1).unwrap();
     let mut store1 = store1;
     store1
-        .attach_child("child-1", cawala_topology::ChildKind::Node, None)
+        .attach_child("child-1", cawala_topology::ChildKind::Node, None, 1700000000)
         .unwrap();
     store1.save().unwrap();
 
