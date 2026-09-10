@@ -225,7 +225,7 @@ async fn join_request_then_approve_assigns_address() {
     applicant
         .engine()
         .await
-        .begin_outbound_join(join.clone(), node(&parent_id))
+        .begin_outbound_join(join.clone(), node(&parent_id), None)
         .expect("record outbound join");
 
     let signed_join = SignedControl::authorize(

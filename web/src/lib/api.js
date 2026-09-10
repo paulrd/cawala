@@ -299,6 +299,113 @@ export async function issueBurn(accountAddress, amount, reason) {
   throw new Error('Not implemented: real issueBurn');
 }
 
+// ── Invite parsing ────────────────────────────────────────────
+
+/**
+ * Parse and validate a Cawala invite code/URI.
+ *
+ * Accepted formats:
+ *   - Full URI: cawala://join?parent=<EndpointId>&op=<64-hex>&slot=<0..7>&exp=<unix>&label=<encoded>
+ *   - Bare base64url: a URL-safe base64 string (no prefix) — decoded as JSON
+ *     with the same fields.
+ *
+ * @param {string} code - Raw invite string from the user.
+ * @returns {Promise<{ parent: string, operator: string, slot?: number, expiry?: number, label?: string }>}
+ * @throws {Error} With a user-facing message if the invite is invalid.
+ */
+export async function parseInvite(code) {
+  const trimmed = (code || '').trim();
+  if (!trimmed) {
+    throw new Error('Paste an invite code or link from a node operator.');
+  }
+
+  if (_useMock) {
+    await mockDelay(150);
+    return _mockParseInvite(trimmed);
+  }
+
+  // TODO(wasm): Decode the invite using the Rust invite format.
+  // The Rust side will expose a parse_invite() function that returns
+  // the structured fields. For now, mirror the URI parsing logic so
+  // the UI is ready when the wasm surface lands.
+  throw new Error('Not implemented: real parseInvite');
+}
+
+/**
+ * Mock invite parser. Recognises:
+ *   - cawala://join?parent=...&op=... (valid)
+ *   - Anything else that looks vaguely like base64 (valid with defaults)
+ *   - Empty / garbage → throws
+ */
+function _mockParseInvite(raw) {
+  // Try URI format first
+  try {
+    const url = new URL(raw);
+    if (url.protocol === 'cawala:' && url.pathname === '/join') {
+      const parent = url.searchParams.get('parent');
+      const op = url.searchParams.get('op');
+      if (!parent || !op) {
+        throw new Error('Invite is missing required fields (parent, operator key).');
+      }
+      if (!/^[0-9a-fA-F]{64}$/.test(op)) {
+        throw new Error('Operator key must be 64 hex characters.');
+      }
+      const slotRaw = url.searchParams.get('slot');
+      const expRaw = url.searchParams.get('exp');
+      const labelRaw = url.searchParams.get('label');
+      const result = {
+        parent,
+        operator: op,
+      };
+      if (slotRaw != null) {
+        const slot = Number(slotRaw);
+        if (!Number.isInteger(slot) || slot < 0 || slot > 7) {
+          throw new Error('Slot must be an integer between 0 and 7.');
+        }
+        result.slot = slot;
+      }
+      if (expRaw != null) {
+        const exp = Number(expRaw);
+        if (!Number.isFinite(exp) || exp <= 0) {
+          throw new Error('Expiry must be a valid unix timestamp.');
+        }
+        result.expiry = exp;
+      }
+      if (labelRaw) {
+        result.label = decodeURIComponent(labelRaw);
+      }
+      return result;
+    }
+  } catch (e) {
+    // If it was a URL parse error or a validation error we threw, re-throw validation errors
+    if (e.message && !e.message.includes('Invalid URL')) {
+      throw e;
+    }
+  }
+
+  // Try bare base64url JSON
+  try {
+    const padded = raw.replace(/-/g, '+').replace(/_/g, '/');
+    const json = atob(padded);
+    const obj = JSON.parse(json);
+    if (obj.parent && obj.op) {
+      const result = { parent: obj.parent, operator: obj.op };
+      if (obj.slot != null) result.slot = obj.slot;
+      if (obj.exp != null) result.expiry = obj.exp;
+      if (obj.label) result.label = obj.label;
+      return result;
+    }
+    throw new Error('Invite is missing required fields (parent, operator key).');
+  } catch (e) {
+    if (e.message && e.message.includes('missing required')) {
+      throw e;
+    }
+  }
+
+  // Nothing worked
+  throw new Error("That doesn't look like a cawala invite. Ask the node operator to send a fresh one.");
+}
+
 // ── Data fetching ─────────────────────────────────────────────
 
 /**

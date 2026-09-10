@@ -39,6 +39,7 @@
 /// [`cawala_msg`]: https://docs.rs/cawala-msg
 pub const MAX_CONTROL_FRAME: u32 = 64 * 1024;
 
+pub mod invite;
 pub mod reply;
 pub mod request;
 pub mod senior;
@@ -46,6 +47,7 @@ pub mod sign;
 
 pub use cawala_ledger::{NodeId, OperatorPubKey, OperatorSecretKey, Signature};
 pub use cawala_topology::{ChildKind, OctAddr};
+pub use invite::{INVITE_SCHEME, Invite, InviteError};
 pub use reply::{
     CONTROL_ALPN, CONTROL_REPLY_VERSION, ChildSnapshot, ControlReply, NodeSnapshot, ParentSnapshot,
     RejectCode,

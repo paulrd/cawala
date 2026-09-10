@@ -50,18 +50,18 @@
     </div>
   </Card>
 
-  <Card title="Location Hint">
+  <Card title="Location Service">
     <div class="settings-section">
       <p class="muted text-sm">
-        The location service suggests an octal address based on your geographic region. This is a hint only &mdash; your parent assigns the final address.
+        An optional companion service that suggests an octal address based on your geographic region. This is a separate, external service &mdash; not required to use Cawala. Your parent node assigns the final address regardless.
       </p>
       <div class="setting-row" style="margin-top: var(--sp-3);">
         <span class="setting-label">Service</span>
         <code class="text-sm">location.cawala.net</code>
       </div>
       <div class="setting-row">
-        <span class="setting-label">Last lookup</span>
-        <span class="text-sm muted">No lookups yet</span>
+        <span class="setting-label">Status</span>
+        <span class="text-sm muted">Not connected</span>
       </div>
     </div>
   </Card>

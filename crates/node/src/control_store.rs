@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use cawala_control::{JoinRequest, NodeId};
+use cawala_control::{JoinRequest, NodeId, OperatorPubKey};
 
 /// Name of the pending-joins file inside the data dir.
 pub const PENDING_JOINS_FILE: &str = "pending_joins.json";
@@ -33,6 +33,12 @@ pub struct OutboundJoin {
     pub request: JoinRequest,
     /// The node the request was sent to.
     pub parent: NodeId,
+    /// The parent's operator key pinned out-of-band by an invite, if this join
+    /// was started from one. A `JoinApproved` is only accepted when its
+    /// controller matches this key. `None` for a legacy/direct `--parent`
+    /// join, preserving the old trust-on-first-use behavior.
+    #[serde(default)]
+    pub pinned_operator: Option<OperatorPubKey>,
 }
 
 /// In-memory handle to the persisted pending/outbound join state.
@@ -93,8 +99,20 @@ impl ControlStore {
     }
 
     /// Record (replacing any existing) outbound join for `parent`.
-    pub fn set_outbound(&mut self, request: JoinRequest, parent: NodeId) {
-        self.outbound = Some(OutboundJoin { request, parent });
+    ///
+    /// `pinned_operator` is the parent's operator key when the join came from
+    /// an invite (`Some`), or `None` for a direct `--parent` join.
+    pub fn set_outbound(
+        &mut self,
+        request: JoinRequest,
+        parent: NodeId,
+        pinned_operator: Option<OperatorPubKey>,
+    ) {
+        self.outbound = Some(OutboundJoin {
+            request,
+            parent,
+            pinned_operator,
+        });
     }
 
     /// Clear the outbound join (approved or rejected).
@@ -212,7 +230,7 @@ mod tests {
         let mut store = ControlStore::open(dir.path()).unwrap();
         store.add_pending(join("applicant-a", Some(3)));
         store.add_pending(join("applicant-b", None));
-        store.set_outbound(join("me", Some(1)), node("parent"));
+        store.set_outbound(join("me", Some(1)), node("parent"), None);
         store.save().unwrap();
 
         let loaded = ControlStore::open(dir.path()).unwrap();
@@ -227,6 +245,31 @@ mod tests {
         let out = loaded.outbound().expect("outbound present");
         assert_eq!(out.parent, node("parent"));
         assert_eq!(out.request.node, node("me"));
+    }
+
+    #[test]
+    fn pinned_operator_round_trips_through_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ControlStore::open(dir.path()).unwrap();
+        let pinned = OperatorSecretKey::from_bytes([9u8; 32]).public();
+        store.set_outbound(join("me", Some(1)), node("parent"), Some(pinned));
+        store.save().unwrap();
+
+        let loaded = ControlStore::open(dir.path()).unwrap();
+        assert_eq!(loaded.outbound().unwrap().pinned_operator, Some(pinned));
+
+        // A document without the field (legacy/direct join) loads as `None`.
+        let legacy = serde_json::json!({
+            "request": join("me", Some(1)),
+            "parent": "parent",
+        });
+        std::fs::write(
+            dir.path().join(OUTBOUND_JOIN_FILE),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let loaded = ControlStore::open(dir.path()).unwrap();
+        assert_eq!(loaded.outbound().unwrap().pinned_operator, None);
     }
 
     #[test]
@@ -260,7 +303,7 @@ mod tests {
     fn clear_outbound() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = ControlStore::open(dir.path()).unwrap();
-        store.set_outbound(join("me", None), node("parent"));
+        store.set_outbound(join("me", None), node("parent"), None);
         assert!(store.outbound().is_some());
         store.clear_outbound();
         assert!(store.outbound().is_none());

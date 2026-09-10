@@ -4,8 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use cawala_control::{
-    ChildKind, ControlReply, ControlRequest, CreateChild, DetachChild, JoinRejection, JoinRequest,
-    MoveChild, NodeId, OperatorPubKey, OperatorSecretKey, SetAddress, SignedControl,
+    ChildKind, ControlReply, ControlRequest, CreateChild, DetachChild, Invite, JoinRejection,
+    JoinRequest, MoveChild, NodeId, OperatorPubKey, OperatorSecretKey, SetAddress, SignedControl,
 };
 use cawala_ledger::{AccountRef, LedgerPubKey};
 use cawala_node::{
@@ -72,20 +72,45 @@ enum Command {
 /// direct-only (no tree routing).
 #[derive(Subcommand)]
 enum ControlCommand {
-    /// Send a self-signed join request to a prospective parent.
+    /// Send a self-signed join request to a prospective parent, either by
+    /// endpoint id or by an invite URI (which also pins the parent's operator
+    /// key).
     Join {
-        /// The prospective parent's `EndpointId`.
-        #[arg(long, value_name = "ENDPOINT_ID")]
-        parent: String,
+        /// The prospective parent's `EndpointId` (mutually exclusive with
+        /// `--invite`).
+        #[arg(long, value_name = "ENDPOINT_ID", conflicts_with = "invite")]
+        parent: Option<String>,
+        /// A `cawala://join?...` invite carrying the parent and its pinned
+        /// operator key (mutually exclusive with `--parent`).
+        #[arg(long, value_name = "URI", conflicts_with = "parent")]
+        invite: Option<String>,
         /// Whether this node joins as a node or a user.
         #[arg(long, value_name = "KIND", default_value = "node")]
         kind: KindArg,
-        /// Requested octal slot 0..=7; omitted asks the parent to pick.
+        /// Requested octal slot 0..=7; omitted asks the parent to pick. When
+        /// `--invite` carries a slot it takes precedence.
         #[arg(long, value_name = "SLOT", value_parser = clap::value_parser!(u8).range(0..=7))]
         slot: Option<u8>,
         /// Optional location-service hint (never authoritative).
         #[arg(long, value_name = "HINT")]
         location: Option<String>,
+    },
+    /// Print a `cawala://join?...` connection invite for this node.
+    ///
+    /// The invite carries this node's endpoint id and operator public key, so
+    /// a joiner can verify the `JoinApproved` signature against the pinned key.
+    Invite {
+        /// Desired octal slot 0..=7 to offer the joiner; omitted lets this node
+        /// pick at approval time.
+        #[arg(long, value_name = "SLOT", value_parser = clap::value_parser!(u8).range(0..=7))]
+        slot: Option<u8>,
+        /// Unix-seconds expiry to offer the joiner; omitted means the joiner
+        /// applies its own default TTL.
+        #[arg(long, value_name = "EPOCH_SECONDS")]
+        expiry: Option<u64>,
+        /// Human-readable label (at most 64 bytes).
+        #[arg(long, value_name = "LABEL")]
+        label: Option<String>,
     },
     /// List join requests awaiting approval at this node.
     Joins,
@@ -596,32 +621,82 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
     match command {
         ControlCommand::Join {
             parent,
+            invite,
             kind,
             slot,
             location,
         } => {
+            let now = now_unix_seconds();
+            // Resolve the parent node and, for an invite, its pinned operator
+            // key. `--parent` keeps the old (unpinned) behavior.
+            let (parent_id, pinned_operator, desired_slot, expiry) = match (parent, invite) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("--parent and --invite are mutually exclusive")
+                }
+                (Some(parent), None) => (
+                    NodeId::from(parent),
+                    None,
+                    slot,
+                    now.saturating_add(JOIN_TTL_SECONDS),
+                ),
+                (None, Some(uri)) => {
+                    let invite = Invite::parse(&uri)
+                        .map_err(|err| anyhow::anyhow!("invalid invite: {err}"))?;
+                    invite
+                        .validate()
+                        .map_err(|err| anyhow::anyhow!("invalid invite: {err}"))?;
+                    let expiry = invite
+                        .expiry
+                        .unwrap_or_else(|| now.saturating_add(JOIN_TTL_SECONDS));
+                    (
+                        invite.parent.clone(),
+                        Some(invite.operator),
+                        invite.slot.or(slot),
+                        expiry,
+                    )
+                }
+                (None, None) => anyhow::bail!("one of --parent or --invite is required"),
+            };
+
             let child_kind: ChildKind = kind.into();
             let ledger = match child_kind {
                 ChildKind::Node => Some(ledger_keys::load_or_create_ledger_key(data_dir)?.public()),
                 ChildKind::User => None,
             };
-            let now = now_unix_seconds();
             let request = JoinRequest {
                 node: me.clone(),
                 kind: child_kind,
                 operator: operator.public(),
                 ledger,
-                desired_slot: slot,
+                desired_slot,
                 location_hint: location,
                 nonce: now,
-                expiry: now.saturating_add(JOIN_TTL_SECONDS),
+                expiry,
             };
             let mut engine = ControlNode::open(data_dir, &node_id, operator.clone())?;
-            engine.begin_outbound_join(request.clone(), NodeId::from(parent.clone()))?;
+            engine.begin_outbound_join(request.clone(), parent_id.clone(), pinned_operator)?;
             let signed =
                 SignedControl::authorize(me.clone(), &operator, ControlRequest::Join(request))?;
-            let reply = send_control(&secret_key, &parent, &signed).await?;
+            let reply = send_control(&secret_key, &parent_id.to_string(), &signed).await?;
             print_reply(&reply);
+        }
+        ControlCommand::Invite {
+            slot,
+            expiry,
+            label,
+        } => {
+            let invite = Invite {
+                parent: me.clone(),
+                operator: operator.public(),
+                slot,
+                expiry,
+                label,
+            };
+            invite
+                .validate()
+                .map_err(|err| anyhow::anyhow!("invalid invite: {err}"))?;
+            println!("{}", invite.encode());
+            println!("connection invite: share this with a node joining under {node_id}");
         }
         ControlCommand::Joins => {
             let engine = ControlNode::open(data_dir, &node_id, operator)?;

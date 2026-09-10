@@ -215,12 +215,18 @@ impl ControlNode {
 
     /// Applicant side: queue the outbound join so a later `JoinApproved` /
     /// `JoinRejected` from `parent` can be matched.
+    ///
+    /// `pinned_operator` is the parent's operator key when the join was started
+    /// from an [`Invite`](cawala_control::Invite); it is then enforced in
+    /// [`ControlNode::handle_join_approved`]. Pass `None` for a direct
+    /// `--parent` join.
     pub fn begin_outbound_join(
         &mut self,
         request: JoinRequest,
         parent: NodeId,
+        pinned_operator: Option<OperatorPubKey>,
     ) -> Result<(), ControlError> {
-        self.pending.set_outbound(request, parent);
+        self.pending.set_outbound(request, parent, pinned_operator);
         self.pending
             .save()
             .map_err(|err| ControlError::Codec(err.to_string()))
@@ -407,6 +413,18 @@ impl ControlNode {
     /// Applicant side: apply a parent's [`JoinApproval`] by setting the parent
     /// link and the assigned address.
     ///
+    /// # Pinning closes the trust-on-first-use gap
+    ///
+    /// For a direct `--parent` join the applicant has no prior knowledge of the
+    /// parent's operator key, so the first signature it sees is trusted
+    /// (trust-on-first-use): the approval only has to be *self*-consistent.
+    /// An invite removes that gap by carrying the parent's operator key
+    /// out-of-band; when
+    /// [`OutboundJoin::pinned_operator`](crate::control_store::OutboundJoin::pinned_operator)
+    /// is `Some`, this method additionally requires `signed.controller` to equal the pinned
+    /// key and rejects the approval as [`RejectCode::Unauthorized`] otherwise.
+    /// The `None` case keeps the previous behavior unchanged.
+    ///
     /// # v1 gap: assigned-address subtree is not verified
     ///
     /// v1 accepts whatever address the parent assigns without checking that it
@@ -428,6 +446,13 @@ impl ControlNode {
             return ControlReply::Rejected(RejectCode::NotAttached);
         };
         if outbound.parent != signed.origin || outbound.request.node != approval.child {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        // An invite pins the parent's operator key: the approval must be signed
+        // by exactly that key, not merely by any self-consistent one.
+        if let Some(expected) = outbound.pinned_operator
+            && signed.controller != expected
+        {
             return ControlReply::Rejected(RejectCode::Unauthorized);
         }
 
@@ -925,5 +950,111 @@ mod tests {
             ControlReply::Pending
         );
         assert_eq!(engine.pending().pending().len(), MAX_PENDING_JOINS);
+    }
+
+    /// A fresh applicant engine ("me") with no parent/address, plus the join
+    /// request it has outbound.
+    fn outbound_applicant(
+        dir: &std::path::Path,
+        pinned: Option<OperatorPubKey>,
+    ) -> (ControlNode, JoinRequest) {
+        let operator = OperatorSecretKey::from_bytes([1u8; 32]);
+        let request = JoinRequest {
+            node: NodeId::from("me"),
+            kind: ChildKind::User,
+            operator: operator.public(),
+            ledger: None,
+            desired_slot: None,
+            location_hint: None,
+            nonce: 7,
+            expiry: u64::MAX,
+        };
+        let store = ControlStore::open(dir).unwrap();
+        let record = RecordStore::open(dir, "me").unwrap();
+        let mut engine = ControlNode::new(
+            dir.to_path_buf(),
+            "me",
+            operator,
+            record,
+            PeerRegistry::new(),
+            store,
+        );
+        engine
+            .begin_outbound_join(request.clone(), NodeId::from("parent"), pinned)
+            .unwrap();
+        (engine, request)
+    }
+
+    fn approval_for(request: &JoinRequest) -> JoinApproval {
+        JoinApproval {
+            child: request.node.clone(),
+            child_operator: request.operator,
+            child_ledger: request.ledger,
+            kind: request.kind,
+            slot: 2,
+            address: "0.2".parse().unwrap(),
+            date_joined: 10,
+            nonce: request.nonce,
+        }
+    }
+
+    #[tokio::test]
+    async fn begin_outbound_join_stores_pinned_operator() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = OperatorSecretKey::from_bytes([9u8; 32]).public();
+        let (engine, _) = outbound_applicant(dir.path(), Some(pinned));
+
+        let outbound = engine.pending().outbound().expect("outbound present");
+        assert_eq!(outbound.parent, NodeId::from("parent"));
+        assert_eq!(outbound.pinned_operator, Some(pinned));
+
+        // The pin is persisted, not just in-memory.
+        let reloaded = ControlStore::open(dir.path()).unwrap();
+        assert_eq!(
+            reloaded.outbound().unwrap().pinned_operator,
+            Some(pinned),
+            "pinned operator must survive a save/reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_approval_requires_the_pinned_signer() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = OperatorSecretKey::from_bytes([9u8; 32]);
+        let attacker = OperatorSecretKey::from_bytes([10u8; 32]);
+        let (mut engine, request) = outbound_applicant(dir.path(), Some(pinned.public()));
+        let approval = approval_for(&request);
+        let remote = EndpointId::from(SecretKey::generate().public());
+
+        // A self-consistent approval signed by some other key is rejected.
+        let forged = SignedControl::authorize(
+            NodeId::from("parent"),
+            &attacker,
+            ControlRequest::JoinApproved(approval.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            engine.receive_at(remote, forged, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+        assert!(engine.record().parent.is_none(), "no link was installed");
+        assert!(
+            engine.pending().outbound().is_some(),
+            "the outbound join is retained for a legitimate approval"
+        );
+
+        // The pinned key's approval is accepted.
+        let good = SignedControl::authorize(
+            NodeId::from("parent"),
+            &pinned,
+            ControlRequest::JoinApproved(approval),
+        )
+        .unwrap();
+        assert_eq!(
+            engine.receive_at(remote, good, 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(engine.record().parent.as_ref().unwrap().parent_id, "parent");
+        assert!(engine.pending().outbound().is_none());
     }
 }

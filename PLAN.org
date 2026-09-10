@@ -225,9 +225,11 @@
         network-reachable findings (decode amplification, unbounded node-id
         retention, retry poisoning) were fixed and re-verified.
    5. *M4 - Control & web client* (PHASE 1 DONE 2026-09-10; in progress):
-      senior-child control flow, indirect multi-node control, Svelte PWA +
-      location SQLite service, join flow (parent approves -> leaf issues
-      address).
+      senior-child control flow, indirect multi-node control, Svelte PWA,
+      join flow (parent approves -> leaf issues address). Onboarding is
+      invite-based so nodes stay undiscoverable; the location *suggestion*
+      service is out of scope (an optional, independently hosted companion
+      that only suggests an octal address from lat/lon or a map click).
       - New pure, wasm-safe crate `crates/control`: versioned signed control
         payloads (`JoinRequest`/`JoinApproved`/`JoinRejected`, `CreateChild`,
         `DetachChild`, `MoveChild`, `SetAddress`, `Query`) using the same
@@ -246,15 +248,23 @@
         set-address|query` CLI. Hermetic multi-node join/control tests cover
         non-senior rejection, capacity, snapshot query, and a bounded pending
         queue.
+      - Onboarding invite (`crates/control::invite`): a portable
+        `cawala://join?parent=<EndpointId>&op=<operator-pubkey>[&slot&exp&label]`
+        URI carrying the parent's EndpointId and a pinned operator key. The
+        node CLI generates it (`control invite`) and consumes it
+        (`control join --invite`); pinning the parent operator key closes the
+        phase-1 trust-on-first-use gap on `JoinApproved`.
       - PWA (foundation): Svelte 5 shell, dark design-token system, 14 shared
-        components, hash router, rune stores, and a single `lib/api.js`
-        adapter (mock mode) insulating the UI from the wasm/control surface;
-        route pages present, live wiring pending.
+        components, hash router, rune stores, a single `lib/api.js` adapter
+        (mock mode) insulating the UI from the wasm/control surface, and an
+        invite-entry join flow; route pages present, live wiring pending.
       - Deferred: tree-routed indirect multi-node control; network issue/burn;
-        wasm control exports + PWA live-data wiring; the location SQLite
-        service (awaiting the operator-provided database/schema);
-        `MoveChild` limited to re-slotting under the same node; no control
-        replay nonce (authority is re-evaluated live per request).
+        wasm control exports + PWA live-data wiring; `MoveChild` limited to
+        re-slotting under the same node; no control replay nonce (authority is
+        re-evaluated live per request). The location suggestion service is out
+        of scope for now: a separate, independently hostable, non-authoritative
+        companion (lat/lon or map click -> suggested octal address); the leaf
+        still validates and issues the final address.
   6. *M5 - Hardening*: exit rights, foster-parent recovery, compromise-path
      docs, audit tooling, governance/regulatory surface (Hawala exposure is
      real - community question, not code).
