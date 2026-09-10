@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.86"
+cawala-control = { path = "../control" }
 cawala-ledger = { path = "../ledger" }
 cawala-msg = { path = "../msg" }
 cawala-topology = { path = "../topology" }

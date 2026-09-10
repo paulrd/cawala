@@ -4,6 +4,7 @@ members = [
     "crates/node",
     "crates/client-wasm",
     "crates/topology",
+    "crates/control",
     "crates/ledger",
     "crates/msg",
 ]

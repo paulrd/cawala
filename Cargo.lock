@@ -321,6 +321,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cawala-control"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "cawala-ledger",
+ "cawala-topology",
+ "postcard",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "cawala-ledger"
 version = "0.1.0"
 dependencies = [
@@ -348,6 +360,7 @@ name = "cawala-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cawala-control",
  "cawala-ledger",
  "cawala-msg",
  "cawala-proto",

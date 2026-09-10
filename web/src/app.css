@@ -1,58 +1,311 @@
+/* ============================================================
+   Cawala M4 PWA — Design Tokens & Base Styles
+   ============================================================ */
+
 :root {
-  --bg: #f5f6f8;
-  --card: #ffffff;
-  --fg: #1b1e23;
-  --border: #d6dae0;
-  --muted: #6a7280;
-  --ok: #0a7d33;
-  --error: #c62828;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono",
-    monospace;
+  /* — Spacing (4px base) — */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+
+  /* — Type scale — */
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.5rem;
+  --text-2xl: 2rem;
+
+  --leading-tight: 1.25;
+  --leading-normal: 1.5;
+
+  /* — Color roles (dark-first) — */
+  --bg: #0f1114;
+  --bg-raised: #181b20;
+  --bg-hover: #1e2228;
+  --border: #2a2e35;
+  --fg: #e4e6ea;
+  --muted: #8b919a;
+  --accent: #3b82f6;
+  --accent-dim: #1e3a5f;
+  --accent-hover: #2563eb;
+
+  /* Semantic */
+  --ok: #22c55e;
+  --ok-dim: #052e16;
+  --warn: #f59e0b;
+  --warn-dim: #451a03;
+  --danger: #ef4444;
+  --danger-dim: #450a0a;
+
+  /* — Fonts — */
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+
+  /* — Radii — */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+
+  /* — Shadows — */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+
+  /* — Transitions — */
+  --duration-fast: 100ms;
+  --duration-normal: 200ms;
+  --ease: ease-in-out;
+
+  /* — Layout — */
+  --sidebar-width: 240px;
+  --topbar-height: 56px;
+  --mobile-nav-height: 56px;
 }
 
-* {
+/* ============================================================
+   Reset & Base
+   ============================================================ */
+
+*,
+*::before,
+*::after {
   box-sizing: border-box;
 }
 
 body {
   margin: 0;
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
-    Arial, sans-serif;
+  font-family: var(--sans);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
   background: var(--bg);
   color: var(--fg);
-  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-main {
-  max-width: 720px;
-  margin: 0 auto;
-  padding: 24px 16px 48px;
+h1, h2, h3, h4, h5, h6 {
+  margin: 0;
+  font-weight: 600;
+  line-height: var(--leading-tight);
 }
 
-h1 {
-  font-size: 1.35rem;
-  margin: 0 0 4px;
-}
+h1 { font-size: var(--text-xl); }
+h2 { font-size: var(--text-lg); }
+h3 { font-size: var(--text-base); }
 
-h2 {
-  font-size: 1rem;
-  margin: 0 0 10px;
-}
+p { margin: 0; }
 
-.tagline {
-  margin: 0 0 20px;
-  color: var(--muted);
-  font-size: 0.9rem;
+a {
+  color: var(--accent);
+  text-decoration: none;
 }
+a:hover { text-decoration: underline; }
 
-.card {
-  background: var(--card);
+code {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  background: var(--bg-raised);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 16px;
-  margin-bottom: 16px;
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
 }
 
-.card--error {
-  border-color: var(--error);
+/* ============================================================
+   Skip Link (accessibility)
+   ============================================================ */
+
+.skip-link {
+  position: absolute;
+  top: -100px;
+  left: var(--sp-4);
+  z-index: 9999;
+  background: var(--accent);
+  color: var(--fg);
+  padding: var(--sp-2) var(--sp-4);
+  border-radius: var(--radius-md);
+  font-weight: 600;
+  text-decoration: none;
+}
+.skip-link:focus {
+  top: var(--sp-4);
+}
+
+/* ============================================================
+   Focus Ring (global)
+   ============================================================ */
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Remove default outline for mouse/touch users */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ============================================================
+   Scrollbar (subtle, dark)
+   ============================================================ */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
+
+/* ============================================================
+   Utility classes
+   ============================================================ */
+
+.mono {
+  font-family: var(--mono);
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.text-sm {
+  font-size: var(--text-sm);
+}
+
+.text-xs {
+  font-size: var(--text-xs);
+}
+
+/* Visually hidden but accessible to screen readers */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ============================================================
+   Reduced Motion
+   ============================================================ */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ============================================================
+   Skeleton animation (used by LoadingSkeleton)
+   ============================================================ */
+
+@keyframes skeleton-pulse {
+  0%, 100% { opacity: 0.15; }
+  50% { opacity: 0.3; }
+}
+
+.skeleton {
+  background: var(--muted);
+  border-radius: var(--radius-sm);
+  animation: skeleton-pulse 1.5s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+    opacity: 0.2;
+  }
+}
+
+/* ============================================================
+   Table base styles
+   ============================================================ */
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+td {
+  padding: var(--sp-3);
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+tr:hover td {
+  background: var(--bg-hover);
+}
+
+/* Right-align numeric columns */
+td.num, th.num {
+  text-align: right;
+  font-family: var(--mono);
+}
+
+/* ============================================================
+   Form elements
+   ============================================================ */
+
+input[type="text"],
+input[type="number"],
+input[type="search"],
+select,
+textarea {
+  font: inherit;
+  font-size: var(--text-sm);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  transition: border-color var(--duration-fast) var(--ease);
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-dim);
+}
+
+input::placeholder {
+  color: var(--muted);
 }

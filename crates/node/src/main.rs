@@ -1,14 +1,21 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use cawala_ledger::AccountRef;
+use cawala_control::{
+    ChildKind, ControlReply, ControlRequest, CreateChild, DetachChild, JoinRejection, JoinRequest,
+    MoveChild, NodeId, OperatorPubKey, OperatorSecretKey, SetAddress, SignedControl,
+};
+use cawala_ledger::{AccountRef, LedgerPubKey};
 use cawala_node::{
-    MsgConfig, RoutableSnapshot, build_envelope, identity, ledger_keys, ledger_store, record,
-    send_envelope, spawn_msg_node, spawn_with_secret_key,
+    ControlNode, MsgConfig, RoutableSnapshot, build_envelope, identity, ledger_keys, ledger_store,
+    record, send_envelope, spawn_control_node, spawn_control_only, spawn_with_secret_key,
 };
 use cawala_topology::OctAddr;
 use clap::{Parser, Subcommand, ValueEnum};
+use iroh::EndpointId;
+use tokio::sync::Mutex;
 use tracing::info;
 
 #[derive(Parser)]
@@ -47,6 +54,117 @@ enum Command {
     Msg {
         #[command(subcommand)]
         command: MsgCommand,
+    },
+    /// Direct control-plane commands (M4): join handshake and senior-child
+    /// topology control.
+    Control {
+        #[command(subcommand)]
+        command: ControlCommand,
+    },
+}
+
+/// Direct `cawala/control/0` commands.
+///
+/// `node`/`parent` are always an iroh `EndpointId` (hex or base32). Commands
+/// that mutate a *neighbor's* topology address that neighbor directly: the
+/// request is self-signed by this node's operator key and authorized at the
+/// target either as self-admin or as its senior child. In v1 control is
+/// direct-only (no tree routing).
+#[derive(Subcommand)]
+enum ControlCommand {
+    /// Send a self-signed join request to a prospective parent.
+    Join {
+        /// The prospective parent's `EndpointId`.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        parent: String,
+        /// Whether this node joins as a node or a user.
+        #[arg(long, value_name = "KIND", default_value = "node")]
+        kind: KindArg,
+        /// Requested octal slot 0..=7; omitted asks the parent to pick.
+        #[arg(long, value_name = "SLOT", value_parser = clap::value_parser!(u8).range(0..=7))]
+        slot: Option<u8>,
+        /// Optional location-service hint (never authoritative).
+        #[arg(long, value_name = "HINT")]
+        location: Option<String>,
+    },
+    /// List join requests awaiting approval at this node.
+    Joins,
+    /// Approve a pending join request, assigning it a slot and address.
+    Approve {
+        /// The applicant's `EndpointId`.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        node: String,
+        /// Octal slot 0..=7; omitted picks the lowest free slot.
+        #[arg(long, value_name = "SLOT", value_parser = clap::value_parser!(u8).range(0..=7))]
+        slot: Option<u8>,
+    },
+    /// Reject a pending join request.
+    Reject {
+        /// The applicant's `EndpointId`.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        node: String,
+        /// Human-readable reason (defaults to "rejected").
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
+    },
+    /// Ask a directly-controlled neighbor to create a child.
+    CreateChild {
+        /// The controlled neighbor's `EndpointId`.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        node: String,
+        /// The new child's `EndpointId`.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        child: String,
+        /// Whether the new child is a node or a user.
+        #[arg(long, value_name = "KIND", default_value = "node")]
+        kind: KindArg,
+        /// The new child's operator public key, hex (64 chars).
+        #[arg(long, value_name = "OPERATOR_HEX")]
+        operator: String,
+        /// The new child's ledger public key, hex (64 chars); required for a
+        /// node, omitted for a user.
+        #[arg(long, value_name = "LEDGER_HEX")]
+        ledger: Option<String>,
+        /// Octal slot 0..=7; omitted lets the target pick.
+        #[arg(long, value_name = "SLOT", value_parser = clap::value_parser!(u8).range(0..=7))]
+        slot: Option<u8>,
+    },
+    /// Ask a directly-controlled neighbor to detach one of its children.
+    DetachChild {
+        /// The controlled neighbor's `EndpointId`.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        node: String,
+        /// The child's `EndpointId`.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        child: String,
+    },
+    /// Ask a directly-controlled neighbor to re-slot one of its direct
+    /// children (v1 is downward-only within the same node).
+    MoveChild {
+        /// The controlled neighbor's `EndpointId`.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        node: String,
+        /// The child's `EndpointId`.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        child: String,
+        /// New octal slot 0..=7; omitted picks the lowest free slot.
+        #[arg(long, value_name = "SLOT", value_parser = clap::value_parser!(u8).range(0..=7))]
+        slot: Option<u8>,
+    },
+    /// Ask a directly-controlled neighbor to assert or clear its address.
+    SetAddress {
+        /// The controlled neighbor's `EndpointId`.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        node: String,
+        /// Octal address to assert; omitted clears the address.
+        #[arg(long, value_name = "ADDR")]
+        address: Option<String>,
+    },
+    /// Query a directly-controlled neighbor's snapshot.
+    Query {
+        /// The controlled neighbor's `EndpointId`.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        node: String,
     },
 }
 
@@ -156,6 +274,7 @@ async fn main() -> Result<()> {
         Some(Command::Topo { command }) => topo(&cli.data_dir, command),
         Some(Command::Ledger { command }) => ledger(&cli.data_dir, command),
         Some(Command::Msg { command }) => msg_command(&cli.data_dir, command).await,
+        Some(Command::Control { command }) => control_command(&cli.data_dir, command).await,
     }
 }
 
@@ -167,16 +286,21 @@ async fn run(data_dir: PathBuf) -> Result<()> {
     let store = record::RecordStore::open(&data_dir, &node_id)?;
     store.save()?;
 
+    let operator = OperatorSecretKey::from_bytes(secret_key.to_bytes());
+    let control = Arc::new(Mutex::new(ControlNode::open(
+        &data_dir, &node_id, operator,
+    )?));
+
     if let Some(address) = store.record().address.clone() {
         let snapshot = RoutableSnapshot::from_record(store.record())?;
 
         // Must stay alive for the accept loop; dropped at process exit.
         let (_router, mut received) =
-            spawn_msg_node(secret_key, snapshot, MsgConfig::default()).await?;
-        info!(endpoint_id = %node_id, %address, "node endpoint bound with messaging");
+            spawn_control_node(secret_key, snapshot, MsgConfig::default(), control).await?;
+        info!(endpoint_id = %node_id, %address, "node endpoint bound with messaging + control");
         println!("EndpointId: {node_id}");
         println!("Address: {address}");
-        println!("Serving cawala/ping/0 and cawala/msg/0");
+        println!("Serving cawala/ping/0, cawala/msg/0, and cawala/control/0");
 
         // Log envelopes delivered locally at this node.
         tokio::spawn(async move {
@@ -197,17 +321,17 @@ async fn run(data_dir: PathBuf) -> Result<()> {
         }
     }
 
-    // No asserted address: routing is impossible, so serve ping only.
-    let _router = spawn_with_secret_key(secret_key).await?;
-    info!(endpoint_id = %node_id, "node endpoint bound (ping only)");
+    // No asserted address: routing is impossible, so messaging is disabled, but
+    // direct control still works (an address-less applicant must be able to
+    // receive `JoinApproved`).
+    let _router = spawn_control_only(secret_key, control).await?;
+    info!(endpoint_id = %node_id, "node endpoint bound (ping + control; messaging disabled)");
     println!("EndpointId: {node_id}");
     eprintln!(
         "warning: node has no asserted address; messaging disabled. \
          Run `cawala-node topo set-address <ADDR>`."
     );
-    println!(
-        "Run the web client to ping this node, or check the round-trip with: cargo test -p cawala-node"
-    );
+    println!("Serving cawala/ping/0 and cawala/control/0");
 
     // Await forever; dropping `router` would abort the accept loop.
     loop {
@@ -461,6 +585,251 @@ async fn msg_command(data_dir: &std::path::Path, command: MsgCommand) -> Result<
         }
     }
 }
+
+/// Direct control-plane commands.
+async fn control_command(data_dir: &std::path::Path, command: ControlCommand) -> Result<()> {
+    let secret_key = identity::load_or_create_secret_key(data_dir)?;
+    let node_id = secret_key.public().to_string();
+    let operator = OperatorSecretKey::from_bytes(secret_key.to_bytes());
+    let me = NodeId::from(node_id.clone());
+
+    match command {
+        ControlCommand::Join {
+            parent,
+            kind,
+            slot,
+            location,
+        } => {
+            let child_kind: ChildKind = kind.into();
+            let ledger = match child_kind {
+                ChildKind::Node => Some(ledger_keys::load_or_create_ledger_key(data_dir)?.public()),
+                ChildKind::User => None,
+            };
+            let now = now_unix_seconds();
+            let request = JoinRequest {
+                node: me.clone(),
+                kind: child_kind,
+                operator: operator.public(),
+                ledger,
+                desired_slot: slot,
+                location_hint: location,
+                nonce: now,
+                expiry: now.saturating_add(JOIN_TTL_SECONDS),
+            };
+            let mut engine = ControlNode::open(data_dir, &node_id, operator.clone())?;
+            engine.begin_outbound_join(request.clone(), NodeId::from(parent.clone()))?;
+            let signed =
+                SignedControl::authorize(me.clone(), &operator, ControlRequest::Join(request))?;
+            let reply = send_control(&secret_key, &parent, &signed).await?;
+            print_reply(&reply);
+        }
+        ControlCommand::Joins => {
+            let engine = ControlNode::open(data_dir, &node_id, operator)?;
+            let pending = engine.pending().pending();
+            if pending.is_empty() {
+                println!("no pending join requests");
+            } else {
+                for request in pending {
+                    println!(
+                        "{} kind={} operator={} slot={} expiry={}",
+                        request.node,
+                        kind_name(request.kind),
+                        request.operator,
+                        request
+                            .desired_slot
+                            .map_or_else(|| "auto".to_string(), |slot| slot.to_string()),
+                        request.expiry,
+                    );
+                }
+            }
+        }
+        ControlCommand::Approve { node, slot } => {
+            let mut engine = ControlNode::open(data_dir, &node_id, operator.clone())?;
+            let approval = engine.approve_pending(&node, slot, now_unix_seconds())?;
+            let signed = SignedControl::authorize(
+                me.clone(),
+                &operator,
+                ControlRequest::JoinApproved(approval),
+            )?;
+            let reply = send_control(&secret_key, &node, &signed).await?;
+            print_reply(&reply);
+        }
+        ControlCommand::Reject { node, reason } => {
+            let mut engine = ControlNode::open(data_dir, &node_id, operator.clone())?;
+            let nonce = engine
+                .pending()
+                .pending_for(&NodeId::from(node.clone()))
+                .map(|request| request.nonce)
+                .unwrap_or(0);
+            engine.reject_pending(&node)?;
+            let rejection = JoinRejection {
+                child: NodeId::from(node.clone()),
+                reason: reason.unwrap_or_else(|| "rejected".to_string()),
+                nonce,
+            };
+            let signed = SignedControl::authorize(
+                me.clone(),
+                &operator,
+                ControlRequest::JoinRejected(rejection),
+            )?;
+            let reply = send_control(&secret_key, &node, &signed).await?;
+            print_reply(&reply);
+        }
+        ControlCommand::CreateChild {
+            node,
+            child,
+            kind,
+            operator: child_operator,
+            ledger,
+            slot,
+        } => {
+            let request = ControlRequest::CreateChild(CreateChild {
+                child: NodeId::from(child),
+                operator: parse_operator_pubkey(&child_operator)?,
+                ledger: ledger.map(|hex| parse_ledger_pubkey(&hex)).transpose()?,
+                kind: kind.into(),
+                slot,
+                date_joined: now_unix_seconds(),
+            });
+            send_control_command(&secret_key, &node, me, &operator, request).await?;
+        }
+        ControlCommand::DetachChild { node, child } => {
+            let request = ControlRequest::DetachChild(DetachChild {
+                child: NodeId::from(child),
+            });
+            send_control_command(&secret_key, &node, me, &operator, request).await?;
+        }
+        ControlCommand::MoveChild { node, child, slot } => {
+            let request = ControlRequest::MoveChild(MoveChild {
+                child: NodeId::from(child),
+                new_parent: NodeId::from(node.clone()),
+                slot,
+            });
+            send_control_command(&secret_key, &node, me, &operator, request).await?;
+        }
+        ControlCommand::SetAddress { node, address } => {
+            let address = address
+                .map(|raw| {
+                    raw.parse::<OctAddr>()
+                        .map_err(|err| anyhow::anyhow!("invalid address '{raw}': {err}"))
+                })
+                .transpose()?;
+            let request = ControlRequest::SetAddress(SetAddress { address });
+            send_control_command(&secret_key, &node, me, &operator, request).await?;
+        }
+        ControlCommand::Query { node } => {
+            send_control_command(&secret_key, &node, me, &operator, ControlRequest::Query).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Build, sign, send, and print one control request to `target`.
+async fn send_control_command(
+    secret_key: &iroh::SecretKey,
+    target: &str,
+    origin: NodeId,
+    operator: &OperatorSecretKey,
+    request: ControlRequest,
+) -> Result<()> {
+    let signed = SignedControl::authorize(origin, operator, request)?;
+    let reply = send_control(secret_key, target, &signed).await?;
+    print_reply(&reply);
+    Ok(())
+}
+
+/// Bind a short-lived endpoint, dial `target`, and exchange one control frame.
+async fn send_control(
+    secret_key: &iroh::SecretKey,
+    target: &str,
+    signed: &SignedControl,
+) -> Result<ControlReply> {
+    let target: EndpointId = target
+        .parse()
+        .map_err(|err| anyhow::anyhow!("invalid endpoint id '{target}': {err}"))?;
+    // Sending only needs a bound endpoint; the control ALPN is negotiated with
+    // the remote, not registered locally.
+    let router = spawn_with_secret_key(secret_key.clone()).await?;
+    let reply = ControlNode::send_direct(
+        router.endpoint(),
+        target,
+        signed,
+        Duration::from_secs(CONTROL_TIMEOUT_SECONDS),
+    )
+    .await?;
+    router
+        .shutdown()
+        .await
+        .map_err(|err| anyhow::anyhow!("router shutdown: {err}"))?;
+    Ok(reply)
+}
+
+fn print_reply(reply: &ControlReply) {
+    match reply {
+        ControlReply::Accepted => println!("accepted"),
+        ControlReply::Pending => println!("pending"),
+        ControlReply::Rejected(code) => println!("rejected: {code:?}"),
+        ControlReply::Snapshot(snapshot) => print_snapshot(snapshot),
+    }
+}
+
+fn print_snapshot(snapshot: &cawala_control::NodeSnapshot) {
+    println!("node_id: {}", snapshot.node_id);
+    match &snapshot.address {
+        Some(address) => println!("address: {address}"),
+        None => println!("address: none"),
+    }
+    match &snapshot.parent {
+        Some(parent) => println!(
+            "parent: {} slot {} address {}",
+            parent.node_id, parent.slot, parent.address
+        ),
+        None => println!("parent: none"),
+    }
+    if snapshot.children.is_empty() {
+        println!("children: (none)");
+    } else {
+        for child in &snapshot.children {
+            println!(
+                "child: {} kind={} slot={} address={} joined={}",
+                child.child_id,
+                kind_name(child.kind),
+                child.slot,
+                child
+                    .address
+                    .as_ref()
+                    .map_or_else(|| "none".to_string(), |address| address.to_string()),
+                child.date_joined,
+            );
+        }
+    }
+}
+
+fn parse_operator_pubkey(raw: &str) -> Result<OperatorPubKey> {
+    let bytes = parse_hex32(raw, "operator")?;
+    OperatorPubKey::from_bytes(&bytes).map_err(|err| anyhow::anyhow!("invalid operator key: {err}"))
+}
+
+fn parse_ledger_pubkey(raw: &str) -> Result<LedgerPubKey> {
+    let bytes = parse_hex32(raw, "ledger")?;
+    LedgerPubKey::from_bytes(&bytes).map_err(|err| anyhow::anyhow!("invalid ledger key: {err}"))
+}
+
+fn parse_hex32(raw: &str, label: &str) -> Result<[u8; 32]> {
+    let bytes = decode_hex(raw)?;
+    bytes.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "{label} key must be exactly 32 bytes (64 hex digits), found {}",
+            bytes.len()
+        )
+    })
+}
+
+/// Join requests expire this long after creation.
+const JOIN_TTL_SECONDS: u64 = 3600;
+
+/// Per-request direct-control deadline.
+const CONTROL_TIMEOUT_SECONDS: u64 = 15;
 
 /// Parse a `ID=ADDR` next-hop hint.
 ///
