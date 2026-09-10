@@ -3,6 +3,52 @@
    destroyed by sending messages to other sovereign nodes that are organized
    into a hierarchical network based primarily on geographical region.
 
+* Terminology
+  Cawala separates a node's *identity* from its *location*. "Address" is
+  overloaded across the stack, so it is always qualified when it matters.
+  - *Node*: a running `cawala-node` process with its own data directory,
+    identity key, topology links, and ledger.
+  - *User*: a leaf account holder (a browser client); a `ChildKind::User`
+    with an operator key but no ledger of its own.
+  - *EndpointId* (Iroh): the node's Ed25519 public identity key rendered as a
+    string. Stable and immutable; used to authenticate the peer.
+  - *NodeId*: Cawala/ledger name for that same identity string (an
+    EndpointId). The key in the peer registry (`PeerKeys.node_id`).
+  - *EndpointAddr* (Iroh): how to dial a peer *now* - an EndpointId plus
+    transport addresses (relay URL and/or direct IP:port). Changes over time;
+    it is not an identity.
+  - *Octal address* (`OctAddr`): the node's position in the tree - dotted
+    octal digits, e.g. `0.3.5.2`; root is `0`; one digit per level. Used for
+    routing, and changes when a node is moved or re-slotted.
+  - *Slot*: the last octal digit of an address; a node's position among its
+    parent's children (`0..=7`).
+  - *Depth*: number of digits (tree levels). The root has depth 1; there is no
+    hard depth cap.
+  - *Parent / child*: topology links. A node holds one parent link and up to 8
+    child links; users are always leaves.
+  - *LCA*: least common ancestor - the longest shared address prefix, and the
+    settlement point for cross-subtree payments.
+  - *Envelope*: the M3 wire message - `src: PeerRef { node, addr }`,
+    `dst: OctAddr`, `msg_id`, `msg_type`, `nonce`, `ttl`, `payload`,
+    `hop_chain`.
+  - *Operator key*: Ed25519 key that authorises control and intent; distinct
+    from the ledger key.
+  - *Ledger key*: Ed25519 key that signs ledger entries and commitments; it
+    never leaves the node.
+  - *Control message*: an M4 operator-signed request (join, topology edit,
+    query) carried over the `cawala/control/0` ALPN.
+  - *Invite*: out-of-band onboarding code -
+    `cawala://join?parent=<EndpointId>&op=<operator>[&slot&exp&label]`.
+  - *Location service*: optional, non-authoritative hint service (lat/lon or
+    map click -> suggested octal address). Out of scope for M4; it never
+    issues the final address.
+
+  Protocol ALPNs: `cawala/ping/0` (M0 health check), `cawala/msg/0` (M3
+  envelope routing), `cawala/control/0` (M4 direct signed control).
+
+  Key rule: *identity is immutable; address is mutable.* Both travel together
+  in an M3 envelope (`node` = EndpointId, `addr` = octal address).
+
 * Goals and Non-Goals
 ** Goals
   - Use decentralized technology (Iroh) to allow users to easily deploy their
