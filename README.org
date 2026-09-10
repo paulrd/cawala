@@ -37,8 +37,15 @@
     never leaves the node.
   - *Control message*: an M4 operator-signed request (join, topology edit,
     query) carried over the `cawala/control/0` ALPN.
+  - *Address lookup* (Iroh discovery): given only an EndpointId, Iroh
+    resolves it to an EndpointAddr through the configured lookup service
+    (pkarr/DNS under the N0 preset). An invite's optional `relay`/`ip`
+    transport hints supply the address directly, so no lookup service is
+    needed.
   - *Invite*: out-of-band onboarding code -
-    `cawala://join?parent=<EndpointId>&op=<operator>[&slot&exp&label]`.
+    `cawala://join?parent=<EndpointId>&op=<operator>[&slot&exp&label][&relay&ip]`.
+    `relay`/`ip` are transport hints that let the joiner dial the parent
+    without an address-lookup service.
   - *Location service*: optional, non-authoritative hint service (lat/lon or
     map click -> suggested octal address). Out of scope for M4; it never
     issues the final address.

@@ -35,6 +35,10 @@
     parsedInvite?.operator ? truncateMiddle(parsedInvite.operator, 8) : '',
   );
 
+  let relayTruncated = $derived(
+    parsedInvite?.relay ? truncateMiddle(parsedInvite.relay, 14) : '',
+  );
+
   // ── Actions ─────────────────────────────────────────────────
 
   async function handleParse() {
@@ -102,6 +106,13 @@
     if (parsedInvite?.parent) {
       const ok = await copyToClipboard(parsedInvite.parent);
       if (ok) showToast('Parent endpoint ID copied', 'ok', 2000);
+    }
+  }
+
+  async function handleCopyRelay() {
+    if (parsedInvite?.relay) {
+      const ok = await copyToClipboard(parsedInvite.relay);
+      if (ok) showToast('Relay URL copied', 'ok', 2000);
     }
   }
 
@@ -233,7 +244,48 @@
               </span>
             </div>
           {/if}
+
+          {#if parsedInvite.relay}
+            <div class="detail-row">
+              <span class="detail-label">Relay</span>
+              <div class="detail-value">
+                <span class="mono text-xs">{relayTruncated}</span>
+                <button
+                  type="button"
+                  class="copy-inline"
+                  onclick={handleCopyRelay}
+                  title="Copy full relay URL"
+                  aria-label="Copy relay URL"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+                </button>
+              </div>
+            </div>
+          {/if}
+
+          {#if parsedInvite.ip}
+            <div class="detail-row">
+              <span class="detail-label">Direct address</span>
+              <span class="detail-value"><code class="mono text-xs">{parsedInvite.ip}</code></span>
+            </div>
+          {/if}
         </div>
+
+        {#if parsedInvite.relay || parsedInvite.ip}
+          <p class="transport-hint muted text-xs">
+            {#if parsedInvite.relay && parsedInvite.ip}
+              This invite includes a relay and a direct address. Your client can connect through the relay or directly, depending on what works from your network.
+            {:else if parsedInvite.relay}
+              This invite includes a relay URL. Your client will connect through this relay instead of relying on public address lookup.
+            {:else}
+              This invite includes a direct address. Your client can connect directly without public address lookup.
+            {/if}
+          </p>
+        {:else}
+          <p class="transport-hint muted text-xs">
+            No transport hints in this invite. Your client will use iroh's default address lookup to reach the parent node.
+          </p>
+        {/if}
 
         <div class="invite-actions">
           <button
@@ -457,6 +509,11 @@
     justify-content: flex-end;
     gap: var(--sp-3);
     padding-top: var(--sp-2);
+  }
+
+  .transport-hint {
+    line-height: var(--leading-normal);
+    padding: 0 var(--sp-1);
   }
 
   /* ── Waiting state ── */

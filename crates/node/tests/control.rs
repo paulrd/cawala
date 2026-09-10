@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cawala_control::{
-    ChildKind, ControlReply, ControlRequest, CreateChild, JoinRequest, NodeId, OperatorPubKey,
-    OperatorSecretKey, RejectCode, SetAddress, SignedControl,
+    ChildKind, ControlReply, ControlRequest, CreateChild, Invite, JoinRequest, NodeId,
+    OperatorPubKey, OperatorSecretKey, RejectCode, SetAddress, SignedControl,
 };
 use cawala_ledger::{LedgerPubKey, LedgerSecretKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_node::control::{ControlNode, spawn_control_only_on};
@@ -276,6 +276,91 @@ async fn join_request_then_approve_assigns_address() {
             Some(&applicant_op.public())
         );
     }
+
+    parent.shutdown().await;
+    applicant.shutdown().await;
+}
+
+/// An invite carrying only an `ip` transport hint must let an applicant dial
+/// the parent with no address-lookup service configured.
+#[tokio::test]
+async fn join_with_ip_hint_reaches_parent_without_lookup() {
+    let parent_key = SecretKey::generate();
+    let applicant_key = SecretKey::generate();
+    let parent_id = parent_key.public().to_string();
+    let applicant_id = applicant_key.public().to_string();
+    let parent_op = operator(&parent_key);
+    let applicant_op = operator(&applicant_key);
+
+    let parent_dir = tempfile::tempdir().unwrap();
+    let applicant_dir = tempfile::tempdir().unwrap();
+    let parent = spawn_node(NodeSpec {
+        secret: &parent_key,
+        operator: parent_op.clone(),
+        dir: parent_dir.path(),
+        node_id: &parent_id,
+        address: Some("0"),
+        parent: None,
+        children: &[],
+        peers: vec![],
+    })
+    .await;
+    let applicant = spawn_node(NodeSpec {
+        secret: &applicant_key,
+        operator: applicant_op.clone(),
+        dir: applicant_dir.path(),
+        node_id: &applicant_id,
+        address: None,
+        parent: None,
+        children: &[],
+        peers: vec![],
+    })
+    .await;
+
+    // The parent's actual bound loopback address. `presets::Minimal` with
+    // `RelayMode::Disabled` configures no address-lookup service, so this can
+    // only be reached by dialing the IP hint directly.
+    let ip = parent
+        .endpoint
+        .addr()
+        .ip_addrs()
+        .next()
+        .copied()
+        .expect("parent has a bound loopback address");
+
+    let invite = Invite {
+        parent: node(&parent_id),
+        operator: parent_op.public(),
+        slot: None,
+        expiry: None,
+        label: None,
+        relay: None,
+        ip: Some(ip),
+    };
+    invite.validate().expect("valid invite");
+    // Round-trip through the frozen URI so the test exercises encode/parse.
+    let parsed = Invite::parse(&invite.encode()).expect("parse invite");
+    assert_eq!(parsed, invite);
+
+    let target = ControlNode::invite_endpoint_addr(&parsed).expect("invite dial target");
+    assert!(target.ip_addrs().any(|addr| addr == &ip));
+
+    let join = join_request(&applicant_id, &applicant_op, None, None, u64::MAX);
+    applicant
+        .engine()
+        .await
+        .begin_outbound_join(join.clone(), node(&parent_id), Some(parent_op.public()))
+        .expect("record outbound join");
+
+    let signed = SignedControl::authorize(
+        node(&applicant_id),
+        &applicant_op,
+        ControlRequest::Join(join),
+    )
+    .unwrap();
+    let reply = send(&applicant.endpoint, &target, &signed).await;
+    assert_eq!(reply, ControlReply::Pending);
+    assert_eq!(parent.engine().await.pending().pending().len(), 1);
 
     parent.shutdown().await;
     applicant.shutdown().await;

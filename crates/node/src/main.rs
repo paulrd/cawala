@@ -111,6 +111,14 @@ enum ControlCommand {
         /// Human-readable label (at most 64 bytes).
         #[arg(long, value_name = "LABEL")]
         label: Option<String>,
+        /// Optional relay URL transport hint (http/https/ws/wss), so a joiner
+        /// can dial this node without an address-lookup service.
+        #[arg(long, value_name = "URL")]
+        relay: Option<String>,
+        /// Optional direct IP transport hint (`HOST:PORT`), e.g. this node's
+        /// bound loopback or public `SocketAddr`.
+        #[arg(long, value_name = "HOST:PORT")]
+        ip: Option<String>,
     },
     /// List join requests awaiting approval at this node.
     Joins,
@@ -629,7 +637,13 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
             let now = now_unix_seconds();
             // Resolve the parent node and, for an invite, its pinned operator
             // key. `--parent` keeps the old (unpinned) behavior.
-            let (parent_id, pinned_operator, desired_slot, expiry) = match (parent, invite) {
+            //
+            // `target` is `Some` only when an invite carries transport hints
+            // (`relay`/`ip`): then we dial the exact `EndpointAddr` rather than
+            // relying on an address-lookup service. A hintless invite keeps the
+            // id-only `send_direct` path (which uses address lookup).
+            let (parent_id, pinned_operator, desired_slot, expiry, target) = match (parent, invite)
+            {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("--parent and --invite are mutually exclusive")
                 }
@@ -638,6 +652,7 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
                     None,
                     slot,
                     now.saturating_add(JOIN_TTL_SECONDS),
+                    None,
                 ),
                 (None, Some(uri)) => {
                     let invite = Invite::parse(&uri)
@@ -648,11 +663,19 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
                     let expiry = invite
                         .expiry
                         .unwrap_or_else(|| now.saturating_add(JOIN_TTL_SECONDS));
+                    let target = if invite.relay.is_some() || invite.ip.is_some() {
+                        Some(ControlNode::invite_endpoint_addr(&invite).map_err(|err| {
+                            anyhow::anyhow!("invalid invite transport hints: {err}")
+                        })?)
+                    } else {
+                        None
+                    };
                     (
                         invite.parent.clone(),
                         Some(invite.operator),
                         invite.slot.or(slot),
                         expiry,
+                        target,
                     )
                 }
                 (None, None) => anyhow::bail!("one of --parent or --invite is required"),
@@ -677,20 +700,35 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
             engine.begin_outbound_join(request.clone(), parent_id.clone(), pinned_operator)?;
             let signed =
                 SignedControl::authorize(me.clone(), &operator, ControlRequest::Join(request))?;
-            let reply = send_control(&secret_key, &parent_id.to_string(), &signed).await?;
+            let reply = match target {
+                Some(target) => send_control_addr(&secret_key, target, &signed).await?,
+                None => send_control(&secret_key, &parent_id.to_string(), &signed).await?,
+            };
             print_reply(&reply);
         }
         ControlCommand::Invite {
             slot,
             expiry,
             label,
+            relay,
+            ip,
         } => {
+            let relay = relay
+                .map(|raw| Invite::parse_relay(&raw))
+                .transpose()
+                .map_err(|err| anyhow::anyhow!("invalid --relay: {err}"))?;
+            let ip = ip
+                .map(|raw| Invite::parse_ip(&raw))
+                .transpose()
+                .map_err(|err| anyhow::anyhow!("invalid --ip: {err}"))?;
             let invite = Invite {
                 parent: me.clone(),
                 operator: operator.public(),
                 slot,
                 expiry,
                 label,
+                relay,
+                ip,
             };
             invite
                 .validate()
@@ -832,6 +870,29 @@ async fn send_control(
         Duration::from_secs(CONTROL_TIMEOUT_SECONDS),
     )
     .await?;
+    router
+        .shutdown()
+        .await
+        .map_err(|err| anyhow::anyhow!("router shutdown: {err}"))?;
+    Ok(reply)
+}
+
+/// Like [`send_control`], but dials an explicit [`iroh::EndpointAddr`] carrying
+/// transport hints (from an invite's `relay`/`ip`), bypassing address lookup.
+async fn send_control_addr(
+    secret_key: &iroh::SecretKey,
+    target: iroh::EndpointAddr,
+    signed: &SignedControl,
+) -> Result<ControlReply> {
+    let router = spawn_with_secret_key(secret_key.clone()).await?;
+    let reply = ControlNode::send_direct_addr(
+        router.endpoint(),
+        target,
+        signed,
+        Duration::from_secs(CONTROL_TIMEOUT_SECONDS),
+    )
+    .await
+    .map_err(|err| anyhow::anyhow!("direct control to invite hints failed: {err}"))?;
     router
         .shutdown()
         .await

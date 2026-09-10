@@ -305,12 +305,12 @@ export async function issueBurn(accountAddress, amount, reason) {
  * Parse and validate a Cawala invite code/URI.
  *
  * Accepted formats:
- *   - Full URI: cawala://join?parent=<EndpointId>&op=<64-hex>&slot=<0..7>&exp=<unix>&label=<encoded>
+ *   - Full URI: cawala://join?parent=<EndpointId>&op=<64-hex>[&slot=<0..7>][&exp=<unix>][&label=<pct>][&relay=<url>][&ip=<host:port>]
  *   - Bare base64url: a URL-safe base64 string (no prefix) — decoded as JSON
  *     with the same fields.
  *
  * @param {string} code - Raw invite string from the user.
- * @returns {Promise<{ parent: string, operator: string, slot?: number, expiry?: number, label?: string }>}
+ * @returns {Promise<{ parent: string, operator: string, slot?: number, expiry?: number, label?: string, relay?: string, ip?: string }>}
  * @throws {Error} With a user-facing message if the invite is invalid.
  */
 export async function parseInvite(code) {
@@ -353,6 +353,8 @@ function _mockParseInvite(raw) {
       const slotRaw = url.searchParams.get('slot');
       const expRaw = url.searchParams.get('exp');
       const labelRaw = url.searchParams.get('label');
+      const relayRaw = url.searchParams.get('relay');
+      const ipRaw = url.searchParams.get('ip');
       const result = {
         parent,
         operator: op,
@@ -374,6 +376,33 @@ function _mockParseInvite(raw) {
       if (labelRaw) {
         result.label = decodeURIComponent(labelRaw);
       }
+      if (relayRaw) {
+        const relay = decodeURIComponent(relayRaw);
+        // Must have a scheme and host — reject bare strings
+        try {
+          const parsed = new URL(relay);
+          if (!parsed.protocol || !parsed.host) {
+            throw new Error();
+          }
+        } catch {
+          throw new Error('Relay must be a valid URL (e.g. https://relay.example.com).');
+        }
+        result.relay = relay;
+      }
+      if (ipRaw) {
+        // Validate host:port format — reject empty host, missing port, non-numeric port
+        const colonIdx = ipRaw.lastIndexOf(':');
+        if (colonIdx <= 0 || colonIdx === ipRaw.length - 1) {
+          throw new Error('IP must be in host:port format (e.g. 192.168.1.1:4433).');
+        }
+        const host = ipRaw.slice(0, colonIdx);
+        const portStr = ipRaw.slice(colonIdx + 1);
+        const port = Number(portStr);
+        if (!host || !/^\d{1,5}$/.test(portStr) || !Number.isInteger(port) || port < 1 || port > 65535) {
+          throw new Error('IP must be in host:port format with a valid port (e.g. 192.168.1.1:4433).');
+        }
+        result.ip = ipRaw;
+      }
       return result;
     }
   } catch (e) {
@@ -393,6 +422,8 @@ function _mockParseInvite(raw) {
       if (obj.slot != null) result.slot = obj.slot;
       if (obj.exp != null) result.expiry = obj.exp;
       if (obj.label) result.label = obj.label;
+      if (obj.relay) result.relay = obj.relay;
+      if (obj.ip) result.ip = obj.ip;
       return result;
     }
     throw new Error('Invite is missing required fields (parent, operator key).');

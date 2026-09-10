@@ -10,22 +10,36 @@
 //! The wire format is:
 //!
 //! ```text
-//! cawala://join?parent=<EndpointId string>&op=<lowercase-hex-64>&slot=<0..7>&exp=<unix-seconds>&label=<percent-encoded>
+//! cawala://join?parent=<EndpointId string>&op=<lowercase-hex-64>[&slot=<0..7>][&exp=<unix-seconds>][&label=<percent-encoded>][&relay=<url>][&ip=<host:port>]
 //! ```
 //!
-//! `parent` and `op` are required; `slot`, `exp`, and `label` are optional.
-//! Unknown query parameters are ignored, duplicated parameters are an error,
-//! and there is no checksum in v1.
+//! `parent` and `op` are required; `slot`, `exp`, `label`, `relay`, and `ip`
+//! are optional. At most one `relay` and at most one `ip` may appear. Unknown
+//! query parameters are ignored, duplicated parameters are an error, and there
+//! is no checksum in v1.
+//!
+//! # Transport hints
+//!
+//! `relay` and `ip` are optional transport hints that let a joiner dial the
+//! parent without any iroh address-lookup service. A relay must be an absolute
+//! URL with a host and an `http`/`https`/`ws`/`wss` scheme; an `ip` must be a
+//! `SocketAddr` (`host:port`).
 //!
 //! # Purity
 //!
 //! Parsing and encoding are pure and synchronous. `url` is a pure-Rust,
-//! wasm-safe crate; this module adds no I/O, clock, or RNG dependency.
+//! wasm-safe crate; `std::net::SocketAddr` is available on wasm32. This module
+//! adds no I/O, clock, or RNG dependency.
+
+use std::net::SocketAddr;
 
 use url::Url;
 
 use cawala_ledger::{NodeId, OperatorPubKey};
 use cawala_topology::MAX_SLOT;
+
+/// Relay-URL schemes accepted in an invite's `relay` hint.
+const RELAY_SCHEMES: [&str; 4] = ["http", "https", "ws", "wss"];
 
 /// URI scheme of an invite.
 pub const INVITE_SCHEME: &str = "cawala";
@@ -54,6 +68,11 @@ pub struct Invite {
     pub expiry: Option<u64>,
     /// Optional human-readable label (e.g. a network name).
     pub label: Option<String>,
+    /// Optional relay URL transport hint, so a joiner can dial the parent
+    /// without an address-lookup service.
+    pub relay: Option<Url>,
+    /// Optional direct IP transport hint (the parent's bound `SocketAddr`).
+    pub ip: Option<SocketAddr>,
 }
 
 impl Invite {
@@ -82,7 +101,31 @@ impl Invite {
             out.push_str("&label=");
             out.push_str(&percent_encode(label));
         }
+        if let Some(relay) = &self.relay {
+            out.push_str("&relay=");
+            out.push_str(&percent_encode(relay.as_str()));
+        }
+        if let Some(ip) = &self.ip {
+            out.push_str("&ip=");
+            out.push_str(&percent_encode(&ip.to_string()));
+        }
         out
+    }
+
+    /// Parse an optional `relay` transport hint.
+    ///
+    /// The value must be an absolute URL with a host and one of the
+    /// `http`/`https`/`ws`/`wss` schemes; anything else is
+    /// [`InviteError::BadRelay`].
+    pub fn parse_relay(raw: &str) -> Result<Url, InviteError> {
+        let url = Url::parse(raw).map_err(|_| InviteError::BadRelay(raw.to_string()))?;
+        validate_relay_url(&url)?;
+        Ok(url)
+    }
+
+    /// Parse an optional `ip` transport hint as a `SocketAddr` (`host:port`).
+    pub fn parse_ip(raw: &str) -> Result<SocketAddr, InviteError> {
+        raw.parse().map_err(|_| InviteError::BadIp(raw.to_string()))
     }
 
     /// Parse a `cawala://join?...` URI.
@@ -102,6 +145,8 @@ impl Invite {
         let mut slot: Option<String> = None;
         let mut expiry: Option<String> = None;
         let mut label: Option<String> = None;
+        let mut relay: Option<String> = None;
+        let mut ip: Option<String> = None;
         let mut seen: Vec<String> = Vec::new();
 
         for (key, value) in url.query_pairs() {
@@ -116,6 +161,8 @@ impl Invite {
                 "slot" => slot = Some(value.into_owned()),
                 "exp" => expiry = Some(value.into_owned()),
                 "label" => label = Some(value.into_owned()),
+                "relay" => relay = Some(value.into_owned()),
+                "ip" => ip = Some(value.into_owned()),
                 // Unknown parameters are ignored (forward-compatible).
                 _ => {}
             }
@@ -147,6 +194,8 @@ impl Invite {
                     .map_err(|_| InviteError::BadExpiry(raw.clone()))?,
             ),
         };
+        let relay = relay.map(|raw| Invite::parse_relay(&raw)).transpose()?;
+        let ip = ip.map(|raw| Invite::parse_ip(&raw)).transpose()?;
 
         Ok(Invite {
             parent: NodeId::from(parent),
@@ -154,14 +203,18 @@ impl Invite {
             slot,
             expiry,
             label,
+            relay,
+            ip,
         })
     }
 
     /// Check the invite's bounded/range-constrained fields.
     ///
     /// `slot`, when present, must be in `0..=7`; `label`, when present, must be
-    /// at most [`MAX_LABEL_LEN`] bytes. `parent` is required non-empty and
-    /// `operator` is a typed key, so neither can be structurally absent.
+    /// at most [`MAX_LABEL_LEN`] bytes. `relay`, when present, must be an
+    /// absolute URL with a host and an `http`/`https`/`ws`/`wss` scheme. `parent`
+    /// is required non-empty, `operator` is a typed key, and `ip` is a typed
+    /// `SocketAddr`, so those cannot be structurally invalid.
     pub fn validate(&self) -> Result<(), InviteError> {
         if let Some(slot) = self.slot
             && slot > MAX_SLOT
@@ -179,8 +232,23 @@ impl Invite {
         if self.parent.as_str().is_empty() {
             return Err(InviteError::Missing("parent"));
         }
+        if let Some(relay) = &self.relay {
+            validate_relay_url(relay)?;
+        }
         Ok(())
     }
+}
+
+/// Validate a relay transport hint: it must be an absolute URL with a host and
+/// an `http`/`https`/`ws`/`wss` scheme.
+fn validate_relay_url(url: &Url) -> Result<(), InviteError> {
+    if url.host_str().is_none() {
+        return Err(InviteError::BadRelay(url.as_str().to_string()));
+    }
+    if !RELAY_SCHEMES.contains(&url.scheme()) {
+        return Err(InviteError::BadRelay(url.as_str().to_string()));
+    }
+    Ok(())
 }
 
 /// Percent-encode a query component.
@@ -269,6 +337,12 @@ pub enum InviteError {
     /// The `exp` parameter is not a `u64`.
     #[error("invalid expiry '{0}'")]
     BadExpiry(String),
+    /// The `relay` parameter is not a usable relay URL (bad scheme, no host).
+    #[error("invalid relay '{0}'")]
+    BadRelay(String),
+    /// The `ip` parameter is not a `SocketAddr`.
+    #[error("invalid ip '{0}'")]
+    BadIp(String),
     /// A parameter appeared more than once.
     #[error("duplicate parameter '{0}'")]
     Duplicate(String),
@@ -301,7 +375,13 @@ mod tests {
             slot: Some(3),
             expiry: Some(1_700_000_000),
             label: Some("Cawala Lab".to_string()),
+            relay: None,
+            ip: None,
         }
+    }
+
+    fn relay(url: &str) -> Url {
+        Url::parse(url).unwrap()
     }
 
     #[test]
@@ -332,12 +412,152 @@ mod tests {
             slot: None,
             expiry: None,
             label: None,
+            relay: None,
+            ip: None,
         };
         let uri = invite.encode();
         assert!(!uri.contains("slot="));
         assert!(!uri.contains("exp="));
         assert!(!uri.contains("label="));
+        assert!(!uri.contains("relay="));
+        assert!(!uri.contains("ip="));
         assert_eq!(Invite::parse(&uri).unwrap(), invite);
+    }
+
+    #[test]
+    fn round_trip_relay_and_ip() {
+        let invite = Invite {
+            relay: Some(relay("https://relay.example.com/")),
+            ip: Some("127.0.0.1:9000".parse().unwrap()),
+            ..full()
+        };
+        let uri = invite.encode();
+        assert!(uri.contains("relay="), "{uri}");
+        assert!(uri.contains("ip="), "{uri}");
+        let parsed = Invite::parse(&uri).unwrap();
+        assert_eq!(parsed, invite);
+        assert_eq!(parsed.validate(), Ok(()));
+        assert_eq!(parsed.relay, Some(relay("https://relay.example.com/")));
+        assert_eq!(parsed.ip, Some("127.0.0.1:9000".parse().unwrap()));
+    }
+
+    #[test]
+    fn round_trip_relay_only() {
+        let invite = Invite {
+            relay: Some(relay("wss://relay.example.com")),
+            ..full()
+        };
+        let uri = invite.encode();
+        assert!(uri.contains("relay="));
+        assert!(!uri.contains("ip="));
+        assert_eq!(Invite::parse(&uri).unwrap(), invite);
+    }
+
+    #[test]
+    fn round_trip_ip_only() {
+        let invite = Invite {
+            ip: Some("[::1]:9000".parse().unwrap()),
+            ..full()
+        };
+        let uri = invite.encode();
+        assert!(!uri.contains("relay="));
+        assert!(uri.contains("ip="));
+        assert_eq!(Invite::parse(&uri).unwrap(), invite);
+    }
+
+    #[test]
+    fn parse_rejects_bad_relay() {
+        let op = to_hex(&operator(1).to_bytes());
+        // No host.
+        assert_eq!(
+            Invite::parse(&format!(
+                "cawala://join?parent=p&op={op}&relay=not%20a%20url"
+            ))
+            .unwrap_err(),
+            InviteError::BadRelay("not a url".to_string())
+        );
+        // A valid URL with no host.
+        assert_eq!(
+            Invite::parse(&format!("cawala://join?parent=p&op={op}&relay=mailto:a@b")).unwrap_err(),
+            InviteError::BadRelay("mailto:a@b".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_rejects_bad_relay_scheme() {
+        let op = to_hex(&operator(1).to_bytes());
+        assert_eq!(
+            Invite::parse(&format!(
+                "cawala://join?parent=p&op={op}&relay=ftp%3A%2F%2Frelay.example.com%2F"
+            ))
+            .unwrap_err(),
+            InviteError::BadRelay("ftp://relay.example.com/".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_rejects_malformed_ip() {
+        let op = to_hex(&operator(1).to_bytes());
+        assert_eq!(
+            Invite::parse(&format!("cawala://join?parent=p&op={op}&ip=nope")).unwrap_err(),
+            InviteError::BadIp("nope".to_string())
+        );
+        // Missing port.
+        assert_eq!(
+            Invite::parse(&format!("cawala://join?parent=p&op={op}&ip=127.0.0.1")).unwrap_err(),
+            InviteError::BadIp("127.0.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_relay_and_ip() {
+        let op = to_hex(&operator(1).to_bytes());
+        assert_eq!(
+            Invite::parse(&format!(
+                "cawala://join?parent=p&op={op}&relay=https%3A%2F%2Fa.example.com%2F&relay=https%3A%2F%2Fb.example.com%2F"
+            ))
+            .unwrap_err(),
+            InviteError::Duplicate("relay".to_string())
+        );
+        assert_eq!(
+            Invite::parse(&format!(
+                "cawala://join?parent=p&op={op}&ip=127.0.0.1%3A1&ip=127.0.0.1%3A2"
+            ))
+            .unwrap_err(),
+            InviteError::Duplicate("ip".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_relay() {
+        let mut invite = full();
+        invite.relay = Some(relay("ftp://relay.example.com/"));
+        assert_eq!(
+            invite.validate(),
+            Err(InviteError::BadRelay(
+                "ftp://relay.example.com/".to_string()
+            ))
+        );
+
+        // A hostless URL cannot be produced by `Url::parse` for `http`, but a
+        // non-network scheme has no host and must also be rejected.
+        invite.relay = Some(relay("mailto:a@b"));
+        assert_eq!(
+            invite.validate(),
+            Err(InviteError::BadRelay("mailto:a@b".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_relay_accepts_allowed_schemes() {
+        for raw in [
+            "http://relay.example.com/",
+            "https://relay.example.com/",
+            "ws://relay.example.com/",
+            "wss://relay.example.com/",
+        ] {
+            assert!(Invite::parse_relay(raw).is_ok(), "{raw}");
+        }
     }
 
     #[test]

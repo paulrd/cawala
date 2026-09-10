@@ -28,7 +28,7 @@ use tracing::info;
 
 use cawala_control::{
     CONTROL_ALPN, CONTROL_FORMAT_VERSION, ChildKind, ChildSnapshot, ControlError, ControlReply,
-    ControlRequest, CreateChild, DetachChild, JoinApproval, JoinRejection, JoinRequest,
+    ControlRequest, CreateChild, DetachChild, Invite, JoinApproval, JoinRejection, JoinRequest,
     MAX_CONTROL_FRAME, MoveChild, NodeId, NodeSnapshot, OperatorPubKey, OperatorSecretKey,
     ParentSnapshot, RejectCode, SetAddress, SignedControl, senior_child, verify_control,
 };
@@ -624,6 +624,36 @@ impl ControlNode {
             return ControlReply::Rejected(code);
         }
         ControlReply::Snapshot(self.snapshot())
+    }
+
+    /// Build the direct dial target for an [`Invite`], applying its optional
+    /// `relay`/`ip` transport hints.
+    ///
+    /// An invite carrying neither hint yields an id-only [`EndpointAddr`],
+    /// preserving the address-lookup path. A hint that cannot be converted to
+    /// an iroh transport address is a [`ControlError::Codec`].
+    pub fn invite_endpoint_addr(invite: &Invite) -> Result<EndpointAddr, ControlError> {
+        let parent: EndpointId = invite.parent.as_str().parse().map_err(|err| {
+            ControlError::Codec(format!(
+                "invalid parent endpoint id '{}': {err}",
+                invite.parent
+            ))
+        })?;
+        let mut addrs = Vec::new();
+        if let Some(url) = &invite.relay {
+            let relay: iroh::RelayUrl = url.as_str().parse().map_err(|err| {
+                ControlError::Codec(format!("invalid relay URL in invite: {err}"))
+            })?;
+            addrs.push(iroh::TransportAddr::Relay(relay));
+        }
+        if let Some(ip) = invite.ip {
+            addrs.push(iroh::TransportAddr::Ip(ip));
+        }
+        Ok(if addrs.is_empty() {
+            EndpointAddr::from(parent)
+        } else {
+            EndpointAddr::from_parts(parent, addrs)
+        })
     }
 
     /// Dial `target` and perform one direct control request/response.

@@ -249,11 +249,13 @@
         non-senior rejection, capacity, snapshot query, and a bounded pending
         queue.
       - Onboarding invite (`crates/control::invite`): a portable
-        `cawala://join?parent=<EndpointId>&op=<operator-pubkey>[&slot&exp&label]`
-        URI carrying the parent's EndpointId and a pinned operator key. The
-        node CLI generates it (`control invite`) and consumes it
-        (`control join --invite`); pinning the parent operator key closes the
-        phase-1 trust-on-first-use gap on `JoinApproved`.
+        `cawala://join?parent=<EndpointId>&op=<operator-pubkey>[&slot&exp&label][&relay&ip]`
+        URI carrying the parent's EndpointId, a pinned operator key, and
+        optional transport hints (`relay` URL / direct `ip`) so the joiner can
+        dial without an iroh address-lookup service. The node CLI generates it
+        (`control invite`) and consumes it (`control join --invite`); pinning
+        the parent operator key closes the phase-1 trust-on-first-use gap on
+        `JoinApproved`.
       - PWA (foundation): Svelte 5 shell, dark design-token system, 14 shared
         components, hash router, rune stores, a single `lib/api.js` adapter
         (mock mode) insulating the UI from the wasm/control surface, and an
