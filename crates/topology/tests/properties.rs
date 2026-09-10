@@ -230,7 +230,7 @@ fn gen_op(rng: &mut Rng, t: &Topology, counter: &mut usize) -> (Op, Check) {
             // (attaching it would be a cycle).
             let compatible: Vec<String> = unattached
                 .iter()
-                .filter(|child| !is_ancestor_of(t, child, &parent))
+                .filter(|child| !is_ancestor_of(t, child, parent))
                 .cloned()
                 .collect();
             let Some(child) = rng.pick(&compatible) else {

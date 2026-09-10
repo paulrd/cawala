@@ -1,7 +1,7 @@
 //! Integration test: in-process server + client endpoints over the public N0
 //! relay (presets::N0). Requires network access to the N0 relay.
 
-use cawala_node::{ping, ping_with_addr, PingHandler, PingPong, ALPN};
+use cawala_node::{ALPN, PingHandler, PingPong, ping, ping_with_addr};
 use iroh::endpoint::presets::N0;
 use iroh::protocol::Router;
 

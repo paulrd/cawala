@@ -320,15 +320,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "cawala-ledger"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "cawala-topology",
+ "ed25519-dalek",
+ "postcard",
+ "proptest",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "cawala-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cawala-ledger",
  "cawala-proto",
  "cawala-topology",
  "clap",
  "iroh",
  "n0-future",
+ "postcard",
  "serde",
  "serde_json",
  "tempfile",

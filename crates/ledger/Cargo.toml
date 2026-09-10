@@ -1,0 +1,18 @@
+[package]
+name = "cawala-ledger"
+version = "0.1.0"
+edition = "2024"
+
+# Pure, synchronous, wasm-safe ledger core: no tokio, no iroh, no std::fs, no
+# RNG. Signatures/key generation are deterministic (callers supply the 32-byte
+# secret). Depends only on the topology model, postcard, and ed25519/blake3.
+[dependencies]
+cawala-topology = { path = "../topology" }
+serde = { version = "1.0.217", features = ["derive"] }
+postcard = { version = "1.1.3", features = ["use-std"] }
+thiserror = "2.0"
+ed25519-dalek = "3.0"
+blake3 = "1.8"
+
+[dev-dependencies]
+proptest = "1.6"

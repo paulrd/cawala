@@ -158,9 +158,40 @@
        it first joined; CLI attach-child --date-joined keeps a moved child's
        original date or resets to now when omitted.
      - 59 workspace tests green, including the relay ping/pong test.
-  3. *M2 - Ledger & settlement*: append-only signed Merkle-committed ledgers,
-     operator/ledger key separation, prefunded-only LCA settlement + netting.
-     Adversarial double-spend test harness proving detection at netting.
+   3. *M2 - Ledger & settlement* (DONE 2026-09-10): append-only signed
+      Merkle-committed ledgers, operator/ledger key separation, prefunded-only
+      LCA settlement + netting, adversarial double-spend harness.
+      - New pure, sync, wasm-safe crate `crates/ledger`: double-entry postings
+        over `{Parent, Child(NodeId), Equity}` validated by one conservation +
+        non-negativity rule; versioned canonical signed format
+        (`ENTRY_FORMAT_VERSION`) with golden vectors for every entry body.
+      - Append-only per-entry hash chain plus an RFC 6962 Merkle tree (blake3,
+        domain-separated) with entry-inclusion and account-state proofs; signed
+        periodic commitments (`SignedCommitment`, `BalanceAttestation`) and a
+        genesis-anchored `verify_chain`.
+      - Key separation: the operator key (`<data-dir>/secret_key` -> NodeId)
+        authorizes intent (orders, issue/burn); a distinct ledger key
+        (`<data-dir>/ledger_key`) signs entries and commitments and never leaves
+        the node. `PeerRegistry` binds key -> identity (users carry an operator
+        key only) with decode-time re-validation.
+      - Prefunded-only LCA settlement: `plan_transfer` builds the
+        ascend/LCA/descend cascade from `OctAddr::lca`, preflights every debit
+        and credit, and `execute_plan` applies it atomically (staged clone).
+      - Netting (`net`) detects commitment forks, chain-invalid histories,
+        edge mirror mismatches, route redirects, replay/double-spend
+        (`payment_id` in >1 cascade) and reconstructed overdraw, and only emits
+        net transfers when the books are clean.
+      - Adversarial harness proves detection at netting: replayed order,
+        equivocation, a fully-mirrored branch redirect (all hops append, caught
+        only by route reconstruction), mirror tamper, substituted `payment_id`,
+        and overdraw.
+      - Node integration: `<data-dir>/ledger_key`, `<data-dir>/ledger_peers.json`,
+        a filesystem append-only `FileLog` (length-prefixed postcard frames,
+        fsync, replay-on-open re-derives balances), and CLI
+        `ledger init | show | verify`.
+      - Tests: 177 in `crates/ledger` (138 unit + 12 ledger + 9 netting +
+        3 property + 15 settlement) and 27 node lib tests; workspace clippy
+        clean. The relay ping/pong test still requires network.
   4. *M3 - Messaging/routing protocol*: ALPN framing, envelope (src, dst,
      msg_id, type, nonce, payload, hop_chain), longest-prefix routing,
      replay/ordering protection.

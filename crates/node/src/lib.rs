@@ -13,10 +13,19 @@ use iroh::{
 use std::io;
 use tracing::info;
 
-pub use proto::{PingPong, ALPN};
+pub use proto::{ALPN, PingPong};
 
 pub mod identity;
+pub mod ledger_keys;
+pub mod ledger_peers;
+pub mod ledger_store;
 pub mod record;
+
+pub use ledger_keys::{LEDGER_KEY_FILE, load_or_create_ledger_key, persist_ledger_key};
+pub use ledger_peers::{PEERS_FILE, load_peers, save_peers};
+pub use ledger_store::{
+    FileLog, LEDGER_FORMAT_VERSION, LedgerMeta, load_or_create_meta, open_ledger,
+};
 
 /// Bind an endpoint with the given persisted [`iroh::SecretKey`] and start the
 /// `cawala/ping/0` accept loop.

@@ -24,8 +24,8 @@ pub fn load_or_create_secret_key(data_dir: &Path) -> Result<SecretKey> {
         .with_context(|| format!("failed to create data dir {}", data_dir.display()))?;
     let path = data_dir.join(SECRET_KEY_FILE);
     if path.exists() {
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+        let bytes =
+            std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
         let arr: [u8; SECRET_KEY_LEN] = bytes.as_slice().try_into().map_err(|_| {
             anyhow::anyhow!(
                 "secret key file must contain exactly {SECRET_KEY_LEN} bytes, found {}",

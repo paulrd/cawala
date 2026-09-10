@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use cawala_node::{identity, record, spawn_with_secret_key};
+use cawala_ledger::AccountRef;
+use cawala_node::{identity, ledger_keys, ledger_store, record, spawn_with_secret_key};
 use clap::{Parser, Subcommand, ValueEnum};
 use tracing::info;
 
@@ -33,6 +34,21 @@ enum Command {
         #[command(subcommand)]
         command: TopoCommand,
     },
+    /// Inspect this node's on-disk ledger.
+    Ledger {
+        #[command(subcommand)]
+        command: LedgerCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum LedgerCommand {
+    /// Print node id, ledger id, entry count/height, head hash, and balances.
+    Show,
+    /// Replay the on-disk log and report chain/conservation validity.
+    Verify,
+    /// Create the ledger key and an empty log/meta (idempotent).
+    Init,
 }
 
 #[derive(Subcommand)]
@@ -95,6 +111,7 @@ async fn main() -> Result<()> {
         Some(Command::Run) | None => run(cli.data_dir).await,
         Some(Command::Init) => init(&cli.data_dir),
         Some(Command::Topo { command }) => topo(&cli.data_dir, command),
+        Some(Command::Ledger { command }) => ledger(&cli.data_dir, command),
     }
 }
 
@@ -126,9 +143,74 @@ fn init(data_dir: &std::path::Path) -> Result<()> {
     let node_id = secret_key.public().to_string();
     let store = record::RecordStore::open(data_dir, &node_id)?;
     store.save()?;
+    // Also bootstrap the ledger identity at init time.
+    let ledger_key = ledger_keys::load_or_create_ledger_key(data_dir)?;
+    ledger_store::init_ledger(data_dir, &node_id, &ledger_key.public())?;
     println!("EndpointId: {node_id}");
-    println!("identity and node record are ready in {}", data_dir.display());
+    println!("LedgerId: {}", ledger_key.public());
+    println!(
+        "identity, node record, and ledger are ready in {}",
+        data_dir.display()
+    );
     Ok(())
+}
+
+/// Ledger inspection and bootstrap.
+fn ledger(data_dir: &std::path::Path, command: LedgerCommand) -> Result<()> {
+    let secret_key = identity::load_or_create_secret_key(data_dir)?;
+    let node_id = secret_key.public().to_string();
+    let ledger_key = ledger_keys::load_or_create_ledger_key(data_dir)?;
+
+    match command {
+        LedgerCommand::Init => {
+            let meta = ledger_store::init_ledger(data_dir, &node_id, &ledger_key.public())?;
+            println!("node_id: {}", meta.node_id);
+            println!("ledger_id: {}", meta.ledger_id);
+            println!("format_version: {}", meta.format_version);
+            println!(
+                "ledger layout ready in {}",
+                ledger_store::ledger_dir(data_dir).display()
+            );
+        }
+        LedgerCommand::Show => {
+            let ledger = ledger_store::open_ledger(data_dir, &node_id, &ledger_key)?;
+            show_ledger(&node_id, &ledger);
+        }
+        LedgerCommand::Verify => match ledger_store::open_ledger(data_dir, &node_id, &ledger_key) {
+            Ok(ledger) => {
+                println!("valid: true");
+                println!("entries: {}", ledger.len());
+                println!("height: {}", ledger.height());
+                println!("head: {}", ledger.head_hash());
+            }
+            Err(err) => {
+                println!("valid: false");
+                println!("error: {err}");
+                return Err(err);
+            }
+        },
+    }
+    Ok(())
+}
+
+fn show_ledger(node_id: &str, ledger: &cawala_ledger::Ledger<ledger_store::FileLog>) {
+    println!("node_id: {node_id}");
+    println!("ledger_id: {}", ledger.ledger_id());
+    println!("entries: {}", ledger.len());
+    println!("height: {}", ledger.height());
+    println!("head: {}", ledger.head_hash());
+    println!("balances:");
+    for (account, balance) in ledger.balances().accounts() {
+        println!("  {}: {balance}", account_name(&account));
+    }
+}
+
+fn account_name(account: &AccountRef) -> String {
+    match account {
+        AccountRef::Parent => "parent".to_string(),
+        AccountRef::Child(id) => format!("child:{id}"),
+        AccountRef::Equity => "equity".to_string(),
+    }
 }
 
 /// Topology link inspection and mutation.
@@ -139,7 +221,12 @@ fn topo(data_dir: &std::path::Path, command: TopoCommand) -> Result<()> {
 
     match command {
         TopoCommand::Show => show(&store),
-        TopoCommand::AttachChild { child, kind, slot, date_joined } => {
+        TopoCommand::AttachChild {
+            child,
+            kind,
+            slot,
+            date_joined,
+        } => {
             let date_joined = date_joined.unwrap_or_else(now_unix_seconds);
             store.attach_child(&child, kind.into(), slot, date_joined)?;
             store.save()?;
@@ -179,7 +266,10 @@ fn show(store: &record::RecordStore) {
     let rec = store.record();
     println!("node_id: {}", rec.node_id);
     match &rec.parent {
-        Some(parent) => println!("parent: {{ parent_id: {}, slot: {} }}", parent.parent_id, parent.slot),
+        Some(parent) => println!(
+            "parent: {{ parent_id: {}, slot: {} }}",
+            parent.parent_id, parent.slot
+        ),
         None => println!("parent: none"),
     }
     if rec.children.is_empty() {
