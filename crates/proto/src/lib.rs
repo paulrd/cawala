@@ -12,12 +12,13 @@
 
 use std::io;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod addr;
 
-pub use addr::{OctAddr, ParseOctAddrError, MAX_SLOT};
+pub use addr::{MAX_SLOT, OctAddr, ParseOctAddrError};
 
 /// ALPN negotiated on every cawala/ping/0 connection.
 pub const ALPN: &[u8] = b"cawala/ping/0";
@@ -33,17 +34,63 @@ pub enum PingPong {
     Pong { seq: u64, payload: Vec<u8> },
 }
 
-fn encode(msg: &PingPong) -> Result<Vec<u8>, io::Error> {
-    postcard::to_allocvec(msg).map_err(|err| {
+/// Write one length-prefixed postcard frame to `w`.
+///
+/// Frame layout: `u32` LE byte-length followed by the postcard-encoded
+/// value bytes. Generic over any [`Serialize`] type so higher-level crates
+/// (e.g. the messaging envelope) can reuse the same wire framing without
+/// going through [`PingPong`].
+pub async fn write_framed<T, W>(w: &mut W, value: &T) -> io::Result<()>
+where
+    T: Serialize + ?Sized,
+    W: AsyncWrite + Unpin,
+{
+    let bytes = postcard::to_allocvec(value).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("postcard encode failed: {err}"),
         )
-    })
+    })?;
+    w.write_u32_le(bytes.len() as u32).await?;
+    w.write_all(&bytes).await?;
+    w.flush().await
 }
 
-fn decode(bytes: &[u8]) -> Result<PingPong, io::Error> {
-    postcard::from_bytes(bytes).map_err(|err| {
+/// Read one length-prefixed postcard frame from `r`.
+///
+/// Uses [`MAX_FRAME_SIZE`] as the limit; see [`read_framed_with_limit`] for the
+/// full behavior. Generic over any [`DeserializeOwned`] type, mirroring
+/// [`write_framed`].
+pub async fn read_framed<T, R>(r: &mut R) -> io::Result<T>
+where
+    T: DeserializeOwned,
+    R: AsyncRead + Unpin,
+{
+    read_framed_with_limit(r, MAX_FRAME_SIZE).await
+}
+
+/// Read one length-prefixed postcard frame, rejecting a length prefix larger
+/// than `max`.
+///
+/// Returns `UnexpectedEof` if the stream ends mid-frame, and `InvalidData` on
+/// a postcard decode failure or a length prefix above `max`. Callers should
+/// pass the smallest limit their message type can legitimately need, so a
+/// hostile prefix cannot force a large allocation before any validation runs.
+pub async fn read_framed_with_limit<T, R>(r: &mut R, max: u32) -> io::Result<T>
+where
+    T: DeserializeOwned,
+    R: AsyncRead + Unpin,
+{
+    let len = r.read_u32_le().await?;
+    if len > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame length {len} exceeds max {max}"),
+        ));
+    }
+    let mut bytes = vec![0u8; len as usize];
+    r.read_exact(&mut bytes).await?;
+    postcard::from_bytes(&bytes).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("postcard decode failed: {err}"),
@@ -53,36 +100,22 @@ fn decode(bytes: &[u8]) -> Result<PingPong, io::Error> {
 
 /// Write one length-prefixed `PingPong` frame to `w`.
 ///
-/// Frame layout: `u32` LE byte-length followed by the postcard-encoded
-/// message bytes.
+/// Thin wrapper over [`write_framed`], preserving the original signature.
 pub async fn write_frame<W>(w: &mut W, msg: &PingPong) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let bytes = encode(msg)?;
-    w.write_u32_le(bytes.len() as u32).await?;
-    w.write_all(&bytes).await?;
-    w.flush().await
+    write_framed(w, msg).await
 }
 
 /// Read one length-prefixed `PingPong` frame from `r`.
 ///
-/// Returns `UnexpectedEof` if the stream ends mid-frame, and `InvalidData` on
-/// a postcard decode failure or an oversized length prefix.
+/// Thin wrapper over [`read_framed`], preserving the original signature.
 pub async fn read_frame<R>(r: &mut R) -> io::Result<PingPong>
 where
     R: AsyncRead + Unpin,
 {
-    let len = r.read_u32_le().await?;
-    if len > MAX_FRAME_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("frame length {len} exceeds max {MAX_FRAME_SIZE}"),
-        ));
-    }
-    let mut bytes = vec![0u8; len as usize];
-    r.read_exact(&mut bytes).await?;
-    decode(&bytes)
+    read_framed(r).await
 }
 
 #[cfg(test)]
@@ -157,5 +190,60 @@ mod tests {
         let mut buf = Cursor::new(vec![0xff, 0xff, 0xff, 0xff]); // length > MAX_FRAME_SIZE
         let err = read_frame(&mut buf).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn framed_generic_roundtrip() {
+        // A type other than `PingPong` must round-trip through the generic
+        // framing helpers, proving the framing is not tied to ping/pong.
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Sample {
+            id: u32,
+            tags: Vec<String>,
+            flag: bool,
+        }
+
+        let value = Sample {
+            id: 7,
+            tags: vec!["a".to_string(), "b".to_string()],
+            flag: true,
+        };
+        let mut buf = Cursor::new(Vec::new());
+        write_framed(&mut buf, &value).await.unwrap();
+        buf.set_position(0);
+        let got: Sample = read_framed(&mut buf).await.unwrap();
+        assert_eq!(got, value);
+
+        // A plain `Vec<u32>` round-trips too.
+        let nums = vec![1u32, 2, 3, 4];
+        let mut buf = Cursor::new(Vec::new());
+        write_framed(&mut buf, &nums).await.unwrap();
+        buf.set_position(0);
+        let got: Vec<u32> = read_framed(&mut buf).await.unwrap();
+        assert_eq!(got, nums);
+
+        // An oversized length prefix is rejected as `InvalidData`.
+        let mut buf = Cursor::new(vec![0xff, 0xff, 0xff, 0xff]);
+        let err = read_framed::<Vec<u32>, _>(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn framed_limit_rejects_oversize() {
+        // A length prefix above the caller-supplied limit is rejected before
+        // any payload bytes are allocated or read.
+        let mut buf = Cursor::new(vec![4, 0, 0, 0, 1, 2, 3, 4]);
+        let err = read_framed_with_limit::<Vec<u8>, _>(&mut buf, 2)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // A frame exactly at its own size is accepted.
+        let mut buf = Cursor::new(Vec::new());
+        write_framed(&mut buf, &vec![1u8, 2]).await.unwrap();
+        let frame_len = u32::from_le_bytes(buf.get_ref()[..4].try_into().unwrap());
+        buf.set_position(0);
+        let got: Vec<u8> = read_framed_with_limit(&mut buf, frame_len).await.unwrap();
+        assert_eq!(got, vec![1u8, 2]);
     }
 }

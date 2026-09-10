@@ -19,12 +19,17 @@ pub mod identity;
 pub mod ledger_keys;
 pub mod ledger_peers;
 pub mod ledger_store;
+pub mod msg;
 pub mod record;
 
 pub use ledger_keys::{LEDGER_KEY_FILE, load_or_create_ledger_key, persist_ledger_key};
 pub use ledger_peers::{PEERS_FILE, load_peers, save_peers};
 pub use ledger_store::{
     FileLog, LEDGER_FORMAT_VERSION, LedgerMeta, load_or_create_meta, open_ledger,
+};
+pub use msg::{
+    MSG_ALPN, MsgConfig, MsgHandler, MsgSendError, RoutableSnapshot, RoutingSetupError,
+    build_envelope, send_envelope, spawn_msg_node, spawn_msg_node_on,
 };
 
 /// Bind an endpoint with the given persisted [`iroh::SecretKey`] and start the

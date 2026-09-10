@@ -1,20 +1,24 @@
 //! Node record persistence: the node's *links* — one optional parent link and
-//! up to 8 child links — persisted as JSON at `<data-dir>/node.json`.
+//! up to 8 child links — plus its asserted octal [`OctAddr`], persisted as JSON
+//! at `<data-dir>/node.json`.
 //!
-//! Only links are persisted, never derived octal addresses: a lone node cannot
-//! derive its own full address without its parent chain, and addresses are
-//! recomputed from links where the full tree view exists (see the topology
-//! crate).
+//! Links are never accompanied by a locally *derived* address: a lone node
+//! cannot derive its own full address without its parent chain, and addresses
+//! are recomputed from links where the full tree view exists (see the topology
+//! crate). The one stored address is admin-asserted (CLI: `topo set-address`),
+//! not derived, and tells routing where this node sits in the tree.
 //!
 //! Validation is applied on load and on every mutation: at most 8 children,
 //! child slots unique and in `0..=MAX_SLOT`, parent slot in `0..=MAX_SLOT`,
-//! and the kind is restricted to `node`/`user` at (de)serialization time.
+//! a non-root address requires a parent and must match that parent's slot (only
+//! the root address `"0"` may stand alone), and the kind is restricted to
+//! `node`/`user` at (de)serialization time.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use cawala_topology::{ChildKind, MAX_SLOT};
+use cawala_topology::{ChildKind, MAX_SLOT, OctAddr};
 
 /// Name of the node record file inside the data dir.
 pub const NODE_RECORD_FILE: &str = "node.json";
@@ -29,6 +33,7 @@ pub const MAX_CHILDREN: usize = MAX_SLOT as usize + 1;
 /// ```json
 /// {
 ///   "node_id": "<id>",
+///   "address": "0.1.2",
 ///   "parent": { "parent_id": "<id>", "slot": 0 },
 ///   "children": [ { "child_id": "<id>", "kind": "node", "slot": 0, "date_joined": 1700000000 } ]
 /// }
@@ -36,6 +41,10 @@ pub const MAX_CHILDREN: usize = MAX_SLOT as usize + 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRecord {
     pub node_id: String,
+    /// This node's asserted octal address. Never derived locally; an admin sets
+    /// it (CLI: `topo set-address`). `None` means routing is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<OctAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ParentLink>,
     #[serde(default)]
@@ -72,6 +81,13 @@ pub enum RecordError {
     SlotOutOfRange(u8),
     #[error("slot {0} is already taken")]
     SlotTaken(u8),
+    #[error("address '{0}' set without a parent (only the root address \"0\" may have no parent)")]
+    AddressWithoutParent(String),
+    #[error("address slot {address_slot:?} does not match parent slot {parent_slot}")]
+    AddressSlotMismatch {
+        address_slot: Option<u8>,
+        parent_slot: u8,
+    },
     #[error("node already has {MAX_CHILDREN} children (cap reached)")]
     CapExceeded,
     #[error("child '{0}' already present")]
@@ -93,6 +109,7 @@ impl NodeRecord {
     pub fn new(node_id: impl Into<String>) -> Self {
         NodeRecord {
             node_id: node_id.into(),
+            address: None,
             parent: None,
             children: Vec::new(),
         }
@@ -107,6 +124,23 @@ impl NodeRecord {
             }
             if parent.slot > MAX_SLOT {
                 return Err(RecordError::SlotOutOfRange(parent.slot));
+            }
+        }
+        if let Some(address) = &self.address {
+            match &self.parent {
+                Some(parent) => {
+                    if address.depth() < 2 || address.slot() != Some(parent.slot) {
+                        return Err(RecordError::AddressSlotMismatch {
+                            address_slot: address.slot(),
+                            parent_slot: parent.slot,
+                        });
+                    }
+                }
+                None => {
+                    if !address.is_root() {
+                        return Err(RecordError::AddressWithoutParent(address.to_string()));
+                    }
+                }
             }
         }
         if self.children.len() > MAX_CHILDREN {
@@ -274,8 +308,28 @@ impl RecordStore {
     }
 
     /// Clear this node's parent link.
+    ///
+    /// A retained non-root address would no longer be legal without a parent,
+    /// so it is cleared too; a root `"0"` address survives.
     pub fn unset_parent(&mut self) -> Result<(), RecordError> {
         self.record.parent = None;
+        if self.record.address.as_ref().is_some_and(|a| !a.is_root()) {
+            self.record.address = None;
+        }
+        self.record.validate()?;
+        Ok(())
+    }
+
+    /// Assert this node's octal address (admin-set, never derived).
+    pub fn set_address(&mut self, address: OctAddr) -> Result<(), RecordError> {
+        self.record.address = Some(address);
+        self.record.validate()?;
+        Ok(())
+    }
+
+    /// Clear this node's asserted address. Always legal.
+    pub fn unset_address(&mut self) -> Result<(), RecordError> {
+        self.record.address = None;
         self.record.validate()?;
         Ok(())
     }
@@ -548,5 +602,71 @@ mod tests {
             RecordStore::open(dir.path(), "node-a").unwrap_err(),
             RecordError::SlotOutOfRange(8)
         );
+    }
+
+    #[test]
+    fn record_address_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(dir.path());
+        store.set_parent("parent-x", 2).unwrap();
+        store.set_address("0.1.2".parse().unwrap()).unwrap();
+        store.save().unwrap();
+
+        let json = std::fs::read_to_string(dir.path().join(NODE_RECORD_FILE)).unwrap();
+        assert!(json.contains("\"address\": \"0.1.2\""));
+
+        let loaded = RecordStore::open(dir.path(), "node-a").unwrap();
+        assert_eq!(loaded.record(), store.record());
+        assert_eq!(
+            loaded.record().address,
+            Some("0.1.2".parse::<OctAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn record_rejects_address_without_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(dir.path());
+        assert_eq!(
+            store.set_address("0.1.2".parse().unwrap()),
+            Err(RecordError::AddressWithoutParent("0.1.2".into()))
+        );
+        // The root address is legal without a parent.
+        store.set_address("0".parse().unwrap()).unwrap();
+        assert_eq!(store.record().address, Some("0".parse().unwrap()));
+    }
+
+    #[test]
+    fn record_rejects_address_slot_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(dir.path());
+        store.set_parent("parent-x", 2).unwrap();
+        assert_eq!(
+            store.set_address("0.1.5".parse().unwrap()),
+            Err(RecordError::AddressSlotMismatch {
+                address_slot: Some(5),
+                parent_slot: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn unset_parent_clears_nonroot_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut attached = store(dir.path());
+        attached.set_parent("parent-x", 2).unwrap();
+        attached.set_address("0.1.2".parse().unwrap()).unwrap();
+        attached.unset_parent().unwrap();
+        assert!(attached.record().parent.is_none());
+        assert!(attached.record().address.is_none());
+        attached.record().validate().unwrap();
+
+        // A root address needs no parent and survives unset_parent.
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut root = store(dir2.path());
+        root.set_address("0".parse().unwrap()).unwrap();
+        root.unset_parent().unwrap();
+        assert_eq!(root.record().address, Some("0".parse().unwrap()));
+        root.record().validate().unwrap();
     }
 }

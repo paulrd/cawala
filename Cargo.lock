@@ -305,6 +305,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 name = "cawala-client"
 version = "0.1.0"
 dependencies = [
+ "cawala-msg",
  "cawala-proto",
  "console_error_panic_hook",
  "getrandom 0.3.4",
@@ -333,14 +334,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "cawala-msg"
+version = "0.1.0"
+dependencies = [
+ "cawala-proto",
+ "postcard",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "cawala-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "cawala-ledger",
+ "cawala-msg",
  "cawala-proto",
  "cawala-topology",
  "clap",
+ "getrandom 0.3.4",
  "iroh",
  "n0-future",
  "postcard",

@@ -2,8 +2,9 @@
 //! 32 bytes at `<data-dir>/secret_key`.
 //!
 //! A stable key means a stable [`iroh::EndpointId`] across restarts. Only the
-//! key material is persisted here — derived addresses are never stored (see
-//! [`crate::record`]).
+//! key material is persisted here. The node's routing address is *asserted* by
+//! an admin and lives in the record (`node.json`, see [`crate::record`]); it is
+//! never derived locally.
 
 use std::path::Path;
 

@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 # the `getrandom_backend="wasm_js"` cfg set in .cargo/config.toml; iroh 1.0.3
 # pulls getrandom 0.4 with its own `wasm_js` feature.
 [dependencies]
+cawala-msg = { path = "../msg" }
 console_error_panic_hook = "0.1.7"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring"] }

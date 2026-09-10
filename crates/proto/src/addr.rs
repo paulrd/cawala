@@ -187,18 +187,13 @@ mod tests {
     use super::*;
 
     fn addr(s: &str) -> OctAddr {
-        s.parse().unwrap_or_else(|e| panic!("parse of {s:?} failed: {e}"))
+        s.parse()
+            .unwrap_or_else(|e| panic!("parse of {s:?} failed: {e}"))
     }
 
     #[test]
     fn display_round_trips() {
-        for s in [
-            "0",
-            "0.7",
-            "0.0.0.0",
-            "0.3.5.2",
-            "0.3.5.7.1.2.3.4.5.6.7",
-        ] {
+        for s in ["0", "0.7", "0.0.0.0", "0.3.5.2", "0.3.5.7.1.2.3.4.5.6.7"] {
             assert_eq!(addr(s).to_string(), s);
         }
     }
@@ -213,8 +208,8 @@ mod tests {
     #[test]
     fn invalid_inputs_rejected() {
         for s in [
-            "", "0.8", "0.3.5.", ".0", "0x", "0.12", "3", "3.1", "0.00", "0..1",
-            "0.-1", "0. 1", "0.10", "0..", "00", "0.3.5..2",
+            "", "0.8", "0.3.5.", ".0", "0x", "0.12", "3", "3.1", "0.00", "0..1", "0.-1", "0. 1",
+            "0.10", "0..", "00", "0.3.5..2",
         ] {
             assert!(
                 s.parse::<OctAddr>().is_err(),

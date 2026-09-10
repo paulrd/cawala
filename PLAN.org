@@ -192,9 +192,38 @@
       - Tests: 177 in `crates/ledger` (138 unit + 12 ledger + 9 netting +
         3 property + 15 settlement) and 27 node lib tests; workspace clippy
         clean. The relay ping/pong test still requires network.
-  4. *M3 - Messaging/routing protocol*: ALPN framing, envelope (src, dst,
-     msg_id, type, nonce, payload, hop_chain), longest-prefix routing,
-     replay/ordering protection.
+   4. *M3 - Messaging/routing protocol* (DONE 2026-09-10): ALPN framing,
+      envelope (src, dst, msg_id, type, nonce, payload, hop_chain),
+      longest-prefix routing, replay/ordering protection.
+      - New pure, wasm-safe crate `crates/msg`: versioned `Envelope` with a
+        frozen postcard field order and an allocation-bounded hop-chain decode,
+        `Ack`/`AckStatus`/`RejectReason`, hierarchical `next_step`/`route` with
+        unique-path `validate_hop_chain` + `append_hop`, and a bounded in-memory
+        `SeenSet` replay guard keyed on `(origin node, msg_id)` with
+        `unobserve` rollback so transient forward failures are retryable.
+        `cawala/msg/0` ALPN; `MAX_NODE_ID_LEN` and a per-frame `MAX_MSG_FRAME`
+        cap blunt pre-auth allocation. Generic length-prefixed postcard framing
+        (`read_framed_with_limit`) moved into `crates/proto`, ping unchanged.
+      - Node integration: `crates/node/src/msg.rs` (`MsgHandler` with the
+        validate -> chain -> self-in-chain -> neighbor -> replay -> route order;
+        `RoutableSnapshot` derived from the recorded asserted address;
+        `spawn_msg_node`/`send_envelope` hop-by-hop forwarding); persisted
+        `address` field with `topo set-address`/`unset-address` and `msg send`.
+      - Browser integration: `cawala/msg/0` accept as a leaf plus
+        `spawn_with_address`/`send_envelope` (timeout-bounded)/
+        `try_recv_envelope`; the M0 ping API is unchanged.
+      - Trust/scope: envelope metadata (src, hop_chain, nonce, ttl, type) is
+        unauthenticated by design; authenticity is payload-level at the
+        destination, each hop authenticates only its direct QUIC neighbor, and
+        `SeenSet` is a best-effort (non-security) guard. Ordering is payload-
+        level (M2 `seq`/`height`/`prev_hash`), not a transport guarantee; the
+        envelope `nonce` is carried but not used for dedup.
+      - Tests: workspace green (ledger 177, msg 28, node 52 incl. 12 hermetic
+        multi-node messaging tests, proto 18, topology 25, relay ping/pong);
+        `clippy --workspace --all-targets -D warnings` clean; wasm target
+        check clean. Independently reviewed (routing/replay); the three
+        network-reachable findings (decode amplification, unbounded node-id
+        retention, retry poisoning) were fixed and re-verified.
   5. *M4 - Control & web client*: senior-child control flow, indirect
      multi-node control, Svelte PWA + location SQLite service, join flow
      (parent approves -> leaf issues address).
