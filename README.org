@@ -42,9 +42,18 @@
     in the tree to be known so that payments or messages can be routed.
   - a separate SQLITE database can be queried that can suggest the appropriate
     octal address for a given user's location.
-  - A node holds an account for each of its child nodes / users.
+  - Accounts are double-entry: the account a node holds for a child is a
+    *liability* of that node and simultaneously an *asset* of the child - one
+    signed obligation with two viewpoints, mirrored on both ledgers.
+  - An internal node holds up to 8 accounts, one for each of its child nodes; a
+    leaf node holds up to 8 accounts for its users. Every non-root node also
+    holds exactly one asset account with its parent.
+  - Per-node accounting equation: Assets (the account with the parent) minus
+    Liabilities (accounts held for children/users) equals Equity. Transfers post
+    to two accounts and conserve value; only signed issue/burn entries change a
+    node's equity.
   - A node administrator can arbitrarily increase or decrease the value of an
-    account.
+    account (an issue/burn posted against the node's equity).
 * Constraints
   - tech stack is Iroh, Rust, Typescript, Virtual Private Servers
 * Open Questions

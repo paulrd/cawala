@@ -7,3 +7,7 @@
 .slim/clonedeps/repos/**/.git/
 .slim/clonedeps/repos/**/.git/**
 # END oh-my-opencode-slim clonedeps
+
+# Deepwork session state
+!.slim/deepwork/
+!.slim/deepwork/**

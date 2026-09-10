@@ -2,6 +2,9 @@
 .slim/clonedeps/repos/
 # END oh-my-opencode-slim clonedeps
 
+# Deepwork session state (git-local)
+.slim/deepwork/
+
 # Rust build output
 target/
 

@@ -86,6 +86,26 @@
   - Every balance mutation is signed + append-only + visible to all children;
     any child can exit/detach.
   - Failed parent replaced via foster parent from signed state commitments.
+** Accounts & Double-Entry
+  - Each account is a single obligation with two views: the account an
+    internal node holds for a child is a *liability* of that node and an
+    *asset* of the child. Both sides mirror the same signed balance; any
+    mismatch is detectable.
+  - Ledger shape: an internal node holds at most 8 liability accounts, one per
+    child node; a leaf node holds at most 8 accounts for its users; every
+    non-root node also holds exactly one asset account with its parent. The
+    8-account cap is a per-node fan-out limit, independent of tree depth.
+  - Per-node accounting equation: Assets (the account with the parent) minus
+    Liabilities (accounts held for children/users) equals Equity. The root has
+    no parent account, so its books are liabilities plus equity (negative
+    equity = value issued into the tree).
+  - Transfers conserve value: a payment posts to two accounts that are both
+    held by the common parent (an intra-parent move between sibling rows) or by
+    the least common ancestor (cross-subtree settlement, cascading down each
+    branch one balanced hop at a time).
+  - Issue/burn is the only exception: an admin increasing or decreasing an
+    account posts against the node's own equity, so value enters or leaves the
+    closed system only through signed issue/burn entries.
 ** Settlement
   - Cross-subtree payments settle at the least common ancestor (LCA) between
     prefunded settlement accounts - prefunded only, no overdraw (decision 5).
