@@ -6,25 +6,66 @@ export const MAX_CHILDREN = 8;
 /** Slot indices for children. */
 export const SLOT_RANGE = [0, 1, 2, 3, 4, 5, 6, 7];
 
-/** Message type discriminators (matching crates/msg). */
+/**
+ * Mock/UI-only message type discriminators.
+ *
+ * WARNING: these numeric values do NOT match any Rust wire enum. The live
+ * control surface does not ride `send_envelope`; it uses the dedicated
+ * `cawala/control/0` ALPN. These constants are retained so existing imports
+ * keep working, but do not treat them as the wire format. Use ENVELOPE_ACK,
+ * JOIN_STATE, JOIN_OUTCOME, and CONTROL_EVENT below for live status strings.
+ */
 export const MSG_TYPES = {
-  /** Control: request to join. */
+  /** Mock/UI-only: request to join. */
   JOIN_REQUEST: 0x01,
-  /** Control: join approved (leaf issues address). */
+  /** Mock/UI-only: join approved (leaf issues address). */
   JOIN_APPROVED: 0x02,
-  /** Control: join rejected. */
+  /** Mock/UI-only: join rejected. */
   JOIN_REJECTED: 0x03,
-  /** Control: topology edit commands. */
+  /** Mock/UI-only: topology edit commands. */
   TOPO_CREATE_CHILD: 0x10,
   TOPO_MOVE_CHILD: 0x11,
   TOPO_DETACH_CHILD: 0x12,
-  /** Ledger: issue/burn. */
+  /** Mock/UI-only: ledger issue/burn. */
   LEDGER_ADJUST: 0x20,
-  /** Ledger: transfer. */
+  /** Mock/UI-only: ledger transfer. */
   LEDGER_TRANSFER: 0x21,
-  /** Ack/status responses. */
+  /** Mock/UI-only: ack/status responses. */
   ACK: 0xf0,
 };
+
+/**
+ * Real envelope acknowledgement buckets returned by the live wasm
+ * `ClientNode.send_envelope` (Rust `cawala-msg` wire ack status).
+ */
+export const ENVELOPE_ACK = {
+  DELIVERED: 'delivered',
+  DUPLICATE: 'duplicate',
+  REJECTED: 'rejected',
+};
+
+/** Real join-handshake states from the live wasm `JoinStatus.state`. */
+export const JOIN_STATE = {
+  NONE: 'none',
+  PENDING: 'pending',
+  JOINED: 'joined',
+  REJECTED: 'rejected',
+};
+
+/** Real immediate `JoinOutcome.status` buckets from the live wasm client. */
+export const JOIN_OUTCOME = {
+  PENDING: 'pending',
+  REJECTED: 'rejected',
+};
+
+/** Real kinds of control events drained from the live wasm control loop. */
+export const CONTROL_EVENT = {
+  ACCEPTED: 'accepted',
+  REJECTED: 'rejected',
+};
+
+/** ALPN the live browser control client speaks to its parent node. */
+export const CONTROL_ALPN = 'cawala/control/0';
 
 /** Connection status values. */
 export const CONNECTION = {

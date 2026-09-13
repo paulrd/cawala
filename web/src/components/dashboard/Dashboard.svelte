@@ -8,7 +8,7 @@
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
   import EmptyState from '../shared/EmptyState.svelte';
   import ErrorState from '../shared/ErrorState.svelte';
-  import { clientState, nodeState, loadingState, errorState } from '../../lib/stores.js';
+  import { clientState, nodeState, loadingState, errorState, apiCapabilities } from '../../lib/stores.js';
   import { getChildren, getAccounts, getJoinRequests, isMockMode } from '../../lib/api.js';
   import { ROUTES } from '../../lib/constants.js';
   import { navigate } from '../../lib/router.js';
@@ -61,14 +61,27 @@
     nodeState.joinRequests.filter((r) => r.status === 'pending').length,
   );
 
+  let isLive = $derived(!isMockMode());
+
+  // In live mode, balance is always null and online is always false.
+  // Render em-dash for null balance, "Unknown" for online status.
   const childColumns = [
     { key: 'address', label: 'Address', mono: true, sortable: true },
     { key: 'balance', label: 'Balance', align: 'right', mono: true, sortable: true,
-      render: (v) => `<span style="color: ${v > 0 ? 'var(--ok)' : v < 0 ? 'var(--danger)' : 'var(--muted)'}">${v != null ? v.toLocaleString() : '\u2014'}</span>` },
+      render: (v) => {
+        if (v == null) return '<span style="color:var(--muted)">&mdash;</span>';
+        return `<span style="color: ${v > 0 ? 'var(--ok)' : v < 0 ? 'var(--danger)' : 'var(--muted)'}">${v.toLocaleString()}</span>`;
+      } },
     { key: 'seniority', label: 'Joined', sortable: true,
       render: (v) => `<span class="text-sm">${formatDate(v)}</span>` },
     { key: 'online', label: 'Status',
-      render: (v) => `<span class="badge badge--${v ? 'ok' : 'muted'}" style="display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:600;${v ? 'background:var(--ok-dim);color:var(--ok)' : 'background:var(--bg-hover);color:var(--muted)'}">${v ? 'Online' : 'Offline'}</span>` },
+      render: (v, row) => {
+        // In live mode, show "Unknown" instead of lying about online status
+        const label = isLive && !v ? 'Unknown' : v ? 'Online' : 'Offline';
+        const color = v ? 'var(--ok)' : 'var(--muted)';
+        const bg = v ? 'var(--ok-dim)' : 'var(--bg-hover)';
+        return `<span style="display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:600;background:${bg};color:${color}">${label}</span>`;
+      } },
   ];
 </script>
 
@@ -78,10 +91,18 @@
   {:else if errorState.children}
     <ErrorState message="Failed to load node data" onRetry={loadData} />
   {:else}
+    <!-- Identity persistence warning (subtle) -->
+    {#if isLive && !apiCapabilities.identityPersistent}
+      <div class="persistence-warning">
+        <Badge variant="warn" label="Session only" />
+        <span class="text-sm muted">Identity won't persist on this device. If you close this tab, your identity will be lost.</span>
+      </div>
+    {/if}
+
     <div class="summary-grid">
       <Card title="Node Address">
         <div class="summary-value">
-          <Address address={clientState.address ?? '0.3.1'} size="lg" />
+          <Address address={clientState.address} size="lg" />
         </div>
         <div class="summary-meta">
           <EndpointId id={clientState.endpointId} />
@@ -90,9 +111,19 @@
 
       <Card title="Equity">
         <div class="summary-value">
-          <Balance amount={equity} size="lg" />
+          {#if isLive && nodeState.accounts.length === 0}
+            <span class="muted">&mdash;</span>
+          {:else}
+            <Balance amount={equity} size="lg" />
+          {/if}
         </div>
-        <div class="summary-meta muted text-sm">Node equity (assets &minus; liabilities)</div>
+        <div class="summary-meta muted text-sm">
+          {#if isLive && nodeState.accounts.length === 0}
+            No accounting data from this node
+          {:else}
+            Node equity (assets &minus; liabilities)
+          {/if}
+        </div>
       </Card>
 
       <Card title="Children">
@@ -104,6 +135,8 @@
             <button type="button" class="link-btn" onclick={() => navigate(ROUTES.JOINS)}>
               {pendingJoins} pending join{pendingJoins !== 1 ? 's' : ''}
             </button>
+          {:else if isLive}
+            Pending joins not available in the web client
           {:else}
             No pending joins
           {/if}
@@ -112,9 +145,19 @@
 
       <Card title="Total Liability">
         <div class="summary-value">
-          <Balance amount={totalLiability} size="lg" />
+          {#if isLive && nodeState.accounts.length === 0}
+            <span class="muted">&mdash;</span>
+          {:else}
+            <Balance amount={totalLiability} size="lg" />
+          {/if}
         </div>
-        <div class="summary-meta muted text-sm">Owed to children</div>
+        <div class="summary-meta muted text-sm">
+          {#if isLive && nodeState.accounts.length === 0}
+            No accounting data from this node
+          {:else}
+            Owed to children
+          {/if}
+        </div>
       </Card>
     </div>
 
@@ -122,9 +165,11 @@
       {#if nodeState.children.length === 0}
         <EmptyState
           title="No children yet"
-          message="Create a child node or approve a pending join request."
-          actionLabel="View Join Requests"
-          onAction={() => navigate(ROUTES.JOINS)}
+          message={isLive
+            ? "This node has no children in its local topology snapshot."
+            : "Create a child node or approve a pending join request."}
+          actionLabel={isLive ? undefined : "View Join Requests"}
+          onAction={isLive ? undefined : () => navigate(ROUTES.JOINS)}
         />
       {:else}
         <DataTable
@@ -192,6 +237,17 @@
     padding: var(--sp-3) var(--sp-4);
     background: var(--accent-dim);
     border: 1px solid var(--accent);
+    border-radius: var(--radius-md);
+    font-size: var(--text-sm);
+    color: var(--muted);
+  }
+  .persistence-warning {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    padding: var(--sp-3) var(--sp-4);
+    background: var(--warn-dim);
+    border: 1px solid var(--warn);
     border-radius: var(--radius-md);
     font-size: var(--text-sm);
     color: var(--muted);

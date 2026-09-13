@@ -18,6 +18,21 @@ export const clientState = $state({
   error: null,
 });
 
+// ── Live-mode capabilities & control events ──────────────────
+
+/** @type {{ mock: boolean, canAdmin: boolean, canQueryPeers: boolean, identityPersistent: boolean, multiTabLeader: boolean, multiTabWarning: string|null }} */
+export const apiCapabilities = $state({
+  mock: true,
+  canAdmin: false,
+  canQueryPeers: false,
+  identityPersistent: false,
+  multiTabLeader: false,
+  multiTabWarning: null,
+});
+
+/** Last control event drained from the wasm poller. */
+export const lastControlEvent = $state({ value: null });
+
 // ── Node / data state ─────────────────────────────────────────
 
 /** @type {{ children: Array, accounts: Array, joinRequests: Array, activity: Array }} */

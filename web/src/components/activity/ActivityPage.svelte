@@ -8,7 +8,7 @@
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
   import ErrorState from '../shared/ErrorState.svelte';
   import { nodeState, loadingState, errorState } from '../../lib/stores.js';
-  import { getActivityLog } from '../../lib/api.js';
+  import { getActivityLog, isMockMode } from '../../lib/api.js';
   import { ACTIVITY_LABELS } from '../../lib/constants.js';
   import { formatDate } from '../../lib/utils.js';
 
@@ -35,6 +35,8 @@
     loaded = false;
     loadData();
   }
+
+  let isLive = $derived(!isMockMode());
 
   const typeBadgeVariant = {
     transfer: 'info',
@@ -74,27 +76,40 @@
 
 <div class="activity-page">
   <Card title="Activity Log">
-    <div class="toolbar">
-      <select bind:value={filterType} onchange={handleFilter} aria-label="Filter by type">
-        <option value="">All types</option>
-        <option value="transfer">Transfers</option>
-        <option value="issue">Issues</option>
-        <option value="burn">Burns</option>
-        <option value="join_approved">Join Approved</option>
-        <option value="topo_create">Child Created</option>
-        <option value="topo_move">Child Moved</option>
-        <option value="topo_detach">Child Detached</option>
-      </select>
-    </div>
-
-    {#if loadingState.activity && !loaded}
-      <LoadingSkeleton rows={5} />
-    {:else if errorState.activity}
-      <ErrorState message="Failed to load activity" onRetry={loadData} />
-    {:else if nodeState.activity.length === 0}
-      <EmptyState title="No activity yet" message="Activity will appear here as operations are performed." />
+    {#if isLive && nodeState.activity.length === 0 && loaded}
+      <!-- Live mode: activity log not available -->
+      <div class="live-unavailable">
+        <Badge variant="info" label="Live mode" />
+        <p class="unavailable-desc">
+          Activity logging is not available in the web client yet. This node does not expose an activity API to the browser.
+        </p>
+        <p class="unavailable-cli muted text-sm">
+          Activity data is managed by the node process. Check the node CLI for operation history.
+        </p>
+      </div>
     {:else}
-      <DataTable columns={columns} rows={nodeState.activity} />
+      <div class="toolbar">
+        <select bind:value={filterType} onchange={handleFilter} aria-label="Filter by type">
+          <option value="">All types</option>
+          <option value="transfer">Transfers</option>
+          <option value="issue">Issues</option>
+          <option value="burn">Burns</option>
+          <option value="join_approved">Join Approved</option>
+          <option value="topo_create">Child Created</option>
+          <option value="topo_move">Child Moved</option>
+          <option value="topo_detach">Child Detached</option>
+        </select>
+      </div>
+
+      {#if loadingState.activity && !loaded}
+        <LoadingSkeleton rows={5} />
+      {:else if errorState.activity}
+        <ErrorState message="Failed to load activity" onRetry={loadData} />
+      {:else if nodeState.activity.length === 0}
+        <EmptyState title="No activity yet" message="Activity will appear here as operations are performed." />
+      {:else}
+        <DataTable columns={columns} rows={nodeState.activity} />
+      {/if}
     {/if}
   </Card>
 </div>
@@ -118,6 +133,19 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     font: inherit;
+    font-size: var(--text-sm);
+  }
+  .live-unavailable {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+    padding: var(--sp-4) 0;
+  }
+  .unavailable-desc {
+    font-size: var(--text-sm);
+    line-height: var(--leading-normal);
+  }
+  .unavailable-cli {
     font-size: var(--text-sm);
   }
 </style>

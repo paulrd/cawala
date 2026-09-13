@@ -1,19 +1,31 @@
 <script>
+  import { onMount, onDestroy } from 'svelte';
   import Card from '../shared/Card.svelte';
   import EndpointId from '../shared/EndpointId.svelte';
   import Badge from '../shared/Badge.svelte';
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
   import { clientState, showToast } from '../../lib/stores.js';
-  import { parseInvite, requestJoin, isMockMode } from '../../lib/api.js';
+  import {
+    parseInvite,
+    requestJoin,
+    isMockMode,
+    getJoinStatus,
+    getLastControlEvent,
+  } from '../../lib/api.js';
+  import { JOIN_STATE } from '../../lib/constants.js';
   import { truncateMiddle, copyToClipboard } from '../../lib/utils.js';
 
   // ── State ───────────────────────────────────────────────────
-  // One of: 'idle' | 'parsing' | 'valid' | 'invalid' | 'connecting' | 'waiting' | 'approved' | 'error'
+  // One of: 'idle' | 'parsing' | 'valid' | 'invalid' | 'connecting' | 'waiting' | 'approved' | 'rejected' | 'error'
   let flowState = $state('idle');
   let rawInput = $state('');
   let parsedInvite = $state(null);
   let errorMessage = $state('');
   let assignedAddress = $state(null);
+  let rejectReason = $state(null);
+
+  // Polling handle for join-status
+  let _pollTimer = null;
 
   // ── Derived ─────────────────────────────────────────────────
   let expiryFormatted = $derived.by(() => {
@@ -38,6 +50,63 @@
   let relayTruncated = $derived(
     parsedInvite?.relay ? truncateMiddle(parsedInvite.relay, 14) : '',
   );
+
+  // ── Polling ─────────────────────────────────────────────────
+
+  function _startPolling() {
+    _stopPolling();
+    _pollTimer = setInterval(_pollJoinStatus, 2000);
+  }
+
+  function _stopPolling() {
+    if (_pollTimer != null) {
+      clearInterval(_pollTimer);
+      _pollTimer = null;
+    }
+  }
+
+  function _pollJoinStatus() {
+    if (isMockMode()) return;
+    const status = getJoinStatus();
+    if (status.state === JOIN_STATE.JOINED) {
+      _stopPolling();
+      assignedAddress = status.address;
+      flowState = 'approved';
+      clientState.address = status.address;
+      showToast(`Approved. Your address is ${status.address}.`, 'ok');
+    } else if (status.state === JOIN_STATE.REJECTED) {
+      _stopPolling();
+      flowState = 'rejected';
+      rejectReason = status.reason || 'The operator declined your join request.';
+      // Also check for a last control event with more detail.
+      const ev = getLastControlEvent();
+      if (ev?.kind === 'rejected' && ev.reason) {
+        rejectReason = ev.reason;
+      }
+    }
+    // 'pending' and 'none' — keep polling.
+  }
+
+  // ── Mount: check for persisted mid-flow state ──────────────
+  // If the user reloads while waiting, the wasm state may already be
+  // pending/joined/rejected. Restore the correct UI state on mount.
+
+  function _hydrateFromPersistedState() {
+    if (isMockMode()) return;
+    const status = getJoinStatus();
+    if (status.state === JOIN_STATE.JOINED) {
+      assignedAddress = status.address;
+      flowState = 'approved';
+      clientState.address = status.address;
+    } else if (status.state === JOIN_STATE.REJECTED) {
+      flowState = 'rejected';
+      rejectReason = status.reason || 'The operator declined your join request.';
+    } else if (status.state === JOIN_STATE.PENDING) {
+      flowState = 'waiting';
+      showToast('Join request is pending. Waiting for approval.', 'info');
+      _startPolling();
+    }
+  }
 
   // ── Actions ─────────────────────────────────────────────────
 
@@ -64,11 +133,13 @@
   }
 
   function handleReset() {
+    _stopPolling();
     flowState = 'idle';
     rawInput = '';
     parsedInvite = null;
     errorMessage = '';
     assignedAddress = null;
+    rejectReason = null;
   }
 
   async function handleConnect() {
@@ -76,15 +147,17 @@
     flowState = 'connecting';
 
     try {
-      const result = await requestJoin(parsedInvite.parent, null);
+      // Pass the full parsed object so the wasm layer gets the operator key,
+      // slot, relay, expiry, etc. — not just the parent string.
+      const result = await requestJoin(parsedInvite);
       if (result.status === 'pending') {
         flowState = 'waiting';
         showToast('Join request sent. Waiting for approval.', 'info');
-      } else if (result.status === 'approved' && result.address) {
-        assignedAddress = result.address;
-        flowState = 'approved';
-        clientState.address = result.address;
-        showToast(`Approved. Your address is ${result.address}.`, 'ok');
+        _startPolling();
+      } else if (result.status === 'rejected') {
+        flowState = 'rejected';
+        rejectReason = result.reason || 'The operator declined your join request.';
+        showToast('Join request was rejected.', 'danger');
       } else {
         flowState = 'error';
         errorMessage = 'Unexpected response from the parent node.';
@@ -115,6 +188,16 @@
       if (ok) showToast('Relay URL copied', 'ok', 2000);
     }
   }
+
+  // Hydrate on mount: if the user reloaded mid-join, the wasm state may
+  // already be pending/joined/rejected. Restore the correct UI state.
+  onMount(() => {
+    _hydrateFromPersistedState();
+  });
+
+  onDestroy(() => {
+    _stopPolling();
+  });
 
   // If already connected, show a different view
   let alreadyConnected = $derived(!!clientState.address);
@@ -313,7 +396,7 @@
       </div>
 
     {:else if flowState === 'waiting'}
-      <div class="waiting-state">
+      <div class="waiting-state" aria-live="polite" aria-atomic="true">
         <div class="waiting-icon" aria-hidden="true">
           <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="10"/>
@@ -322,7 +405,7 @@
         </div>
         <h3 class="waiting-title">Waiting for approval</h3>
         <p class="waiting-desc muted text-sm">
-          Your join request has been sent to the parent node. The operator needs to approve it before you can use the network.
+          Your join request has been sent to the parent node. The operator needs to approve it before you can use the network. This page will update automatically.
         </p>
         <button type="button" class="btn btn--ghost" onclick={handleReset}>
           Cancel and use a different invite
@@ -330,7 +413,7 @@
       </div>
 
     {:else if flowState === 'approved'}
-      <div class="approved-state">
+      <div class="approved-state" aria-live="polite" aria-atomic="true">
         <div class="approved-icon" aria-hidden="true">
           <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M22 11.08V12a10 10 0 11-5.93-9.14"/>
@@ -347,6 +430,25 @@
         <p class="muted text-xs">
           You can find this in My Node &rarr; Identity.
         </p>
+      </div>
+
+    {:else if flowState === 'rejected'}
+      <div class="rejected-state" aria-live="assertive" aria-atomic="true">
+        <div class="rejected-icon" aria-hidden="true">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M15 9l-6 6M9 9l6 6"/>
+          </svg>
+        </div>
+        <h3 class="rejected-title">Join request rejected</h3>
+        <p class="rejected-desc muted text-sm">
+          {rejectReason}
+        </p>
+        <div class="error-actions">
+          <button type="button" class="btn btn--ghost" onclick={handleReset}>
+            Try a different invite
+          </button>
+        </div>
       </div>
 
     {:else if flowState === 'error'}
@@ -577,6 +679,32 @@
   .approved-address code {
     font-size: var(--text-lg);
     letter-spacing: 0.05em;
+  }
+
+  /* ── Rejected state ── */
+  .rejected-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: var(--sp-3);
+    padding: var(--sp-4) 0;
+  }
+
+  .rejected-icon {
+    color: var(--danger);
+    margin-bottom: var(--sp-1);
+  }
+
+  .rejected-title {
+    font-size: var(--text-base);
+    font-weight: 600;
+    color: var(--danger);
+  }
+
+  .rejected-desc {
+    max-width: 360px;
+    line-height: var(--leading-normal);
   }
 
   /* ── Error section ── */

@@ -493,6 +493,99 @@ async fn non_senior_child_control_rejected() {
     parent.shutdown().await;
 }
 
+/// A `ChildKind::User` browser client with the earliest `date_joined` must not
+/// be the senior child: only `ChildKind::Node` children carry senior-child
+/// control authority, while a node child still does.
+#[tokio::test]
+async fn user_child_is_never_senior_for_control() {
+    let parent_key = SecretKey::generate();
+    let user_key = SecretKey::generate();
+    let node_child_key = SecretKey::generate();
+    let parent_id = parent_key.public().to_string();
+    let user_id = user_key.public().to_string();
+    let node_child_id = node_child_key.public().to_string();
+    let parent_op = operator(&parent_key);
+    let user_op = operator(&user_key);
+    let node_child_op = operator(&node_child_key);
+
+    // The user joined first (earliest date_joined), so it would be "senior" if
+    // user children were counted; the node child joined later.
+    let children = [
+        ChildSpec {
+            id: &user_id,
+            kind: ChildKind::User,
+            slot: 0,
+            date_joined: 10,
+        },
+        ChildSpec {
+            id: &node_child_id,
+            kind: ChildKind::Node,
+            slot: 1,
+            date_joined: 20,
+        },
+    ];
+    let parent_dir = tempfile::tempdir().unwrap();
+    let parent = spawn_node(NodeSpec {
+        secret: &parent_key,
+        operator: parent_op,
+        dir: parent_dir.path(),
+        node_id: &parent_id,
+        address: Some("0"),
+        parent: None,
+        children: &children,
+        peers: vec![
+            // The user peer is otherwise fully verifiable: its registered
+            // operator matches its signer, so only the seniority rule can
+            // reject it. Without the fix this request would be accepted.
+            peer(&user_id, &user_op, None, PeerRole::User),
+            peer(
+                &node_child_id,
+                &node_child_op,
+                Some(&ledger(11)),
+                PeerRole::Node,
+            ),
+        ],
+    })
+    .await;
+
+    let sender = bind(&SecretKey::generate()).await;
+
+    // The earliest-joining user child is not authorized to clear the address.
+    let user_clear = SignedControl::authorize(
+        node(&user_id),
+        &user_op,
+        ControlRequest::SetAddress(SetAddress { address: None }),
+    )
+    .unwrap();
+    assert_eq!(
+        send(&sender, &parent.addr, &user_clear).await,
+        ControlReply::Rejected(RejectCode::Unauthorized)
+    );
+    {
+        let engine = parent.engine().await;
+        assert_eq!(engine.record().address, Some("0".parse().unwrap()));
+    }
+
+    // The node child (later date_joined) is still authorized.
+    let node_clear = SignedControl::authorize(
+        node(&node_child_id),
+        &node_child_op,
+        ControlRequest::SetAddress(SetAddress { address: None }),
+    )
+    .unwrap();
+    assert_eq!(
+        send(&sender, &parent.addr, &node_clear).await,
+        ControlReply::Accepted
+    );
+    {
+        let engine = parent.engine().await;
+        assert_eq!(engine.record().address, None);
+    }
+
+    sender.close().await;
+    parent.shutdown().await;
+}
+
 #[tokio::test]
 async fn senior_child_can_control_parent() {
     let parent_key = SecretKey::generate();

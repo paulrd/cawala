@@ -1,8 +1,9 @@
 <script>
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { initRouter, currentRoute } from './lib/router.js';
-  import { clientState } from './lib/stores.js';
-  import { initApi, spawnClient, isMockMode } from './lib/api.js';
+  import { clientState, apiCapabilities } from './lib/stores.js';
+  import { initApi, spawnClient, destroyClient, isMockMode, getCapabilities } from './lib/api.js';
+  import { CLIENT_STATUS, CONNECTION } from './lib/constants.js';
   import Shell from './components/layout/Shell.svelte';
   import Dashboard from './components/dashboard/Dashboard.svelte';
   import NodePage from './components/node/NodePage.svelte';
@@ -22,17 +23,24 @@
     try {
       await initApi();
       const result = await spawnClient();
-      clientState.status = 'ready';
+      clientState.status = CLIENT_STATUS.READY;
       clientState.endpointId = result.endpointId;
       clientState.address = result.address;
-      clientState.connectionStatus = 'connected';
+      clientState.connectionStatus = CONNECTION.CONNECTED;
+      // Sync capabilities into the store for downstream components.
+      const caps = getCapabilities();
+      Object.assign(apiCapabilities, caps);
     } catch (err) {
-      clientState.status = 'error';
+      clientState.status = CLIENT_STATUS.ERROR;
       clientState.error = err.message;
       initError = err.message;
       console.error('[App] init failed:', err);
     }
     ready = true;
+  });
+
+  onDestroy(() => {
+    destroyClient();
   });
 
   let route = $derived(currentRoute());

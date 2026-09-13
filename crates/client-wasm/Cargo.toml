@@ -13,11 +13,13 @@ crate-type = ["cdylib", "rlib"]
 # the `getrandom_backend="wasm_js"` cfg set in .cargo/config.toml; iroh 1.0.3
 # pulls getrandom 0.4 with its own `wasm_js` feature.
 [dependencies]
+cawala-control = { path = "../control" }
 cawala-msg = { path = "../msg" }
 console_error_panic_hook = "0.1.7"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring"] }
 n0-future = "0.3"
+postcard = { version = "1.1.3", features = ["use-std"] }
 proto = { package = "cawala-proto", path = "../proto" }
 serde = "1.0.217"
 tokio = { version = "1.43.0", default-features = false, features = ["sync", "io-util"] }
@@ -26,3 +28,4 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 tracing-subscriber-wasm = "0.1.0"
 wasm-bindgen = "=0.2.122"
 wasm-bindgen-futures = "0.4.50"
+web-time = "1.1"

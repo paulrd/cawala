@@ -11,14 +11,25 @@
 //! Browsers are **leaves**: they accept envelopes addressed to them and never
 //! forward for others. [`MsgHandler`] mirrors the native `cawala-node`
 //! handler's receive-origin behavior, without any forwarding.
+//!
+//! [`ClientNode::spawn_control`] additionally binds a **stable** control
+//! identity and speaks `cawala/control/0`: it can send a `Join` and receive the
+//! reverse-dialed `JoinApproved`/`JoinRejected`, exposing the handshake state
+//! as [`JoinStatus`]/[`SnapshotDto`]/[`ControlEventDto`]. See [`state`] for the
+//! pure, native-testable state machine.
 
 use std::io;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use cawala_control::{
+    CONTROL_ALPN, ChildKind, ControlReply, ControlRequest, Invite, JoinRequest, NodeId,
+    OperatorSecretKey, SignedControl,
+};
 use cawala_msg::{
     Ack, AckStatus, Envelope, MsgError, MsgId, OctAddr, PeerRef, RejectReason, Seen, SeenConfig,
     SeenSet,
 };
+use iroh::{EndpointAddr, EndpointId};
 use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
@@ -29,6 +40,18 @@ use tracing::info;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber_wasm::MakeConsoleWriter;
 use wasm_bindgen::{JsError, prelude::wasm_bindgen};
+
+mod control;
+pub mod dto;
+pub mod state;
+
+use crate::control::{
+    ControlHandler, JOIN_TTL_SECONDS, SharedControl, exchange_control, invite_endpoint_addr,
+};
+use crate::dto::{
+    ControlEventDto, JoinOutcome, JoinStatus, SnapshotDto, parse_operator_hex, reject_code_str,
+};
+use crate::state::LocalStateV1;
 
 /// WASM entry point, called once when the module is instantiated.
 #[wasm_bindgen(start)]
@@ -47,6 +70,27 @@ fn start() {
         .init();
 
     tracing::info!("cawala client (wasm) started");
+}
+
+/// Generate a fresh 32-byte Ed25519 secret seed for a stable control identity.
+///
+/// Persist these bytes in the PWA (e.g. IndexedDB) and hand them back to
+/// [`ClientNode::spawn_control`] so the browser keeps the same endpoint id and
+/// operator key across reloads.
+#[wasm_bindgen]
+pub fn generate_secret_key() -> Result<Vec<u8>, JsError> {
+    let mut bytes = vec![0u8; 32];
+    getrandom::fill(&mut bytes).map_err(to_js_err)?;
+    Ok(bytes)
+}
+
+/// Current time as unix seconds, via [`web_time::SystemTime`] so it works on
+/// `wasm32-unknown-unknown` as well as natively.
+fn now_unix_seconds() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 /// Server side of the `cawala/ping/0` protocol: accept a connection, read one
@@ -332,6 +376,7 @@ pub struct ClientNode {
     router: Router,
     address: Option<String>,
     rx: Option<tokio::sync::Mutex<mpsc::Receiver<Envelope>>>,
+    control: Arc<SharedControl>,
 }
 
 #[wasm_bindgen]
@@ -348,6 +393,7 @@ impl ClientNode {
             .bind()
             .await
             .map_err(to_js_err)?;
+        let control = Arc::new(SharedControl::new(endpoint.id().to_string(), None));
         let router = Router::builder(endpoint)
             .accept(proto::ALPN, PingHandler)
             .spawn();
@@ -355,6 +401,7 @@ impl ClientNode {
             router,
             address: None,
             rx: None,
+            control,
         })
     }
 
@@ -371,6 +418,7 @@ impl ClientNode {
             .await
             .map_err(to_js_err)?;
         let self_node = endpoint.id().to_string();
+        let control = Arc::new(SharedControl::new(self_node.clone(), None));
         // Bounded, so a slow consumer applies backpressure via `Busy` acks
         // rather than growing without limit.
         let (sink, rx) = mpsc::channel(32);
@@ -382,6 +430,46 @@ impl ClientNode {
             router,
             address: Some(self_addr),
             rx: Some(tokio::sync::Mutex::new(rx)),
+            control,
+        })
+    }
+
+    /// Bind a new endpoint with a **stable** identity derived from a 32-byte
+    /// Ed25519 `secret_key`, speaking `cawala/ping/0` and
+    /// `cawala/control/0` over the N0 relay preset.
+    ///
+    /// The same seed always yields the same endpoint id *and* operator public
+    /// key, so the PWA can keep a durable identity across reloads by persisting
+    /// the bytes from [`generate_secret_key`]. The control ALPN accept loop is
+    /// registered here so the parent's `JoinApproved`/`JoinRejected` can be
+    /// received by reverse dial.
+    pub async fn spawn_control(secret_key: &[u8]) -> Result<ClientNode, JsError> {
+        let seed: [u8; 32] = secret_key
+            .try_into()
+            .map_err(|_| JsError::new("secret key must be exactly 32 bytes"))?;
+        let secret = iroh::SecretKey::from_bytes(&seed);
+        // The operator key is the same Ed25519 key as the iroh endpoint id, as
+        // in the native node (`OperatorSecretKey::from_bytes(sk.to_bytes())`).
+        let operator = OperatorSecretKey::from_bytes(secret.to_bytes());
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(secret)
+            .alpns(vec![proto::ALPN.to_vec(), CONTROL_ALPN.to_vec()])
+            .bind()
+            .await
+            .map_err(to_js_err)?;
+        let control = Arc::new(SharedControl::new(
+            endpoint.id().to_string(),
+            Some(operator),
+        ));
+        let router = Router::builder(endpoint)
+            .accept(proto::ALPN, PingHandler)
+            .accept(CONTROL_ALPN, ControlHandler::new(Arc::clone(&control)))
+            .spawn();
+        Ok(ClientNode {
+            router,
+            address: None,
+            rx: None,
+            control,
         })
     }
 
@@ -389,6 +477,173 @@ impl ClientNode {
     /// other peers so they can connect to you.
     pub fn endpoint_id(&self) -> String {
         self.router.endpoint().id().to_string()
+    }
+
+    /// This client's operator public key as 64 lowercase hex characters.
+    ///
+    /// The control identity derives the operator key from the same Ed25519 seed
+    /// as the endpoint, so this always equals [`ClientNode::endpoint_id`].
+    pub fn operator_public_key(&self) -> String {
+        self.router.endpoint().id().to_string()
+    }
+
+    /// Parse and validate an invite, then send a `Join` to its parent,
+    /// pinning the invite's operator key.
+    ///
+    /// The request is always a `ChildKind::User` join with no ledger key. The
+    /// immediate reply carries the outcome; an eventual `JoinApproved` or
+    /// `JoinRejected` arrives later through the control accept loop and is
+    /// surfaced by [`ClientNode::join_status`] /
+    /// [`ClientNode::try_recv_control_event`].
+    pub async fn join_via_invite(&self, uri: &str) -> Result<JoinOutcome, JsError> {
+        let invite = Invite::parse(uri).map_err(to_js_err)?;
+        invite.validate().map_err(to_js_err)?;
+        let now = now_unix_seconds();
+        if let Some(expiry) = invite.expiry
+            && now > expiry
+        {
+            return Err(JsError::new("invite has expired"));
+        }
+        let target = invite_endpoint_addr(&invite)?;
+        self.join_inner(
+            invite.parent.clone(),
+            invite.slot,
+            invite.expiry,
+            Some(invite.operator),
+            target,
+        )
+        .await
+    }
+
+    /// Send a `Join` to `parent` (an endpoint-id string), optionally requesting
+    /// `slot`, expiring at `expiry` (unix seconds; defaults to one hour), and
+    /// pinning `pinned_operator_hex` (64 hex characters) when known.
+    ///
+    /// This is the unpinned/direct path used when no invite is available;
+    /// [`ClientNode::join_via_invite`] wraps it with invite parsing and
+    /// transport hints.
+    pub async fn join(
+        &self,
+        parent: String,
+        slot: Option<u8>,
+        expiry: Option<f64>,
+        pinned_operator_hex: Option<String>,
+    ) -> Result<JoinOutcome, JsError> {
+        let parent = NodeId::from(parent);
+        let endpoint_id: EndpointId = parent.as_str().parse().map_err(to_js_err)?;
+        let pinned_operator = match pinned_operator_hex {
+            Some(hex) => Some(parse_operator_hex(&hex).map_err(to_js_err)?),
+            None => None,
+        };
+        self.join_inner(
+            parent,
+            slot,
+            expiry.map(|secs| secs as u64),
+            pinned_operator,
+            EndpointAddr::from(endpoint_id),
+        )
+        .await
+    }
+
+    /// Shared implementation for [`ClientNode::join`] and
+    /// [`ClientNode::join_via_invite`].
+    async fn join_inner(
+        &self,
+        parent: NodeId,
+        desired_slot: Option<u8>,
+        expiry: Option<u64>,
+        pinned_operator: Option<cawala_control::OperatorPubKey>,
+        target: EndpointAddr,
+    ) -> Result<JoinOutcome, JsError> {
+        let operator = self
+            .control
+            .operator
+            .clone()
+            .ok_or_else(|| JsError::new("client has no control identity; use spawn_control"))?;
+        let node_id = self.control.node_id().to_string();
+        let me = NodeId::from(node_id);
+
+        let now = now_unix_seconds();
+        let expiry = expiry.unwrap_or_else(|| now.saturating_add(JOIN_TTL_SECONDS));
+        if now > expiry {
+            return Err(JsError::new("join request has expired"));
+        }
+
+        let mut nonce_bytes = [0u8; 8];
+        getrandom::fill(&mut nonce_bytes).map_err(to_js_err)?;
+        let request = JoinRequest {
+            node: me.clone(),
+            kind: ChildKind::User,
+            operator: operator.public(),
+            // A browser is always a leaf user: never a node, never a ledger key.
+            ledger: None,
+            desired_slot,
+            location_hint: None,
+            nonce: u64::from_le_bytes(nonce_bytes),
+            expiry,
+        };
+        request.validate().map_err(to_js_err)?;
+
+        // Persist the outbound join *before* dialing so a reverse-dialed reply
+        // racing the exchange can still be matched.
+        self.control.lock_state().set_outbound(
+            request.clone(),
+            parent.clone(),
+            pinned_operator,
+            now,
+        );
+
+        let signed = SignedControl::authorize(me, &operator, ControlRequest::Join(request))
+            .map_err(to_js_err)?;
+        let reply = exchange_control(self.router.endpoint(), target, &signed).await?;
+
+        match reply {
+            ControlReply::Pending | ControlReply::Accepted => Ok(JoinOutcome::pending()),
+            ControlReply::Rejected(code) => {
+                let code_str = reject_code_str(code).to_string();
+                self.control.lock_state().reject_outbound(&code_str, None);
+                self.control
+                    .push_event(ControlEventDto::rejected(&parent, None));
+                Ok(JoinOutcome::rejected(Some(code_str), None))
+            }
+            ControlReply::Snapshot(_) => {
+                Err(JsError::new("unexpected snapshot reply to a join request"))
+            }
+        }
+    }
+
+    /// A local summary of the join handshake state.
+    pub fn join_status(&self) -> JoinStatus {
+        JoinStatus::from_state(&self.control.lock_state())
+    }
+
+    /// A snapshot of this client's local topology (address, parent, children).
+    pub fn local_snapshot(&self) -> SnapshotDto {
+        SnapshotDto::from_state(self.control.node_id(), &self.control.lock_state())
+    }
+
+    /// Export the local state as postcard bytes.
+    ///
+    /// The blob contains the outbound join, topology record, and last
+    /// rejection; it contains **no secret key material**, so it is safe to
+    /// persist in browser storage.
+    pub fn export_state(&self) -> Vec<u8> {
+        self.control.lock_state().to_bytes()
+    }
+
+    /// Replace the local state from bytes previously produced by
+    /// [`ClientNode::export_state`].
+    pub fn import_state(&self, bytes: &[u8]) -> Result<(), JsError> {
+        let state = LocalStateV1::from_bytes(bytes).map_err(to_js_err)?;
+        *self.control.lock_state() = state;
+        Ok(())
+    }
+
+    /// Non-blocking drain of the next queued control event.
+    ///
+    /// Returns `None` when the queue is empty.
+    pub fn try_recv_control_event(&self) -> Option<ControlEventDto> {
+        self.control.lock_events().pop_front()
     }
 
     /// This client's messaging address, or `None` for a ping-only client.
@@ -549,6 +804,6 @@ impl ClientNode {
     }
 }
 
-fn to_js_err(err: impl std::fmt::Display) -> JsError {
+pub(crate) fn to_js_err(err: impl std::fmt::Display) -> JsError {
     JsError::new(&err.to_string())
 }

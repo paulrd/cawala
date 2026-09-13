@@ -149,13 +149,18 @@ impl ControlNode {
         senior_child(&self.seniority()).is_some_and(|id| id == origin)
     }
 
-    /// This node's children as `(node_id, date_joined)` pairs, in record
+    /// This node's *node* children as `(node_id, date_joined)` pairs, in record
     /// order. [`senior_child`] is order-independent.
+    ///
+    /// `ChildKind::User` children are excluded: they are browser clients, not
+    /// routing peers, and must never be eligible for senior-child control. Only
+    /// `ChildKind::Node` children carry topology authority.
     fn seniority(&self) -> Vec<(NodeId, u64)> {
         self.record
             .record()
             .children
             .iter()
+            .filter(|child| child.kind == ChildKind::Node)
             .map(|child| (NodeId::from(child.child_id.clone()), child.date_joined))
             .collect()
     }

@@ -5,8 +5,9 @@
   import EmptyState from '../shared/EmptyState.svelte';
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
   import ErrorState from '../shared/ErrorState.svelte';
+  import Badge from '../shared/Badge.svelte';
   import { nodeState, loadingState, errorState, showToast } from '../../lib/stores.js';
-  import { getJoinRequests, approveJoin, rejectJoin } from '../../lib/api.js';
+  import { getJoinRequests, approveJoin, rejectJoin, isMockMode, AdminUnavailableError } from '../../lib/api.js';
   import { formatDate } from '../../lib/utils.js';
 
   let loaded = $state(false);
@@ -59,7 +60,15 @@
         (r) => r.endpointId !== confirmTarget.endpointId,
       );
     } catch (err) {
-      showToast(`Action failed: ${err.message}`, 'danger');
+      if (err instanceof AdminUnavailableError) {
+        showToast(
+          'Admin actions are not available in the web client. Run this from the node CLI:\ncawala-node control approve|reject <endpoint-id>',
+          'warn',
+          8000,
+        );
+      } else {
+        showToast(`Action failed: ${err.message}`, 'danger');
+      }
     }
     confirmOpen = false;
     confirmTarget = null;
@@ -71,11 +80,34 @@
   }
 
   let pending = $derived(nodeState.joinRequests.filter((r) => r.status === 'pending'));
+  let isLive = $derived(!isMockMode());
 </script>
 
 <div class="joins-page">
   <Card title="Pending Join Requests">
-    {#if loadingState.joinRequests && !loaded}
+    {#if isLive}
+      <!-- Live mode: admin actions not available in the web client -->
+      <div class="live-unavailable">
+        <div class="unavailable-header">
+          <Badge variant="info" label="Live mode" />
+        </div>
+        <p class="unavailable-desc">
+          Pending join requests and admin actions are not available in the web client yet.
+        </p>
+        <p class="unavailable-cli muted text-sm">
+          To manage join requests, use the node CLI:
+        </p>
+        <code class="unavailable-code">
+          cawala-node control joins
+        </code>
+        <p class="unavailable-cli muted text-sm" style="margin-top: var(--sp-2);">
+          To approve or reject:
+        </p>
+        <code class="unavailable-code">
+          cawala-node control approve|reject &lt;endpoint-id&gt;
+        </code>
+      </div>
+    {:else if loadingState.joinRequests && !loaded}
       <LoadingSkeleton rows={2} />
     {:else if errorState.joinRequests}
       <ErrorState message="Failed to load join requests" onRetry={loadData} />
@@ -185,6 +217,35 @@
   .btn--ghost:hover {
     background: var(--bg-hover);
     color: var(--fg);
+  }
+
+  /* ── Live unavailable state ── */
+  .live-unavailable {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+    padding: var(--sp-4) 0;
+  }
+  .unavailable-header {
+    margin-bottom: var(--sp-1);
+  }
+  .unavailable-desc {
+    font-size: var(--text-sm);
+    line-height: var(--leading-normal);
+  }
+  .unavailable-cli {
+    font-size: var(--text-sm);
+  }
+  .unavailable-code {
+    display: block;
+    padding: var(--sp-3) var(--sp-4);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    color: var(--fg);
+    overflow-x: auto;
   }
 
   @media (max-width: 480px) {

@@ -4,8 +4,10 @@
   import EndpointId from '../shared/EndpointId.svelte';
   import Badge from '../shared/Badge.svelte';
   import ConnectionIndicator from '../shared/ConnectionIndicator.svelte';
-  import { clientState, showToast } from '../../lib/stores.js';
-  import { isMockMode } from '../../lib/api.js';
+  import { clientState, apiCapabilities, showToast } from '../../lib/stores.js';
+  import { isMockMode, isIdentityPersistent, getCapabilities } from '../../lib/api.js';
+
+  let caps = $derived(getCapabilities());
 
   async function handleExportKey() {
     showToast('Key export not yet implemented', 'warn');
@@ -34,18 +36,45 @@
       </div>
       <div class="setting-row">
         <span class="setting-label">Address</span>
-        <Address address={clientState.address ?? 'Not assigned'} size="md" />
+        {#if clientState.address}
+          <Address address={clientState.address} size="md" />
+        {:else}
+          <span class="text-sm muted">Not assigned yet</span>
+        {/if}
       </div>
+      {#if !isMockMode()}
+        <div class="setting-row">
+          <span class="setting-label">Identity</span>
+          {#if caps.identityPersistent}
+            <Badge variant="ok" label="Persisted" />
+          {:else}
+            <div class="persistence-warn">
+              <Badge variant="warn" label="Session only" />
+              <span class="text-xs muted">Identity won't persist after closing this tab (storage unavailable).</span>
+            </div>
+          {/if}
+        </div>
+      {/if}
     </div>
   </Card>
+
+  {#if caps.multiTabWarning}
+    <Card title="Multi-Tab" variant="warn">
+      <div class="settings-section">
+        <p class="text-sm" style="color: var(--warn);">
+          {caps.multiTabWarning}
+        </p>
+      </div>
+    </Card>
+  {/if}
 
   <Card title="Keys">
     <div class="settings-section">
       <p class="muted text-sm" style="margin-bottom: var(--sp-3);">
-        Keys are managed by the cawala-node process. The PWA has read-only access.
+        In live mode, keys are generated and managed by the wasm client in this browser. In mock mode, keys are placeholder values.
       </p>
       <button type="button" class="btn btn--ghost" onclick={handleExportKey}>
-        Export operator key [placeholder]
+        Export identity seed [not yet implemented]
       </button>
     </div>
   </Card>
@@ -61,7 +90,11 @@
       </div>
       <div class="setting-row">
         <span class="setting-label">Status</span>
-        <span class="text-sm muted">Not connected</span>
+        {#if isMockMode()}
+          <span class="text-sm muted">Mock mode (not connected)</span>
+        {:else}
+          <span class="text-sm muted">Not available in the web client</span>
+        {/if}
       </div>
     </div>
   </Card>
@@ -101,6 +134,11 @@
     font-size: var(--text-sm);
     font-weight: 500;
     color: var(--muted);
+  }
+  .persistence-warn {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
   }
   .btn {
     padding: var(--sp-2) var(--sp-3);

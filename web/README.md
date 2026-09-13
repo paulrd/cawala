@@ -1,9 +1,18 @@
-# Cawala — web app (M0)
+# Cawala — web app
 
-Svelte 5 + Vite static app. M0 is a debug harness: a wasm-bindgen client
-(`cawala-client`) spawns an iroh endpoint in the browser and pings Rust nodes
-over the N0 public relay (browsers cannot dial UDP directly, so connections go
-through the relay).
+Svelte 5 + Vite static app. The wasm-bindgen client (`cawala-client`) spawns an
+iroh endpoint in the browser and talks to Rust nodes over the N0 public relay
+(browsers cannot dial UDP directly, so connections go through the relay).
+
+Two modes:
+
+- **Live (default)** — a *user leaf*: the client uses a stable Ed25519 identity
+  persisted in browser storage, parses a `cawala://join?...` invite, performs
+  the join handshake over `cawala/control/0`, and shows the locally assigned
+  address/topology. Live support is intentionally limited (see *Live mode
+  limits*).
+- **Mock (`?mock`)** — the full synthetic UI, used for development/review and
+  as the automatic fallback when wasm init fails.
 
 ## Prerequisites
 
@@ -35,6 +44,27 @@ In another terminal, from the repo root, run a Rust node to get a peer:
 ```sh
 cargo run -p cawala-node
 ```
+
+## Live user join (manual)
+
+1. Start a node and give it an asserted address:
+   `cawala-node topo set-address 0`.
+2. Generate an invite: `cawala-node control invite` (optionally with
+   `--relay`/`--ip` transport hints).
+3. `npm run dev`, open the app, go to **Join**, paste the invite, and Connect.
+4. On the node: `cawala-node control joins` to list the request, then
+   `cawala-node control approve <browser-endpoint-id>` (or `reject`).
+5. The browser polls its persisted state and flips to *joined* with the assigned
+   address. Reloading mid-wait keeps the pending state.
+
+### Live mode limits
+
+The join handshake, Rust invite parsing, stable identity, ping, and the local
+topology snapshot are live. **Not available in the web client:** approving or
+rejecting joins, pending-join listing, account balances, and the activity log
+(the control protocol exposes no request/reply for them). Those pages say so
+and point at the node CLI. The browser is a user leaf — it is never a node
+admin and never holds a ledger key.
 
 ## Test (manual round-trip checklist)
 
@@ -76,6 +106,15 @@ tab can both answer and initiate pings):
 cd web
 node scripts/smoke-tabs.mjs
 # expected: "[smoke-tabs] round-trip OK"
+```
+
+End-to-end join handshake (browser join -> CLI approve -> joined, plus the
+reject path). Network-dependent on the N0 relay/pkarr:
+
+```sh
+cd web
+node scripts/smoke-join.mjs
+# expected: "[smoke-join] ALL CHECKS PASSED"
 ```
 
 ### Production build / preview

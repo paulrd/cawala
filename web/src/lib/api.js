@@ -4,24 +4,31 @@
  * ALL calls to the wasm client and control message layer go through this module.
  * Components never import from ../wasm/ directly.
  *
- * Mock mode:
- *   - By default (or when `?mock` is in the URL, or when wasm init fails),
- *     every function returns plausible fake data so the UI can be developed
- *     and reviewed without a live node.
- *   - To swap in real wasm: call `initRealClient()` which loads the wasm
- *     module and sets a module-level flag. All functions check that flag
- *     and branch accordingly.
+ * Live ("A′ user-live") mode:
+ *   - By default `initApi()` dynamically loads the wasm client, restores (or
+ *     generates) a stable Ed25519 identity, spawns a control node via
+ *     `ClientNode.spawn_control`, restores any persisted state, and sets
+ *     `_useMock = false`. A 2 s poller drains control events (JoinApproved /
+ *     JoinRejected) and persists state.
+ *   - Live support is limited to: stable identity, invite parsing, the join
+ *     handshake, ping, and a local topology snapshot. Admin actions
+ *     (approve/reject), pending joins, accounts, and activity are NOT exposed
+ *     by the protocol/web client and degrade gracefully (typed error / empty).
  *
- * TODO(control): When the Rust control message surface is finalized,
- *   replace the mock branches with real `send_envelope` / `try_recv_envelope`
- *   calls that encode/decode control payloads. The function signatures below
- *   are the contract — changing them should require touching only this file.
+ * Mock mode:
+ *   - When `?mock` is in the URL, or when wasm init fails for any reason,
+ *     every function returns plausible fake data so the UI can be developed
+ *     and reviewed without a live node. The module-level `_useMock` contract
+ *     is preserved.
  */
 
 import {
-  CLIENT_STATUS,
   CONNECTION,
   ACTIVITY_TYPES,
+  ENVELOPE_ACK,
+  JOIN_STATE,
+  JOIN_OUTCOME,
+  CONTROL_EVENT,
 } from './constants.js';
 
 // ── Internal state ────────────────────────────────────────────
@@ -30,6 +37,31 @@ let _useMock = true;
 let _wasmModule = null;
 let _clientNode = null;
 
+// Identity/state storage keys.
+const IDENTITY_KEY = 'cawala.identity.v1';
+const STATE_KEY = 'cawala.state.v1';
+const SEED_BYTES = 32;
+
+let _identityPersistent = false;
+let _memorySeed = null; // in-session fallback when localStorage is unusable
+
+// Control-event poller + last drained event.
+let _controlPoller = null;
+let _lastControlEvent = null;
+
+// Best-effort multi-tab identity leadership.
+let _lockRelease = null;
+let _multiTabLeader = false;
+let _multiTabWarning = null;
+
+// Warn-once bookkeeping (avoid spamming the console every 2 s).
+const _warned = new Set();
+function _warnOnce(key, ...args) {
+  if (_warned.has(key)) return;
+  _warned.add(key);
+  console.warn(...args);
+}
+
 /**
  * Whether we are running in mock mode.
  */
@@ -37,40 +69,301 @@ export function isMockMode() {
   return _useMock;
 }
 
+/**
+ * Whether the stable identity seed is persisted in localStorage. Returns
+ * false when storage is unavailable (Safari private mode / quota) and the
+ * identity is currently session-only.
+ */
+export function isIdentityPersistent() {
+  return _identityPersistent;
+}
+
 // ── Initialization ────────────────────────────────────────────
 
 /**
  * Initialize the API layer.
- * In mock mode this is a no-op. In real mode it loads the wasm module.
  *
- * TODO(control): Wire up real wasm init here.
+ * `?mock` forces mock mode. Otherwise this dynamically imports the wasm
+ * client, restores/generates the stable identity, spawns the control node, and
+ * flips `_useMock` off. On ANY failure it falls back to mock data.
  */
 export async function initApi() {
-  // Check URL param for forced mock
+  // Check URL param for forced mock.
   const params = new URLSearchParams(window.location.search);
   if (params.has('mock')) {
     _useMock = true;
     return;
   }
 
-  // TODO(control): Try to load the real wasm module.
-  // For now, always use mock mode.
   try {
-    // const init = (await import('../wasm/cawala_client.js')).default;
-    // await init();
-    // _wasmModule = await import('../wasm/cawala_client.js');
-    // _useMock = false;
-    _useMock = true;
-  } catch {
-    console.warn('[api] wasm init failed, using mock data');
+    const wasm = await import('../wasm/cawala_client.js');
+    await wasm.default();
+    _wasmModule = wasm;
+
+    // Best-effort single-leader guard: avoid binding two live endpoints with
+    // the same endpoint id from concurrent tabs.
+    const isLeader = await _acquireIdentityLock();
+    if (!isLeader) {
+      _useMock = true;
+      return;
+    }
+
+    await _spawnRealNode();
+    _useMock = false;
+  } catch (err) {
+    console.warn('[api] wasm init failed, using mock data', err);
+    _stopControlPoller();
+    if (_clientNode) {
+      try {
+        _clientNode.free?.();
+      } catch {
+        /* ignore */
+      }
+      _clientNode = null;
+    }
+    _releaseIdentityLock();
     _useMock = true;
   }
+}
+
+// ── Identity, state & spawn helpers ───────────────────────────
+
+/**
+ * Restore the persisted 32-byte seed, or generate and persist a fresh one.
+ * Falls back to an in-memory seed (with a visible warning flag) when storage
+ * throws (Safari private mode / quota).
+ * @param {object} wasm
+ * @returns {Uint8Array}
+ */
+function _loadOrCreateIdentity(wasm) {
+  let storedHex = null;
+  try {
+    storedHex = window.localStorage.getItem(IDENTITY_KEY);
+  } catch (err) {
+    _warnOnce('identity-read', '[api] localStorage unavailable for identity read; using session-only identity', err);
+  }
+
+  if (storedHex) {
+    try {
+      const bytes = _hexToBytes(storedHex);
+      if (bytes.length === SEED_BYTES) {
+        _identityPersistent = true;
+        return bytes;
+      }
+      _warnOnce('identity-len', '[api] stored identity has the wrong length; generating a new one');
+    } catch (err) {
+      _warnOnce('identity-malformed', '[api] stored identity is malformed; generating a new one', err);
+    }
+  }
+
+  // Reuse the in-session fallback if we already generated one.
+  if (_memorySeed) return _memorySeed;
+
+  const seed = wasm.generate_secret_key(); // may throw → initApi falls back to mock
+  _memorySeed = seed;
+
+  try {
+    window.localStorage.setItem(IDENTITY_KEY, _bytesToHex(seed));
+    _identityPersistent = true;
+  } catch (err) {
+    _identityPersistent = false;
+    _warnOnce('identity-write', '[api] could not persist identity (private mode/quota); identity is session-only', err);
+  }
+  return seed;
+}
+
+/**
+ * Load the persisted postcard state blob, if any.
+ * @returns {Uint8Array|null}
+ */
+function _loadState() {
+  let b64 = null;
+  try {
+    b64 = window.localStorage.getItem(STATE_KEY);
+  } catch (err) {
+    _warnOnce('state-read', '[api] localStorage unavailable for state read', err);
+    return null;
+  }
+  if (!b64) return null;
+  try {
+    return _base64ToBytes(b64);
+  } catch (err) {
+    _warnOnce('state-decode', '[api] persisted state is malformed; ignoring it', err);
+    return null;
+  }
+}
+
+/**
+ * Persist `node.export_state()` to localStorage. Best-effort; never throws.
+ */
+function _persistState() {
+  if (!_clientNode) return;
+  try {
+    const bytes = _clientNode.export_state();
+    window.localStorage.setItem(STATE_KEY, _bytesToBase64(bytes));
+  } catch (err) {
+    _warnOnce('state-write', '[api] could not persist client state (private mode/quota)', err);
+  }
+}
+
+/**
+ * Spawn the real control client, restore state, and start the event poller.
+ * @returns {Promise<import('../wasm/cawala_client.js').ClientNode>}
+ */
+async function _spawnRealNode() {
+  const seed = _loadOrCreateIdentity(_wasmModule);
+  const node = await _wasmModule.ClientNode.spawn_control(seed);
+
+  const stateBytes = _loadState();
+  if (stateBytes) {
+    try {
+      node.import_state(stateBytes);
+    } catch (err) {
+      console.warn('[api] import_state failed; starting from a fresh local state', err);
+    }
+  }
+
+  _clientNode = node;
+  _persistState();
+  _startControlPoller();
+  return node;
+}
+
+/**
+ * Require a live client node, throwing a clear error if it is missing.
+ */
+function _requireNode() {
+  if (!_clientNode) {
+    throw new Error('Client is not initialized. Call initApi() before this operation.');
+  }
+  return _clientNode;
+}
+
+/**
+ * Take the exclusive `cawala-identity` lock as the session leader.
+ * Returns true when leadership is held (or Web Locks is unsupported), false
+ * when another tab already owns the identity.
+ * @returns {Promise<boolean>}
+ */
+async function _acquireIdentityLock() {
+  if (
+    typeof navigator === 'undefined' ||
+    !navigator.locks ||
+    typeof navigator.locks.request !== 'function'
+  ) {
+    return true; // No Web Locks: best effort, assume leader.
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => {
+      if (!settled) {
+        settled = true;
+        resolve(value);
+      }
+    };
+
+    navigator.locks
+      .request('cawala-identity', { mode: 'exclusive', ifAvailable: true }, (lock) => {
+        if (!lock) {
+          _multiTabWarning =
+            'Another Cawala tab already owns this identity; running in mock mode to avoid duplicating the live endpoint.';
+          console.warn('[api] multi-tab: identity lock held elsewhere; using mock data');
+          done(false);
+          return undefined;
+        }
+        _multiTabLeader = true;
+        done(true);
+        // Hold the exclusive lock for the lifetime of this client so a second
+        // tab cannot bind another live endpoint with the same id.
+        return new Promise((release) => {
+          _lockRelease = release;
+        });
+      })
+      .catch((err) => {
+        _multiTabWarning = `Identity lock unavailable: ${err?.message ?? String(err)}`;
+        console.warn('[api] multi-tab: identity lock request failed; continuing without lock', err);
+        done(true);
+      });
+  });
+}
+
+/**
+ * Release the held identity lock, if any.
+ */
+function _releaseIdentityLock() {
+  if (_lockRelease) {
+    const release = _lockRelease;
+    _lockRelease = null;
+    try {
+      release();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// ── Control-event poller ──────────────────────────────────────
+
+/**
+ * Start the 2 s control-event drain loop (idempotent).
+ */
+function _startControlPoller() {
+  if (_controlPoller != null) return;
+  _controlPoller = setInterval(_drainControlEvents, 2000);
+}
+
+/**
+ * Stop the control-event drain loop.
+ */
+function _stopControlPoller() {
+  if (_controlPoller != null) {
+    clearInterval(_controlPoller);
+    _controlPoller = null;
+  }
+}
+
+/**
+ * Drain all queued control events into `_lastControlEvent`, copying each DTO to
+ * a plain object and freeing it. Persists state when anything was drained.
+ */
+function _drainControlEvents() {
+  if (_useMock || !_clientNode) return;
+  let drained = false;
+  try {
+    for (;;) {
+      const ev = _clientNode.try_recv_control_event();
+      if (!ev) break;
+      _lastControlEvent = {
+        kind: ev.kind,
+        parent: ev.parent,
+        slot: ev.slot ?? null,
+        address: ev.address ?? null,
+        dateJoined: ev.date_joined ?? null,
+        reason: ev.reason ?? null,
+      };
+      ev.free?.();
+      drained = true;
+    }
+  } catch (err) {
+    _warnOnce('control-drain', '[api] control event drain failed', err);
+    return;
+  }
+  if (drained) _persistState();
+}
+
+/**
+ * The most recently drained control event, as a plain object (or null).
+ */
+export function getLastControlEvent() {
+  return _lastControlEvent ? { ..._lastControlEvent } : null;
 }
 
 // ── Client lifecycle ──────────────────────────────────────────
 
 /**
- * Spawn a client node (or mock equivalent).
+ * Spawn a client node (or mock equivalent). In live mode the node itself is
+ * spawned by `initApi()`; this returns its identity/address.
  * @returns {Promise<{ endpointId: string, address: string|null }>}
  */
 export async function spawnClient() {
@@ -81,14 +374,20 @@ export async function spawnClient() {
       address: '0.3.1',
     };
   }
-  // TODO(control): real wasm spawn
-  throw new Error('Not implemented: real spawnClient');
+  const node = _requireNode();
+  const status = _readJoinStatus(node);
+  return {
+    endpointId: node.endpoint_id(),
+    address: status.address ?? null,
+  };
 }
 
 /**
- * Spawn a client with a known address (for join flow).
+ * Spawn a client with a known address (for join flow). In live mode this is an
+ * alias of `spawnClient()`: the control client derives its own address from the
+ * join handshake, so the hint is informational only.
  * @param {string} address
- * @returns {Promise<{ endpointId: string, address: string }>}
+ * @returns {Promise<{ endpointId: string, address: string|null }>}
  */
 export async function spawnClientWithAddress(address) {
   if (_useMock) {
@@ -98,16 +397,28 @@ export async function spawnClientWithAddress(address) {
       address,
     };
   }
-  // TODO(control): real wasm spawn_with_address
-  throw new Error('Not implemented: real spawnClientWithAddress');
+  return spawnClient();
 }
 
 /**
  * Destroy the current client.
  */
 export function destroyClient() {
-  _clientNode = null;
-  // TODO(control): real wasm free
+  _stopControlPoller();
+  if (_clientNode) {
+    try {
+      _persistState();
+    } catch {
+      /* best effort */
+    }
+    try {
+      _clientNode.free?.();
+    } catch {
+      /* ignore */
+    }
+    _clientNode = null;
+  }
+  _releaseIdentityLock();
 }
 
 // ── Identity & connection ─────────────────────────────────────
@@ -118,18 +429,17 @@ export function destroyClient() {
  */
 export function getEndpointId() {
   if (_useMock) return 'z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK';
-  // TODO(control): return _clientNode.endpoint_id()
-  return '';
+  return _clientNode ? _clientNode.endpoint_id() : '';
 }
 
 /**
- * Get the current messaging address.
+ * Get the current join-assigned address.
  * @returns {string|null}
  */
 export function getAddress() {
   if (_useMock) return '0.3.1';
-  // TODO(control): return _clientNode.address()
-  return null;
+  if (!_clientNode) return null;
+  return _readJoinStatus(_clientNode).address ?? null;
 }
 
 /**
@@ -138,8 +448,7 @@ export function getAddress() {
  */
 export function getConnectionStatus() {
   if (_useMock) return CONNECTION.CONNECTED;
-  // TODO(control): real status
-  return CONNECTION.DISCONNECTED;
+  return _clientNode ? CONNECTION.CONNECTED : CONNECTION.DISCONNECTED;
 }
 
 // ── Ping (existing wasm surface) ──────────────────────────────
@@ -155,58 +464,133 @@ export async function ping(targetEndpointId, payload) {
     await mockDelay(200);
     return payload;
   }
-  // TODO(control): real wasm ping
-  throw new Error('Not implemented: real ping');
+  return _requireNode().ping(targetEndpointId, payload);
 }
 
 // ── Messaging (existing wasm surface) ─────────────────────────
 
 /**
- * Send an envelope to the network.
+ * Send an envelope to the network. The control client has no messaging
+ * address, so this throws a clear error instead of surfacing a wasm error.
  * @param {string} nextHop - Endpoint ID of the direct neighbor.
  * @param {string} dst - Final destination address.
  * @param {number} msgType - Message type discriminator.
  * @param {Uint8Array} payload - Raw payload bytes.
- * @returns {Promise<string>} Ack status string.
+ * @returns {Promise<string>} Ack status string (one of ENVELOPE_ACK.*).
  */
 export async function sendEnvelope(nextHop, dst, msgType, payload) {
   if (_useMock) {
     await mockDelay(150);
-    return 'delivered';
+    return ENVELOPE_ACK.DELIVERED;
   }
-  // TODO(control): real wasm send_envelope
-  throw new Error('Not implemented: real sendEnvelope');
+  const node = _requireNode();
+  if (node.address() == null) {
+    throw new Error(
+      'sendEnvelope is unavailable: this control-only client has no messaging address. ' +
+        'Open a node with an asserted address to send envelopes.',
+    );
+  }
+  return node.send_envelope(nextHop, dst, msgType, payload);
 }
 
 /**
  * Try to receive the next envelope (non-blocking).
- * @returns {object|null} ReceivedEnvelope or null if queue empty.
+ * @returns {object|null} ReceivedEnvelope plain object, or null if empty /
+ *   unavailable on this control client.
  */
 export function tryRecvEnvelope() {
   if (_useMock) return null;
-  // TODO(control): real wasm try_recv_envelope
-  return null;
+  if (!_clientNode) return null;
+  try {
+    const env = _clientNode.try_recv_envelope();
+    if (!env) return null;
+    const plain = {
+      src_addr: env.src_addr,
+      src_node: env.src_node,
+      dst: env.dst,
+      msg_id_hex: env.msg_id_hex,
+      msg_type: env.msg_type,
+      payload: env.payload,
+    };
+    env.free?.();
+    return plain;
+  } catch (err) {
+    // Control-only clients have no envelope receive queue; treat as empty.
+    _warnOnce('envelope-recv', '[api] try_recv_envelope unavailable on this client', err);
+    return null;
+  }
 }
 
-// ── Control messages (TODO(control): real implementations) ─────
+// ── Control messages ──────────────────────────────────────────
+
+/** Typed error for admin actions that the web client cannot perform. */
+export class AdminUnavailableError extends Error {
+  constructor(action = 'admin action') {
+    super(
+      `Admin action "${action}" is not available in the web client. ` +
+        'Run it from the node CLI: `cawala-node control approve|reject <endpoint-id>`.',
+    );
+    this.name = 'AdminUnavailableError';
+    this.code = 'ADMIN_UNAVAILABLE';
+  }
+}
 
 /**
  * Request to join a parent node.
- * @param {string} parentEndpointId
- * @param {string|null} addressHint
- * @returns {Promise<{ status: string, address?: string }>}
+ *
+ * Accepts either a parsed invite object (from `parseInvite`, carrying `raw`),
+ * a raw invite URI string, or a bare parent endpoint id.
+ * @param {string|{ parent?: string, raw?: string, slot?: number, expiry?: number, operator?: string }} parsed
+ * @param {string|null} [addressHint] Backward-compat unused hint.
+ * @returns {Promise<{ status: string, reason?: string }>}
  */
-export async function requestJoin(parentEndpointId, addressHint) {
+export async function requestJoin(parsed, addressHint) {
   if (_useMock) {
     await mockDelay(600);
-    return { status: 'pending' };
+    return { status: JOIN_OUTCOME.PENDING };
   }
-  // TODO(control): encode JOIN_REQUEST envelope, send, await ack
-  throw new Error('Not implemented: real requestJoin');
+
+  const node = _requireNode();
+  let uri = null;
+  let directParent = null;
+  let slot = null;
+  let expiry = null;
+  let operatorHex = null;
+
+  if (typeof parsed === 'string') {
+    const trimmed = parsed.trim();
+    if (trimmed.includes('://')) uri = trimmed;
+    else directParent = trimmed;
+  } else if (parsed && typeof parsed === 'object') {
+    if (typeof parsed.raw === 'string' && parsed.raw.trim()) {
+      uri = parsed.raw.trim();
+    } else {
+      directParent = parsed.parent ?? null;
+    }
+    slot = parsed.slot ?? null;
+    expiry = parsed.expiry ?? null;
+    operatorHex = parsed.operator ?? null;
+  }
+
+  let outcome;
+  if (uri) {
+    outcome = await node.join_via_invite(uri);
+  } else if (directParent) {
+    outcome = await node.join(directParent, slot, expiry, operatorHex);
+  } else {
+    throw new Error('Join request is missing a parent endpoint id or invite.');
+  }
+
+  const status = outcome.status;
+  const reason = outcome.reason;
+  outcome.free?.();
+  _persistState();
+  _drainControlEvents();
+  return reason ? { status, reason } : { status };
 }
 
 /**
- * Approve a pending join request.
+ * Approve a pending join request. Not available in the web client.
  * @param {string} childEndpointId
  * @param {number|null} slot
  * @returns {Promise<{ status: string, address: string }>}
@@ -217,12 +601,11 @@ export async function approveJoin(childEndpointId, slot) {
     const s = slot ?? 4;
     return { status: 'approved', address: `0.3.${s}` };
   }
-  // TODO(control): encode JOIN_APPROVED envelope
-  throw new Error('Not implemented: real approveJoin');
+  throw new AdminUnavailableError('approve');
 }
 
 /**
- * Reject a pending join request.
+ * Reject a pending join request. Not available in the web client.
  * @param {string} childEndpointId
  * @returns {Promise<{ status: string }>}
  */
@@ -231,8 +614,7 @@ export async function rejectJoin(childEndpointId) {
     await mockDelay(300);
     return { status: 'rejected' };
   }
-  // TODO(control): encode JOIN_REJECTED envelope
-  throw new Error('Not implemented: real rejectJoin');
+  throw new AdminUnavailableError('reject');
 }
 
 /**
@@ -246,7 +628,6 @@ export async function createChild(slot) {
     const s = slot ?? 5;
     return { status: 'created', address: `0.3.${s}` };
   }
-  // TODO(control): encode TOPO_CREATE_CHILD envelope
   throw new Error('Not implemented: real createChild');
 }
 
@@ -262,7 +643,6 @@ export async function moveChild(childAddress, newParentAddress, newSlot) {
     await mockDelay(500);
     return { status: 'moved', newAddress: `${newParentAddress}.${newSlot}` };
   }
-  // TODO(control): encode TOPO_MOVE_CHILD envelope
   throw new Error('Not implemented: real moveChild');
 }
 
@@ -276,7 +656,6 @@ export async function detachChild(childAddress) {
     await mockDelay(400);
     return { status: 'detached' };
   }
-  // TODO(control): encode TOPO_DETACH_CHILD envelope
   throw new Error('Not implemented: real detachChild');
 }
 
@@ -295,22 +674,21 @@ export async function issueBurn(accountAddress, amount, reason) {
     const newBalance = (acct ? acct.balance : 0) + amount;
     return { status: amount > 0 ? 'issued' : 'burned', newBalance };
   }
-  // TODO(control): encode LEDGER_ADJUST envelope
   throw new Error('Not implemented: real issueBurn');
 }
 
 // ── Invite parsing ────────────────────────────────────────────
 
 /**
- * Parse and validate a Cawala invite code/URI.
+ * Parse and validate a Cawala invite code/URI using the live wasm parser.
  *
- * Accepted formats:
+ * Accepted formats (live):
  *   - Full URI: cawala://join?parent=<EndpointId>&op=<64-hex>[&slot=<0..7>][&exp=<unix>][&label=<pct>][&relay=<url>][&ip=<host:port>]
- *   - Bare base64url: a URL-safe base64 string (no prefix) — decoded as JSON
- *     with the same fields.
+ *     (bare base64 is NOT a real format and is rejected in live mode; the mock
+ *     parser still accepts it so existing mock UI flows keep working.)
  *
  * @param {string} code - Raw invite string from the user.
- * @returns {Promise<{ parent: string, operator: string, slot?: number, expiry?: number, label?: string, relay?: string, ip?: string }>}
+ * @returns {Promise<{ parent: string, operator: string, slot?: number, expiry?: number, label?: string, relay?: string, ip?: string, raw: string }>}
  * @throws {Error} With a user-facing message if the invite is invalid.
  */
 export async function parseInvite(code) {
@@ -324,11 +702,32 @@ export async function parseInvite(code) {
     return _mockParseInvite(trimmed);
   }
 
-  // TODO(wasm): Decode the invite using the Rust invite format.
-  // The Rust side will expose a parse_invite() function that returns
-  // the structured fields. For now, mirror the URI parsing logic so
-  // the UI is ready when the wasm surface lands.
-  throw new Error('Not implemented: real parseInvite');
+  if (!_wasmModule) {
+    throw new Error('Invite parsing is unavailable: the wasm client is not loaded.');
+  }
+
+  let info;
+  try {
+    info = _wasmModule.parse_invite(trimmed);
+  } catch (err) {
+    throw new Error(`Invalid invite: ${err?.message ?? err}`);
+  }
+
+  try {
+    const result = {
+      parent: info.parent,
+      operator: info.operator,
+      raw: trimmed,
+    };
+    if (info.slot !== undefined) result.slot = info.slot;
+    if (info.expiry !== undefined) result.expiry = info.expiry;
+    if (info.label !== undefined) result.label = info.label;
+    if (info.relay !== undefined) result.relay = info.relay;
+    if (info.ip !== undefined) result.ip = info.ip;
+    return result;
+  } finally {
+    info.free?.();
+  }
 }
 
 /**
@@ -358,6 +757,7 @@ function _mockParseInvite(raw) {
       const result = {
         parent,
         operator: op,
+        raw,
       };
       if (slotRaw != null) {
         const slot = Number(slotRaw);
@@ -418,7 +818,7 @@ function _mockParseInvite(raw) {
     const json = atob(padded);
     const obj = JSON.parse(json);
     if (obj.parent && obj.op) {
-      const result = { parent: obj.parent, operator: obj.op };
+      const result = { parent: obj.parent, operator: obj.op, raw };
       if (obj.slot != null) result.slot = obj.slot;
       if (obj.exp != null) result.expiry = obj.exp;
       if (obj.label) result.label = obj.label;
@@ -440,7 +840,8 @@ function _mockParseInvite(raw) {
 // ── Data fetching ─────────────────────────────────────────────
 
 /**
- * Get the list of children for this node.
+ * Get the list of children for this node from the local topology snapshot.
+ * Empty for a leaf.
  * @returns {Promise<Array>}
  */
 export async function getChildren() {
@@ -448,12 +849,31 @@ export async function getChildren() {
     await mockDelay(200);
     return [...MOCK_DATA.children];
   }
-  // TODO(control): request via control messages
-  throw new Error('Not implemented: real getChildren');
+
+  const node = _requireNode();
+  const snap = node.local_snapshot();
+  // Read the children list once: the getter may hand back fresh wasm handles
+  // on each access, so caching is required to free the exact objects we mapped.
+  const children = snap.children;
+  try {
+    return children.map((child) => ({
+      address: child.address ?? null,
+      endpointId: child.child_id,
+      balance: null,
+      seniority: new Date(child.date_joined * 1000).toISOString(),
+      online: false,
+      slot: child.slot,
+    }));
+  } finally {
+    for (const child of children) child.free?.();
+    snap.free?.();
+  }
 }
 
 /**
- * Get accounts held by this node.
+ * Get accounts held by this node. No ledger backend is exposed to the web
+ * client in this increment, so live mode returns an empty list rather than
+ * fabricating balances.
  * @returns {Promise<Array>}
  */
 export async function getAccounts() {
@@ -461,12 +881,12 @@ export async function getAccounts() {
     await mockDelay(200);
     return [...MOCK_DATA.accounts];
   }
-  // TODO(control): request via control messages
-  throw new Error('Not implemented: real getAccounts');
+  return [];
 }
 
 /**
- * Get pending join requests.
+ * Get pending join requests. Pending joins are not exposed by the protocol, so
+ * live mode returns an empty list.
  * @returns {Promise<Array>}
  */
 export async function getJoinRequests() {
@@ -474,12 +894,12 @@ export async function getJoinRequests() {
     await mockDelay(200);
     return [...MOCK_DATA.joinRequests];
   }
-  // TODO(control): request via control messages
-  throw new Error('Not implemented: real getJoinRequests');
+  return [];
 }
 
 /**
- * Get activity log entries.
+ * Get activity log entries. No backend is exposed to the web client in this
+ * increment, so live mode returns an empty list.
  * @param {object} [filters]
  * @param {string} [filters.type]
  * @param {string} [filters.address]
@@ -502,12 +922,65 @@ export async function getActivityLog(filters) {
     }
     return entries;
   }
-  // TODO(control): request via control messages
-  throw new Error('Not implemented: real getActivityLog');
+  return [];
 }
 
 /**
- * Look up a suggested address by location.
+ * Live join-handshake status.
+ * @returns {{ state: string, parent: string|null, slot: number|null, address: string|null, reason: string|null }}
+ */
+export function getJoinStatus() {
+  if (_useMock) {
+    return {
+      state: JOIN_STATE.JOINED,
+      parent: null,
+      slot: null,
+      address: '0.3.1',
+      reason: null,
+    };
+  }
+  if (!_clientNode) {
+    return { state: JOIN_STATE.NONE, parent: null, slot: null, address: null, reason: null };
+  }
+  return _readJoinStatus(_clientNode);
+}
+
+/**
+ * Copy a wasm `JoinStatus` DTO to a plain object and free it.
+ * @param {object} node
+ */
+function _readJoinStatus(node) {
+  const status = node.join_status();
+  try {
+    return {
+      state: status.state,
+      parent: status.parent ?? null,
+      slot: status.slot ?? null,
+      address: status.address ?? null,
+      reason: status.reason ?? null,
+    };
+  } finally {
+    status.free?.();
+  }
+}
+
+/**
+ * Describe what this client can do right now.
+ * @returns {{ mock: boolean, canAdmin: boolean, canQueryPeers: boolean, identityPersistent: boolean, multiTabLeader: boolean, multiTabWarning: string|null }}
+ */
+export function getCapabilities() {
+  return {
+    mock: _useMock,
+    canAdmin: false,
+    canQueryPeers: false,
+    identityPersistent: _identityPersistent,
+    multiTabLeader: _multiTabLeader,
+    multiTabWarning: _multiTabWarning,
+  };
+}
+
+/**
+ * Look up a suggested address by location. Not available in the web client.
  * @param {number} lat
  * @param {number} lon
  * @returns {Promise<string|null>}
@@ -518,8 +991,66 @@ export async function lookupAddressByLocation(lat, lon) {
     // Mock: return a plausible address based on rough region
     return '0.3';
   }
-  // TODO(control): query location SQLite service
-  throw new Error('Not implemented: real lookupAddressByLocation');
+  throw new Error(
+    'Address lookup by location is not available in the web client yet. ' +
+      'Use the node operator CLI to derive an address.',
+  );
+}
+
+// ── Hex / base64 helpers ──────────────────────────────────────
+
+/**
+ * @param {Uint8Array} bytes
+ * @returns {string} lowercase hex
+ */
+function _bytesToHex(bytes) {
+  let out = '';
+  for (let i = 0; i < bytes.length; i++) {
+    out += bytes[i].toString(16).padStart(2, '0');
+  }
+  return out;
+}
+
+/**
+ * @param {string} hex
+ * @returns {Uint8Array}
+ */
+function _hexToBytes(hex) {
+  const clean = String(hex).trim().toLowerCase();
+  if (clean.length % 2 !== 0 || !/^[0-9a-f]*$/.test(clean)) {
+    throw new Error('malformed hex');
+  }
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(clean.substr(i * 2, 2), 16);
+  }
+  return out;
+}
+
+/**
+ * @param {Uint8Array} bytes
+ * @returns {string} base64
+ */
+function _bytesToBase64(bytes) {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+/**
+ * @param {string} b64
+ * @returns {Uint8Array}
+ */
+function _base64ToBytes(b64) {
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
 }
 
 // ── Mock data ─────────────────────────────────────────────────
