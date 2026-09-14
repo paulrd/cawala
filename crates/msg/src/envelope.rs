@@ -26,6 +26,9 @@ pub const MSG_LEDGER_V1: MessageType = 1;
 /// Control payloads; reserved for M4.
 pub const MSG_CONTROL_V1: MessageType = 2;
 
+/// Cross-subtree settlement payloads (P3), distinct from `MSG_CONTROL_V1`.
+pub const MSG_SETTLE_V1: MessageType = 3;
+
 /// Stable identifier for a message, independent of any relay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MsgId(pub [u8; 16]);

@@ -19,10 +19,10 @@
 use std::collections::BTreeMap;
 
 use cawala_ledger::{
-    AccountRef, Amount, AuthRef, Entry, EntryBody, Finding, Hash, HopRole, Ledger, LedgerLog,
-    LedgerSecretKey, LedgerSet, MemLog, NetTransfer, NodeId, OperatorSecretKey, PaymentOrder,
-    PeerKeys, PeerRegistry, PeerRole, PlannedHop, Posting, SettlementPlan, SignedAmount,
-    SignedCommitment, SignedEntry, build_commitment, execute_plan, net, plan_transfer,
+    AccountRef, Amount, AuthRef, EdgeAccount, Entry, EntryBody, Finding, Hash, HopRole, Ledger,
+    LedgerLog, LedgerSecretKey, LedgerSet, MemLog, NetTransfer, NodeId, OperatorSecretKey,
+    PaymentOrder, PeerKeys, PeerRegistry, PeerRole, PlannedHop, Posting, SettlementPlan,
+    SignedAmount, SignedCommitment, SignedEntry, build_commitment, execute_plan, net, plan_transfer,
     verify_cascade,
 };
 use cawala_topology::{ChildKind, Topology};
@@ -138,13 +138,10 @@ fn issue(ledger: &mut Ledger, key: &LedgerSecretKey, child: &str, amount: u64) {
         ledger,
         key,
         EntryBody::Issue {
-            account: ca(child),
+            child: n(child),
             amount: Amount::new(amount),
         },
-        vec![
-            p(ca(child), amount as i64),
-            p(AccountRef::Equity, -(amount as i64)),
-        ],
+        vec![p(ca(child), amount as i64)],
         Some(dummy_auth()),
     );
 }
@@ -855,6 +852,135 @@ fn gapped_commitment_chain_is_reported_invalid() {
             Finding::ChainInvalid { node, .. } if node == &n("R")
         )),
         "expected ChainInvalid for R's unlinked chain, got {:?}",
+        report.findings
+    );
+    assert!(report.nets.is_empty());
+}
+
+/// A re-attached child with a stranded `Parent` claim (`Parent > 0`) whose new
+/// parent never credited `Child(child)` (`Child == 0`) is a documented
+/// [`Finding::MirrorMismatch`]: settling the stranded claim is the M5
+/// "exit rights" obligation. Netting logic is unchanged; this pins the expected
+/// detection so the obligation is not silently lost.
+#[test]
+fn stranded_parent_on_reattach_is_a_mirror_mismatch() {
+    let mut topo = Topology::new_root("R");
+    topo.add_node("A", ChildKind::Node).unwrap();
+    topo.attach("R", "A", Some(0)).unwrap();
+
+    let r_key = k(101);
+    let a_key = k(102);
+    let mut set = LedgerSet::new();
+    set.insert(n("R"), Ledger::new_root(r_key.public())).unwrap();
+    set.insert(n("A"), Ledger::new_non_root(a_key.public()))
+        .unwrap();
+
+    // A was attached and prefunded a child (Parent 100), then detached and was
+    // re-attached under R; R never issued or descended to A.
+    open(
+        set.get_mut(&n("A")).unwrap(),
+        &a_key,
+        "uA",
+        ChildKind::User,
+    );
+    descend(set.get_mut(&n("A")).unwrap(), &a_key, "uA", 100);
+    assert_eq!(
+        set.get(&n("A")).unwrap().balances().parent_balance(),
+        Some(Amount::new(100))
+    );
+    assert_eq!(
+        set.get(&n("R")).unwrap().balances().child_balance(&n("A")),
+        Amount::ZERO
+    );
+
+    let report = net(&topo, &set, &PeerRegistry::new(), &[], &BTreeMap::new());
+    assert_eq!(
+        report.findings,
+        vec![Finding::MirrorMismatch {
+            edge: EdgeAccount {
+                parent: n("R"),
+                child: n("A"),
+            },
+            parent_view: Amount::ZERO,
+            child_view: Amount::new(100),
+        }],
+        "expected the stranded Parent claim to surface as MirrorMismatch"
+    );
+    assert!(report.nets.is_empty());
+}
+
+/// A child that descends value to its own subtree without its parent ever
+/// extending the edge has `Parent > 0` while the parent's `Child == 0`: a
+/// `MirrorMismatch`. Local issuance is externally backed, but it is not a
+/// cross-subtree prefund.
+#[test]
+fn descend_without_parent_extension_is_mirror_mismatch() {
+    let mut topo = Topology::new_root("R");
+    topo.add_node("A", ChildKind::Node).unwrap();
+    topo.add_node("uA", ChildKind::User).unwrap();
+    topo.attach("R", "A", Some(0)).unwrap();
+    topo.attach("A", "uA", Some(0)).unwrap();
+
+    let r_key = k(101);
+    let a_key = k(102);
+    let mut set = LedgerSet::new();
+    set.insert(n("R"), Ledger::new_root(r_key.public())).unwrap();
+    set.insert(n("A"), Ledger::new_non_root(a_key.public()))
+        .unwrap();
+
+    open(
+        set.get_mut(&n("A")).unwrap(),
+        &a_key,
+        "uA",
+        ChildKind::User,
+    );
+    descend(set.get_mut(&n("A")).unwrap(), &a_key, "uA", 100);
+
+    let report = net(&topo, &set, &PeerRegistry::new(), &[], &BTreeMap::new());
+    assert!(
+        report.findings.iter().any(|f| matches!(
+            f,
+            Finding::MirrorMismatch { edge, parent_view, child_view }
+                if edge.parent == n("R")
+                    && edge.child == n("A")
+                    && *parent_view == Amount::ZERO
+                    && *child_view == Amount::new(100)
+        )),
+        "expected a MirrorMismatch for the un-extended R->A edge, got {:?}",
+        report.findings
+    );
+}
+
+/// A local `Issue` (boundary op on a child liability) is externally backed and
+/// is not an anomaly by itself: it does not touch `Parent`, so every topology
+/// edge mirror still holds.
+#[test]
+fn local_issue_yields_no_finding() {
+    let mut topo = Topology::new_root("R");
+    topo.add_node("A", ChildKind::Node).unwrap();
+    topo.add_node("uA", ChildKind::User).unwrap();
+    topo.attach("R", "A", Some(0)).unwrap();
+    topo.attach("A", "uA", Some(0)).unwrap();
+
+    let r_key = k(101);
+    let a_key = k(102);
+    let mut set = LedgerSet::new();
+    set.insert(n("R"), Ledger::new_root(r_key.public())).unwrap();
+    set.insert(n("A"), Ledger::new_non_root(a_key.public()))
+        .unwrap();
+
+    open(
+        set.get_mut(&n("A")).unwrap(),
+        &a_key,
+        "uA",
+        ChildKind::User,
+    );
+    issue(set.get_mut(&n("A")).unwrap(), &a_key, "uA", 50);
+
+    let report = net(&topo, &set, &PeerRegistry::new(), &[], &BTreeMap::new());
+    assert!(
+        report.findings.is_empty(),
+        "a local issue is not an anomaly: {:?}",
         report.findings
     );
     assert!(report.nets.is_empty());

@@ -30,15 +30,25 @@ use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 
+use cawala_ledger::{
+    AuthRef, Hash, HopRole, PaymentOrder, PeerKeys, PeerRegistry, PeerRole, SignedEntry,
+    classify_hop, hop_postings,
+};
 use cawala_msg::{
-    Ack, AckStatus, Envelope, LedgerPayloadV1, MSG_LEDGER_V1, MessageType, MsgError, MsgId,
-    Neighbor, NeighborKind, OrderRejectV1, OrderResultV1, OrderStatusV1, PeerRef, RejectReason,
-    Routable, RouteDecision, RouteError, Seen, SeenConfig, SeenSet,
+    Ack, AckStatus, Envelope, LedgerPayloadV1, LedgerPayloadV2, MSG_LEDGER_V1, MSG_SETTLE_V1,
+    MessageType, MsgError, MsgId, Neighbor, NeighborKind, OrderRejectV1, OrderResultV1,
+    OrderStatusV1, PeerRef, RejectReason, Routable, RouteDecision, RouteError, Seen, SeenConfig,
+    SeenSet, SettleForwardV1, SettleHopV1, SettleOutcomeV1, SettlePayloadV1, SettleRejectV1,
+    SettleResultV1, ValueNoticeV1, VersionedLedgerPayload, decode_versioned,
 };
 use cawala_topology::ChildKind;
 
-use crate::ledger_service::{ApplyOutcome, LedgerService};
+use crate::ledger_service::{ApplyOutcome, HopOutcome, LedgerService};
 use crate::record::{NodeRecord, RecordStore};
+use crate::settlement::{
+    DerivedHop, PendingSettlement, SettlementManager, TerminalRecord, derive_hop, expected_signers,
+    route_is_depth_one,
+};
 
 /// ALPN negotiated on every `cawala/msg/0` connection.
 pub use cawala_msg::ALPN as MSG_ALPN;
@@ -705,46 +715,35 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Process one locally delivered `MSG_LEDGER_V1` envelope at a leaf node.
+/// The settlement timeout used for origin reservations, in seconds.
+pub const SETTLE_TIMEOUT_SECS: u64 = 30;
+
+/// Process one locally delivered `MSG_LEDGER_V1` envelope.
 ///
-/// This is the node's **drain-loop** half of the ledger protocol: it runs after
-/// [`MsgHandler`] has queued the envelope (`Delivered` means "queued", not
-/// "applied"). Dispatch deliberately lives outside [`MsgHandler`] so the
-/// transport never blocks on ledger IO.
-///
-/// `Order` payloads are applied to the shared [`LedgerService`] and answered
-/// with an [`OrderResultV1`] carrying a fresh balance receipt for the payer.
-/// `BalanceQuery` payloads from a `User` child are answered with a signed
-/// [`BalanceReceiptV1`]. Inbound results/receipts at a leaf and malformed
-/// payloads are logged and skipped. No failure path panics: a bad payload or an
-/// unreachable reply must not kill the drain task.
+/// `Order` payloads are applied to the shared [`LedgerService`]; a v2 order with
+/// a remote payee starts a cross-subtree settlement. `BalanceQuery` payloads
+/// from a `User` child are answered with a signed receipt. No failure path
+/// panics: a bad payload or an unreachable reply must not kill the drain task.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_ledger_envelope(
     endpoint: &Endpoint,
     source: &NeighborSource,
     config: &MsgConfig,
     ledger: &Arc<tokio::sync::Mutex<LedgerService>>,
+    manager: &Arc<tokio::sync::Mutex<SettlementManager>>,
     data_dir: &Path,
     node_id: &str,
     env: Envelope,
 ) {
-    let payload = match LedgerPayloadV1::from_bytes(&env.payload) {
-        Ok(payload) => payload,
-        Err(err) => {
-            tracing::warn!(
-                msg_id = %env.msg_id.to_hex(),
-                %err,
-                "malformed MSG_LEDGER_V1 payload; skipping"
-            );
-            return;
+    match decode_versioned(&env.payload) {
+        Ok(VersionedLedgerPayload::V1(payload)) => {
+            dispatch_ledger_payload_v1(endpoint, source, config, ledger, data_dir, node_id, env, payload)
+                .await;
         }
-    };
-
-    match payload {
-        LedgerPayloadV1::Order(order_v1) => {
-            let order = order_v1.order;
-            let auth = order_v1.auth;
-            let order_hash = order.hash();
-            let sender = env.src.node.clone();
+        Ok(VersionedLedgerPayload::V2(LedgerPayloadV2::Order(order_v2))) => {
+            let order = order_v2.order;
+            let auth = order_v2.auth;
+            let payee_addr = order_v2.payee_addr;
 
             let record = match RecordStore::open(data_dir, node_id) {
                 Ok(store) => store.record().clone(),
@@ -754,68 +753,175 @@ pub async fn dispatch_ledger_envelope(
                 }
             };
 
-            // `apply_order` alone cannot distinguish "not a child" from other
-            // structural failures, so reject a non-user-child sender up front
-            // and always answer with a result (never drop silently).
-            let ledger = Arc::clone(ledger);
-            let now = unix_now();
-            let applied = tokio::task::spawn_blocking(move || {
-                let mut service = ledger.blocking_lock();
-                let sender_is_user_child = record
-                    .children
-                    .iter()
-                    .any(|child| child.kind == ChildKind::User && child.child_id == sender);
-                if !sender_is_user_child {
-                    return (
-                        ApplyOutcome {
-                            status: OrderStatusV1::Rejected,
-                            entry_seq: None,
-                            entry_hash: None,
-                            reason: Some(OrderRejectV1::NotAChild),
-                        },
-                        None,
-                    );
-                }
-                let outcome = service.apply_order(
+            // The sender must be a local `User` child at the address it claims.
+            if user_child_address(&record, &env.src.node) != Some(env.src.addr.clone()) {
+                let result = OrderResultV1 {
+                    reply_to: env.msg_id,
+                    order_hash: order.hash(),
+                    status: OrderStatusV1::Rejected,
+                    entry_seq: None,
+                    entry_hash: None,
+                    reason: Some(OrderRejectV1::NotAChild),
+                    balance: None,
+                };
+                send_ledger_reply(endpoint, source, config, &env, LedgerPayloadV1::OrderResult(result))
+                    .await;
+                return;
+            }
+
+            let payee_is_local = record
+                .children
+                .iter()
+                .any(|child| child.kind == ChildKind::User && child.child_id == order.to.as_str());
+            if payee_is_local {
+                apply_same_leaf_order(endpoint, source, config, ledger, &env, &record, &order, &auth)
+                    .await;
+            } else {
+                handle_settlement_order(
+                    endpoint,
+                    source,
+                    config,
+                    ledger,
+                    manager,
+                    &env,
+                    &record,
                     &order,
                     &auth,
-                    &cawala_ledger::NodeId::from(sender),
-                    &record,
-                    now,
-                );
-                let balance = match &outcome.status {
-                    OrderStatusV1::Applied | OrderStatusV1::Duplicate => service
-                        .balance_receipt(&order.from, &record, None, None, None)
-                        .ok(),
-                    OrderStatusV1::Rejected => None,
-                };
-                (outcome, balance)
-            })
-            .await;
+                    &payee_addr,
+                )
+                .await;
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                msg_id = %env.msg_id.to_hex(),
+                %err,
+                "malformed MSG_LEDGER_V1 payload; skipping"
+            );
+        }
+    }
+}
 
-            let (outcome, balance) = match applied {
-                Ok(applied) => applied,
+/// Apply the existing same-leaf `Direct` order path (v1 and local-payee v2).
+#[allow(clippy::too_many_arguments)]
+async fn apply_same_leaf_order(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    ledger: &Arc<tokio::sync::Mutex<LedgerService>>,
+    env: &Envelope,
+    record: &NodeRecord,
+    order: &PaymentOrder,
+    auth: &AuthRef,
+) {
+    let order = order.clone();
+    let auth = auth.clone();
+    let record = record.clone();
+    let sender = env.src.node.clone();
+    let order_hash = order.hash();
+    let ledger = Arc::clone(ledger);
+    let now = unix_now();
+
+    let applied = tokio::task::spawn_blocking(move || {
+        let mut service = ledger.blocking_lock();
+        let sender_is_user_child = record
+            .children
+            .iter()
+            .any(|child| child.kind == ChildKind::User && child.child_id == sender);
+        if !sender_is_user_child {
+            return (
+                ApplyOutcome {
+                    status: OrderStatusV1::Rejected,
+                    entry_seq: None,
+                    entry_hash: None,
+                    reason: Some(OrderRejectV1::NotAChild),
+                },
+                None,
+            );
+        }
+        let outcome = service.apply_order(
+            &order,
+            &auth,
+            &cawala_ledger::NodeId::from(sender),
+            &record,
+            now,
+        );
+        let balance = match &outcome.status {
+            OrderStatusV1::Applied | OrderStatusV1::Duplicate => {
+                match service.balance_receipt(&order.from, &record, None, None, None) {
+                    Ok(receipt) => Some(receipt),
+                    Err(err) => {
+                        tracing::warn!(
+                            %err,
+                            "payer balance receipt omitted (ledger read lock contention)"
+                        );
+                        None
+                    }
+                }
+            }
+            OrderStatusV1::Rejected => None,
+        };
+        (outcome, balance)
+    })
+    .await;
+
+    let (outcome, balance) = match applied {
+        Ok(applied) => applied,
+        Err(err) => {
+            tracing::warn!(%err, "ledger apply task failed; skipping order");
+            return;
+        }
+    };
+
+    let result = OrderResultV1 {
+        reply_to: env.msg_id,
+        order_hash,
+        status: outcome.status,
+        entry_seq: outcome.entry_seq,
+        entry_hash: outcome.entry_hash,
+        reason: outcome.reason,
+        balance,
+    };
+    send_ledger_reply(
+        endpoint,
+        source,
+        config,
+        env,
+        LedgerPayloadV1::OrderResult(result),
+    )
+    .await;
+}
+
+/// Dispatch a v1 ledger payload body.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_ledger_payload_v1(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    ledger: &Arc<tokio::sync::Mutex<LedgerService>>,
+    data_dir: &Path,
+    node_id: &str,
+    env: Envelope,
+    payload: LedgerPayloadV1,
+) {
+    match payload {
+        LedgerPayloadV1::Order(order_v1) => {
+            let record = match RecordStore::open(data_dir, node_id) {
+                Ok(store) => store.record().clone(),
                 Err(err) => {
-                    tracing::warn!(%err, "ledger apply task failed; skipping order");
+                    tracing::warn!(%err, "cannot reload node record to apply an order; skipping");
                     return;
                 }
             };
-
-            let result = OrderResultV1 {
-                reply_to: env.msg_id,
-                order_hash,
-                status: outcome.status,
-                entry_seq: outcome.entry_seq,
-                entry_hash: outcome.entry_hash,
-                reason: outcome.reason,
-                balance,
-            };
-            send_ledger_reply(
+            apply_same_leaf_order(
                 endpoint,
                 source,
                 config,
+                ledger,
                 &env,
-                LedgerPayloadV1::OrderResult(result),
+                &record,
+                &order_v1.order,
+                &order_v1.auth,
             )
             .await;
         }
@@ -828,17 +934,7 @@ pub async fn dispatch_ledger_envelope(
                 }
             };
 
-            // Only this leaf's own users get receipts, and only at the address
-            // their slot derives. This mirrors the `is_neighbor` check in the
-            // handler with an explicit record lookup.
-            let derived = record.address.as_ref().and_then(|address| {
-                record
-                    .children
-                    .iter()
-                    .find(|child| child.child_id == env.src.node && child.kind == ChildKind::User)
-                    .map(|child| address.child(child.slot))
-            });
-            if derived.as_ref() != Some(&env.src.addr) {
+            if user_child_address(&record, &env.src.node).as_ref() != Some(&env.src.addr) {
                 tracing::warn!(
                     src = %env.src.node,
                     "BalanceQuery from a non-user-child or mismatched address; ignoring"
@@ -885,6 +981,808 @@ pub async fn dispatch_ledger_envelope(
     }
 }
 
+/// Start a cross-subtree settlement at the payer's leaf (the origin).
+#[allow(clippy::too_many_arguments)]
+async fn handle_settlement_order(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    ledger: &Arc<tokio::sync::Mutex<LedgerService>>,
+    manager: &Arc<tokio::sync::Mutex<SettlementManager>>,
+    env: &Envelope,
+    record: &NodeRecord,
+    order: &PaymentOrder,
+    auth: &AuthRef,
+    payee_addr: &cawala_msg::OctAddr,
+) {
+    let payment_id = order.hash();
+    let now = unix_now();
+
+    let Some(payer_addr) = user_child_address(record, &env.src.node) else {
+        return;
+    };
+    let Some(this_addr) = record.address.clone() else {
+        return;
+    };
+    let Some(payee_leaf_addr) = payee_addr.parent() else {
+        reject_order(endpoint, source, config, env, order.hash(), OrderRejectV1::BadRequest).await;
+        return;
+    };
+
+    // v1 depth-1 guard: reject anything deeper without touching the ledger.
+    if !route_is_depth_one(&payer_addr, payee_addr) {
+        reject_order(endpoint, source, config, env, order.hash(), OrderRejectV1::BadRequest).await;
+        return;
+    }
+    let Ok(derived) = derive_hop(record, &this_addr, &payer_addr, payee_addr) else {
+        reject_order(endpoint, source, config, env, order.hash(), OrderRejectV1::BadRequest).await;
+        return;
+    };
+
+    let order_c = order.clone();
+    let auth_c = auth.clone();
+    let ledger_arc = Arc::clone(ledger);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut service = ledger_arc.blocking_lock();
+        // Resolve the payer's row locally; the browser is our own user child.
+        let payer_key = service
+            .effective_registry()
+            .ok()
+            .and_then(|registry| registry.get(&order_c.from).cloned());
+        let Some(payer_key) = payer_key else {
+            return (HopOutcome::Rejected { reason: OrderRejectV1::Unauthorized }, None, None);
+        };
+        let registry = match assemble_settlement_registry(&service, &payer_key, &order_c, &auth_c) {
+            Ok(registry) => registry,
+            Err(reason) => return (HopOutcome::Rejected { reason }, None, None),
+        };
+        let outcome = service.apply_hop(
+            &order_c,
+            &auth_c,
+            derived.role,
+            derived.first,
+            derived.second,
+            &registry,
+            now,
+        );
+        let entry = match &outcome {
+            HopOutcome::Applied { seq, .. } | HopOutcome::Duplicate { seq, .. } => {
+                service.entry_at(*seq).ok()
+            }
+            HopOutcome::Rejected { .. } => None,
+        };
+        (outcome, Some(payer_key), entry)
+    })
+    .await;
+
+    let (outcome, payer_key, entry) = match outcome {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(%err, "settlement reserve task failed");
+            return;
+        }
+    };
+
+    match outcome {
+        HopOutcome::Applied { seq, hash } => {
+            let (Some(payer_key), Some(entry)) = (payer_key, entry) else {
+                reject_order(endpoint, source, config, env, order.hash(), OrderRejectV1::Internal).await;
+                return;
+            };
+            let forward = SettleForwardV1 {
+                order: order.clone(),
+                auth: auth.clone(),
+                payer_key,
+                payer_addr: payer_addr.clone(),
+                payee_addr: payee_addr.clone(),
+                hops: vec![SettleHopV1 {
+                    signer_addr: this_addr.clone(),
+                    entry,
+                }],
+            };
+            if !forward.hops_within_bound() {
+                reject_order(endpoint, source, config, env, order.hash(), OrderRejectV1::BadRequest).await;
+                return;
+            }
+            let pending = PendingSettlement {
+                browser: env.src.clone(),
+                browser_msg_id: env.msg_id,
+                order: order.clone(),
+                auth: auth.clone(),
+                payer_addr: payer_addr.clone(),
+                payee_addr: payee_addr.clone(),
+                payee_leaf_addr: payee_leaf_addr.clone(),
+                local_seq: seq,
+                local_hash: hash,
+                deadline_secs: now + SETTLE_TIMEOUT_SECS,
+            };
+            if let Some(evicted) = manager.lock().await.reserve(pending) {
+                send_timeout_result(endpoint, source, config, &evicted).await;
+            }
+            let signers = expected_signers(&payer_addr, payee_addr)
+                .expect("depth-1 route has three signers");
+            send_settle_payload_to(
+                endpoint,
+                source,
+                config,
+                signers[1].clone(),
+                SettlePayloadV1::Forward(forward),
+            )
+            .await;
+        }
+        HopOutcome::Duplicate { seq, hash } => {
+            // The local reservation already exists: answer from the cached
+            // terminal if the cascade finished, else as a duplicate.
+            let terminal = manager.lock().await.terminal(&payment_id).cloned();
+            let (status, reason, entry_seq, entry_hash) = match terminal {
+                Some(term) => match term.outcome {
+                    SettleOutcomeV1::Applied {
+                        terminal_seq,
+                        terminal_hash,
+                        terminal_entry: _,
+                    } => (
+                        OrderStatusV1::Duplicate,
+                        None,
+                        Some(terminal_seq),
+                        Some(terminal_hash),
+                    ),
+                    SettleOutcomeV1::Rejected { reason } => (
+                        OrderStatusV1::Duplicate,
+                        Some(map_settle_reject(&reason)),
+                        Some(seq),
+                        Some(hash),
+                    ),
+                },
+                None => (
+                    OrderStatusV1::Duplicate,
+                    None,
+                    Some(seq),
+                    Some(hash),
+                ),
+            };
+            let balance = payer_receipt(ledger, record, &order.from).await;
+            let result = OrderResultV1 {
+                reply_to: env.msg_id,
+                order_hash: payment_id,
+                status,
+                entry_seq,
+                entry_hash,
+                reason,
+                balance,
+            };
+            send_ledger_reply(endpoint, source, config, env, LedgerPayloadV1::OrderResult(result)).await;
+        }
+        HopOutcome::Rejected { reason } => {
+            reject_order(endpoint, source, config, env, payment_id, reason).await;
+        }
+    }
+}
+
+/// Reply `Rejected(reason)` to the browser.
+async fn reject_order(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    env: &Envelope,
+    order_hash: Hash,
+    reason: OrderRejectV1,
+) {
+    let result = OrderResultV1 {
+        reply_to: env.msg_id,
+        order_hash,
+        status: OrderStatusV1::Rejected,
+        entry_seq: None,
+        entry_hash: None,
+        reason: Some(reason),
+        balance: None,
+    };
+    send_ledger_reply(endpoint, source, config, env, LedgerPayloadV1::OrderResult(result)).await;
+}
+
+/// Build a fresh payer balance receipt, if one can be built.
+async fn payer_receipt(
+    ledger: &Arc<tokio::sync::Mutex<LedgerService>>,
+    record: &NodeRecord,
+    payer: &cawala_ledger::NodeId,
+) -> Option<cawala_msg::BalanceReceiptV1> {
+    let ledger = Arc::clone(ledger);
+    let record = record.clone();
+    let payer = payer.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut service = ledger.blocking_lock();
+        match service.balance_receipt(&payer, &record, None, None, None) {
+            Ok(receipt) => Some(receipt),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "payer balance receipt omitted (ledger read lock contention)"
+                );
+                None
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Emit a synthesized timeout `OrderResult` for an expired/evicted settlement.
+async fn send_timeout_result(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    pending: &PendingSettlement,
+) {
+    let result = OrderResultV1 {
+        reply_to: pending.browser_msg_id,
+        order_hash: pending.order.hash(),
+        status: OrderStatusV1::Rejected,
+        entry_seq: None,
+        entry_hash: None,
+        reason: Some(OrderRejectV1::Internal),
+        balance: None,
+    };
+    send_order_result_to(endpoint, source, config, &pending.browser, result).await;
+}
+
+/// Sweep timed-out origin settlements and notify their browsers.
+pub async fn sweep_settlements(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    manager: &Arc<tokio::sync::Mutex<SettlementManager>>,
+    now: u64,
+) {
+    let expired = manager.lock().await.sweep_expired(now);
+    for pending in expired {
+        send_timeout_result(endpoint, source, config, &pending).await;
+    }
+}
+
+/// Process one locally delivered `MSG_SETTLE_V1` envelope.
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_settle_envelope(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    ledger: &Arc<tokio::sync::Mutex<LedgerService>>,
+    manager: &Arc<tokio::sync::Mutex<SettlementManager>>,
+    data_dir: &Path,
+    node_id: &str,
+    env: Envelope,
+) {
+    let payload = match SettlePayloadV1::from_bytes(&env.payload) {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::warn!(
+                msg_id = %env.msg_id.to_hex(),
+                %err,
+                "malformed MSG_SETTLE_V1 payload; skipping"
+            );
+            return;
+        }
+    };
+    match payload {
+        SettlePayloadV1::Result(result) => {
+            handle_settle_result(endpoint, source, config, ledger, manager, data_dir, node_id, env, result)
+                .await;
+        }
+        SettlePayloadV1::Forward(forward) => {
+            handle_settle_forward(endpoint, source, config, ledger, data_dir, node_id, env, forward)
+                .await;
+        }
+    }
+}
+
+/// Handle a settlement `Result` at the origin: emit the browser's `OrderResult`.
+#[allow(clippy::too_many_arguments)]
+async fn handle_settle_result(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    ledger: &Arc<tokio::sync::Mutex<LedgerService>>,
+    manager: &Arc<tokio::sync::Mutex<SettlementManager>>,
+    data_dir: &Path,
+    node_id: &str,
+    env: Envelope,
+    result: SettleResultV1,
+) {
+    let payment_id = result.payment_id;
+    let pending = {
+        let mut mgr = manager.lock().await;
+        let Some(pending) = mgr.pending(&payment_id).cloned() else {
+            return;
+        };
+        // The result must come from the payee leaf.
+        if env.src.addr != pending.payee_leaf_addr {
+            tracing::warn!(
+                src = %env.src.node,
+                "settlement result from a non-payee-leaf; ignoring"
+            );
+            return;
+        }
+        // A carried terminal entry is advisory evidence, not authentication:
+        // accept it only if it is the `Descend` this pending order expects.
+        // Otherwise drop the result and let the origin's timeout sweep — not a
+        // forged success — resolve it.
+        if let SettleOutcomeV1::Applied { terminal_entry, .. } = &result.outcome
+            && !terminal_entry_is_valid(terminal_entry, &pending.order)
+        {
+            tracing::warn!(
+                payment_id = %payment_id.to_hex(),
+                "settlement result carries an invalid terminal entry; ignoring"
+            );
+            return;
+        }
+        let Some(pending) = mgr.take_pending(&payment_id) else {
+            return;
+        };
+        mgr.record_terminal(
+            payment_id,
+            TerminalRecord {
+                browser: pending.browser.clone(),
+                browser_msg_id: pending.browser_msg_id,
+                order: pending.order.clone(),
+                terminal_entry: match &result.outcome {
+                    SettleOutcomeV1::Applied { terminal_entry, .. } => {
+                        Some(terminal_entry.clone())
+                    }
+                    SettleOutcomeV1::Rejected { .. } => None,
+                },
+                outcome: result.outcome.clone(),
+            },
+        );
+        pending
+    };
+
+    let (status, reason, entry_seq, entry_hash) = match &result.outcome {
+        SettleOutcomeV1::Applied {
+            terminal_seq,
+            terminal_hash,
+            terminal_entry: _,
+        } => (
+            OrderStatusV1::Applied,
+            None,
+            Some(*terminal_seq),
+            Some(*terminal_hash),
+        ),
+        SettleOutcomeV1::Rejected { reason } => (
+            OrderStatusV1::Rejected,
+            Some(map_settle_reject(reason)),
+            None,
+            None,
+        ),
+    };
+
+    let balance = if status == OrderStatusV1::Applied {
+        let record = RecordStore::open(data_dir, node_id)
+            .map(|store| store.record().clone())
+            .ok();
+        match record {
+            Some(record) => payer_receipt(ledger, &record, &pending.order.from).await,
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let order_result = OrderResultV1 {
+        reply_to: pending.browser_msg_id,
+        order_hash: pending.order.hash(),
+        status,
+        entry_seq,
+        entry_hash,
+        reason,
+        balance,
+    };
+    send_order_result_to(endpoint, source, config, &pending.browser, order_result).await;
+}
+
+/// Handle a settlement `Forward` at an intermediate or terminal signer.
+#[allow(clippy::too_many_arguments)]
+async fn handle_settle_forward(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    ledger: &Arc<tokio::sync::Mutex<LedgerService>>,
+    data_dir: &Path,
+    node_id: &str,
+    env: Envelope,
+    forward: SettleForwardV1,
+) {
+    if !forward.hops_within_bound() {
+        return;
+    }
+    let snapshot = source.snapshot();
+    let this = snapshot.routable.this.clone();
+
+    let Some(signers) = expected_signers(&forward.payer_addr, &forward.payee_addr) else {
+        return;
+    };
+    // The hop index is derived from how many hops are already carried; the wire
+    // never chooses it. This node must be the next expected signer.
+    let index = forward.hops.len();
+    if index >= signers.len() || this.addr != signers[index] {
+        return;
+    }
+    // The transport-appended chain must be exactly the expected signer prefix
+    // (`signers[0]`, then each previous signer). This binds the derived hop
+    // index to the authenticated path and rejects a forged cascade that a
+    // non-signer (e.g. a User child) relays through a leaf: the transport keeps
+    // the true origin as `hop_chain[0]`, so it cannot name `signers[0]`.
+    if env.hop_chain.len() != index {
+        return;
+    }
+    for (i, hop) in env.hop_chain.iter().enumerate() {
+        if hop.addr != signers[i] {
+            return;
+        }
+    }
+    // The sender is the neighbor-verified last hop appended by the transport,
+    // never the unauthenticated `env.src`.
+    let Some(sender) = env.hop_chain.last().map(|hop| &hop.addr) else {
+        return;
+    };
+    if index == 0 {
+        // Only the payer leaf may start a cascade...
+        if sender != &signers[0] {
+            return;
+        }
+    } else if sender != &signers[index - 1] {
+        // ...and only the previous expected signer may hand off.
+        return;
+    }
+    let is_terminal = index + 1 == signers.len();
+
+    let record = match RecordStore::open(data_dir, node_id) {
+        Ok(store) => store.record().clone(),
+        Err(err) => {
+            tracing::warn!(%err, "cannot reload node record for a settlement hop");
+            return;
+        }
+    };
+
+    // If this node is the payer leaf (`index == 0`), the order's payer must be
+    // its own user child at `payer_addr`.
+    if this.addr == signers[0]
+        && user_child_address(&record, forward.order.from.as_str())
+            != Some(forward.payer_addr.clone())
+    {
+        return;
+    }
+
+    if is_terminal
+        && user_child_address(&record, forward.order.to.as_str())
+            != Some(forward.payee_addr.clone())
+    {
+        send_settle_result(
+            endpoint,
+            source,
+            config,
+            signers[0].clone(),
+            forward.order.hash(),
+            SettleOutcomeV1::Rejected {
+                reason: SettleRejectV1::IntermediateRejected {
+                    at: cawala_ledger::NodeId::from(this.node.clone()),
+                    reason: OrderRejectV1::NotAChild,
+                },
+            },
+        )
+        .await;
+        return;
+    }
+
+    let Ok(derived) = derive_hop(&record, &this.addr, &forward.payer_addr, &forward.payee_addr)
+    else {
+        send_settle_result(
+            endpoint,
+            source,
+            config,
+            signers[0].clone(),
+            forward.order.hash(),
+            SettleOutcomeV1::Rejected {
+                reason: SettleRejectV1::Malformed,
+            },
+        )
+        .await;
+        return;
+    };
+
+    let order = forward.order.clone();
+    let auth = forward.auth.clone();
+    let payer_key = forward.payer_key.clone();
+    let derived_c = derived.clone();
+    let carried = forward.hops.clone();
+    let signers_c = signers.clone();
+    let payer_addr = forward.payer_addr.clone();
+    let payee_addr = forward.payee_addr.clone();
+    let this_addr = this.addr.clone();
+    let ledger_arc = Arc::clone(ledger);
+    let now = unix_now();
+    let applied = tokio::task::spawn_blocking(move || {
+        let mut service = ledger_arc.blocking_lock();
+        let registry = match assemble_settlement_registry(&service, &payer_key, &order, &auth) {
+            Ok(registry) => registry,
+            Err(reason) => {
+                return Err(HopOutcome::Rejected { reason });
+            }
+        };
+        // Defense in depth: the carried evidence must name the expected
+        // signers, be a valid transfer of this order, and (where the signer's
+        // ledger key is resolvable) carry a valid signature.
+        if !carried_hops_match(
+            &carried,
+            &signers_c,
+            &payer_addr,
+            &payee_addr,
+            &this_addr,
+            &order,
+            &service,
+            &registry,
+        ) {
+            return Err(HopOutcome::Rejected {
+                reason: OrderRejectV1::Unauthorized,
+            });
+        }
+        Ok(service.apply_hop(
+            &order,
+            &auth,
+            derived_c.role,
+            derived_c.first,
+            derived_c.second,
+            &registry,
+            now,
+        ))
+    })
+    .await;
+
+    let outcome = match applied {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(outcome)) => outcome,
+        Err(err) => {
+            tracing::warn!(%err, "settlement hop task failed");
+            return;
+        }
+    };
+
+    let (seq, hash) = match outcome {
+        HopOutcome::Applied { seq, hash } => (seq, hash),
+        HopOutcome::Duplicate { seq, hash } => {
+            let ledger_arc = Arc::clone(ledger);
+            let recovered = tokio::task::spawn_blocking(move || {
+                ledger_arc.blocking_lock().entry_at(seq).ok()
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(entry) = recovered else {
+                return;
+            };
+            if !entry_matches_hop(&entry, &forward.order, &derived) {
+                return;
+            }
+            (seq, hash)
+        }
+        HopOutcome::Rejected { reason } => {
+            send_settle_result(
+                endpoint,
+                source,
+                config,
+                signers[0].clone(),
+                forward.order.hash(),
+                SettleOutcomeV1::Rejected {
+                    reason: SettleRejectV1::IntermediateRejected {
+                        at: cawala_ledger::NodeId::from(this.node.clone()),
+                        reason,
+                    },
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    // Recover the appended (or already-applied) entry as evidence.
+    let ledger_arc = Arc::clone(ledger);
+    let entry = tokio::task::spawn_blocking(move || ledger_arc.blocking_lock().entry_at(seq).ok())
+        .await
+        .ok()
+        .flatten();
+    let mut hops = forward.hops.clone();
+    if let Some(entry) = &entry
+        && !hops.iter().any(|hop| hop.signer_addr == this.addr)
+    {
+        hops.push(SettleHopV1 {
+            signer_addr: this.addr.clone(),
+            entry: entry.clone(),
+        });
+    }
+
+    if is_terminal {
+        // A terminal `Applied` result carries the signed `Descend` entry so the
+        // origin retains signed ground truth; without it we cannot vouch for the
+        // outcome, so stay silent rather than emit a forged-looking success.
+        let Some(terminal_entry) = entry else {
+            return;
+        };
+        send_settle_result(
+            endpoint,
+            source,
+            config,
+            signers[0].clone(),
+            forward.order.hash(),
+            SettleOutcomeV1::Applied {
+                terminal_seq: seq,
+                terminal_hash: hash,
+                terminal_entry,
+            },
+        )
+        .await;
+        push_payee_receipt(
+            endpoint,
+            source,
+            config,
+            ledger,
+            &record,
+            &forward,
+            seq,
+            hash,
+            now,
+        )
+        .await;
+    } else {
+        let next = signers[index + 1].clone();
+        let relayed = SettleForwardV1 { hops, ..forward };
+        relay_settle_forward(endpoint, source, config, &env, next, relayed).await;
+    }
+}
+
+/// Defense-in-depth check over carried settlement evidence.
+///
+/// Every carried hop must name the expected signer, be a canonical transfer of
+/// this order with the role the classifier derives for that signer, and pass
+/// conservation. Where the signer's ledger key is resolvable (this node's own
+/// key), the entry signature is verified too; unregistered peer keys keep the
+/// name/role/shape checks.
+#[allow(clippy::too_many_arguments)]
+fn carried_hops_match(
+    hops: &[SettleHopV1],
+    signers: &[cawala_msg::OctAddr; 3],
+    payer_addr: &cawala_msg::OctAddr,
+    payee_addr: &cawala_msg::OctAddr,
+    this_addr: &cawala_msg::OctAddr,
+    order: &PaymentOrder,
+    service: &LedgerService,
+    registry: &PeerRegistry,
+) -> bool {
+    let self_key = service.ledger_key_public();
+    for (i, hop) in hops.iter().enumerate() {
+        if i >= signers.len() || hop.signer_addr != signers[i] {
+            return false;
+        }
+        let expected_role = classify_hop(payer_addr, payee_addr, &signers[i]);
+        let entry = &hop.entry.entry;
+        let cawala_ledger::EntryBody::Transfer {
+            payment_id,
+            amount,
+            role,
+        } = &entry.body
+        else {
+            return false;
+        };
+        if Some(*role) != expected_role
+            || *payment_id != order.hash()
+            || *amount != order.amount
+            || entry.check_conservation().is_err()
+        {
+            return false;
+        }
+        if hop.signer_addr == *this_addr {
+            if entry.ledger_id != self_key || hop.entry.verify(&self_key).is_err() {
+                return false;
+            }
+        } else if registry.verify_entry(&hop.entry).is_ok() {
+            // Resolvable registered key: the signature already verified.
+        }
+    }
+    true
+}
+
+/// Verify a recovered duplicate hop entry matches the locally derived hop.
+fn entry_matches_hop(entry: &SignedEntry, order: &PaymentOrder, derived: &DerivedHop) -> bool {
+    let cawala_ledger::EntryBody::Transfer {
+        payment_id,
+        amount,
+        role,
+    } = &entry.entry.body
+    else {
+        return false;
+    };
+    let Ok(m) = i64::try_from(order.amount.get()) else {
+        return false;
+    };
+    *payment_id == order.hash()
+        && *amount == order.amount
+        && *role == derived.role
+        && entry.entry.postings == hop_postings(derived.role, &derived.first, &derived.second, m)
+}
+
+/// Send a settlement `Result` to the origin.
+async fn send_settle_result(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    origin: cawala_msg::OctAddr,
+    payment_id: Hash,
+    outcome: SettleOutcomeV1,
+) {
+    send_settle_payload_to(
+        endpoint,
+        source,
+        config,
+        origin,
+        SettlePayloadV1::Result(SettleResultV1 {
+            payment_id,
+            outcome,
+        }),
+    )
+    .await;
+}
+
+/// Push a signed receipt with a `Descend` notice to the payee user.
+#[allow(clippy::too_many_arguments)]
+async fn push_payee_receipt(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    ledger: &Arc<tokio::sync::Mutex<LedgerService>>,
+    record: &NodeRecord,
+    forward: &SettleForwardV1,
+    entry_seq: u64,
+    entry_hash: Hash,
+    now: u64,
+) {
+    let notice = ValueNoticeV1 {
+        entry_seq,
+        entry_hash,
+        payment_id: forward.order.hash(),
+        from: forward.order.from.clone(),
+        to: forward.order.to.clone(),
+        amount: forward.order.amount,
+        role: HopRole::Descend,
+        issued_at: now,
+    };
+    let user = forward.order.to.clone();
+    let record = record.clone();
+    let ledger_arc = Arc::clone(ledger);
+    let receipt = tokio::task::spawn_blocking(move || {
+        let mut service = ledger_arc.blocking_lock();
+        match service.balance_receipt(&user, &record, None, None, Some(notice)) {
+            Ok(receipt) => Some(receipt),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "payee balance receipt omitted (ledger read lock contention)"
+                );
+                None
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(receipt) = receipt {
+        send_ledger_payload_to(
+            endpoint,
+            source,
+            config,
+            forward.payee_addr.clone(),
+            LedgerPayloadV1::BalanceReceipt(receipt),
+        )
+        .await;
+    }
+}
+
 /// Encode `payload`, build a reply envelope to `env.src`, and send it. Failures
 /// are logged and dropped so the drain loop keeps running.
 async fn send_ledger_reply(
@@ -894,30 +1792,208 @@ async fn send_ledger_reply(
     env: &Envelope,
     payload: LedgerPayloadV1,
 ) {
+    send_ledger_payload_to(endpoint, source, config, env.src.addr.clone(), payload).await;
+}
+
+/// Encode a v1 ledger `payload` and send it to `dst` over `MSG_LEDGER_V1`.
+/// Failures are logged and dropped so the drain loop keeps running.
+async fn send_ledger_payload_to(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    dst: cawala_msg::OctAddr,
+    payload: LedgerPayloadV1,
+) {
     let bytes = match payload.to_bytes() {
         Ok(bytes) => bytes,
         Err(err) => {
-            tracing::warn!(%err, "failed to encode ledger reply");
+            tracing::warn!(%err, "failed to encode ledger payload");
             return;
         }
     };
     let snapshot = source.snapshot();
     let src = snapshot.routable.this.clone();
-    let reply = match build_envelope(&src, env.src.addr.clone(), MSG_LEDGER_V1, bytes, config.ttl) {
-        Ok(reply) => reply,
+    let env = match build_envelope(&src, dst, MSG_LEDGER_V1, bytes, config.ttl) {
+        Ok(env) => env,
         Err(err) => {
-            tracing::warn!(%err, "failed to build ledger reply envelope");
+            tracing::warn!(%err, "failed to build ledger envelope");
             return;
         }
     };
-    match send_envelope(endpoint, &snapshot, &reply, config.hop_timeout).await {
+    match send_envelope(endpoint, &snapshot, &env, config.hop_timeout).await {
         Ok(ack) => tracing::debug!(
-            msg_id = %reply.msg_id.to_hex(),
+            msg_id = %env.msg_id.to_hex(),
             status = ack.status_str(),
-            "sent ledger reply"
+            "sent ledger payload"
         ),
-        Err(err) => tracing::warn!(%err, "failed to send ledger reply"),
+        Err(err) => tracing::warn!(%err, "failed to send ledger payload"),
     }
+}
+
+/// Encode a settlement `payload` and send it to `dst` over `MSG_SETTLE_V1`.
+async fn send_settle_payload_to(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    dst: cawala_msg::OctAddr,
+    payload: SettlePayloadV1,
+) {
+    let bytes = match payload.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(%err, "failed to encode settle payload");
+            return;
+        }
+    };
+    let snapshot = source.snapshot();
+    let src = snapshot.routable.this.clone();
+    let env = match build_envelope(&src, dst, MSG_SETTLE_V1, bytes, config.ttl) {
+        Ok(env) => env,
+        Err(err) => {
+            tracing::warn!(%err, "failed to build settle envelope");
+            return;
+        }
+    };
+    match send_envelope(endpoint, &snapshot, &env, config.hop_timeout).await {
+        Ok(ack) => tracing::debug!(
+            msg_id = %env.msg_id.to_hex(),
+            status = ack.status_str(),
+            "sent settle payload"
+        ),
+        Err(err) => tracing::warn!(%err, "failed to send settle payload"),
+    }
+}
+
+/// Relay an in-flight settlement forward one more step, preserving the
+/// envelope's hop chain (so the settlement origin stays `hop_chain[0]`).
+async fn relay_settle_forward(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    env: &Envelope,
+    next: cawala_msg::OctAddr,
+    forward: SettleForwardV1,
+) {
+    let bytes = match SettlePayloadV1::Forward(forward).to_bytes() {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(%err, "failed to encode settle forward");
+            return;
+        }
+    };
+    let mut out = env.clone();
+    out.dst = next;
+    out.msg_type = MSG_SETTLE_V1;
+    out.payload = bytes;
+    let snapshot = source.snapshot();
+    // The transport appends a hop only when *forwarding*; a locally delivered
+    // envelope has not recorded this node, so add it before re-addressing and
+    // consume one TTL for the extra hop.
+    if cawala_msg::append_hop(&mut out, &snapshot.routable.this).is_err() {
+        tracing::warn!("failed to append settlement hop to the relayed envelope");
+        return;
+    }
+    out.ttl = out.ttl.saturating_sub(1);
+    match send_envelope(endpoint, &snapshot, &out, config.hop_timeout).await {
+        Ok(ack) => tracing::debug!(
+            msg_id = %out.msg_id.to_hex(),
+            status = ack.status_str(),
+            "relayed settle forward"
+        ),
+        // A downstream transport failure is handled by the origin's timeout
+        // sweep; the local hop is already applied and retry is idempotent.
+        Err(err) => tracing::warn!(%err, "failed to relay settle forward"),
+    }
+}
+
+/// Send an `OrderResultV1` to a browser over `MSG_LEDGER_V1`.
+async fn send_order_result_to(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    browser: &PeerRef,
+    result: OrderResultV1,
+) {
+    send_ledger_payload_to(
+        endpoint,
+        source,
+        config,
+        browser.addr.clone(),
+        LedgerPayloadV1::OrderResult(result),
+    )
+    .await;
+}
+
+/// The derived address of `child_id` in `record`, if it is a `User` child.
+fn user_child_address(record: &NodeRecord, child_id: &str) -> Option<cawala_msg::OctAddr> {
+    let address = record.address.as_ref()?;
+    record
+        .children
+        .iter()
+        .find(|child| child.kind == ChildKind::User && child.child_id == child_id)
+        .map(|child| address.child(child.slot))
+}
+
+/// Whether a carried terminal entry is the `Descend` the pending order expects.
+///
+/// This is an advisory structural check, not authentication: it prevents a
+/// forged/mismatched entry from being stored as signed ground truth.
+fn terminal_entry_is_valid(entry: &SignedEntry, order: &PaymentOrder) -> bool {
+    matches!(
+        &entry.entry.body,
+        cawala_ledger::EntryBody::Transfer { payment_id, amount, role }
+            if *role == HopRole::Descend
+                && *payment_id == order.hash()
+                && *amount == order.amount
+    )
+}
+
+/// Map a settlement rejection onto the browser-facing `OrderRejectV1`.
+fn map_settle_reject(reason: &SettleRejectV1) -> OrderRejectV1 {
+    match reason {
+        // TODO(P4): `OrderResultV1` is frozen v1 and cannot carry the failing
+        // hop's `at`; surface it at the browser boundary in a P4 payload.
+        SettleRejectV1::IntermediateRejected { reason, .. } => reason.clone(),
+        SettleRejectV1::PayerRejected
+        | SettleRejectV1::RouteTooDeep
+        | SettleRejectV1::Malformed => OrderRejectV1::BadRequest,
+    }
+}
+
+/// Assemble the registry for a settlement hop: this node's effective registry
+/// plus the carried payer row (validated against the order/authorisation).
+fn assemble_settlement_registry(
+    service: &LedgerService,
+    payer_key: &PeerKeys,
+    order: &PaymentOrder,
+    auth: &AuthRef,
+) -> Result<PeerRegistry, OrderRejectV1> {
+    if payer_key.node_id != order.from
+        || payer_key.role != PeerRole::User
+        || payer_key.ledger.is_some()
+        || payer_key.operator != auth.operator
+    {
+        return Err(OrderRejectV1::Unauthorized);
+    }
+    let mut registry = service
+        .effective_registry()
+        .map_err(|_| OrderRejectV1::Internal)?;
+    match registry.get(&order.from) {
+        Some(existing) => {
+            if existing.operator != auth.operator
+                || existing.role != PeerRole::User
+                || existing.ledger.is_some()
+            {
+                return Err(OrderRejectV1::Unauthorized);
+            }
+        }
+        None => {
+            registry
+                .insert(payer_key.clone())
+                .map_err(|_| OrderRejectV1::Unauthorized)?;
+        }
+    }
+    Ok(registry)
 }
 
 #[cfg(test)]
@@ -1273,7 +2349,7 @@ mod tests {
         service.ensure_account_open(&payer, ChildKind::User).unwrap();
         service.ensure_account_open(&payee, ChildKind::User).unwrap();
         let node_operator = OperatorSecretKey::from_bytes(node_secret.to_bytes());
-        service.fund(&payer, 100, &node_operator, 1, 1_000).unwrap();
+        service.fund(&payer, ChildKind::User, 100, &node_operator, 1, 1_000).unwrap();
 
         let leaf_endpoint = hermetic_endpoint(&node_secret).await;
         let payer_endpoint = hermetic_endpoint(&payer_secret).await;
@@ -1290,6 +2366,8 @@ mod tests {
 
         // Dispatch task mirrors `run()`'s sink drain loop.
         let ledger = Arc::new(tokio::sync::Mutex::new(service));
+        let manager = Arc::new(tokio::sync::Mutex::new(SettlementManager::new()));
+        let dispatch_manager = Arc::clone(&manager);
         let dispatch_dir = dir.path().to_path_buf();
         let dispatch_node = node_id.clone();
         let dispatch_source = source.clone();
@@ -1303,6 +2381,7 @@ mod tests {
                     &dispatch_source,
                     &dispatch_config,
                     &dispatch_ledger,
+                    &dispatch_manager,
                     &dispatch_dir,
                     &dispatch_node,
                     env,
@@ -1422,7 +2501,7 @@ mod tests {
         let mut service = LedgerService::open(dir.path(), &node_id).unwrap();
         service.ensure_account_open(&user, ChildKind::User).unwrap();
         let node_operator = OperatorSecretKey::from_bytes(node_secret.to_bytes());
-        service.fund(&user, 42, &node_operator, 1, 1_000).unwrap();
+        service.fund(&user, ChildKind::User, 42, &node_operator, 1, 1_000).unwrap();
 
         let leaf_endpoint = hermetic_endpoint(&node_secret).await;
         let user_endpoint = hermetic_endpoint(&user_secret).await;
@@ -1439,6 +2518,8 @@ mod tests {
             spawn_msg_node_with_source_on(leaf_endpoint.clone(), source.clone(), config.clone());
 
         let ledger = Arc::new(tokio::sync::Mutex::new(service));
+        let manager = Arc::new(tokio::sync::Mutex::new(SettlementManager::new()));
+        let dispatch_manager = Arc::clone(&manager);
         let dispatch_dir = dir.path().to_path_buf();
         let dispatch_node = node_id.clone();
         let dispatch_source = source;
@@ -1452,6 +2533,7 @@ mod tests {
                     &dispatch_source,
                     &dispatch_config,
                     &dispatch_ledger,
+                    &dispatch_manager,
                     &dispatch_dir,
                     &dispatch_node,
                     env,
@@ -1543,6 +2625,8 @@ mod tests {
         let ledger = Arc::new(tokio::sync::Mutex::new(
             LedgerService::open(dir.path(), &node_id).unwrap(),
         ));
+        let manager = Arc::new(tokio::sync::Mutex::new(SettlementManager::new()));
+        let dispatch_manager = Arc::clone(&manager);
         let dispatch_dir = dir.path().to_path_buf();
         let dispatch_node = node_id.clone();
         let dispatch_source = source;
@@ -1556,6 +2640,7 @@ mod tests {
                     &dispatch_source,
                     &dispatch_config,
                     &dispatch_ledger,
+                    &dispatch_manager,
                     &dispatch_dir,
                     &dispatch_node,
                     env,

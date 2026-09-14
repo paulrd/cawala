@@ -33,6 +33,8 @@ pub const ORDER_CONTEXT: &str = "cawala-ledger/order/v1";
 pub const ISSUE_CONTEXT: &str = "cawala-ledger/issue-request/v1";
 /// BLAKE3 derive-key context for [`BurnRequest::hash`].
 pub const BURN_CONTEXT: &str = "cawala-ledger/burn-request/v1";
+/// BLAKE3 derive-key context for [`PrefundRequest::hash`].
+pub const PREFUND_CONTEXT: &str = "cawala-ledger/prefund-request/v1";
 
 fn encode_node_id(out: &mut Vec<u8>, id: &NodeId) {
     let bytes = id.as_str().as_bytes();
@@ -215,6 +217,69 @@ impl BurnRequest {
     }
 }
 
+/// An operator-signed request to prefund a child account.
+///
+/// A prefund is a node-level [`HopRole::Descend`] transfer: the **parent** node
+/// (the entry's ledger signer) credits its own `Parent` asset account and the
+/// named `child`'s liability account in one `[Parent:+amount, Child:+amount]`
+/// hop. Unlike [`IssueRequest`] (a boundary op that raises a child against
+/// external backing), it is a balanced transfer that leaves the derived equity
+/// unchanged, so a non-root ledger can use it to establish the parent/child
+/// mirrors of the linked ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrefundRequest {
+    /// The node extending the prefund; also the entry's ledger signer (the
+    /// parent).
+    pub node: NodeId,
+    /// The child account to credit.
+    pub child: NodeId,
+    /// Amount to prefund.
+    pub amount: Amount,
+    /// Per-cascade replay nonce (consumed once by Phase D).
+    pub nonce: u64,
+    /// Unix-style expiry; valid while `now <= expiry`.
+    pub expiry: u64,
+}
+
+impl PrefundRequest {
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        encode_node_id(out, &self.node);
+        encode_node_id(out, &self.child);
+        out.extend_from_slice(&self.amount.get().to_le_bytes());
+        out.extend_from_slice(&self.nonce.to_le_bytes());
+        out.extend_from_slice(&self.expiry.to_le_bytes());
+    }
+
+    /// The canonical request bytes (the preimage of [`Self::hash`]).
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, LedgerError> {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        Ok(out)
+    }
+
+    /// The domain-separated request hash
+    /// (`cawala-ledger/prefund-request/v1`).
+    pub fn hash(&self) -> Hash {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        derive_order_hash(PREFUND_CONTEXT, &out)
+    }
+
+    /// Authorise this request with an operator key, producing an [`AuthRef`].
+    ///
+    /// The signature is over [`Self::hash`]'s bytes, so it cannot be replayed
+    /// as a different order kind.
+    pub fn authorize(&self, operator: &OperatorSecretKey) -> Result<AuthRef, LedgerError> {
+        let request_hash = self.hash();
+        Ok(AuthRef {
+            operator: operator.public(),
+            nonce: self.nonce,
+            order_hash: request_hash,
+            signature: operator.sign(request_hash.as_bytes()),
+        })
+    }
+}
+
 /// For `Direct` transfers, the debited child must be `order.from` and the
 /// credited child must be `order.to`.
 ///
@@ -350,7 +415,7 @@ pub fn verify_issue(
         return Err(LedgerError::LedgerMismatch);
     }
 
-    let EntryBody::Issue { account, amount } = &signed.entry.body else {
+    let EntryBody::Issue { child, amount } = &signed.entry.body else {
         return Err(LedgerError::InvalidEntryShape);
     };
     let auth = signed
@@ -368,15 +433,101 @@ pub fn verify_issue(
     }
     require_no_expiry(request.expiry, now)?;
 
-    match account {
-        AccountRef::Child(id) if id == &request.account => {}
-        _ => return Err(LedgerError::InvalidEntryShape),
+    if child != &request.account {
+        return Err(LedgerError::InvalidEntryShape);
     }
     if *amount != request.amount {
         return Err(LedgerError::InvalidEntryShape);
     }
 
     auth.operator.verify(order_hash.as_bytes(), &auth.signature)
+}
+
+/// Verify that a signed prefund entry carries a valid authorisation for
+/// `request`.
+///
+/// A prefund keeps the strict node-level binding (like an issue): the entry
+/// must be signed by the ledger of `request.node`. Requires, in order:
+/// [`Entry::check_conservation`] passes; the entry verifies under a registered
+/// ledger key and that signer is `request.node` (else
+/// [`LedgerError::LedgerMismatch`]); the body is
+/// `Transfer { role: Descend }`; `auth` is present and its operator matches the
+/// signer's; the body `payment_id` commits to `request.hash()`;
+/// `order_hash`/`nonce` match the request; the request is unexpired; the body
+/// amount matches and the single credited `Child` leg is `request.child`; and
+/// the operator signature verifies over `request.hash()`'s bytes under
+/// `auth.operator`.
+///
+/// # Replay
+///
+/// No replay enforcement; the caller consumes `request.hash()` once.
+pub fn verify_prefund(
+    signed: &SignedEntry,
+    request: &PrefundRequest,
+    registry: &PeerRegistry,
+    now: u64,
+) -> Result<(), LedgerError> {
+    // Reject a malformed entry before trusting any operator material.
+    signed.entry.check_conservation()?;
+    let signer = registry.verify_entry(signed)?;
+    if signer.node_id != request.node {
+        return Err(LedgerError::LedgerMismatch);
+    }
+
+    let EntryBody::Transfer {
+        payment_id,
+        amount,
+        role: HopRole::Descend,
+        ..
+    } = &signed.entry.body
+    else {
+        return Err(LedgerError::InvalidEntryShape);
+    };
+    let auth = signed
+        .entry
+        .auth
+        .as_ref()
+        .ok_or(LedgerError::MissingAuthorization)?;
+    if auth.operator != signer.operator {
+        return Err(LedgerError::Unauthorized);
+    }
+
+    let request_hash = request.hash();
+    // The body must commit to the presented request. `check_conservation`
+    // already ties `payment_id` to `auth.order_hash`; binding it to
+    // `request.hash()` directly makes the requirement explicit and independent
+    // of the auth binding (mirroring `verify_transfer`).
+    if *payment_id != request_hash {
+        return Err(LedgerError::InvalidEntryShape);
+    }
+    if auth.order_hash != request_hash || auth.nonce != request.nonce {
+        return Err(LedgerError::OrderMismatch);
+    }
+    require_no_expiry(request.expiry, now)?;
+
+    // A `Descend` shape guarantees exactly one credited child; bind it to
+    // `request.child`.
+    let deltas = aggregate_deltas(&signed.entry.postings)?;
+    let mut credited = None;
+    for (account, delta) in &deltas {
+        if let AccountRef::Child(id) = account
+            && *delta > 0
+        {
+            if credited.is_some() {
+                return Err(LedgerError::InvalidEntryShape);
+            }
+            credited = Some(id);
+        }
+    }
+    match credited {
+        Some(id) if id == &request.child => {}
+        _ => return Err(LedgerError::InvalidEntryShape),
+    }
+    if *amount != request.amount {
+        return Err(LedgerError::InvalidEntryShape);
+    }
+
+    auth.operator.verify(request_hash.as_bytes(), &auth.signature)
 }
 
 /// Verify that a signed burn entry carries a valid authorisation for
@@ -407,7 +558,7 @@ pub fn verify_burn(
         return Err(LedgerError::LedgerMismatch);
     }
 
-    let EntryBody::Burn { account, amount } = &signed.entry.body else {
+    let EntryBody::Burn { child, amount } = &signed.entry.body else {
         return Err(LedgerError::InvalidEntryShape);
     };
     let auth = signed
@@ -425,9 +576,8 @@ pub fn verify_burn(
     }
     require_no_expiry(request.expiry, now)?;
 
-    match account {
-        AccountRef::Child(id) if id == &request.account => {}
-        _ => return Err(LedgerError::InvalidEntryShape),
+    if child != &request.account {
+        return Err(LedgerError::InvalidEntryShape);
     }
     if *amount != request.amount {
         return Err(LedgerError::InvalidEntryShape);
@@ -514,10 +664,7 @@ mod tests {
         amount: Amount,
         auth: Option<AuthRef>,
     ) -> SignedEntry {
-        let postings = vec![
-            child_posting(account, amount.get() as i64),
-            posting(AccountRef::Equity, -(amount.get() as i64)),
-        ];
+        let postings = vec![child_posting(account, amount.get() as i64)];
         let entry = Entry {
             ledger_id: ledger_key.public(),
             seq: 0,
@@ -525,7 +672,7 @@ mod tests {
             prev_hash: Hash::ZERO,
             issued_at: 0,
             body: EntryBody::Issue {
-                account: AccountRef::Child(child(account)),
+                child: child(account),
                 amount,
             },
             postings,
@@ -1062,7 +1209,7 @@ mod tests {
             prev_hash: Hash::ZERO,
             issued_at: 0,
             body: EntryBody::Issue {
-                account: AccountRef::Child(child("a")),
+                child: child("a"),
                 amount: request.amount,
             },
             postings: vec![],
@@ -1072,6 +1219,299 @@ mod tests {
         assert_eq!(
             verify_issue(&signed, &request, &registry, 50),
             Err(LedgerError::InvalidEntryShape)
+        );
+    }
+
+    fn prefund_request() -> PrefundRequest {
+        PrefundRequest {
+            node: child("alice"),
+            child: child("a"),
+            amount: Amount::new(25),
+            nonce: 3,
+            expiry: 200,
+        }
+    }
+
+    /// A canonical `Descend` prefund entry for `request` signed by `ledger_key`.
+    fn valid_prefund(ledger_key: &LedgerSecretKey, request: &PrefundRequest) -> SignedEntry {
+        let auth = request.authorize(&operator(1)).unwrap();
+        transfer_entry(
+            ledger_key,
+            request.hash(),
+            request.amount,
+            HopRole::Descend,
+            vec![
+                posting(AccountRef::Parent, request.amount.get() as i64),
+                child_posting(request.child.as_str(), request.amount.get() as i64),
+            ],
+            Some(auth),
+        )
+    }
+
+    #[test]
+    fn valid_prefund_is_accepted() {
+        let op = operator(1);
+        let ledger_key = ledger(11);
+        let registry = registry_with(&[("alice", &op, &ledger_key)]);
+        let request = prefund_request();
+        let signed = valid_prefund(&ledger_key, &request);
+        assert_eq!(verify_prefund(&signed, &request, &registry, 50), Ok(()));
+    }
+
+    #[test]
+    fn prefund_rejects_wrong_or_missing_operator() {
+        let other = operator(2);
+        let ledger_key = ledger(11);
+        let request = prefund_request();
+        let signed = valid_prefund(&ledger_key, &request);
+
+        // Registered operator for alice is a different key.
+        let registry = registry_with(&[("alice", &other, &ledger_key)]);
+        assert_eq!(
+            verify_prefund(&signed, &request, &registry, 50),
+            Err(LedgerError::Unauthorized)
+        );
+
+        // Unregistered signer.
+        let empty = PeerRegistry::new();
+        assert_eq!(
+            verify_prefund(&signed, &request, &empty, 50),
+            Err(LedgerError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn prefund_rejects_unregistered_and_mismatched_ledger() {
+        let op = operator(1);
+        let request = prefund_request();
+        let auth = request.authorize(&op).unwrap();
+        let postings = || {
+            vec![
+                posting(AccountRef::Parent, 25),
+                child_posting("a", 25),
+            ]
+        };
+
+        // Unregistered signer.
+        let registry = registry_with(&[("alice", &op, &ledger(11))]);
+        let signed = transfer_entry(
+            &ledger(22),
+            request.hash(),
+            request.amount,
+            HopRole::Descend,
+            postings(),
+            Some(auth.clone()),
+        );
+        assert_eq!(
+            verify_prefund(&signed, &request, &registry, 50),
+            Err(LedgerError::Unauthorized)
+        );
+
+        // Signed by bob's ledger while alice authorises.
+        let bob = operator(2);
+        let registry = registry_with(&[("alice", &op, &ledger(11)), ("bob", &bob, &ledger(22))]);
+        let signed = transfer_entry(
+            &ledger(22),
+            request.hash(),
+            request.amount,
+            HopRole::Descend,
+            postings(),
+            Some(auth),
+        );
+        assert_eq!(
+            verify_prefund(&signed, &request, &registry, 50),
+            Err(LedgerError::LedgerMismatch)
+        );
+    }
+
+    #[test]
+    fn prefund_rejects_nonce_mismatch_and_stale_hash() {
+        let op = operator(1);
+        let ledger_key = ledger(11);
+        let registry = registry_with(&[("alice", &op, &ledger_key)]);
+        let request = prefund_request();
+        let postings = || vec![posting(AccountRef::Parent, 25), child_posting("a", 25)];
+
+        let mut auth = request.authorize(&op).unwrap();
+        auth.nonce += 1;
+        let signed = transfer_entry(
+            &ledger_key,
+            request.hash(),
+            request.amount,
+            HopRole::Descend,
+            postings(),
+            Some(auth),
+        );
+        assert_eq!(
+            verify_prefund(&signed, &request, &registry, 50),
+            Err(LedgerError::OrderMismatch)
+        );
+
+        // A stale `order_hash` must be mirrored by `payment_id` so the transfer
+        // invariant is satisfied. The explicit body-hash binding rejects the
+        // stale hash as an invalid entry shape before the order-binding check.
+        let stale = Hash::from_bytes([1u8; 32]);
+        let mut auth = request.authorize(&op).unwrap();
+        auth.order_hash = stale;
+        let signed = transfer_entry(
+            &ledger_key,
+            stale,
+            request.amount,
+            HopRole::Descend,
+            postings(),
+            Some(auth),
+        );
+        assert_eq!(
+            verify_prefund(&signed, &request, &registry, 50),
+            Err(LedgerError::InvalidEntryShape)
+        );
+    }
+
+    #[test]
+    fn prefund_rejects_payment_id_disagreeing_with_request() {
+        let op = operator(1);
+        let ledger_key = ledger(11);
+        let registry = registry_with(&[("alice", &op, &ledger_key)]);
+
+        // The entry commits to `r1` (`payment_id == auth.order_hash ==
+        // r1.hash()`), but is verified against a different request `r2`. The
+        // body-hash binding must reject it before the auth binding is reached.
+        let r1 = prefund_request();
+        let r2 = PrefundRequest {
+            nonce: r1.nonce + 1,
+            ..r1.clone()
+        };
+        assert_ne!(r1.hash(), r2.hash());
+        let signed = valid_prefund(&ledger_key, &r1);
+        assert_eq!(
+            verify_prefund(&signed, &r2, &registry, 50),
+            Err(LedgerError::InvalidEntryShape)
+        );
+    }
+
+    #[test]
+    fn prefund_rejects_expiry_amount_and_child() {
+        let op = operator(1);
+        let ledger_key = ledger(11);
+        let registry = registry_with(&[("alice", &op, &ledger_key)]);
+        let request = prefund_request();
+        let auth = request.authorize(&op).unwrap();
+
+        // Expired.
+        let signed = valid_prefund(&ledger_key, &request);
+        assert_eq!(
+            verify_prefund(&signed, &request, &registry, request.expiry + 1),
+            Err(LedgerError::OrderExpired)
+        );
+
+        // Amount mismatch (postings stay canonical for the body amount).
+        let signed = transfer_entry(
+            &ledger_key,
+            request.hash(),
+            Amount::new(26),
+            HopRole::Descend,
+            vec![posting(AccountRef::Parent, 26), child_posting("a", 26)],
+            Some(auth.clone()),
+        );
+        assert_eq!(
+            verify_prefund(&signed, &request, &registry, 50),
+            Err(LedgerError::InvalidEntryShape)
+        );
+
+        // Wrong credited child.
+        let signed = transfer_entry(
+            &ledger_key,
+            request.hash(),
+            request.amount,
+            HopRole::Descend,
+            vec![posting(AccountRef::Parent, 25), child_posting("b", 25)],
+            Some(auth),
+        );
+        assert_eq!(
+            verify_prefund(&signed, &request, &registry, 50),
+            Err(LedgerError::InvalidEntryShape)
+        );
+    }
+
+    #[test]
+    fn prefund_rejects_non_descend_role_and_missing_auth() {
+        let op = operator(1);
+        let ledger_key = ledger(11);
+        let registry = registry_with(&[("alice", &op, &ledger_key)]);
+        let request = prefund_request();
+
+        // A valid `Ascend` signed for the same request is the wrong body role.
+        let auth = request.authorize(&op).unwrap();
+        let signed = transfer_entry(
+            &ledger_key,
+            request.hash(),
+            request.amount,
+            HopRole::Ascend,
+            vec![posting(AccountRef::Parent, -25), child_posting("a", -25)],
+            Some(auth),
+        );
+        assert_eq!(
+            verify_prefund(&signed, &request, &registry, 50),
+            Err(LedgerError::InvalidEntryShape)
+        );
+
+        // Missing auth is rejected by conservation before any operator check.
+        let signed = transfer_entry(
+            &ledger_key,
+            request.hash(),
+            request.amount,
+            HopRole::Descend,
+            vec![posting(AccountRef::Parent, 25), child_posting("a", 25)],
+            None,
+        );
+        assert_eq!(
+            verify_prefund(&signed, &request, &registry, 50),
+            Err(LedgerError::MissingAuthorization)
+        );
+    }
+
+    #[test]
+    fn prefund_issue_and_order_hashes_are_domain_separated() {
+        // Identical field values across the three request kinds must not
+        // collide: each kind uses its own derive-key context.
+        let prefund = PrefundRequest {
+            node: child("alice"),
+            child: child("a"),
+            amount: Amount::new(25),
+            nonce: 7,
+            expiry: 200,
+        };
+        let issue = IssueRequest {
+            node: child("alice"),
+            account: child("a"),
+            amount: Amount::new(25),
+            nonce: 7,
+            expiry: 200,
+        };
+        let order = PaymentOrder {
+            from: child("alice"),
+            to: child("a"),
+            amount: Amount::new(25),
+            nonce: 7,
+            expiry: 200,
+        };
+        assert_ne!(prefund.hash(), issue.hash());
+        assert_ne!(prefund.hash(), order.hash());
+        assert_ne!(issue.hash(), order.hash());
+    }
+
+    #[test]
+    fn authorize_prefund_round_trips_over_the_hash() {
+        let op = operator(1);
+        let request = prefund_request();
+        let auth = request.authorize(&op).unwrap();
+        assert_eq!(auth.operator, op.public());
+        assert_eq!(auth.nonce, request.nonce);
+        assert_eq!(auth.order_hash, request.hash());
+        assert_eq!(
+            auth.operator
+                .verify(request.hash().as_bytes(), &auth.signature),
+            Ok(())
         );
     }
 
@@ -1091,10 +1531,7 @@ mod tests {
         amount: Amount,
         auth: Option<AuthRef>,
     ) -> SignedEntry {
-        let postings = vec![
-            child_posting(account, -(amount.get() as i64)),
-            posting(AccountRef::Equity, amount.get() as i64),
-        ];
+        let postings = vec![child_posting(account, -(amount.get() as i64))];
         let entry = Entry {
             ledger_id: ledger_key.public(),
             seq: 0,
@@ -1102,7 +1539,7 @@ mod tests {
             prev_hash: Hash::ZERO,
             issued_at: 0,
             body: EntryBody::Burn {
-                account: AccountRef::Child(child(account)),
+                child: child(account),
                 amount,
             },
             postings,

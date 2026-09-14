@@ -35,12 +35,22 @@ use cawala_ledger::{
     Amount, AuthRef, BalanceAttestation, Hash, HopRole, LedgerPubKey, NodeId, PaymentOrder,
     SignedCommitment,
 };
+use proto::OctAddr;
 
 use crate::MsgId;
 
 /// Wire version of the ledger payload, prefixed to every
 /// [`LedgerPayloadV1::to_bytes`] encoding.
 pub const LEDGER_PAYLOAD_VERSION: u8 = 1;
+
+/// Wire version of the v2 ledger payload, prefixed to every
+/// [`LedgerPayloadV2::to_bytes`] encoding.
+///
+/// A separate constant (and prefix byte) keeps the frozen v1 bytes and
+/// [`LEDGER_PAYLOAD_VERSION`] untouched: an old client reads a v2 frame's first
+/// byte and cleanly rejects it with
+/// [`LedgerPayloadError::UnsupportedVersion`].
+pub const LEDGER_PAYLOAD_V2_VERSION: u8 = 2;
 
 /// Maximum receipt history length a caller should accept, in `ValueNoticeV1`
 /// entries. This is a use-site bound; decoding never truncates.
@@ -234,6 +244,96 @@ fn codec_error(err: postcard::Error) -> LedgerPayloadError {
     LedgerPayloadError::Codec(err.to_string())
 }
 
+/// A versioned **v2** ledger payload.
+///
+/// Variant order is frozen. v2 exists because [`LedgerPayloadV1`] cannot be
+/// extended in place (positional postcard): a new variant requires a new
+/// version-prefixed type. Replies remain v1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LedgerPayloadV2 {
+    /// Browser -> leaf: submit an operator-signed order with the payee's
+    /// address, so the leaf can route a cross-subtree settlement.
+    Order(OrderV2),
+}
+
+impl LedgerPayloadV2 {
+    /// Encode with the [`LEDGER_PAYLOAD_V2_VERSION`] prefix followed by the
+    /// postcard body.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, LedgerPayloadError> {
+        let body = postcard::to_allocvec(self).map_err(codec_error)?;
+        let mut out = Vec::with_capacity(body.len() + 1);
+        out.push(LEDGER_PAYLOAD_V2_VERSION);
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Decode a version-prefixed v2 payload.
+    ///
+    /// Rejects an empty buffer, a non-v2 version, a truncated or invalid body,
+    /// and any trailing bytes after the body. Never panics on arbitrary input.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, LedgerPayloadError> {
+        let (version, body) = bytes
+            .split_first()
+            .ok_or_else(|| LedgerPayloadError::Codec("empty ledger payload".to_string()))?;
+        if *version != LEDGER_PAYLOAD_V2_VERSION {
+            return Err(LedgerPayloadError::UnsupportedVersion(*version));
+        }
+        decode_body(body)
+    }
+}
+
+/// Browser -> leaf: an operator-signed order plus the payee's address.
+///
+/// Field order is frozen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderV2 {
+    /// The order the payer's operator signed.
+    pub order: PaymentOrder,
+    /// The operator binding that travels with the order.
+    pub auth: AuthRef,
+    /// The payee's user `OctAddr`, needed to derive the settlement route.
+    pub payee_addr: OctAddr,
+}
+
+/// A ledger payload of any known version, for version-dispatching callers.
+// Non-wire Rust wrapper; variant sizes differ, so allow the sized-difference lint.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionedLedgerPayload {
+    /// A [`LEDGER_PAYLOAD_VERSION`] payload.
+    V1(LedgerPayloadV1),
+    /// A [`LEDGER_PAYLOAD_V2_VERSION`] payload.
+    V2(LedgerPayloadV2),
+}
+
+/// Decode a version-prefixed ledger payload of either known version.
+///
+/// An unknown version (including a future one) is rejected with
+/// [`LedgerPayloadError::UnsupportedVersion`], so an old client never
+/// misinterprets a newer frame.
+pub fn decode_versioned(bytes: &[u8]) -> Result<VersionedLedgerPayload, LedgerPayloadError> {
+    let (version, body) = bytes
+        .split_first()
+        .ok_or_else(|| LedgerPayloadError::Codec("empty ledger payload".to_string()))?;
+    match *version {
+        LEDGER_PAYLOAD_VERSION => Ok(VersionedLedgerPayload::V1(decode_body(body)?)),
+        LEDGER_PAYLOAD_V2_VERSION => Ok(VersionedLedgerPayload::V2(decode_body(body)?)),
+        other => Err(LedgerPayloadError::UnsupportedVersion(other)),
+    }
+}
+
+/// Decode a postcard body, rejecting trailing bytes.
+fn decode_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, LedgerPayloadError> {
+    match postcard::take_from_bytes::<T>(body) {
+        Ok((value, [])) => Ok(value),
+        Ok((_, rest)) => Err(LedgerPayloadError::Codec(format!(
+            "{} trailing byte(s) after ledger payload",
+            rest.len()
+        ))),
+        Err(err) => Err(codec_error(err)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +373,20 @@ mod tests {
                 expiry: 100,
             },
             auth: auth(),
+        }
+    }
+
+    fn sample_order_v2() -> OrderV2 {
+        OrderV2 {
+            order: PaymentOrder {
+                from: node("alice"),
+                to: node("bob"),
+                amount: Amount::new(7),
+                nonce: 5,
+                expiry: 100,
+            },
+            auth: auth(),
+            payee_addr: "0.2.4".parse().expect("valid octal address"),
         }
     }
 
@@ -483,6 +597,61 @@ mod tests {
     const GOLDEN_ORDER: &str = "010005616c69636503626f6207056417cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
     const GOLDEN_ORDER_RESULT: &str = "01011111111111111111111111111111111122222222222222222222222222222222222222222222222222222222222222220001030155555555555555555555555555555555555555555555555555555555555555550000";
     const GOLDEN_BALANCE_RECEIPT: &str = "010301111111111111111111111111111111110109d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873704726f6f7403626f62d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737070377777777777777777777777777777777777777777777777777777777777777770102019999999999999999999999999999999999999999999999999999999999999999d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787370303666666666666666666666666666666666666666666666666666666666666666677777777777777777777777777777777777777777777777777777777777777778888888888888888888888888888888888888888888888888888888888888888d209b5f3b3be6445c4b4e4e8f2e91e8850065645823451661488532ae7c8910024087d553915e793a513d50e59857e5a2c5df02de5111360835f659fba46095a670f01035555555555555555555555555555555555555555555555555555555555555555222222222222222222222222222222222222222222222222222222222222222205616c69636503626f620703d20901035555555555555555555555555555555555555555555555555555555555555555222222222222222222222222222222222222222222222222222222222222222205616c69636503626f620703d209";
+
+    #[test]
+    fn v2_order_round_trips_and_is_versioned_separately() {
+        let payload = LedgerPayloadV2::Order(sample_order_v2());
+        let bytes = payload.to_bytes().unwrap();
+        assert_eq!(bytes[0], LEDGER_PAYLOAD_V2_VERSION);
+        assert_ne!(LEDGER_PAYLOAD_V2_VERSION, LEDGER_PAYLOAD_VERSION);
+        assert_eq!(LedgerPayloadV2::from_bytes(&bytes).unwrap(), payload);
+
+        // An old v1 reader rejects a v2 frame cleanly.
+        assert_eq!(
+            LedgerPayloadV1::from_bytes(&bytes),
+            Err(LedgerPayloadError::UnsupportedVersion(LEDGER_PAYLOAD_V2_VERSION))
+        );
+        // A v2 reader rejects a v1 frame cleanly.
+        let v1 = LedgerPayloadV1::Order(sample_order()).to_bytes().unwrap();
+        assert_eq!(
+            LedgerPayloadV2::from_bytes(&v1),
+            Err(LedgerPayloadError::UnsupportedVersion(LEDGER_PAYLOAD_VERSION))
+        );
+    }
+
+    #[test]
+    fn decode_versioned_dispatches_both_versions() {
+        let v1 = LedgerPayloadV1::Order(sample_order());
+        let v1_bytes = v1.to_bytes().unwrap();
+        assert_eq!(
+            decode_versioned(&v1_bytes).unwrap(),
+            VersionedLedgerPayload::V1(v1)
+        );
+
+        let v2 = LedgerPayloadV2::Order(sample_order_v2());
+        let v2_bytes = v2.to_bytes().unwrap();
+        assert_eq!(
+            decode_versioned(&v2_bytes).unwrap(),
+            VersionedLedgerPayload::V2(v2)
+        );
+
+        // Unknown / future version and empty buffer are rejected.
+        assert_eq!(
+            decode_versioned(&[LEDGER_PAYLOAD_V2_VERSION + 1]),
+            Err(LedgerPayloadError::UnsupportedVersion(3))
+        );
+        assert!(decode_versioned(&[]).is_err());
+
+        // Truncated and trailing bytes are rejected for each version.
+        for valid in [&v1_bytes, &v2_bytes] {
+            for cut in 0..valid.len() {
+                assert!(decode_versioned(&valid[..cut]).is_err());
+            }
+            let mut trailing = valid.clone();
+            trailing.push(0);
+            assert!(decode_versioned(&trailing).is_err());
+        }
+    }
 
     fn to_hex(bytes: &[u8]) -> String {
         let mut out = String::with_capacity(bytes.len() * 2);

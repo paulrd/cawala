@@ -11,16 +11,17 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::account::{
-    AccountRef, NodeId, Posting, aggregate_deltas, class_sums, postings_conserve,
-};
+use crate::account::{AccountRef, NodeId, Posting, PostingRule, aggregate_deltas, check_posting_rule};
 use crate::amount::Amount;
 use crate::error::LedgerError;
 use crate::hash::Hash;
 use crate::keys::{LedgerId, LedgerPubKey, LedgerSecretKey, OperatorPubKey, Signature};
 
 /// Version prefix of [`Entry::canonical_bytes`]. Bump on any format change.
-pub const ENTRY_FORMAT_VERSION: u8 = 2;
+///
+/// v3 removed the `Equity` account and made `Issue`/`Burn` child-only boundary
+/// operations (`account: AccountRef` -> `child: NodeId`).
+pub const ENTRY_FORMAT_VERSION: u8 = 3;
 
 /// The position of a transfer hop within the LCA settlement cascade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -73,8 +74,9 @@ pub enum EntryBody {
         /// Whether the child is a node or a user.
         kind: cawala_topology::ChildKind,
     },
-    /// A value transfer that conserves equity. The exact accounts moved are
-    /// fixed by [`HopRole`] and validated by [`Entry::check_conservation`].
+    /// A value transfer. The exact accounts moved are fixed by [`HopRole`] and
+    /// validated by [`Entry::check_conservation`]; the set is **balanced**
+    /// (`ΔParent == ΔΣChild`), so it leaves the derived equity unchanged.
     Transfer {
         /// Correlates the hops of one payment.
         payment_id: Hash,
@@ -83,19 +85,26 @@ pub enum EntryBody {
         /// The hop's position in the settlement cascade.
         role: HopRole,
     },
-    /// Create value into a child account against equity:
-    /// `[account:+amount, Equity:−amount]`.
+    /// Create value into a child's liability account:
+    /// `{Child(child):+amount}`.
+    ///
+    /// A **boundary** operation: it is exempt from the balance equation and
+    /// mints value backed by external real-world assets (out of scope). It
+    /// lowers the node's derived equity `Parent − ΣChild`.
     Issue {
-        /// The credited account (must be `Child(_)`).
-        account: AccountRef,
+        /// The credited child account (must be one child).
+        child: NodeId,
         /// The amount created (must be `> 0`).
         amount: Amount,
     },
-    /// Destroy value from a child account against equity:
-    /// `[account:−amount, Equity:+amount]`.
+    /// Destroy value from a child's liability account:
+    /// `{Child(child):−amount}`.
+    ///
+    /// A **boundary** operation: exempt from the balance equation and
+    /// externally backed. It raises the node's derived equity.
     Burn {
-        /// The debited account (must be `Child(_)`).
-        account: AccountRef,
+        /// The debited child account (must be one child).
+        child: NodeId,
         /// The amount destroyed (must be `> 0`).
         amount: Amount,
     },
@@ -109,6 +118,21 @@ pub enum EntryBody {
         /// The operator's authorisation signature.
         operator_sig: Signature,
     },
+}
+
+impl EntryBody {
+    /// The posting rule this body must obey (a pure function of the body).
+    ///
+    /// `Issue`/`Burn` are child-only boundary operations, exempt from the
+    /// balance equation; every other body is balanced. This is deliberately
+    /// **body-keyed, not rootness-keyed**, so it is deterministic under dynamic
+    /// attach/detach.
+    pub(crate) fn posting_rule(&self) -> PostingRule {
+        match self {
+            EntryBody::Issue { .. } | EntryBody::Burn { .. } => PostingRule::Boundary,
+            _ => PostingRule::Balanced,
+        }
+    }
 }
 
 /// One ledger entry.
@@ -146,23 +170,29 @@ impl Entry {
         )
     }
 
-    /// Validate the posting set against the double-entry rules **and** the
-    /// canonical shape declared by the body.
+    /// Validate the posting set against the per-entry rule **and** the canonical
+    /// shape declared by the body.
     ///
-    /// First checks the raw posting sum
-    /// `Σdelta(Parent) − Σdelta(Child) − Σdelta(Equity) == 0` (in `i128`),
-    /// then binds the body to the postings:
+    /// The rule is a pure function of the body ([`EntryBody::posting_rule`]) and
+    /// is enforced through the shared [`check_posting_rule`] helper, so
+    /// append-time validation, [`Balances::apply`], and
+    /// [`Balances::apply_boundary`] cannot drift:
     ///
-    /// - `Transfer { amount, role }`: `amount > 0`, `Δequity == 0`, and,
-    ///   per role:
+    /// - `Transfer` / `OpenAccount`: **balanced**, `ΔParent == ΔΣChild`.
+    /// - `Issue` / `Burn`: **boundary**, exactly one `Child` leg, exempt from
+    ///   the balance equation.
+    ///
+    /// The body/postings binding is then checked:
+    ///
+    /// - `Transfer { amount, role }`: `amount > 0`, and, per role:
     ///   - `Ascend`: exactly `[Parent:−amount, Child(_):−amount]`;
     ///   - `Descend`: exactly `[Parent:+amount, Child(_):+amount]`;
     ///   - `Direct`/`Lca`: exactly two distinct `Child(_)` postings, one
-    ///     `+amount` and one `−amount`, with no `Parent`/`Equity` leg.
-    /// - `Issue { account, amount }`: `account` is `Child(_)`, `amount > 0`,
-    ///   exactly `[account:+amount, Equity:−amount]`.
-    /// - `Burn { account, amount }`: `account` is `Child(_)`, `amount > 0`,
-    ///   exactly `[account:−amount, Equity:+amount]`.
+    ///     `+amount` and one `−amount`, with no `Parent` leg.
+    /// - `Issue { child, amount }`: `amount > 0`, exactly
+    ///   `[{Child(child):+amount}]`.
+    /// - `Burn { child, amount }`: `amount > 0`, exactly
+    ///   `[{Child(child):−amount}]`.
     /// - `OpenAccount`: postings must be empty (opening is a pure account
     ///   creation; the zero balance is materialized by [`crate::log::Ledger::append`]).
     /// - `RotateLedgerKey`: [`LedgerError::Unsupported`] in Phase A.
@@ -197,27 +227,22 @@ impl Entry {
         }
 
         let deltas = aggregate_deltas(&self.postings)?;
-        let (delta_parent, delta_child, delta_equity) = class_sums(&deltas)?;
-        postings_conserve(delta_parent, delta_child, delta_equity)?;
-        self.validate_shape(&deltas, delta_equity)
+        check_posting_rule(&deltas, self.body.posting_rule())?;
+        self.validate_shape(&deltas)
     }
 
     /// Enforce the canonical posting shape for the declared body.
-    fn validate_shape(
-        &self,
-        deltas: &BTreeMap<AccountRef, i128>,
-        delta_equity: i128,
-    ) -> Result<(), LedgerError> {
+    fn validate_shape(&self, deltas: &BTreeMap<AccountRef, i128>) -> Result<(), LedgerError> {
         match &self.body {
             EntryBody::OpenAccount { .. } => {
-                if !self.postings.is_empty() || delta_equity != 0 {
+                if !self.postings.is_empty() {
                     return Err(LedgerError::InvalidEntryShape);
                 }
                 Ok(())
             }
             EntryBody::Transfer { amount, role, .. } => {
                 let amount = amount.get() as i128;
-                if amount == 0 || delta_equity != 0 {
+                if amount == 0 {
                     return Err(LedgerError::InvalidEntryShape);
                 }
                 let parent = deltas.get(&AccountRef::Parent).copied().unwrap_or(0);
@@ -256,34 +281,29 @@ impl Entry {
                     Err(LedgerError::InvalidEntryShape)
                 }
             }
-            EntryBody::Issue { account, amount } => {
+            EntryBody::Issue { child, amount } => {
                 let amount = amount.get() as i128;
                 if amount == 0 {
                     return Err(LedgerError::InvalidEntryShape);
                 }
-                if !matches!(account, AccountRef::Child(_)) {
-                    return Err(LedgerError::InvalidEntryShape);
-                }
-                if deltas.len() == 2
-                    && deltas.get(account).copied() == Some(amount)
-                    && deltas.get(&AccountRef::Equity).copied() == Some(-amount)
+                if deltas.len() == 1
+                    && deltas.get(&AccountRef::Child(child.clone())).copied() == Some(amount)
                 {
                     Ok(())
                 } else {
                     Err(LedgerError::InvalidEntryShape)
                 }
             }
-            EntryBody::Burn { account, amount } => {
+            EntryBody::Burn { child, amount } => {
                 let amount = amount.get() as i128;
                 if amount == 0 {
                     return Err(LedgerError::InvalidEntryShape);
                 }
-                if !matches!(account, AccountRef::Child(_)) {
-                    return Err(LedgerError::InvalidEntryShape);
-                }
-                if deltas.len() == 2
-                    && deltas.get(account).copied() == Some(-amount)
-                    && deltas.get(&AccountRef::Equity).copied() == Some(amount)
+                if deltas.len() == 1
+                    && deltas
+                        .get(&AccountRef::Child(child.clone()))
+                        .copied()
+                        == Some(-amount)
                 {
                     Ok(())
                 } else {
@@ -515,11 +535,11 @@ mod tests {
                 role: HopRole::Direct,
             },
             EntryBody::Issue {
-                account: AccountRef::Child(child("a")),
+                child: child("a"),
                 amount: Amount::ZERO,
             },
             EntryBody::Burn {
-                account: AccountRef::Child(child("a")),
+                child: child("a"),
                 amount: Amount::ZERO,
             },
         ] {
@@ -540,10 +560,10 @@ mod tests {
             auth: Some(auth()),
             ..base(
                 EntryBody::Issue {
-                    account: AccountRef::Child(child("a")),
+                    child: child("a"),
                     amount: Amount::new(100),
                 },
-                vec![child_posting("a", 100), posting(AccountRef::Equity, -100)],
+                vec![child_posting("a", 100)],
             )
         };
         assert_eq!(issue.check_conservation(), Ok(()));
@@ -552,30 +572,46 @@ mod tests {
             auth: Some(auth()),
             ..base(
                 EntryBody::Burn {
-                    account: AccountRef::Child(child("a")),
+                    child: child("a"),
                     amount: Amount::new(40),
                 },
-                vec![child_posting("a", -40), posting(AccountRef::Equity, 40)],
+                vec![child_posting("a", -40)],
             )
         };
         assert_eq!(burn.check_conservation(), Ok(()));
     }
 
     #[test]
-    fn issue_to_non_child_account_is_rejected() {
-        // This posting set conserves, so only the account-kind rule rejects it.
-        let entry = Entry {
+    fn issue_rejects_non_child_only_shapes() {
+        // A `Parent` leg is not allowed on a boundary op.
+        let parent_leg = Entry {
             auth: Some(auth()),
             ..base(
                 EntryBody::Issue {
-                    account: AccountRef::Parent,
+                    child: child("a"),
                     amount: Amount::new(100),
                 },
-                vec![posting(AccountRef::Parent, 100), child_posting("a", 100)],
+                vec![child_posting("a", 100), posting(AccountRef::Parent, 100)],
             )
         };
         assert_eq!(
-            entry.check_conservation(),
+            parent_leg.check_conservation(),
+            Err(LedgerError::InvalidEntryShape)
+        );
+
+        // An extra child leg is not allowed.
+        let extra_leg = Entry {
+            auth: Some(auth()),
+            ..base(
+                EntryBody::Issue {
+                    child: child("a"),
+                    amount: Amount::new(100),
+                },
+                vec![child_posting("a", 100), child_posting("b", 100)],
+            )
+        };
+        assert_eq!(
+            extra_leg.check_conservation(),
             Err(LedgerError::InvalidEntryShape)
         );
     }
@@ -586,10 +622,10 @@ mod tests {
             auth: Some(auth()),
             ..base(
                 EntryBody::Issue {
-                    account: AccountRef::Child(child("a")),
+                    child: child("a"),
                     amount: Amount::new(100),
                 },
-                vec![child_posting("a", 99), posting(AccountRef::Equity, -99)],
+                vec![child_posting("a", 99)],
             )
         };
         assert_eq!(
@@ -602,10 +638,10 @@ mod tests {
     fn missing_auth_is_rejected() {
         let issue = base(
             EntryBody::Issue {
-                account: AccountRef::Child(child("a")),
+                child: child("a"),
                 amount: Amount::new(10),
             },
-            vec![child_posting("a", 10), posting(AccountRef::Equity, -10)],
+            vec![child_posting("a", 10)],
         );
         assert_eq!(
             issue.check_conservation(),
@@ -640,13 +676,13 @@ mod tests {
 
     #[test]
     fn open_account_rejects_any_postings() {
-        // Non-zero postings.
+        // Non-zero balanced postings.
         let nonzero = base(
             EntryBody::OpenAccount {
                 child: child("a"),
                 kind: cawala_topology::ChildKind::User,
             },
-            vec![child_posting("a", 1), posting(AccountRef::Equity, -1)],
+            vec![child_posting("a", 1), child_posting("b", -1)],
         );
         assert_eq!(
             nonzero.check_conservation(),
@@ -791,10 +827,10 @@ mod tests {
                 "issue",
                 golden_entry(
                     EntryBody::Issue {
-                        account: AccountRef::Child(child("a")),
+                        child: child("a"),
                         amount,
                     },
-                    vec![child_posting("a", 7), posting(AccountRef::Equity, -7)],
+                    vec![child_posting("a", 7)],
                     Some(golden_auth()),
                 ),
             ),
@@ -802,10 +838,10 @@ mod tests {
                 "burn",
                 golden_entry(
                     EntryBody::Burn {
-                        account: AccountRef::Child(child("a")),
+                        child: child("a"),
                         amount,
                     },
-                    vec![child_posting("a", -7), posting(AccountRef::Equity, 7)],
+                    vec![child_posting("a", -7)],
                     Some(golden_auth()),
                 ),
             ),
@@ -837,14 +873,14 @@ mod tests {
         }
     }
 
-    const GOLDEN_OPEN_ACCOUNT: &str = "02d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d209000161000000";
-    const GOLDEN_TRANSFER_ASCEND: &str = "02d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d209012222222222222222222222222222222222222222222222222222222222222222070002000d0101610d0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
-    const GOLDEN_TRANSFER_LCA: &str = "02d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d2090122222222222222222222222222222222222222222222222222222222222222220701020101610d0101620e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
-    const GOLDEN_TRANSFER_DESCEND: &str = "02d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d209012222222222222222222222222222222222222222222222222222222222222222070202000e0101610e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
-    const GOLDEN_TRANSFER_DIRECT: &str = "02d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d2090122222222222222222222222222222222222222222222222222222222222222220703020101610d0101620e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
-    const GOLDEN_ISSUE: &str = "02d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d2090201016107020101610e020d0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
-    const GOLDEN_BURN: &str = "02d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d2090301016107020101610d020e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
-    const GOLDEN_ROTATE: &str = "02d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d20904c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242647ee6334067ec8141217bfe87e83ea3a89dbc91b2f615c993275bae5eeab0557e12f5f62257a1eef97ba76f68d2cf83379ebc7c2f0071998f9539d523cd1a090000";
+    const GOLDEN_OPEN_ACCOUNT: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d209000161000000";
+    const GOLDEN_TRANSFER_ASCEND: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d209012222222222222222222222222222222222222222222222222222222222222222070002000d0101610d0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
+    const GOLDEN_TRANSFER_LCA: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d2090122222222222222222222222222222222222222222222222222222222222222220701020101610d0101620e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
+    const GOLDEN_TRANSFER_DESCEND: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d209012222222222222222222222222222222222222222222222222222222222222222070202000e0101610e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
+    const GOLDEN_TRANSFER_DIRECT: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d2090122222222222222222222222222222222222222222222222222222222222222220703020101610d0101620e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
+    const GOLDEN_ISSUE: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d20902016107010101610e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
+    const GOLDEN_BURN: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d20903016107010101610d0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
+    const GOLDEN_ROTATE: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d20904c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242647ee6334067ec8141217bfe87e83ea3a89dbc91b2f615c993275bae5eeab0557e12f5f62257a1eef97ba76f68d2cf83379ebc7c2f0071998f9539d523cd1a090000";
     const AUTH_REF_GOLDEN: &str = "17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
 
     fn to_hex(bytes: &[u8]) -> String {
@@ -923,10 +959,10 @@ mod tests {
             auth: Some(auth()),
             ..base(
                 EntryBody::Issue {
-                    account: AccountRef::Child(child("a")),
+                    child: child("a"),
                     amount: Amount::new(10),
                 },
-                vec![child_posting("a", 10), posting(AccountRef::Equity, -10)],
+                vec![child_posting("a", 10)],
             )
         };
         let mut signed = SignedEntry::sign(entry, &key).unwrap();

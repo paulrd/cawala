@@ -24,6 +24,7 @@ pub mod ledger_service;
 pub mod ledger_store;
 pub mod msg;
 pub mod record;
+pub mod settlement;
 
 pub use control::{
     ControlHandler, ControlNode, spawn_control_node, spawn_control_node_on, spawn_control_only,
@@ -32,13 +33,17 @@ pub use control::{
 pub use control_store::{ControlStore, OUTBOUND_JOIN_FILE, OutboundJoin, PENDING_JOINS_FILE};
 pub use ledger_keys::{LEDGER_KEY_FILE, load_or_create_ledger_key, persist_ledger_key};
 pub use ledger_peers::{PEERS_FILE, load_peers, save_peers};
-pub use ledger_service::{ApplyOutcome, LedgerService};
+pub use ledger_service::{ApplyOutcome, HopOutcome, LedgerService};
 pub use ledger_store::{
-    FileLog, LEDGER_FORMAT_VERSION, LedgerMeta, load_or_create_meta, open_ledger,
+    FileLog, LEDGER_FORMAT_VERSION, LedgerLock, LedgerMeta, load_or_create_meta, open_ledger,
 };
 pub use msg::{
     MSG_ALPN, MsgConfig, MsgHandler, MsgSendError, RoutableSnapshot, RoutingSetupError,
     build_envelope, send_envelope, spawn_msg_node, spawn_msg_node_on,
+};
+pub use settlement::{
+    DerivedHop, MAX_PENDING, MAX_TERMINAL, PendingSettlement, SettlementManager, TerminalRecord,
+    derive_hop, expected_signers, route_is_depth_one,
 };
 
 /// Bind an endpoint with the given persisted [`iroh::SecretKey`] and start the

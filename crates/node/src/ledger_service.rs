@@ -15,7 +15,7 @@
 //! `<data-dir>/ledger/entries.log` plus the node's ledger signing key. Unlike
 //! the pure ledger crate it is synchronous and native; it is **not** wasm-safe.
 //!
-//! # Resync
+//! # Resync and writer serialization
 //!
 //! `control approve` and `ledger fund` run as separate processes that append to
 //! the same ledger file while a node is running. The in-memory ledger and the
@@ -27,13 +27,14 @@
 //! re-reads and replays the whole log first (via the private
 //! `refresh_from_disk`). Full replay is cheap at value v1.
 //!
-//! **Remaining v1 limitation:** resyncing serializes this service against
-//! entries another process has *already flushed*, but provides no mutual
-//! exclusion between two *concurrent* appenders. There is no OS file lock, so
-//! two writers that both resync, both build at the same `seq`, and both append
-//! can still interleave and publish a divergent `seq`/`prev_hash` (or leave a
-//! torn tail, which replay discards). Closing that race needs a file lock or a
-//! single-writer discipline; it is out of scope for this fix.
+//! **Writer serialization:** each mutating transaction (refresh + append) holds
+//! the exclusive advisory lock on `<data-dir>/ledger/.lock`
+//! ([`crate::ledger_store::LedgerLock`]); authoritative reads take it shared.
+//! Two writers — a live node and operator CLI processes — can therefore no
+//! longer interleave at the same `seq` and publish a divergent chain. A
+//! contended `try_lock` fails fast (surfaced as `Internal` from
+//! [`apply_order`](LedgerService::apply_order)/[`apply_hop`](LedgerService::apply_hop))
+//! rather than waiting; the transaction windows are short.
 //!
 //! # Replay protection
 //!
@@ -62,8 +63,9 @@ use anyhow::{Context, Result, bail};
 use cawala_ledger::{
     AccountRef, Amount, AuthRef, BalanceAttestation, Entry, EntryBody, Hash, HopRole, IssueRequest,
     Ledger, LedgerError, LedgerPubKey, LedgerSecretKey, NodeId, OperatorPubKey, OperatorSecretKey,
-    PaymentOrder, PeerKeys, PeerRegistry, PeerRole, Posting, SignedAmount, SignedCommitment,
-    SignedEntry, attest_balance, build_commitment, entry_hash, verify_issue, verify_transfer,
+    PaymentOrder, PeerKeys, PeerRegistry, PeerRole, Posting, PrefundRequest, SignedAmount,
+    SignedCommitment, SignedEntry, attest_balance, build_commitment, entry_hash, hop_postings,
+    verify_issue, verify_prefund, verify_transfer,
 };
 use cawala_msg::{
     BalanceReceiptV1, MAX_RECEIPT_HISTORY, MsgId, OrderRejectV1, OrderStatusV1, ValueNoticeV1,
@@ -73,8 +75,8 @@ use cawala_topology::ChildKind;
 use crate::identity;
 use crate::ledger_keys::load_or_create_ledger_key;
 use crate::ledger_peers::load_peers;
-use crate::ledger_store::{FileLog, init_ledger, open_ledger};
-use crate::record::NodeRecord;
+use crate::ledger_store::{FileLog, LedgerLock, init_ledger, open_ledger};
+use crate::record::{NodeRecord, RecordStore};
 
 /// The result of applying one [`PaymentOrder`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,13 +102,42 @@ impl ApplyOutcome {
     }
 }
 
-/// A leaf node's ledger: the replayed log, its signing key, and the
-/// `payment_id` replay guard.
+/// The result of applying one hop of a cross-subtree settlement cascade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HopOutcome {
+    /// The hop was appended at `seq` with entry `hash`.
+    Applied {
+        /// The appended entry's sequence number.
+        seq: u64,
+        /// The appended entry's hash.
+        hash: Hash,
+    },
+    /// This node already applied `order.hash()`; the original entry's
+    /// `(seq, hash)` is returned and nothing is appended.
+    Duplicate {
+        /// The previously applied entry's sequence number.
+        seq: u64,
+        /// The previously applied entry's hash.
+        hash: Hash,
+    },
+    /// The hop was rejected; nothing was appended.
+    Rejected {
+        /// The rejection reason.
+        reason: OrderRejectV1,
+    },
+}
+
+/// A leaf node's ledger: the replayed log, its signing key, the derived
+/// control-plane rootness, and the `payment_id` replay guard.
 pub struct LedgerService {
     data_dir: PathBuf,
     node_id: String,
     ledger: Ledger<FileLog>,
     key: LedgerSecretKey,
+    /// Whether this node currently has no parent link (control-plane only).
+    /// Derived from `node.json` on every load/refresh and never persisted; it
+    /// does **not** gate ledger validity.
+    is_root: bool,
     /// `payment_id -> (entry seq, entry hash)` for every applied transfer.
     consumed: ConsumedIndex,
 }
@@ -125,6 +156,7 @@ impl LedgerService {
             node_id: node_id.to_string(),
             ledger,
             key,
+            is_root: derive_is_root(data_dir, node_id),
             consumed,
         })
     }
@@ -132,6 +164,10 @@ impl LedgerService {
     /// Replay `data_dir`'s ledger for `node_id`/`key` and rebuild the replay
     /// guard. Shared by [`open`](Self::open) and `refresh_from_disk` so the two
     /// load paths cannot drift.
+    ///
+    /// Rootness is **not** plumbed into the ledger: the `Parent` account is
+    /// structurally universal, so a log replays identically regardless of
+    /// attachment. Rootness is derived separately as a control-plane fact.
     fn load(
         data_dir: &Path,
         node_id: &str,
@@ -145,21 +181,46 @@ impl LedgerService {
         Ok((ledger, consumed))
     }
 
-    /// Re-read the on-disk ledger, replacing the in-memory ledger and replay
-    /// guard with the authoritative replayed state.
+    /// Re-read the on-disk ledger, replacing the in-memory ledger, derived
+    /// rootness, and replay guard with the authoritative replayed state.
     ///
     /// External processes append to `<data-dir>/ledger/entries.log` while a
     /// node runs, so mutations and authoritative reads call this first. The
     /// signing key is loaded once in [`open`](Self::open) and is **not**
     /// regenerated or rotated here.
     ///
-    /// This does not lock the file: two *concurrent* appenders can still race
-    /// between their resync and append (see the module-level "Resync" note).
+    /// # Locking
+    ///
+    /// This private helper does **not** take the ledger lock itself; it is only
+    /// safe while the caller holds the per-transaction lock. Every public
+    /// mutator ([`ensure_account_open`](Self::ensure_account_open),
+    /// [`fund`](Self::fund), [`prefund`](Self::prefund),
+    /// [`apply_order`](Self::apply_order), [`apply_hop`](Self::apply_hop)) holds
+    /// the exclusive lock across its whole refresh-and-append, and
+    /// [`balance_receipt`](Self::balance_receipt) holds the shared lock across
+    /// its refresh-and-attest, so two writers can no longer race between resync
+    /// and append.
     fn refresh_from_disk(&mut self) -> Result<()> {
         let (ledger, consumed) = Self::load(&self.data_dir, &self.node_id, &self.key)?;
         self.ledger = ledger;
+        self.is_root = derive_is_root(&self.data_dir, &self.node_id);
         self.consumed = consumed;
         Ok(())
+    }
+
+    /// Acquire the shared ledger lock, retrying once on contention.
+    ///
+    /// Authoritative reads are best-effort within a short transaction window, so
+    /// a single bounded retry avoids silently degrading a receipt to `None` when
+    /// a writer's lock is momentarily held.
+    fn acquire_shared_read_lock(&self) -> Result<LedgerLock> {
+        match LedgerLock::acquire_shared(&self.data_dir) {
+            Ok(lock) => Ok(lock),
+            Err(first) => {
+                tracing::warn!(%first, "ledger read lock contention; retrying once");
+                LedgerLock::acquire_shared(&self.data_dir)
+            }
+        }
     }
 
     /// This node's id.
@@ -167,9 +228,32 @@ impl LedgerService {
         &self.node_id
     }
 
+    /// Whether this node is currently top-level (its record has no parent
+    /// link).
+    ///
+    /// This is a **control-plane** fact only: the ledger itself always carries
+    /// a universal `Parent` account, so this never gates ledger validity. It is
+    /// re-derived from `node.json` on every load/refresh, so an attach/detach at
+    /// runtime is picked up on the next refresh.
+    pub fn is_root(&self) -> bool {
+        self.is_root
+    }
+
     /// The replayed ledger (read access for inspection/commitments).
     pub fn ledger(&self) -> &Ledger<FileLog> {
         &self.ledger
+    }
+
+    /// A copy of the accepted entry at `seq`.
+    ///
+    /// Used by the settlement relay to recover the entry it appended (e.g. the
+    /// `Duplicate` path, where the append already happened on a prior attempt).
+    pub fn entry_at(&self, seq: u64) -> Result<SignedEntry, LedgerError> {
+        self.ledger
+            .get(seq as usize)?
+            .ok_or(LedgerError::MissingEntry {
+                index: seq as usize,
+            })
     }
 
     /// This node's ledger public key.
@@ -189,6 +273,7 @@ impl LedgerService {
     /// `Ok(false)` when the account was already open (regardless of the `kind`
     /// it was opened with).
     pub fn ensure_account_open(&mut self, child: &NodeId, kind: ChildKind) -> Result<bool> {
+        let _lock = LedgerLock::acquire_exclusive(&self.data_dir)?;
         self.refresh_from_disk()?;
         self.ensure_account_open_inner(child, kind)
     }
@@ -221,8 +306,14 @@ impl LedgerService {
         Ok(true)
     }
 
-    /// Issue `amount` into `to`'s account against equity, authorized by the
-    /// node operator key.
+    /// Issue `amount` into `to`'s account, authorized by the node operator key.
+    ///
+    /// A child-only boundary operation (`{Child(child):+amount}`): it mints
+    /// value backed by the node's external real-world assets (out of scope) and
+    /// does not post equity — the node's equity is derived `Parent − ΣChild`.
+    /// Any node may adjust the accounts it holds for its children (R2), whether
+    /// or not it currently has a parent link. `kind` selects the child account
+    /// kind (a user leaf child or a node child).
     ///
     /// This is an **explicit operator act**: every call issues value again (the
     /// ledger has no per-issue replay guard), which is why it is deliberately
@@ -237,6 +328,7 @@ impl LedgerService {
     pub fn fund(
         &mut self,
         to: &NodeId,
+        kind: ChildKind,
         amount: u64,
         operator: &OperatorSecretKey,
         nonce: u64,
@@ -245,8 +337,9 @@ impl LedgerService {
         if amount == 0 {
             bail!("amount must be greater than zero");
         }
+        let _lock = LedgerLock::acquire_exclusive(&self.data_dir)?;
         self.refresh_from_disk()?;
-        self.ensure_account_open_inner(to, ChildKind::User)?;
+        self.ensure_account_open_inner(to, kind)?;
 
         let request = IssueRequest {
             node: NodeId::from(self.node_id.clone()),
@@ -267,19 +360,13 @@ impl LedgerService {
             prev_hash: self.ledger.head_hash(),
             issued_at: now,
             body: EntryBody::Issue {
-                account: AccountRef::Child(to.clone()),
+                child: to.clone(),
                 amount: Amount::new(amount),
             },
-            postings: vec![
-                Posting {
-                    account: AccountRef::Child(to.clone()),
-                    delta: SignedAmount::new(amount_i64),
-                },
-                Posting {
-                    account: AccountRef::Equity,
-                    delta: SignedAmount::new(-amount_i64),
-                },
-            ],
+            postings: vec![Posting {
+                account: AccountRef::Child(to.clone()),
+                delta: SignedAmount::new(amount_i64),
+            }],
             auth: Some(auth),
         };
         let signed = SignedEntry::sign(entry, &self.key)?;
@@ -288,6 +375,103 @@ impl LedgerService {
 
         let hash = entry_hash(&signed.entry)?;
         self.ledger.append(signed)?;
+        Ok((seq, hash))
+    }
+
+    /// Extend `amount` from this node's parent account into `child`'s account,
+    /// authorized by the node operator key.
+    ///
+    /// This is the linked-ledger partner of a parent's [`fund`](Self::fund):
+    /// it appends a `Descend` transfer with postings
+    /// `[Parent:+amount, Child(child):+amount]`, so the node's `Parent` asset
+    /// mirrors its parent's `Child(this node)` liability while the child's
+    /// liability is credited. It mints no equity.
+    ///
+    /// The **ledger** permits a `Descend` at any node (the `Parent` account is
+    /// universal). This service applies a **policy** guard: a top-level node
+    /// (`is_root()`) is refused, because a detached `Descend` would write an
+    /// unattributable self-claim with no parent to mirror it.
+    ///
+    /// `kind` selects the child account kind and `child`'s account is opened
+    /// first if needed. A replay (an identical `PrefundRequest`) is rejected
+    /// **before** anything is appended, including the account-opening entry.
+    /// The `PrefundRequest` is authorized by `operator` and the signed entry is
+    /// re-verified with [`verify_prefund`] against the effective registry before
+    /// it is appended. The request's `payment_id` is recorded in the replay
+    /// guard.
+    ///
+    /// `nonce` and `now` are caller-supplied; the request is valid while
+    /// `now <= expiry` (with `expiry = now + 3600`).
+    ///
+    /// Returns the appended entry's `(seq, hash)`.
+    pub fn prefund(
+        &mut self,
+        child: &NodeId,
+        kind: ChildKind,
+        amount: u64,
+        operator: &OperatorSecretKey,
+        nonce: u64,
+        now: u64,
+    ) -> Result<(u64, Hash)> {
+        if amount == 0 {
+            bail!("amount must be greater than zero");
+        }
+        let _lock = LedgerLock::acquire_exclusive(&self.data_dir)?;
+        self.refresh_from_disk()?;
+        if self.is_root() {
+            bail!(
+                "this node is a root (top-level): a Descend prefund would write an unattributable \
+                 self-claim; use `ledger fund` to issue into a child account"
+            );
+        }
+
+        let request = PrefundRequest {
+            node: NodeId::from(self.node_id.clone()),
+            child: child.clone(),
+            amount: Amount::new(amount),
+            nonce,
+            expiry: now.saturating_add(3600),
+        };
+        if self.consumed.contains_key(&request.hash()) {
+            bail!("prefund request {nonce} was already applied");
+        }
+        self.ensure_account_open_inner(child, kind)?;
+
+        let auth = request.authorize(operator)?;
+        let amount_i64 =
+            i64::try_from(amount).context("amount exceeds the ledger's signed range")?;
+
+        let seq = self.ledger.len() as u64;
+        let entry = Entry {
+            ledger_id: self.key.public(),
+            seq,
+            height: seq,
+            prev_hash: self.ledger.head_hash(),
+            issued_at: now,
+            body: EntryBody::Transfer {
+                payment_id: request.hash(),
+                amount: Amount::new(amount),
+                role: HopRole::Descend,
+            },
+            postings: vec![
+                Posting {
+                    account: AccountRef::Parent,
+                    delta: SignedAmount::new(amount_i64),
+                },
+                Posting {
+                    account: AccountRef::Child(child.clone()),
+                    delta: SignedAmount::new(amount_i64),
+                },
+            ],
+            auth: Some(auth),
+        };
+        let signed = SignedEntry::sign(entry, &self.key)?;
+        let registry = self.effective_registry()?;
+        verify_prefund(&signed, &request, &registry, now)?;
+
+        let hash = entry_hash(&signed.entry)?;
+        self.ledger.append(signed)?;
+        self.consumed.insert(request.hash(), (seq, hash));
         Ok((seq, hash))
     }
 
@@ -319,6 +503,15 @@ impl LedgerService {
         record: &NodeRecord,
         now: u64,
     ) -> ApplyOutcome {
+        // Serialize the whole refresh+append transaction against other writers
+        // (a running node or CLI process). Contention is an internal error.
+        let _lock = match LedgerLock::acquire_exclusive(&self.data_dir) {
+            Ok(lock) => lock,
+            Err(err) => {
+                tracing::warn!(%err, "ledger write lock contention; rejecting order");
+                return ApplyOutcome::rejected(OrderRejectV1::Internal);
+            }
+        };
         if self.refresh_from_disk().is_err() {
             return ApplyOutcome::rejected(OrderRejectV1::Internal);
         }
@@ -399,6 +592,126 @@ impl LedgerService {
         }
     }
 
+    /// Apply one hop of a cross-subtree settlement cascade.
+    ///
+    /// `role` and `first`/`second` are the hop's canonical shape for *this*
+    /// signer, derived from the route by [`cawala_ledger::classify_hop`] and
+    /// laid out by [`cawala_ledger::hop_postings`]. The caller supplies a
+    /// `registry` that contains this node's self row (so the entry's signer
+    /// resolves in [`verify_transfer`]) **and** the payer row (so
+    /// `order.from`'s operator can be checked against `auth.operator`); Phase 3
+    /// builds that registry from [`effective_registry`](Self::effective_registry)
+    /// plus the carried payer keys.
+    ///
+    /// Sequence:
+    ///
+    /// 1. refresh from disk (rebuilding the replay guard);
+    /// 2. structural preflight ([`OrderRejectV1::BadRequest`] for a self-payment
+    ///    or a zero amount);
+    /// 3. replay guard on `order.hash()` ([`HopOutcome::Duplicate`], no append);
+    /// 4. build the canonical entry through [`hop_postings`] and sign it;
+    /// 5. [`verify_transfer`] against `registry` (conservation, registered
+    ///    signer, payer-operator binding, expiry, `payment_id`, and amount);
+    /// 6. append, mapping ledger errors to [`HopOutcome::Rejected`];
+    /// 7. record the consumed `payment_id` and report [`HopOutcome::Applied`].
+    ///
+    /// On any rejection the ledger is left untouched and the `payment_id` is
+    /// **not** consumed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_hop(
+        &mut self,
+        order: &PaymentOrder,
+        auth: &AuthRef,
+        role: HopRole,
+        first: AccountRef,
+        second: AccountRef,
+        registry: &PeerRegistry,
+        now: u64,
+    ) -> HopOutcome {
+        // Serialize the whole refresh+append transaction against other writers
+        // (a running node or CLI process). Contention is an internal error.
+        let _lock = match LedgerLock::acquire_exclusive(&self.data_dir) {
+            Ok(lock) => lock,
+            Err(err) => {
+                tracing::warn!(%err, "ledger write lock contention; rejecting hop");
+                return HopOutcome::Rejected {
+                    reason: OrderRejectV1::Internal,
+                };
+            }
+        };
+        if self.refresh_from_disk().is_err() {
+            return HopOutcome::Rejected {
+                reason: OrderRejectV1::Internal,
+            };
+        }
+        if order.amount == Amount::ZERO || order.from == order.to {
+            return HopOutcome::Rejected {
+                reason: OrderRejectV1::BadRequest,
+            };
+        }
+
+        let payment_id = order.hash();
+        if let Some((seq, hash)) = self.consumed.get(&payment_id) {
+            return HopOutcome::Duplicate {
+                seq: *seq,
+                hash: *hash,
+            };
+        }
+
+        let Ok(amount_i64) = i64::try_from(order.amount.get()) else {
+            return HopOutcome::Rejected {
+                reason: OrderRejectV1::BadRequest,
+            };
+        };
+
+        let seq = self.ledger.len() as u64;
+        let entry = Entry {
+            ledger_id: self.key.public(),
+            seq,
+            height: seq,
+            prev_hash: self.ledger.head_hash(),
+            issued_at: now,
+            body: EntryBody::Transfer {
+                payment_id,
+                amount: order.amount,
+                role,
+            },
+            postings: hop_postings(role, &first, &second, amount_i64),
+            auth: Some(auth.clone()),
+        };
+
+        let signed = match SignedEntry::sign(entry, &self.key) {
+            Ok(signed) => signed,
+            Err(_) => {
+                return HopOutcome::Rejected {
+                    reason: OrderRejectV1::Internal,
+                };
+            }
+        };
+        if let Err(err) = verify_transfer(&signed, order, registry, now) {
+            return HopOutcome::Rejected {
+                reason: reject_reason(&err),
+            };
+        }
+
+        let hash = match entry_hash(&signed.entry) {
+            Ok(hash) => hash,
+            Err(_) => {
+                return HopOutcome::Rejected {
+                    reason: OrderRejectV1::Internal,
+                };
+            }
+        };
+        if let Err(err) = self.ledger.append(signed) {
+            return HopOutcome::Rejected {
+                reason: reject_reason(&err),
+            };
+        }
+
+        self.consumed.insert(payment_id, (seq, hash));
+        HopOutcome::Applied { seq, hash }
+    }
+
     /// Build a signed balance receipt for `user` from the current ledger head.
     ///
     /// The attestation is over the current state and the commitment's parent is
@@ -420,6 +733,7 @@ impl LedgerService {
         query_id: Option<u64>,
         notice: Option<ValueNoticeV1>,
     ) -> Result<BalanceReceiptV1> {
+        let _lock = self.acquire_shared_read_lock()?;
         self.refresh_from_disk()?;
         if child_kind(record, user) != Some(ChildKind::User) {
             bail!("'{user}' is not a user child of this leaf");
@@ -540,6 +854,19 @@ fn rebuild_consumed(ledger: &Ledger<FileLog>) -> Result<ConsumedIndex> {
         }
     }
     Ok(consumed)
+}
+
+/// Whether `node_id`'s ledger is a root: no readable `node.json`, or a record
+/// with no parent link. A missing or invalid record is treated as root so a
+/// bare data directory (e.g. a tempdir test) still gets a usable root ledger.
+///
+/// Public so the `ledger show`/`ledger verify` CLI paths derive rootness the
+/// same way [`LedgerService`] does.
+pub fn derive_is_root(data_dir: &Path, node_id: &str) -> bool {
+    match RecordStore::open(data_dir, node_id) {
+        Ok(store) => store.record().parent.is_none(),
+        Err(_) => true,
+    }
 }
 
 /// The `User` kind of `id` in `record`, if the leaf lists it.
@@ -680,7 +1007,7 @@ mod tests {
         service.ensure_account_open(&a, ChildKind::User).unwrap();
         service.ensure_account_open(&b, ChildKind::User).unwrap();
         let operator = node_operator(dir);
-        service.fund(&a, 100, &operator, 1, now).unwrap();
+        service.fund(&a, ChildKind::User, 100, &operator, 1, now).unwrap();
 
         let a_op = OperatorSecretKey::from_bytes([11u8; 32]);
         let b_op = OperatorSecretKey::from_bytes([12u8; 32]);
@@ -707,7 +1034,7 @@ mod tests {
         assert!(!service.ensure_account_open(&a, ChildKind::User).unwrap());
 
         let operator = node_operator(dir.path());
-        let (seq, _hash) = service.fund(&a, 100, &operator, 1, 1_000).unwrap();
+        let (seq, _hash) = service.fund(&a, ChildKind::User, 100, &operator, 1, 1_000).unwrap();
         assert_eq!(seq, 1, "seq 0 opens the account, seq 1 issues");
         assert_eq!(service.balance_of(&a), Amount::new(100));
         assert_eq!(service.ledger().len(), 2);
@@ -847,7 +1174,7 @@ mod tests {
         // Only A is opened and funded; B has a record entry but no account.
         service.ensure_account_open(&a, ChildKind::User).unwrap();
         let operator = node_operator(dir.path());
-        service.fund(&a, 100, &operator, 1, now).unwrap();
+        service.fund(&a, ChildKind::User, 100, &operator, 1, now).unwrap();
 
         let a_op = OperatorSecretKey::from_bytes([11u8; 32]);
         let b_op = OperatorSecretKey::from_bytes([12u8; 32]);
@@ -929,7 +1256,7 @@ mod tests {
             let mut external = LedgerService::open(dir.path(), NODE).unwrap();
             assert!(external.ensure_account_open(&a, ChildKind::User).unwrap());
             assert!(external.ensure_account_open(&b, ChildKind::User).unwrap());
-            external.fund(&a, 100, &operator, 1, now).unwrap();
+            external.fund(&a, ChildKind::User, 100, &operator, 1, now).unwrap();
         }
 
         let a_op = OperatorSecretKey::from_bytes([11u8; 32]);
@@ -987,7 +1314,7 @@ mod tests {
         {
             let mut external = LedgerService::open(dir.path(), NODE).unwrap();
             external.ensure_account_open(&a, ChildKind::User).unwrap();
-            external.fund(&a, 100, &operator, 1, now).unwrap();
+            external.fund(&a, ChildKind::User, 100, &operator, 1, now).unwrap();
         }
 
         let receipt = a_service
@@ -1004,7 +1331,7 @@ mod tests {
         // A second external issue is likewise reflected on the next receipt.
         {
             let mut external = LedgerService::open(dir.path(), NODE).unwrap();
-            external.fund(&a, 50, &operator, 2, now).unwrap();
+            external.fund(&a, ChildKind::User, 50, &operator, 2, now).unwrap();
         }
         let receipt = a_service
             .balance_receipt(&a, &record, None, None, None)
@@ -1088,5 +1415,432 @@ mod tests {
         );
         // The self row is in-memory only: the file was never written.
         assert!(!dir.path().join(crate::ledger_peers::PEERS_FILE).exists());
+    }
+
+    /// Write a `node.json` for `node_id` with a parent link, making the node
+    /// control-plane non-root on the next open.
+    fn attach_parent(dir: &Path, node_id: &str, parent_id: &str) {
+        let mut store = RecordStore::open(dir, node_id).unwrap();
+        store.set_parent(parent_id, 0).unwrap();
+        store.save().unwrap();
+    }
+
+    /// Clear `node_id`'s parent link, making the node control-plane top-level
+    /// again.
+    fn detach_parent(dir: &Path, node_id: &str) {
+        let mut store = RecordStore::open(dir, node_id).unwrap();
+        store.unset_parent().unwrap();
+        store.save().unwrap();
+    }
+
+    #[test]
+    fn root_fund_then_non_root_prefund_establishes_mirror() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let leaf_dir = tempfile::tempdir().unwrap();
+        let root_id = "root-node";
+        let leaf_id = "leaf-node";
+        let leaf = NodeId::from(leaf_id);
+        let a = user("user-a");
+
+        // Root issues 100 to the leaf (a node child).
+        let mut root = LedgerService::open(root_dir.path(), root_id).unwrap();
+        assert!(root.is_root());
+        let root_op = node_operator(root_dir.path());
+        root.fund(&leaf, ChildKind::Node, 100, &root_op, 1, 1_000)
+            .unwrap();
+        assert_eq!(root.balance_of(&leaf), Amount::new(100));
+
+        // The leaf gains a parent link and is now non-root.
+        attach_parent(leaf_dir.path(), leaf_id, root_id);
+        let mut leaf_service = LedgerService::open(leaf_dir.path(), leaf_id).unwrap();
+        assert!(!leaf_service.is_root());
+
+        // Leaf prefunds 100 to its user child via a `Descend`.
+        let leaf_op = node_operator(leaf_dir.path());
+        leaf_service
+            .prefund(&a, ChildKind::User, 100, &leaf_op, 1, 1_000)
+            .unwrap();
+        assert_eq!(leaf_service.balance_of(&a), Amount::new(100));
+        assert_eq!(
+            leaf_service.ledger().balances().parent_balance(),
+            Some(Amount::new(100))
+        );
+
+        // Mirror: the parent's Child(leaf) liability equals the leaf's Parent
+        // asset.
+        assert_eq!(
+            root.balance_of(&leaf),
+            leaf_service
+                .ledger()
+                .balances()
+                .parent_balance()
+                .expect("leaf is non-root")
+        );
+
+        // Reopen both from disk and assert head/balances are stable.
+        let root_head = root.ledger().head_hash();
+        let root_len = root.ledger().len();
+        let leaf_head = leaf_service.ledger().head_hash();
+        let leaf_len = leaf_service.ledger().len();
+
+        let root2 = LedgerService::open(root_dir.path(), root_id).unwrap();
+        assert_eq!(root2.ledger().len(), root_len);
+        assert_eq!(root2.ledger().head_hash(), root_head);
+        assert_eq!(root2.balance_of(&leaf), Amount::new(100));
+
+        let mut leaf2 = LedgerService::open(leaf_dir.path(), leaf_id).unwrap();
+        assert!(!leaf2.is_root());
+        assert_eq!(leaf2.ledger().len(), leaf_len);
+        assert_eq!(leaf2.ledger().head_hash(), leaf_head);
+        assert_eq!(leaf2.balance_of(&a), Amount::new(100));
+        assert_eq!(
+            leaf2.ledger().balances().parent_balance(),
+            Some(Amount::new(100))
+        );
+
+        // A colliding prefund (same node/child/amount/nonce/expiry) is a replay.
+        let err = leaf2
+            .prefund(&a, ChildKind::User, 100, &leaf_op, 1, 1_000)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already applied"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(leaf2.ledger().len(), leaf_len, "replay must not append");
+    }
+
+    #[test]
+    fn non_root_fund_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf_id = "leaf-node";
+        attach_parent(dir.path(), leaf_id, "root-node");
+        let mut service = LedgerService::open(dir.path(), leaf_id).unwrap();
+        assert!(!service.is_root());
+
+        let a = user("user-a");
+        let b = user("user-b");
+        let leaf_op = node_operator(dir.path());
+        // R2: a parented node may still issue into a child (boundary op).
+        service
+            .fund(&a, ChildKind::User, 100, &leaf_op, 1, 1_000)
+            .unwrap();
+        assert_eq!(service.balance_of(&a), Amount::new(100));
+        assert_eq!(service.ledger().balances().equity(), -100);
+        // Issuing on a parented ledger never touches the Parent claim.
+        assert_eq!(
+            service.ledger().balances().parent_balance(),
+            Some(Amount::ZERO)
+        );
+
+        // A same-leaf Direct then spends it.
+        service.ensure_account_open(&b, ChildKind::User).unwrap();
+        let a_op = OperatorSecretKey::from_bytes([11u8; 32]);
+        let b_op = OperatorSecretKey::from_bytes([12u8; 32]);
+        register_users(dir.path(), &[("user-a", &a_op), ("user-b", &b_op)]);
+        let record = record_with(&["user-a", "user-b"]);
+        let payment = order(&a, &b, 30, 7, 1_100);
+        let auth = payment.authorize(&a_op).unwrap();
+        let outcome = service.apply_order(&payment, &auth, &a, &record, 1_000);
+        assert_eq!(
+            outcome.status,
+            OrderStatusV1::Applied,
+            "unexpected reason: {:?}",
+            outcome.reason
+        );
+        assert_eq!(service.balance_of(&a), Amount::new(70));
+        assert_eq!(service.balance_of(&b), Amount::new(30));
+
+        // Cross-subtree: an `Ascend` needs a prefunded parent edge. This node
+        // issued locally (Parent == 0), so the ascend overdraws `Parent` and is
+        // rejected without appending.
+        let len = service.ledger().len();
+        let ascend = order(&a, &b, 10, 8, 1_200);
+        let ascend_auth = ascend.authorize(&a_op).unwrap();
+        let registry = service.effective_registry().unwrap();
+        let outcome = service.apply_hop(
+            &ascend,
+            &ascend_auth,
+            HopRole::Ascend,
+            AccountRef::Parent,
+            AccountRef::Child(a.clone()),
+            &registry,
+            1_000,
+        );
+        assert_eq!(
+            outcome,
+            HopOutcome::Rejected {
+                reason: OrderRejectV1::InsufficientBalance
+            }
+        );
+        assert_eq!(service.ledger().len(), len, "rejected ascend must not append");
+    }
+
+    #[test]
+    fn root_prefund_is_rejected() {
+        // A top-level node has no parent to mirror a `Descend` against, so the
+        // service blocks it as a policy (the ledger itself permits it).
+        let root_dir = tempfile::tempdir().unwrap();
+        let mut root = LedgerService::open(root_dir.path(), "root-node").unwrap();
+        assert!(root.is_root());
+        let root_op = node_operator(root_dir.path());
+        let err = root
+            .prefund(&user("user-a"), ChildKind::User, 10, &root_op, 1, 1_000)
+            .unwrap_err();
+        assert!(err.to_string().contains("root"), "unexpected error: {err}");
+        assert_eq!(root.ledger().len(), 0, "rejected prefund must not append");
+    }
+
+    #[test]
+    fn fresh_ledger_has_a_zero_parent_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = LedgerService::open(dir.path(), "fresh-node").unwrap();
+        assert_eq!(
+            service.ledger().balances().parent_balance(),
+            Some(Amount::ZERO)
+        );
+        assert!(
+            service
+                .ledger()
+                .balances()
+                .accounts()
+                .any(|(account, _)| account == AccountRef::Parent),
+            "the Parent account is universal and enumerable"
+        );
+    }
+
+    #[test]
+    fn same_leaf_direct_applies_on_non_root_leaf_after_prefund() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf_id = "leaf-node";
+        attach_parent(dir.path(), leaf_id, "root-node");
+
+        let mut service = LedgerService::open(dir.path(), leaf_id).unwrap();
+        assert!(!service.is_root());
+        let a = user("user-a");
+        let b = user("user-b");
+        let leaf_op = node_operator(dir.path());
+        service
+            .prefund(&a, ChildKind::User, 100, &leaf_op, 1, 1_000)
+            .unwrap();
+        service.ensure_account_open(&b, ChildKind::User).unwrap();
+
+        let a_op = OperatorSecretKey::from_bytes([11u8; 32]);
+        let b_op = OperatorSecretKey::from_bytes([12u8; 32]);
+        register_users(dir.path(), &[("user-a", &a_op), ("user-b", &b_op)]);
+        let record = record_with(&["user-a", "user-b"]);
+
+        let payment = order(&a, &b, 30, 7, 1_100);
+        let auth = payment.authorize(&a_op).unwrap();
+        let outcome = service.apply_order(&payment, &auth, &a, &record, 1_000);
+        assert_eq!(
+            outcome.status,
+            OrderStatusV1::Applied,
+            "unexpected reason: {:?}",
+            outcome.reason
+        );
+        assert_eq!(service.balance_of(&a), Amount::new(70));
+        assert_eq!(service.balance_of(&b), Amount::new(30));
+        // The same-leaf move leaves the prefunded parent asset untouched.
+        assert_eq!(
+            service.ledger().balances().parent_balance(),
+            Some(Amount::new(100))
+        );
+    }
+
+    #[test]
+    fn root_to_non_root_transition_preserves_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf_id = "leaf-node";
+        let a = user("user-a");
+
+        // Append entries while top-level.
+        let (head, len) = {
+            let mut service = LedgerService::open(dir.path(), leaf_id).unwrap();
+            assert!(service.is_root());
+            assert_eq!(
+                service.ledger().balances().parent_balance(),
+                Some(Amount::ZERO)
+            );
+            service.ensure_account_open(&a, ChildKind::User).unwrap();
+            let op = node_operator(dir.path());
+            service
+                .fund(&a, ChildKind::User, 100, &op, 1, 1_000)
+                .unwrap();
+            (service.ledger().head_hash(), service.ledger().len())
+        };
+
+        // Attach: replay stays valid and the zero Parent claim appears.
+        attach_parent(dir.path(), leaf_id, "root-node");
+        let service = LedgerService::open(dir.path(), leaf_id).unwrap();
+        assert!(!service.is_root());
+        assert_eq!(service.ledger().len(), len);
+        assert_eq!(service.ledger().head_hash(), head);
+        assert_eq!(service.balance_of(&a), Amount::new(100));
+        assert_eq!(service.ledger().balances().equity(), -100);
+        assert_eq!(
+            service.ledger().balances().parent_balance(),
+            Some(Amount::ZERO)
+        );
+        let attached_head = service.ledger().head_hash();
+        let attached_len = service.ledger().len();
+
+        // Detach again: still replays, head/len stable, Parent preserved.
+        detach_parent(dir.path(), leaf_id);
+        let service = LedgerService::open(dir.path(), leaf_id).unwrap();
+        assert!(service.is_root());
+        assert_eq!(service.ledger().len(), attached_len);
+        assert_eq!(service.ledger().head_hash(), attached_head);
+        assert_eq!(service.balance_of(&a), Amount::new(100));
+        assert_eq!(
+            service.ledger().balances().parent_balance(),
+            Some(Amount::ZERO)
+        );
+    }
+
+    #[test]
+    fn attach_after_root_issue_then_prefund_mirrors_parent() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let leaf_dir = tempfile::tempdir().unwrap();
+        let leaf_id = "leaf-node";
+        let leaf = NodeId::from(leaf_id);
+        let a = user("user-a");
+        let b = user("user-b");
+
+        // An unattached leaf with root-`Issue` history (no Parent postings).
+        let (head, len) = {
+            let mut service = LedgerService::open(leaf_dir.path(), leaf_id).unwrap();
+            assert!(service.is_root());
+            assert_eq!(
+                service.ledger().balances().parent_balance(),
+                Some(Amount::ZERO)
+            );
+            service
+                .fund(
+                    &a,
+                    ChildKind::User,
+                    100,
+                    &node_operator(leaf_dir.path()),
+                    1,
+                    1_000,
+                )
+                .unwrap();
+            (service.ledger().head_hash(), service.ledger().len())
+        };
+
+        // The parent issues 50 to the leaf as a node child.
+        let mut parent = LedgerService::open(root_dir.path(), "root-node").unwrap();
+        let parent_op = node_operator(root_dir.path());
+        parent
+            .fund(&leaf, ChildKind::Node, 50, &parent_op, 1, 1_000)
+            .unwrap();
+        assert_eq!(parent.balance_of(&leaf), Amount::new(50));
+
+        // Attach: replay is stable and Parent is still zero.
+        attach_parent(leaf_dir.path(), leaf_id, "root-node");
+        let mut service = LedgerService::open(leaf_dir.path(), leaf_id).unwrap();
+        assert!(!service.is_root());
+        assert_eq!(service.ledger().len(), len);
+        assert_eq!(service.ledger().head_hash(), head);
+        assert_eq!(
+            service.ledger().balances().parent_balance(),
+            Some(Amount::ZERO)
+        );
+
+        // Prefund a child: Parent becomes > 0 and mirrors the parent's
+        // `Child(leaf)` liability.
+        service
+            .prefund(&b, ChildKind::User, 50, &node_operator(leaf_dir.path()), 1, 1_000)
+            .unwrap();
+        assert_eq!(service.balance_of(&b), Amount::new(50));
+        assert_eq!(
+            service.ledger().balances().parent_balance(),
+            Some(Amount::new(50))
+        );
+        assert_eq!(
+            parent.balance_of(&leaf),
+            service.ledger().balances().parent_balance().unwrap()
+        );
+
+        // Reopen both and assert stability.
+        let leaf_head = service.ledger().head_hash();
+        let leaf_len = service.ledger().len();
+        let leaf2 = LedgerService::open(leaf_dir.path(), leaf_id).unwrap();
+        assert!(!leaf2.is_root());
+        assert_eq!(leaf2.ledger().head_hash(), leaf_head);
+        assert_eq!(leaf2.ledger().len(), leaf_len);
+        assert_eq!(
+            leaf2.ledger().balances().parent_balance(),
+            Some(Amount::new(50))
+        );
+        assert_eq!(leaf2.balance_of(&b), Amount::new(50));
+        let parent2 = LedgerService::open(root_dir.path(), "root-node").unwrap();
+        assert_eq!(parent2.balance_of(&leaf), Amount::new(50));
+    }
+
+    #[test]
+    fn detach_after_attach_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf_id = "leaf-node";
+        attach_parent(dir.path(), leaf_id, "root-node");
+
+        let mut service = LedgerService::open(dir.path(), leaf_id).unwrap();
+        assert!(!service.is_root());
+        let a = user("user-a");
+        let b = user("user-b");
+        service
+            .prefund(&a, ChildKind::User, 100, &node_operator(dir.path()), 1, 1_000)
+            .unwrap();
+        service.ensure_account_open(&b, ChildKind::User).unwrap();
+
+        // Detach: the full history (including Parent postings) replays.
+        detach_parent(dir.path(), leaf_id);
+        let mut service = LedgerService::open(dir.path(), leaf_id).unwrap();
+        assert!(service.is_root());
+        assert_eq!(
+            service.ledger().balances().parent_balance(),
+            Some(Amount::new(100))
+        );
+        assert_eq!(service.balance_of(&a), Amount::new(100));
+
+        // A same-leaf Direct still applies on the detached ledger.
+        let a_op = OperatorSecretKey::from_bytes([11u8; 32]);
+        let b_op = OperatorSecretKey::from_bytes([12u8; 32]);
+        register_users(dir.path(), &[("user-a", &a_op), ("user-b", &b_op)]);
+        let record = record_with(&["user-a", "user-b"]);
+        let payment = order(&a, &b, 30, 7, 1_100);
+        let auth = payment.authorize(&a_op).unwrap();
+        let outcome = service.apply_order(&payment, &auth, &a, &record, 1_000);
+        assert_eq!(
+            outcome.status,
+            OrderStatusV1::Applied,
+            "unexpected reason: {:?}",
+            outcome.reason
+        );
+        assert_eq!(service.balance_of(&a), Amount::new(70));
+        assert_eq!(service.balance_of(&b), Amount::new(30));
+
+        // An Ascend hop that overdraws the stranded Parent claim is rejected
+        // with `InsufficientBalance` (the Parent account exists everywhere), and
+        // appends nothing.
+        let len = service.ledger().len();
+        let over = order(&a, &b, 150, 8, 1_200);
+        let over_auth = over.authorize(&a_op).unwrap();
+        let registry = service.effective_registry().unwrap();
+        let outcome = service.apply_hop(
+            &over,
+            &over_auth,
+            HopRole::Ascend,
+            AccountRef::Parent,
+            AccountRef::Child(a.clone()),
+            &registry,
+            1_000,
+        );
+        assert_eq!(
+            outcome,
+            HopOutcome::Rejected {
+                reason: OrderRejectV1::InsufficientBalance
+            }
+        );
+        assert_eq!(service.ledger().len(), len, "rejected hop must not append");
     }
 }

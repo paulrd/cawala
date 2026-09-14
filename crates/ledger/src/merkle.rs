@@ -156,10 +156,10 @@ pub fn entry_root(entries: &[SignedEntry]) -> Result<Hash, LedgerError> {
 
 /// The Merkle root over a node's current account state.
 ///
-/// Leaf order is defined by [`Balances::accounts`]: `Parent` (when present),
-/// then `Child` accounts in `NodeId` (BTreeMap) order — including zero
-/// balances — then `Equity`. The root is therefore deterministic and
-/// independent of the history that produced the balances.
+/// Leaf order is defined by [`Balances::accounts`]: `Parent` (universal), then
+/// `Child` accounts in `NodeId` (BTreeMap) order — including zero balances. The
+/// root is therefore deterministic and independent of the history that produced
+/// the balances.
 pub fn state_root(balances: &Balances) -> Hash {
     let leaves: Vec<Hash> = balances
         .accounts()
@@ -172,7 +172,7 @@ pub fn state_root(balances: &Balances) -> Hash {
 ///
 /// Returns `(index, proof)` where `index` is the account's position in
 /// [`Balances::accounts`] order. Returns [`LedgerError::IndexOutOfRange`] when
-/// the account is not present (an unopened child, or `Parent` at the root).
+/// the account is not present (an unopened child).
 pub fn state_inclusion_proof(
     balances: &Balances,
     account: &AccountRef,
@@ -359,31 +359,22 @@ mod tests {
         let mut a = Balances::new_non_root();
         a.open_account(&child("b")).unwrap();
         a.open_account(&child("a")).unwrap();
-        a.apply(&[
-            posting(AccountRef::Child(child("a")), 5),
-            posting(AccountRef::Equity, -5),
-        ])
-        .unwrap();
+        a.apply_boundary(&[posting(AccountRef::Child(child("a")), 5)])
+            .unwrap();
 
         let mut b = Balances::new_non_root();
         b.open_account(&child("a")).unwrap();
         b.open_account(&child("b")).unwrap();
-        b.apply(&[
-            posting(AccountRef::Child(child("a")), 5),
-            posting(AccountRef::Equity, -5),
-        ])
-        .unwrap();
+        b.apply_boundary(&[posting(AccountRef::Child(child("a")), 5)])
+            .unwrap();
 
         assert_eq!(state_root(&a), state_root(&b));
         assert_eq!(state_root(&a), state_root(&a.clone()));
 
         // A different balance changes the root.
         let mut c = a.clone();
-        c.apply(&[
-            posting(AccountRef::Child(child("a")), 1),
-            posting(AccountRef::Equity, -1),
-        ])
-        .unwrap();
+        c.apply_boundary(&[posting(AccountRef::Child(child("a")), 1)])
+            .unwrap();
         assert_ne!(state_root(&a), state_root(&c));
     }
 
@@ -393,10 +384,7 @@ mod tests {
         balances.open_account(&child("b")).unwrap();
         balances.open_account(&child("a")).unwrap();
         balances
-            .apply(&[
-                posting(AccountRef::Child(child("a")), 5),
-                posting(AccountRef::Equity, -5),
-            ])
+            .apply_boundary(&[posting(AccountRef::Child(child("a")), 5)])
             .unwrap();
 
         let root_hash = state_root(&balances);
@@ -414,12 +402,18 @@ mod tests {
             state_inclusion_proof(&balances, &AccountRef::Child(child("z"))),
             Err(LedgerError::IndexOutOfRange)
         );
-        // The root has no parent account.
+        // The Parent account is universal, so even a detached ledger has a
+        // Parent leaf and a proof for it.
         let root = Balances::new_root();
-        assert_eq!(
-            state_inclusion_proof(&root, &AccountRef::Parent),
-            Err(LedgerError::IndexOutOfRange)
-        );
+        let root_hash = state_root(&root);
+        let tree_size = root.accounts().count();
+        for (account, balance) in root.accounts() {
+            let (index, proof) = state_inclusion_proof(&root, &account).unwrap();
+            assert!(
+                verify_state_inclusion(&account, balance, index, tree_size, &proof, &root_hash),
+                "state proof failed for {account:?}"
+            );
+        }
     }
 
     proptest! {

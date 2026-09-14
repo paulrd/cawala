@@ -97,9 +97,9 @@ pub fn node_hash(left: &Hash, right: &Hash) -> Hash {
 
 /// Domain-separated state leaf hash for an account and its balance.
 ///
-/// `AccountRef` is encoded with an explicit tag and a length-prefixed child
-/// id; the balance is encoded as 16 little-endian bytes (i128), negative
-/// equity included.
+/// `AccountRef` is encoded with an explicit tag and a length-prefixed child id;
+/// the balance is encoded as 16 little-endian bytes (i128). There is no
+/// `Equity` tag: equity is derived, not an account.
 pub fn state_leaf_hash(account: &AccountRef, balance: i128) -> Hash {
     let mut hasher = blake3::Hasher::new_derive_key(STATE_CONTEXT);
     match account {
@@ -111,9 +111,6 @@ pub fn state_leaf_hash(account: &AccountRef, balance: i128) -> Hash {
             let id_bytes = id.as_str().as_bytes();
             hasher.update(&(id_bytes.len() as u32).to_le_bytes());
             hasher.update(id_bytes);
-        }
-        AccountRef::Equity => {
-            hasher.update(&[0x02]);
         }
     }
     hasher.update(&balance.to_le_bytes());
@@ -170,7 +167,7 @@ mod tests {
         assert_ne!(empty_tree_root(), Hash::ZERO);
         // Same input, different domains -> different outputs.
         assert_ne!(
-            state_leaf_hash(&AccountRef::Equity, 0),
+            state_leaf_hash(&AccountRef::Parent, 0),
             entry_hash(&sample_entry()).unwrap()
         );
     }
@@ -191,14 +188,12 @@ mod tests {
         let a = state_leaf_hash(&AccountRef::Parent, 0);
         let b = state_leaf_hash(&AccountRef::Child(NodeId::from("a")), 0);
         let c = state_leaf_hash(&AccountRef::Child(NodeId::from("b")), 0);
-        let d = state_leaf_hash(&AccountRef::Equity, 0);
         assert_eq!(a, state_leaf_hash(&AccountRef::Parent, 0));
         assert_ne!(a, b);
         assert_ne!(b, c);
-        assert_ne!(b, d);
         assert_ne!(
-            state_leaf_hash(&AccountRef::Equity, 0),
-            state_leaf_hash(&AccountRef::Equity, 1)
+            state_leaf_hash(&AccountRef::Child(NodeId::from("a")), 0),
+            state_leaf_hash(&AccountRef::Child(NodeId::from("a")), 1)
         );
     }
 

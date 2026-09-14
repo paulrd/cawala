@@ -7,12 +7,16 @@
 //! Covered invariants:
 //!
 //! - `root_accounting_identity_holds`: after every random issue/burn/transfer
-//!   the root identity `0 − Σchildren − equity == 0` holds, the model balances
-//!   match, overdraw is the only rejection, and the hash chain links cleanly.
+//!   the derived identity `equity == Parent − Σchildren` holds, the model
+//!   balances match, overdraw is the only rejection, and the hash chain links
+//!   cleanly.
 //! - `non_root_accounting_identity_holds`: the same for a non-root ledger
 //!   across all Ascend/Descend/LCA/Issue/Burn shapes.
-//! - `equity_tracks_issue_and_burn`: equity changes by exactly the issued and
-//!   burned amounts.
+//! - `equity_tracks_issue_and_burn`: derived equity changes by exactly the
+//!   issued and burned amounts.
+//!
+//! `Issue`/`Burn` are child-only boundary operations, so only `Parent`/`Child`
+//! non-negativity is enforced; equity is derived and `E < 0` is normal.
 
 use std::collections::BTreeMap;
 
@@ -136,26 +140,20 @@ impl Chain {
     fn issue(&mut self, account: &str, amount: u64) -> Result<(), LedgerError> {
         self.commit(
             EntryBody::Issue {
-                account: AccountRef::Child(child(account)),
+                child: child(account),
                 amount: Amount::new(amount),
             },
-            vec![
-                child_posting(account, amount as i64),
-                posting(AccountRef::Equity, -(amount as i64)),
-            ],
+            vec![child_posting(account, amount as i64)],
         )
     }
 
     fn burn(&mut self, account: &str, amount: u64) -> Result<(), LedgerError> {
         self.commit(
             EntryBody::Burn {
-                account: AccountRef::Child(child(account)),
+                child: child(account),
                 amount: Amount::new(amount),
             },
-            vec![
-                child_posting(account, -(amount as i64)),
-                posting(AccountRef::Equity, amount as i64),
-            ],
+            vec![child_posting(account, -(amount as i64))],
         )
     }
 
@@ -239,9 +237,9 @@ fn check_root_identity(balances: &Balances) {
         .map(|name| balances.child_balance(&child(name)).get() as i128)
         .sum();
     assert_eq!(
-        parent - children - balances.equity(),
-        0,
-        "accounting identity must hold"
+        balances.equity(),
+        parent - children,
+        "equity is derived as Parent − ΣChild"
     );
 }
 
@@ -252,9 +250,9 @@ fn check_non_root_identity(balances: &Balances) {
         .map(|name| balances.child_balance(&child(name)).get() as i128)
         .sum();
     assert_eq!(
-        parent - children - balances.equity(),
-        0,
-        "non-root accounting identity must hold"
+        balances.equity(),
+        parent - children,
+        "equity is derived as Parent − ΣChild"
     );
 }
 

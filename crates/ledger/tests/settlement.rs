@@ -17,7 +17,8 @@ use std::collections::BTreeMap;
 use cawala_ledger::{
     AccountRef, Amount, AuthRef, Balances, Entry, EntryBody, Hash, HopRole, Ledger, LedgerError,
     LedgerSecretKey, LedgerSet, NodeId, OperatorSecretKey, PaymentOrder, PeerKeys, PeerRegistry,
-    PeerRole, Posting, SignedAmount, SignedEntry, execute_plan, plan_transfer,
+    PeerRole, Posting, SignedAmount, SignedEntry, classify_hop, execute_plan, expected_hops,
+    plan_transfer,
 };
 use cawala_topology::{ChildKind, Topology};
 
@@ -116,13 +117,10 @@ fn issue(ledger: &mut Ledger, key: &LedgerSecretKey, child: &str, amount: u64) {
         ledger,
         key,
         EntryBody::Issue {
-            account: ca(child),
+            child: n(child),
             amount: Amount::new(amount),
         },
-        vec![
-            p(ca(child), amount as i64),
-            p(AccountRef::Equity, -(amount as i64)),
-        ],
+        vec![p(ca(child), amount as i64)],
         Some(dummy_auth()),
     );
 }
@@ -171,9 +169,32 @@ fn transfer_role(entry: &Entry) -> HopRole {
     }
 }
 
-fn equity_sum(set: &LedgerSet) -> i128 {
+/// Total `Parent` assets across every ledger in the set.
+fn total_parent(set: &LedgerSet) -> i128 {
     set.node_ids()
-        .map(|id| set.get(id).unwrap().balances().equity())
+        .map(|id| {
+            set.get(id)
+                .unwrap()
+                .balances()
+                .parent_balance()
+                .map(|amount| amount.get() as i128)
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+/// Total `ΣChild` liabilities across every ledger in the set.
+fn total_child(set: &LedgerSet) -> i128 {
+    set.node_ids()
+        .map(|id| {
+            set.get(id)
+                .unwrap()
+                .balances()
+                .accounts()
+                .filter(|(account, _)| matches!(account, AccountRef::Child(_)))
+                .map(|(_, balance)| balance)
+                .sum::<i128>()
+        })
         .sum()
 }
 
@@ -316,6 +337,36 @@ fn ledger_set_insert_and_lookup() {
     );
 }
 
+/// The classifier must agree with the topology oracle: every hop
+/// `expected_hops` emits for `uA -> uB` classifies its signer to that hop's
+/// role. This links the node per-hop executor's route derivation to the
+/// `plan_transfer` oracle.
+#[test]
+fn expected_hops_classify_to_their_roles() {
+    let fx = Fixture::new();
+    let order = PaymentOrder {
+        from: n("uA"),
+        to: n("uB"),
+        amount: Amount::new(100),
+        nonce: 1,
+        expiry: 1000,
+    };
+    let from_addr = fx.topo.address_of("uA").unwrap();
+    let to_addr = fx.topo.address_of("uB").unwrap();
+    let hops = expected_hops(&fx.topo, &order).unwrap();
+    assert_eq!(hops.len(), 5, "worked topology has a 5-hop route");
+    for hop in &hops {
+        let signer_addr = fx.topo.address_of(hop.signer.as_str()).unwrap();
+        assert_eq!(
+            classify_hop(&from_addr, &to_addr, &signer_addr),
+            Some(hop.role),
+            "signer {} must classify as {:?}",
+            hop.signer,
+            hop.role
+        );
+    }
+}
+
 #[test]
 fn cross_subtree_plan_and_execute() {
     let mut fx = Fixture::new();
@@ -376,7 +427,8 @@ fn cross_subtree_plan_and_execute() {
         }
     }
 
-    let equity_before = equity_sum(&fx.set);
+    let parent_before = total_parent(&fx.set);
+    let child_before = total_child(&fx.set);
     let executed = execute_plan(&plan, &mut fx.set, &fx.keys, &fx.registry, 50).unwrap();
     assert_eq!(executed.len(), 5);
 
@@ -464,8 +516,12 @@ fn cross_subtree_plan_and_execute() {
         );
     }
 
-    // Transfers conserve: total equity is unchanged.
-    assert_eq!(equity_sum(&fx.set), equity_before);
+    // Transfers are balanced: over a transfer-only run, `ΔParent == ΔΣChild`.
+    assert_eq!(
+        total_parent(&fx.set) - parent_before,
+        total_child(&fx.set) - child_before,
+        "transfer-only runs must satisfy ΔParent == ΔΣChild"
+    );
 }
 
 #[test]

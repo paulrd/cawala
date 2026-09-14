@@ -37,7 +37,12 @@ pub const ENTRIES_FILE: &str = "entries.log";
 pub const META_FILE: &str = "meta.json";
 
 /// On-disk ledger format version.
-pub const LEDGER_FORMAT_VERSION: u32 = 1;
+///
+/// v2: the `Equity` account and `EntryBody::Issue`/`Burn` equity legs were
+/// removed (`Issue`/`Burn` are child-only boundary ops; equity is derived), and
+/// the signed entry format advanced to
+/// [`cawala_ledger::ENTRY_FORMAT_VERSION`] 3.
+pub const LEDGER_FORMAT_VERSION: u32 = 2;
 
 /// Maximum accepted encoded frame size in bytes, mirroring `proto`'s bound.
 pub const MAX_ENTRY_FRAME_SIZE: u32 = proto::MAX_FRAME_SIZE;
@@ -71,6 +76,97 @@ pub fn meta_path(data_dir: &Path) -> PathBuf {
     ledger_dir(data_dir).join(META_FILE)
 }
 
+/// Name of the advisory ledger write lock file inside the ledger dir.
+pub const LOCK_FILE: &str = ".lock";
+
+/// Name of the process-instance lock file (not the ledger write lock).
+pub const NODE_LOCK_FILE: &str = "node.lock";
+
+/// An advisory file lock guarding the ledger.
+///
+/// # Writer discipline
+///
+/// [`FileLog`] has no internal mutual exclusion, so two processes that both
+/// resync, build at the same `seq`, and append can interleave and publish a
+/// divergent chain. [`LedgerService`](crate::ledger_service::LedgerService)
+/// therefore takes an **exclusive** lock around each mutating transaction
+/// (refresh + append) and a **shared** lock around each authoritative read.
+/// Writer transactions across processes (a running node and operator CLI
+/// commands) are serialized; a contended `try_lock` fails fast with a clear
+/// message rather than waiting. The lock is released when the guard drops.
+#[derive(Debug)]
+pub struct LedgerLock {
+    // Held only to keep the OS advisory lock alive; dropping releases it.
+    _file: File,
+}
+
+impl LedgerLock {
+    /// Acquire the exclusive (writer) ledger lock on
+    /// `<data-dir>/ledger/.lock`, failing fast if any other process holds it in
+    /// any mode.
+    pub fn acquire_exclusive(data_dir: &Path) -> Result<Self> {
+        Self::acquire_file(&ledger_dir(data_dir).join(LOCK_FILE), exclusive_message(data_dir), true)
+    }
+
+    /// Acquire a shared (reader) ledger lock on `<data-dir>/ledger/.lock`,
+    /// failing fast if a writer currently holds the exclusive lock.
+    pub fn acquire_shared(data_dir: &Path) -> Result<Self> {
+        Self::acquire_file(&ledger_dir(data_dir).join(LOCK_FILE), exclusive_message(data_dir), false)
+    }
+
+    /// Acquire the process-instance lock on `<data-dir>/node.lock` exclusively.
+    ///
+    /// This only prevents two node processes from serving the same data dir; it
+    /// is held for the process lifetime and is never taken by CLI commands, so
+    /// operator commands can still run against a live node.
+    pub fn acquire_process_instance(data_dir: &Path) -> Result<Self> {
+        Self::acquire_file(
+            &data_dir.join(NODE_LOCK_FILE),
+            format!(
+                "another cawala node is already running on data dir {}",
+                data_dir.display()
+            ),
+            true,
+        )
+    }
+
+    fn acquire_file(path: &Path, contention: String, exclusive: bool) -> Result<Self> {
+        use std::fs::TryLockError;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        let locked = if exclusive {
+            file.try_lock()
+        } else {
+            file.try_lock_shared()
+        };
+        match locked {
+            Ok(()) => Ok(LedgerLock { _file: file }),
+            Err(TryLockError::WouldBlock) => bail!("{contention}"),
+            Err(TryLockError::Error(err)) => {
+                Err(err).with_context(|| format!("failed to lock {}", path.display()))
+            }
+        }
+    }
+}
+
+fn exclusive_message(data_dir: &Path) -> String {
+    format!(
+        "ledger data dir {} is locked by another cawala writer; retry once the \
+         current transaction completes",
+        data_dir.display()
+    )
+}
+
 /// Load `<data-dir>/ledger/meta.json`, rejecting an unsupported format version.
 pub fn load_meta(data_dir: &Path) -> Result<LedgerMeta> {
     let path = meta_path(data_dir);
@@ -79,6 +175,15 @@ pub fn load_meta(data_dir: &Path) -> Result<LedgerMeta> {
     let meta: LedgerMeta = serde_json::from_slice(&bytes)
         .with_context(|| format!("{} is not a valid ledger meta file", path.display()))?;
     if meta.format_version != LEDGER_FORMAT_VERSION {
+        if meta.format_version < LEDGER_FORMAT_VERSION {
+            // Older frames may post `Equity` legs, which no longer exist.
+            bail!(
+                "{}: ledger format changed (Equity removed); recreate the data dir \
+                 (found format version {}, expected {LEDGER_FORMAT_VERSION})",
+                path.display(),
+                meta.format_version
+            );
+        }
         bail!(
             "{}: unsupported ledger format version {} (expected {LEDGER_FORMAT_VERSION})",
             path.display(),
@@ -132,6 +237,11 @@ pub fn init_ledger(data_dir: &Path, node_id: &str, ledger_id: &LedgerPubKey) -> 
 /// Open the on-disk ledger for `node_id`, re-deriving balances from the signed
 /// history.
 ///
+/// Rootness is a **control-plane fact** (whether the node record currently has
+/// a parent link), never a ledger property: the `Parent` account is universal,
+/// so this replays a log with or without `Parent` postings identically. Attach
+/// and detach therefore never brick the ledger.
+///
 /// The frame log is replayed through [`Ledger::append`], which re-verifies each
 /// entry's ledger signature, dense sequence, `prev_hash` chain, conservation,
 /// and non-negativity. A corrupt or tampered log therefore fails here rather
@@ -155,7 +265,7 @@ pub fn open_ledger(
 
     let log = FileLog::open_for_replay(data_dir)?;
     let persisted = log.entry_count();
-    let mut ledger = Ledger::new_root_with_log(key.public(), log);
+    let mut ledger = Ledger::new_non_root_with_log(key.public(), log);
     for index in 0..persisted {
         let entry = ledger
             .get(index)?
@@ -413,7 +523,7 @@ impl LedgerLog for FileLog {
 mod tests {
     use super::*;
     use cawala_ledger::{
-        AccountRef, Amount, AuthRef, Entry, EntryBody, LedgerLog, LedgerSecretKey, NodeId,
+        AccountRef, Amount, AuthRef, Entry, EntryBody, HopRole, LedgerLog, LedgerSecretKey, NodeId,
         OperatorSecretKey, Posting, SignedAmount,
     };
 
@@ -462,17 +572,38 @@ mod tests {
             prev_hash: prev,
             issued_at: 100 + seq,
             body: EntryBody::Issue {
-                account: AccountRef::Child(child(id)),
+                child: child(id),
                 amount: Amount::new(amount),
+            },
+            postings: vec![Posting {
+                account: AccountRef::Child(child(id)),
+                delta: SignedAmount::new(amount as i64),
+            }],
+            auth: Some(auth(seq)),
+        };
+        SignedEntry::sign(entry, key).unwrap()
+    }
+
+    fn descend(key: &LedgerSecretKey, seq: u64, prev: Hash, id: &str, amount: u64) -> SignedEntry {
+        let entry = Entry {
+            ledger_id: key.public(),
+            seq,
+            height: seq,
+            prev_hash: prev,
+            issued_at: 100 + seq,
+            body: EntryBody::Transfer {
+                payment_id: Hash::ZERO,
+                amount: Amount::new(amount),
+                role: HopRole::Descend,
             },
             postings: vec![
                 Posting {
-                    account: AccountRef::Child(child(id)),
+                    account: AccountRef::Parent,
                     delta: SignedAmount::new(amount as i64),
                 },
                 Posting {
-                    account: AccountRef::Equity,
-                    delta: SignedAmount::new(-(amount as i64)),
+                    account: AccountRef::Child(child(id)),
+                    delta: SignedAmount::new(amount as i64),
                 },
             ],
             auth: Some(auth(seq)),
@@ -523,6 +654,30 @@ mod tests {
     }
 
     #[test]
+    fn load_meta_rejects_older_format_with_a_clear_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ledger_key();
+        // Simulate a v1 meta written before `Equity` was removed.
+        save_meta(
+            dir.path(),
+            &LedgerMeta {
+                format_version: 1,
+                node_id: NODE.to_string(),
+                ledger_id: key.public(),
+            },
+        )
+        .unwrap();
+
+        let err = load_meta(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ledger format changed (Equity removed)"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("recreate the data dir"), "unexpected error: {msg}");
+    }
+
+    #[test]
     fn append_reopen_roundtrip_preserves_entries_head_and_balances() {
         let dir = tempfile::tempdir().unwrap();
         let key = ledger_key();
@@ -556,6 +711,39 @@ mod tests {
             Amount::new(100)
         );
         assert_eq!(reopened.balances().equity(), -100);
+    }
+
+    #[test]
+    fn replay_of_parent_postings_is_constructor_agnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ledger_key();
+
+        // A history containing a `Parent` posting (a `Descend`).
+        let (head, balances) = {
+            let mut ledger = open_ledger(dir.path(), NODE, &key).unwrap();
+            let opened = open_account(&key, 0, Hash::ZERO, "a");
+            let head0 = entry_hash(&opened.entry).unwrap();
+            ledger.append(opened).unwrap();
+            let descended = descend(&key, 1, head0, "a", 100);
+            ledger.append(descended).unwrap();
+            (ledger.head_hash(), ledger.balances().clone())
+        };
+
+        // Reopening replays it identically: rootness is not a ledger property,
+        // so no attachment state can make this fail (both ledger constructors
+        // are aliases; see `cawala_ledger::log::Ledger`).
+        let reopened = open_ledger(dir.path(), NODE, &key).unwrap();
+        assert_eq!(reopened.len(), 2);
+        assert_eq!(reopened.head_hash(), head);
+        assert_eq!(reopened.balances(), &balances);
+        assert_eq!(
+            reopened.balances().parent_balance(),
+            Some(Amount::new(100))
+        );
+        assert_eq!(
+            reopened.balances().child_balance(&child("a")),
+            Amount::new(100)
+        );
     }
 
     #[test]
@@ -732,5 +920,45 @@ mod tests {
             err.to_string().contains("ledger id"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn ledger_lock_is_exclusive_then_shared_after_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = LedgerLock::acquire_exclusive(dir.path()).unwrap();
+
+        // A second exclusive acquisition fails while the first is held.
+        let err = LedgerLock::acquire_exclusive(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("locked by another cawala writer"),
+            "unexpected error: {err}"
+        );
+        // A shared read lock also fails while the writer holds the lock.
+        assert!(LedgerLock::acquire_shared(dir.path()).is_err());
+
+        drop(first);
+
+        // After release, exclusive and repeated shared acquisitions succeed.
+        let exclusive = LedgerLock::acquire_exclusive(dir.path()).unwrap();
+        drop(exclusive);
+        let shared_a = LedgerLock::acquire_shared(dir.path()).unwrap();
+        let shared_b = LedgerLock::acquire_shared(dir.path()).unwrap();
+        drop(shared_a);
+        drop(shared_b);
+    }
+
+    #[test]
+    fn process_instance_lock_is_separate_from_the_ledger_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = LedgerLock::acquire_process_instance(dir.path()).unwrap();
+
+        // A second instance lock fails, but the ledger write lock is still free.
+        assert!(LedgerLock::acquire_process_instance(dir.path()).is_err());
+        let write = LedgerLock::acquire_exclusive(dir.path()).unwrap();
+        drop(write);
+
+        drop(instance);
+        let again = LedgerLock::acquire_process_instance(dir.path()).unwrap();
+        drop(again);
     }
 }

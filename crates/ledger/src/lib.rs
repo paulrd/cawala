@@ -7,23 +7,29 @@
 //!
 //! # Model
 //!
-//! Each node keeps a [`Balances`] triple:
+//! The ledger stores only two account classes per node:
 //!
-//! - an asset account with its parent ([`AccountRef::Parent`], absent at the
-//!   root),
-//! - one liability account per child ([`AccountRef::Child`]),
-//! - its equity ([`AccountRef::Equity`]).
+//! - an asset account with its parent ([`AccountRef::Parent`], structurally
+//!   universal: present on every ledger, and a stranded claim — normally zero —
+//!   on a top-level/detached node),
+//! - one liability account per child ([`AccountRef::Child`]).
 //!
-//! The per-node accounting equation is `assets − liabilities = equity`, i.e.
-//! `Σdelta(Parent) − Σdelta(Child) − Σdelta(Equity) == 0` for every accepted
-//! [`Posting`] set (enforced by [`Balances::apply`] and
-//! [`Entry::check_conservation`]). Issue/burn are the only operations that
-//! move equity; transfers conserve it.
+//! There is **no** equity account and equity is never posted: a node's equity is
+//! **derived** as `Parent − ΣChild` ([`Balances::equity`]), externally backed
+//! (goodwill, land, materials, ... out of scope). The per-entry rule is a pure
+//! function of the entry body, so it is deterministic under dynamic rootness:
+//!
+//! - `Transfer`/`OpenAccount` are **balanced**: `ΔParent == ΔΣChild`;
+//! - `Issue`/`Burn` are **boundary** operations on one child account
+//!   (`{Child:+amount}` / `{Child:−amount}`), exempt from the balance equation.
+//!
+//! `E < 0` is normal and is never an overdraw; only `Parent`/`Child`
+//! non-negativity is enforced.
 //!
 //! Entries are appended to a [`Ledger`] through [`Ledger::append`], which
 //! verifies the ledger signature, the dense `seq` starting at 0, `height ==
-//! seq`, the `prev_hash` chain, conservation, the canonical body-shape binding,
-//! and prefunded-only non-negativity before mutating any state. The signed
+//! seq`, the `prev_hash` chain, the per-entry rule, the canonical body-shape
+//! binding, and non-negativity before mutating any state. The signed
 //! entry format is versioned by [`ENTRY_FORMAT_VERSION`]; field/variant order
 //! must not be reordered.
 
@@ -44,8 +50,8 @@ pub mod settlement;
 pub use account::{AccountRef, Balances, NodeId, Posting};
 pub use amount::{Amount, SignedAmount};
 pub use auth::{
-    BURN_CONTEXT, BurnRequest, ISSUE_CONTEXT, IssueRequest, ORDER_CONTEXT, PaymentOrder,
-    verify_burn, verify_issue, verify_transfer,
+    BURN_CONTEXT, BurnRequest, ISSUE_CONTEXT, IssueRequest, ORDER_CONTEXT, PREFUND_CONTEXT,
+    PaymentOrder, PrefundRequest, verify_burn, verify_issue, verify_prefund, verify_transfer,
 };
 pub use commit::{
     BalanceAttestation, COMMITMENT_CONTEXT, Commitment, EdgeAccount, SignedCommitment,
@@ -65,5 +71,6 @@ pub use merkle::{
 pub use netting::{Finding, NetTransfer, NettingReport, net, verify_cascade};
 pub use registry::{PeerKeys, PeerRegistry, PeerRole};
 pub use settlement::{
-    ExpectedHop, LedgerSet, PlannedHop, SettlementPlan, execute_plan, expected_hops, plan_transfer,
+    ExpectedHop, LedgerSet, PlannedHop, SettlementPlan, classify_hop, execute_plan, expected_hops,
+    hop_postings, plan_transfer,
 };

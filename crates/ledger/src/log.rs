@@ -1,6 +1,6 @@
 //! The append-only ledger log and its state machine.
 
-use crate::account::Balances;
+use crate::account::{Balances, PostingRule};
 use crate::entry::{EntryBody, SignedEntry};
 use crate::error::LedgerError;
 use crate::hash::{Hash, entry_hash};
@@ -93,31 +93,43 @@ pub struct Ledger<L: LedgerLog = MemLog> {
 }
 
 impl Ledger<MemLog> {
-    /// Create a root ledger (no parent account) with an in-memory log.
+    /// Create a root ledger (top-level) with an in-memory log.
     pub fn new_root(ledger_pubkey: LedgerPubKey) -> Self {
         Self::new_root_with_log(ledger_pubkey, MemLog::new())
     }
 
-    /// Create a non-root ledger (zeroed parent account) with an in-memory log.
+    /// Create a non-root ledger (parented) with an in-memory log.
+    ///
+    /// Identical to [`Self::new_root`]: rootness is a control-plane fact, not a
+    /// ledger structural property (see [`Self::new_root_with_log`]).
     pub fn new_non_root(ledger_pubkey: LedgerPubKey) -> Self {
         Self::new_non_root_with_log(ledger_pubkey, MemLog::new())
     }
 }
 
 impl<L: LedgerLog> Ledger<L> {
-    /// Create a root ledger over a caller-supplied log backend.
+    /// Create a ledger over a caller-supplied log backend.
+    ///
+    /// Rootness is **not** a ledger structural property: every ledger carries a
+    /// universal `Parent` account (see [`Balances`]), whether or not the node
+    /// currently has a parent link. This is identical to
+    /// [`Self::new_non_root_with_log`]; both names are kept for call-site
+    /// clarity.
     pub fn new_root_with_log(ledger_pubkey: LedgerPubKey, log: L) -> Self {
-        Ledger {
-            ledger_id: ledger_pubkey,
-            ledger_pubkey,
-            balances: Balances::new_root(),
-            log,
-            height: 0,
-        }
+        Self::with_log(ledger_pubkey, log)
     }
 
-    /// Create a non-root ledger over a caller-supplied log backend.
+    /// Create a ledger over a caller-supplied log backend.
+    ///
+    /// See [`Self::new_root_with_log`]: rootness is a control-plane fact, so
+    /// this is the same construction.
     pub fn new_non_root_with_log(ledger_pubkey: LedgerPubKey, log: L) -> Self {
+        Self::with_log(ledger_pubkey, log)
+    }
+
+    /// Shared constructor: a ledger always starts with the universal `Parent`
+    /// account at zero.
+    fn with_log(ledger_pubkey: LedgerPubKey, log: L) -> Self {
         Ledger {
             ledger_id: ledger_pubkey,
             ledger_pubkey,
@@ -229,12 +241,18 @@ impl<L: LedgerLog> Ledger<L> {
 
         // Apply to a clone first: a failed apply must not touch the ledger.
         // Opening an account materializes its zero balance, so `accounts()` and
-        // therefore `state_root` are independent of posting history.
+        // therefore `state_root` are independent of posting history. The body's
+        // `posting_rule()` is the single source of truth for whether the set is
+        // balanced or a child-only boundary op, so a future boundary body cannot
+        // drift from `check_conservation`.
         let mut next_balances = self.balances.clone();
         if let EntryBody::OpenAccount { child, .. } = &entry.body {
             next_balances.open_account(child)?;
         }
-        next_balances.apply(&entry.postings)?;
+        match entry.body.posting_rule() {
+            PostingRule::Balanced => next_balances.apply(&entry.postings)?,
+            PostingRule::Boundary => next_balances.apply_boundary(&entry.postings)?,
+        }
 
         let new_height = entry.height;
         self.log.append(signed)?;
@@ -280,13 +298,10 @@ mod tests {
     fn issue(account: &str, amount: u64) -> (EntryBody, Vec<Posting>) {
         (
             EntryBody::Issue {
-                account: AccountRef::Child(child(account)),
+                child: child(account),
                 amount: Amount::new(amount),
             },
-            vec![
-                child_posting(account, amount as i64),
-                posting(AccountRef::Equity, -(amount as i64)),
-            ],
+            vec![child_posting(account, amount as i64)],
         )
     }
 
@@ -428,6 +443,30 @@ mod tests {
         assert_eq!(h.ledger.head_hash(), Hash::ZERO);
         assert!(h.ledger.is_empty());
         assert_eq!(h.ledger.get(0).unwrap(), None);
+    }
+
+    #[test]
+    fn empty_ledger_has_a_zero_parent_account() {
+        // Universal invariant: a fresh ledger of either kind carries the
+        // `Parent` account at zero and enumerates it.
+        for h in [Harness::root(), Harness::non_root()] {
+            assert_eq!(h.ledger.balances().parent_balance(), Some(Amount::ZERO));
+            assert!(
+                h.ledger
+                    .balances()
+                    .accounts()
+                    .any(|(account, _)| account == AccountRef::Parent)
+            );
+        }
+    }
+
+    #[test]
+    fn root_and_non_root_constructors_are_equivalent() {
+        let key = LedgerSecretKey::from_bytes([21u8; 32]);
+        let root = Ledger::new_root(key.public());
+        let non_root = Ledger::new_non_root(key.public());
+        assert_eq!(root.balances(), non_root.balances());
+        assert_eq!(root.balances().parent_balance(), Some(Amount::ZERO));
     }
 
     #[test]
@@ -626,11 +665,14 @@ mod tests {
 
     #[test]
     fn non_conserving_entry_is_rejected() {
+        // A balanced op (Transfer) whose legs do not satisfy
+        // `ΔParent == ΔΣChild` is rejected.
         let mut h = Harness::root();
         let entry = h.build(
-            EntryBody::Issue {
-                account: AccountRef::Child(child("a")),
+            EntryBody::Transfer {
+                payment_id: Hash::ZERO,
                 amount: Amount::new(100),
+                role: HopRole::Direct,
             },
             vec![child_posting("a", 100)],
         );
@@ -675,6 +717,44 @@ mod tests {
             h.ledger.balances().child_balance(&child("a")),
             Amount::new(120)
         );
+    }
+
+    #[test]
+    fn burn_appends_on_a_parented_ledger() {
+        // Any node may change its children's values via the child-only
+        // `Issue`/`Burn` boundary ops (derived equity moves, no equity leg is
+        // posted). There is no node-service burn path today; this pins the
+        // ledger primitive that such a path would use.
+        let mut h = Harness::non_root();
+        h.commit_open("a").unwrap();
+
+        // Fund the child via a Descend (Parent+/Child+).
+        h.commit(
+            EntryBody::Transfer {
+                payment_id: Hash::ZERO,
+                amount: Amount::new(100),
+                role: HopRole::Descend,
+            },
+            vec![posting(AccountRef::Parent, 100), child_posting("a", 100)],
+        )
+        .unwrap();
+
+        // Burn 40 back: a child-only boundary op `{Child−}`.
+        h.commit(
+            EntryBody::Burn {
+                child: child("a"),
+                amount: Amount::new(40),
+            },
+            vec![child_posting("a", -40)],
+        )
+        .unwrap();
+
+        assert_eq!(h.ledger.balances().parent_balance(), Some(Amount::new(100)));
+        assert_eq!(
+            h.ledger.balances().child_balance(&child("a")),
+            Amount::new(60)
+        );
+        assert_eq!(h.ledger.balances().equity(), 40);
     }
 
     /// A distinct log backend proves `Ledger<L>` works through the trait.

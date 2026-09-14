@@ -20,8 +20,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cawala_ledger::{
-    Amount, NodeId, OperatorSecretKey, PaymentOrder, PeerKeys, PeerRegistry, PeerRole,
-    verify_balance_attestation,
+    Amount, Hash, NodeId, OperatorSecretKey, PaymentOrder, PeerKeys, PeerRegistry, PeerRole,
+    entry_hash, verify_balance_attestation,
 };
 use cawala_msg::{
     AckStatus, BalanceQueryV1, LedgerPayloadV1, MSG_LEDGER_V1, OrderRejectV1, OrderStatusV1, OrderV1,
@@ -166,7 +166,7 @@ async fn setup() -> (
     let mut service = LedgerService::open(dir.path(), &node_id).unwrap();
     assert!(service.ensure_account_open(&a, ChildKind::User).unwrap());
     assert!(service.ensure_account_open(&b, ChildKind::User).unwrap());
-    service.fund(&a, 100, &node_operator, 1, now).unwrap();
+    service.fund(&a, ChildKind::User, 100, &node_operator, 1, now).unwrap();
     assert_eq!(service.balance_of(&a), Amount::new(100));
     let leaf_ledger_pub = service.ledger_key_public();
 
@@ -188,11 +188,13 @@ async fn setup() -> (
 
     // Dispatch drain loop, mirroring `run()`'s sink consumer.
     let ledger = Arc::new(tokio::sync::Mutex::new(service));
+    let manager = Arc::new(tokio::sync::Mutex::new(cawala_node::SettlementManager::new()));
     {
         let dispatch_dir = dir.path().to_path_buf();
         let dispatch_node = node_id.clone();
         let dispatch_source = source.clone();
         let dispatch_ledger = Arc::clone(&ledger);
+        let dispatch_manager = Arc::clone(&manager);
         let dispatch_endpoint = leaf_endpoint.clone();
         let dispatch_config = config.clone();
         let _dispatch = tokio::spawn(async move {
@@ -202,6 +204,7 @@ async fn setup() -> (
                     &dispatch_source,
                     &dispatch_config,
                     &dispatch_ledger,
+                    &dispatch_manager,
                     &dispatch_dir,
                     &dispatch_node,
                     env,
@@ -449,4 +452,79 @@ async fn same_leaf_payment_flow_applies_duplicates_and_survives_reopen() {
     assert_eq!(leaf.ledger.lock().await.ledger().len(), len_before);
 
     leaf_router.shutdown().await.unwrap();
+}
+
+/// Two `LedgerService` instances on the same data dir serialize their writes via
+/// the per-transaction ledger lock, so a CLI process and a running node can both
+/// append without corruption and reconcile on reopen.
+#[test]
+fn two_services_on_one_data_dir_append_serialized_and_reconcile() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_secret = identity::load_or_create_secret_key(dir.path()).unwrap();
+    let node_id = node_secret.public().to_string();
+    let operator = OperatorSecretKey::from_bytes(node_secret.to_bytes());
+    let a = NodeId::from("user-a");
+    let b = NodeId::from("user-b");
+    let now = unix_now();
+
+    // A "running node" service and a separate "CLI" service on the same dir.
+    let mut node = LedgerService::open(dir.path(), &node_id).unwrap();
+    node.ensure_account_open(&a, ChildKind::User).unwrap();
+    let mut cli = LedgerService::open(dir.path(), &node_id).unwrap();
+
+    // Interleaved appends from both processes (each refreshes under the lock).
+    node.fund(&a, ChildKind::User, 100, &operator, 1, now).unwrap();
+    cli.fund(&b, ChildKind::User, 50, &operator, 2, now).unwrap();
+    node.fund(&a, ChildKind::User, 25, &operator, 3, now).unwrap();
+
+    // A fresh open reconciles every append into one dense, linked chain.
+    let reopened = LedgerService::open(dir.path(), &node_id).unwrap();
+    assert_eq!(reopened.balance_of(&a), Amount::new(125));
+    assert_eq!(reopened.balance_of(&b), Amount::new(50));
+    // open A, issue A(100), open B, issue B(50), issue A(25) = 5 entries.
+    assert_eq!(reopened.ledger().len(), 5);
+    let mut prev = Hash::ZERO;
+    for index in 0..reopened.ledger().len() {
+        let entry = reopened.ledger().get(index).unwrap().unwrap();
+        assert_eq!(entry.entry.seq, index as u64);
+        assert_eq!(entry.entry.prev_hash, prev);
+        prev = entry_hash(&entry.entry).unwrap();
+    }
+    assert_eq!(reopened.ledger().head_hash(), prev);
+}
+
+/// While another writer holds the exclusive ledger lock, a service mutation must
+/// fail fast (no append), and must succeed once the lock is released.
+#[test]
+fn service_mutation_fails_fast_while_the_write_lock_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_secret = identity::load_or_create_secret_key(dir.path()).unwrap();
+    let node_id = node_secret.public().to_string();
+    let operator = OperatorSecretKey::from_bytes(node_secret.to_bytes());
+    let a = NodeId::from("user-a");
+    let now = unix_now();
+
+    let mut service = LedgerService::open(dir.path(), &node_id).unwrap();
+
+    // Simulate a concurrent writer holding the transaction lock.
+    let held = cawala_node::LedgerLock::acquire_exclusive(dir.path()).unwrap();
+    let err = service
+        .fund(&a, ChildKind::User, 10, &operator, 1, now)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("locked by another cawala writer"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        service.balance_of(&a),
+        Amount::new(0),
+        "a contended mutation must not append"
+    );
+
+    // Releasing the lock lets the same mutation through.
+    drop(held);
+    service
+        .fund(&a, ChildKind::User, 10, &operator, 1, now)
+        .unwrap();
+    assert_eq!(service.balance_of(&a), Amount::new(10));
 }

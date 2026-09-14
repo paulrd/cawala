@@ -139,7 +139,12 @@ fn expect_child(account: &AccountRef) -> Result<&NodeId, LedgerError> {
 ///
 /// `Ascend` and `Descend` move value on both legs in the same direction;
 /// `Lca`/`Direct` move value out of `first` and into `second`.
-fn hop_postings(role: HopRole, first: &AccountRef, second: &AccountRef, m: i64) -> Vec<Posting> {
+///
+/// This is the single source of truth for a hop's posting shape. The node
+/// per-hop executor builds its entries through it so they stay identical to the
+/// hops [`plan_transfer`] plans, and [`classify_hop`] selects the role for a
+/// signer on a route.
+pub fn hop_postings(role: HopRole, first: &AccountRef, second: &AccountRef, m: i64) -> Vec<Posting> {
     match role {
         HopRole::Ascend => vec![posting(first.clone(), -m), posting(second.clone(), -m)],
         HopRole::Descend => vec![posting(first.clone(), m), posting(second.clone(), m)],
@@ -147,6 +152,42 @@ fn hop_postings(role: HopRole, first: &AccountRef, second: &AccountRef, m: i64) 
             vec![posting(first.clone(), -m), posting(second.clone(), m)]
         }
     }
+}
+
+/// The role `this` plays on the canonical route from `src` to `dst`.
+///
+/// `src` and `dst` are endpoint (user) addresses and `this` is a candidate hop
+/// node address. Returns `None` when `this` is off the canonical route.
+///
+/// The route matches [`expected_hops`]: a single `Direct` hop at the shared leaf
+/// when both endpoints have the same parent, otherwise the strictly-ascending
+/// path from the payer's leaf to the least common ancestor, the LCA
+/// reallocation, and the strictly-descending path to the payee's leaf.
+pub fn classify_hop(src: &OctAddr, dst: &OctAddr, this: &OctAddr) -> Option<HopRole> {
+    // Same leaf: the only hop is the leaf itself, moving between the two users.
+    if src.parent() == dst.parent() {
+        return if src.parent().as_ref() == Some(this) {
+            Some(HopRole::Direct)
+        } else {
+            None
+        };
+    }
+
+    let lca = src.lca(dst);
+    if *this == lca {
+        return Some(HopRole::Lca);
+    }
+    // Ascending: the source itself, or a strict ancestor of it that also lies
+    // strictly below the LCA.
+    if *this == *src || (lca.is_ancestor_of(this) && this.is_ancestor_of(src)) {
+        return Some(HopRole::Ascend);
+    }
+    // Descending: the destination itself, or a strict ancestor of it that also
+    // lies strictly below the LCA.
+    if *this == *dst || (lca.is_ancestor_of(this) && this.is_ancestor_of(dst)) {
+        return Some(HopRole::Descend);
+    }
+    None
 }
 
 /// Whether `account` has been materialized in `balances`.
@@ -546,4 +587,111 @@ pub fn execute_plan(
     }
     *ledgers = staged;
     Ok(signed_hops)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(s: &str) -> OctAddr {
+        s.parse()
+            .unwrap_or_else(|err| panic!("parse of {s:?} failed: {err}"))
+    }
+
+    /// Tree: `R=0`, `A=0.0`, `B=0.1`, `L_A=0.0.0`, `L_B=0.1.0`, `uA=0.0.0.0`,
+    /// `uA2=0.0.0.1`, `uB=0.1.0.0`. A payment `uA -> uB` routes
+    /// `L_A Ascend, A Ascend, R Lca, B Descend, L_B Descend`.
+    #[test]
+    fn classify_same_leaf_is_direct_at_the_shared_leaf() {
+        let src = addr("0.0.0.0"); // uA
+        let dst = addr("0.0.0.1"); // uA2
+        assert_eq!(
+            classify_hop(&src, &dst, &addr("0.0.0")),
+            Some(HopRole::Direct)
+        );
+        // Anything above (or outside) the shared leaf is off-route.
+        assert_eq!(classify_hop(&src, &dst, &addr("0.0")), None);
+        assert_eq!(classify_hop(&src, &dst, &addr("0.1.0")), None);
+        assert_eq!(classify_hop(&src, &dst, &addr("0")), None);
+    }
+
+    #[test]
+    fn classify_cross_leaf_cascade() {
+        let src = addr("0.0.0.0"); // uA
+        let dst = addr("0.1.0.0"); // uB
+
+        // Payer leaf and every strict ancestor below the LCA ascend.
+        assert_eq!(
+            classify_hop(&src, &dst, &addr("0.0.0")),
+            Some(HopRole::Ascend)
+        ); // L_A
+        assert_eq!(classify_hop(&src, &dst, &addr("0.0")), Some(HopRole::Ascend)); // A
+        // The root-as-LCA reallocates.
+        assert_eq!(classify_hop(&src, &dst, &addr("0")), Some(HopRole::Lca)); // R
+        // Every strict ancestor below the LCA on the payee side descends.
+        assert_eq!(
+            classify_hop(&src, &dst, &addr("0.1")),
+            Some(HopRole::Descend)
+        ); // B
+        assert_eq!(
+            classify_hop(&src, &dst, &addr("0.1.0")),
+            Some(HopRole::Descend)
+        ); // L_B
+
+        // Off-route siblings and unrelated branches.
+        assert_eq!(classify_hop(&src, &dst, &addr("0.2")), None);
+        assert_eq!(classify_hop(&src, &dst, &addr("0.1.1")), None);
+        assert_eq!(classify_hop(&src, &dst, &addr("0.0.1")), None);
+    }
+
+    #[test]
+    fn classify_uses_a_deeper_lca() {
+        // Both endpoints under `A=0.0`, so the LCA is `A`, not the root.
+        let src = addr("0.0.0.0"); // uA under L_A
+        let dst = addr("0.0.1.0"); // a user under L_A's sibling leaf
+        assert_eq!(classify_hop(&src, &dst, &addr("0.0")), Some(HopRole::Lca));
+        assert_eq!(
+            classify_hop(&src, &dst, &addr("0.0.0")),
+            Some(HopRole::Ascend)
+        );
+        assert_eq!(
+            classify_hop(&src, &dst, &addr("0.0.1")),
+            Some(HopRole::Descend)
+        );
+        // The root is above the LCA and is off-route.
+        assert_eq!(classify_hop(&src, &dst, &addr("0")), None);
+    }
+
+    #[test]
+    fn classify_endpoint_addresses_follow_the_contract() {
+        let src = addr("0.0.0.0");
+        let dst = addr("0.1.0.0");
+        assert_eq!(classify_hop(&src, &dst, &src), Some(HopRole::Ascend));
+        assert_eq!(classify_hop(&src, &dst, &dst), Some(HopRole::Descend));
+    }
+
+    #[test]
+    fn hop_postings_shapes_match_the_roles() {
+        let m = 5;
+        assert_eq!(
+            hop_postings(HopRole::Ascend, &AccountRef::Parent, &AccountRef::Child(NodeId::from("a")), m),
+            vec![posting(AccountRef::Parent, -m), posting(AccountRef::Child(NodeId::from("a")), -m)]
+        );
+        assert_eq!(
+            hop_postings(HopRole::Descend, &AccountRef::Parent, &AccountRef::Child(NodeId::from("a")), m),
+            vec![posting(AccountRef::Parent, m), posting(AccountRef::Child(NodeId::from("a")), m)]
+        );
+        assert_eq!(
+            hop_postings(
+                HopRole::Lca,
+                &AccountRef::Child(NodeId::from("a")),
+                &AccountRef::Child(NodeId::from("b")),
+                m
+            ),
+            vec![
+                posting(AccountRef::Child(NodeId::from("a")), -m),
+                posting(AccountRef::Child(NodeId::from("b")), m),
+            ]
+        );
+    }
 }

@@ -38,7 +38,7 @@ use crate::settlement::{LedgerSet, PlannedHop, expected_hops};
 pub struct NettingReport {
     /// Detected anomalies, in deterministic audit order.
     pub findings: Vec<Finding>,
-    /// Opposing flows collapsed per parent (equity-preserving).
+    /// Opposing flows collapsed per parent (derived-equity-preserving).
     pub nets: Vec<NetTransfer>,
 }
 
@@ -46,7 +46,7 @@ pub struct NettingReport {
 ///
 /// A `NetTransfer` is a summary, not a new obligation: it collapses the gross
 /// opposing flows between the same child pair. Settlement of the *net* between
-/// `from` and `to` preserves every ledger's equity.
+/// `from` and `to` preserves every ledger's derived equity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetTransfer {
     /// The node that holds both child accounts.
@@ -512,8 +512,9 @@ fn audit_routes(
 /// produce a finding here. This replay is defence in depth for a committed or
 /// restored state whose cached balances were not re-validated against its
 /// entries: it recomputes each account as an `i128` running sum and reports the
-/// most negative point. `Equity` is intentionally excluded (negative equity
-/// means value was issued into the tree).
+/// most negative point. Only `Parent`/`Child` are tracked — there is no Equity
+/// account, and boundary `Issue`/`Burn` ops are exempt from the balance equation
+/// but still cannot take a `Child` negative.
 fn audit_overdraw(ledgers: &LedgerSet, findings: &mut Vec<Finding>) {
     for node in ledgers.node_ids() {
         let Some(ledger) = ledgers.get(node) else {
@@ -530,9 +531,6 @@ fn audit_overdraw(ledgers: &LedgerSet, findings: &mut Vec<Finding>) {
                 continue;
             };
             for (account, delta) in deltas {
-                if matches!(account, AccountRef::Equity) {
-                    continue;
-                }
                 let value = running.entry(account.clone()).or_insert(0);
                 *value = value.saturating_add(delta);
                 let low = lowest.entry(account).or_insert(0);

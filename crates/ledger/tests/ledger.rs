@@ -120,26 +120,20 @@ impl Chain {
     fn issue(&mut self, account: &str, amount: u64) -> Result<(), LedgerError> {
         self.commit(
             EntryBody::Issue {
-                account: AccountRef::Child(child(account)),
+                child: child(account),
                 amount: Amount::new(amount),
             },
-            vec![
-                child_posting(account, amount as i64),
-                posting(AccountRef::Equity, -(amount as i64)),
-            ],
+            vec![child_posting(account, amount as i64)],
         )
     }
 
     fn burn(&mut self, account: &str, amount: u64) -> Result<(), LedgerError> {
         self.commit(
             EntryBody::Burn {
-                account: AccountRef::Child(child(account)),
+                child: child(account),
                 amount: Amount::new(amount),
             },
-            vec![
-                child_posting(account, -(amount as i64)),
-                posting(AccountRef::Equity, amount as i64),
-            ],
+            vec![child_posting(account, -(amount as i64))],
         )
     }
 
@@ -349,9 +343,10 @@ fn overdraw_is_rejected() {
 fn non_conserving_entry_is_rejected() {
     let mut chain = Chain::root();
     let signed = chain.build(
-        EntryBody::Issue {
-            account: AccountRef::Child(child("a")),
+        EntryBody::Transfer {
+            payment_id: Hash::ZERO,
             amount: Amount::new(100),
+            role: HopRole::Direct,
         },
         vec![child_posting("a", 100)],
     );
@@ -367,10 +362,10 @@ fn wrong_issue_amount_is_rejected() {
     let mut chain = Chain::root();
     let signed = chain.build(
         EntryBody::Issue {
-            account: AccountRef::Child(child("a")),
+            child: child("a"),
             amount: Amount::new(100),
         },
-        vec![child_posting("a", 99), posting(AccountRef::Equity, -99)],
+        vec![child_posting("a", 99)],
     );
     assert_eq!(
         chain.ledger.append(signed),
@@ -383,10 +378,10 @@ fn missing_auth_is_rejected() {
     let mut chain = Chain::root();
     let signed = chain.build_with_auth(
         EntryBody::Issue {
-            account: AccountRef::Child(child("a")),
+            child: child("a"),
             amount: Amount::new(100),
         },
-        vec![child_posting("a", 100), posting(AccountRef::Equity, -100)],
+        vec![child_posting("a", 100)],
         None,
     );
     assert_eq!(

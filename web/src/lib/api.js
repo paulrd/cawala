@@ -1297,6 +1297,32 @@ export async function getChildren() {
 }
 
 /**
+ * The mock accounts with the derived equity appended.
+ *
+ * Equity is never posted: it is `Parent − ΣChild`. Compute the mock "equity"
+ * figure from the asset/liability rows rather than storing an equity balance,
+ * matching the no-Equity ledger model.
+ * @param {Array} accounts
+ * @returns {Array}
+ */
+function withDerivedEquity(accounts) {
+  const total = (type) =>
+    accounts
+      .filter((a) => a.type === type)
+      .reduce((sum, a) => sum + (a.balance ?? 0), 0);
+  const asset = accounts.find((a) => a.type === 'asset');
+  return [
+    ...accounts,
+    {
+      address: asset?.address ?? '0.3',
+      type: 'equity',
+      label: 'Node equity',
+      balance: total('asset') - total('liability'),
+    },
+  ];
+}
+
+/**
  * Get accounts held by this node. No ledger backend is exposed to the web
  * client in this increment, so live mode returns an empty list rather than
  * fabricating balances.
@@ -1305,7 +1331,7 @@ export async function getChildren() {
 export async function getAccounts() {
   if (_useMock) {
     await mockDelay(200);
-    return [...MOCK_DATA.accounts];
+    return withDerivedEquity(MOCK_DATA.accounts);
   }
   // Only expose a real account once a cryptographically verified balance
   // exists; never fabricate a zero balance before the first receipt.
@@ -1586,13 +1612,6 @@ const MOCK_DATA = {
       type: 'asset',
       label: 'Account with parent 0.3',
       balance: 4500,
-    },
-    // Equity
-    {
-      address: '0.3',
-      type: 'equity',
-      label: 'Node equity',
-      balance: 400,
     },
   ],
   joinRequests: [

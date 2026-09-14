@@ -17,8 +17,9 @@ pub enum LedgerError {
     #[error("arithmetic overflow")]
     Overflow,
 
-    /// The posting set does not satisfy the double-entry conservation rule, or
-    /// the body's equity delta does not match its declared amount.
+    /// The posting set does not satisfy the per-entry posting rule: a balanced
+    /// op's legs must satisfy `ΔParent == ΔΣChild`, while a boundary
+    /// `Issue`/`Burn` must be a single child leg.
     #[error("value conservation violated")]
     ConservationViolation,
 
@@ -26,11 +27,6 @@ pub enum LedgerError {
     /// negative. Transfers are prefunded-only: no overdraw is permitted.
     #[error("insufficient balance")]
     InsufficientBalance,
-
-    /// A [`crate::account::AccountRef::Parent`] posting was applied to a root
-    /// ledger, which has no parent account.
-    #[error("account has no parent")]
-    NoParentAccount,
 
     /// An entry could not be serialized to its canonical bytes.
     #[error("entry encoding failed: {0}")]
