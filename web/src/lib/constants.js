@@ -81,7 +81,9 @@ export const LEDGER_EVENT = {
 export const ORDER_STATUS = {
   APPLIED: 'applied',
   DUPLICATE: 'duplicate',
+  PARTIAL: 'partial',
   REJECTED: 'rejected',
+  INDETERMINATE: 'indeterminate',
 };
 
 /**

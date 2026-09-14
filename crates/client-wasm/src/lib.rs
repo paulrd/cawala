@@ -26,8 +26,9 @@ use cawala_control::{
     OperatorSecretKey, SignedControl,
 };
 use cawala_msg::{
-    Ack, AckStatus, BalanceQueryV1, Envelope, LedgerPayloadV1, MSG_LEDGER_V1, MsgError, MsgId,
-    OctAddr, OrderV1, PeerRef, RejectReason, Seen, SeenConfig, SeenSet,
+    Ack, AckStatus, BalanceQueryV1, Envelope, LedgerPayloadV1, LedgerPayloadV2, MSG_LEDGER_V1,
+    MsgError, MsgId, OctAddr, OrderV2, PeerRef, RejectReason, Seen, SeenConfig, SeenSet,
+    VersionedLedgerPayload, decode_versioned,
 };
 use iroh::{EndpointAddr, EndpointId};
 use iroh::{
@@ -876,13 +877,22 @@ impl ClientNode {
     /// Send a same-leaf `Direct` payment order to `to` (a node id string) and
     /// return its hash plus the routing leaf's ack.
     ///
-    /// The client must be joined (an assigned address and parent). `amount` is
-    /// in the single Cawala nominal unit, must be a whole number, and must fit
-    /// an exact JavaScript integer (`<= 2^53-1`). The order is operator-signed
-    /// and persisted as pending **before** it is dialed, so a racing
-    /// `"order_result"` event can always be matched; the terminal status
-    /// arrives through [`ClientNode::try_recv_ledger_event`].
-    pub async fn send_payment(&self, to: String, amount: f64) -> Result<PaymentOutcome, JsError> {
+    /// The client must be joined (an assigned address and parent). `to` is the
+    /// payee's `EndpointId` and `to_address` is the payee's user `OctAddr`
+    /// (normally from a receive URI); `amount` is in the single Cawala nominal
+    /// unit, must be a whole number, and must fit an exact JavaScript integer
+    /// (`<= 2^53-1`). The order is operator-signed and persisted as pending
+    /// **before** it is dialed, so a racing `"order_result"` event can always be
+    /// matched; the terminal status arrives through
+    /// [`ClientNode::try_recv_ledger_event`] as an `"order_result"` event whose
+    /// `status` is `applied`/`duplicate`/`partial`/`rejected` (`partial` carries
+    /// the failing hop).
+    pub async fn send_payment(
+        &self,
+        to: String,
+        to_address: String,
+        amount: f64,
+    ) -> Result<PaymentOutcome, JsError> {
         let operator = self
             .control
             .operator
@@ -895,6 +905,9 @@ impl ClientNode {
         if recipient.to_string() == self_node {
             return Err(JsError::new("cannot send a payment to yourself"));
         }
+        let payee_addr: OctAddr = to_address
+            .parse()
+            .map_err(|_| JsError::new("invalid payee address"))?;
         let amount = ledger_state::validate_amount(amount).map_err(to_js_err)?;
 
         let now = now_unix_seconds();
@@ -916,11 +929,38 @@ impl ClientNode {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push_pending(order.clone(), auth.clone(), now);
 
-        let payload = LedgerPayloadV1::Order(OrderV1 { order, auth });
-        let ack = self.send_ledger_payload(self_addr, &parent, payload).await?;
+        // v2: the leaf decides same-leaf `Direct` vs a depth-1 settlement from
+        // the payee address.
+        let payload = LedgerPayloadV2::Order(OrderV2 {
+            order,
+            auth,
+            payee_addr,
+        });
+        let ack = self.send_ledger_payload_v2(self_addr, &parent, payload).await?;
         Ok(PaymentOutcome::new(
             order_hash.to_hex(),
             ack.status_str().to_string(),
+        ))
+    }
+
+    /// This client's own user `OctAddr`, when joined.
+    pub fn user_address(&self) -> Option<String> {
+        let state = self.control.lock_state();
+        state.record.address.as_ref().map(|addr| addr.to_string())
+    }
+
+    /// This client's payment receive URI:
+    /// `cawala://pay?to=<EndpointId>&addr=<OctAddr>`.
+    ///
+    /// Share (paste/scan) it so a payer can address a cross-subtree payment to
+    /// this user.
+    pub fn receive_uri(&self) -> Result<String, JsError> {
+        let address = self
+            .user_address()
+            .ok_or_else(|| JsError::new("not joined: no assigned address"))?;
+        Ok(dto::receive_uri_for(
+            self.control.node_id(),
+            &address,
         ))
     }
 
@@ -960,7 +1000,7 @@ impl ClientNode {
                 tracing::info!(msg_type = env.msg_type, "skipping non-ledger envelope");
                 continue;
             }
-            let payload = match LedgerPayloadV1::from_bytes(&env.payload) {
+            let payload = match decode_versioned(&env.payload) {
                 Ok(payload) => payload,
                 Err(err) => {
                     tracing::warn!(%err, "malformed ledger payload");
@@ -968,9 +1008,14 @@ impl ClientNode {
                 }
             };
             return Some(match payload {
-                LedgerPayloadV1::OrderResult(result) => self.apply_order_result_event(&result),
-                LedgerPayloadV1::BalanceReceipt(receipt) => {
+                VersionedLedgerPayload::V1(LedgerPayloadV1::OrderResult(result)) => {
+                    self.apply_order_result_event(&result)
+                }
+                VersionedLedgerPayload::V1(LedgerPayloadV1::BalanceReceipt(receipt)) => {
                     self.apply_balance_receipt_event(&receipt)
+                }
+                VersionedLedgerPayload::V2(LedgerPayloadV2::OrderResult(result)) => {
+                    self.apply_settlement_result_event(&result)
                 }
                 _ => {
                     tracing::warn!("unexpected inbound ledger payload");
@@ -992,6 +1037,26 @@ impl ClientNode {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match ledger_state::apply_order_result(&mut ledger, result, &self_node, &parent, now) {
             Ok(app) => LedgerEventDto::order_result(&app),
+            Err(reason) => LedgerEventDto::invalid(&reason),
+        }
+    }
+
+    /// Apply one inbound v2 settlement `OrderResultV2` to the persisted ledger
+    /// state.
+    fn apply_settlement_result_event(
+        &self,
+        result: &cawala_msg::OrderResultV2,
+    ) -> LedgerEventDto {
+        let Some((self_node, parent)) = self.ledger_binding() else {
+            return LedgerEventDto::invalid("not_joined");
+        };
+        let now = now_unix_seconds();
+        let mut ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match ledger_state::apply_settlement_result(&mut ledger, result, &self_node, &parent, now) {
+            Ok(app) => LedgerEventDto::settlement(&app),
             Err(reason) => LedgerEventDto::invalid(&reason),
         }
     }
@@ -1088,19 +1153,42 @@ impl ClientNode {
         Ok((addr, parent))
     }
 
-    /// Frame `payload` as a `MSG_LEDGER_V1` envelope addressed to the routing
-    /// leaf (the parent) and exchange it for an [`Ack`].
+    /// Frame a v1 `payload` as a `MSG_LEDGER_V1` envelope addressed to the
+    /// routing leaf (the parent) and exchange it for an [`Ack`].
     async fn send_ledger_payload(
         &self,
         self_addr: OctAddr,
         parent: &ParentLink,
         payload: LedgerPayloadV1,
     ) -> Result<Ack, JsError> {
+        let bytes = payload.to_bytes().map_err(to_js_err)?;
+        self.send_ledger_bytes(self_addr, parent, bytes).await
+    }
+
+    /// Frame a v2 `payload` as a `MSG_LEDGER_V1` envelope addressed to the
+    /// routing leaf (the parent) and exchange it for an [`Ack`].
+    async fn send_ledger_payload_v2(
+        &self,
+        self_addr: OctAddr,
+        parent: &ParentLink,
+        payload: LedgerPayloadV2,
+    ) -> Result<Ack, JsError> {
+        let bytes = payload.to_bytes().map_err(to_js_err)?;
+        self.send_ledger_bytes(self_addr, parent, bytes).await
+    }
+
+    /// Frame encoded `bytes` as a `MSG_LEDGER_V1` envelope addressed to the
+    /// routing leaf (the parent) and exchange it for an [`Ack`].
+    async fn send_ledger_bytes(
+        &self,
+        self_addr: OctAddr,
+        parent: &ParentLink,
+        bytes: Vec<u8>,
+    ) -> Result<Ack, JsError> {
         let dst = self_addr
             .parent()
             .ok_or_else(|| JsError::new("assigned address has no parent"))?;
         let next_hop: EndpointId = parent.node_id.as_str().parse().map_err(to_js_err)?;
-        let bytes = payload.to_bytes().map_err(to_js_err)?;
 
         let mut id_bytes = [0u8; MsgId::LEN];
         getrandom::fill(&mut id_bytes).map_err(to_js_err)?;

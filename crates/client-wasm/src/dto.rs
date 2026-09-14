@@ -8,9 +8,12 @@
 
 use cawala_control::{ChildKind, Invite, NodeId, OperatorPubKey, RejectCode};
 use cawala_ledger::Hash;
+use cawala_msg::OctAddr;
 use wasm_bindgen::{JsError, prelude::wasm_bindgen};
 
-use crate::ledger_state::{LedgerStateV1, OrderResultApplication, VerifiedBalanceV1};
+use crate::ledger_state::{
+    LedgerStateV1, OrderResultApplication, SettlementApplication, VerifiedBalanceV1,
+};
 use crate::state::LocalStateV1;
 use crate::to_js_err;
 
@@ -387,6 +390,7 @@ pub struct LedgerEventDto {
     height: Option<f64>,
     counterparty: Option<String>,
     entry_seq: Option<f64>,
+    failed_at: Option<String>,
 }
 
 impl LedgerEventDto {
@@ -402,6 +406,23 @@ impl LedgerEventDto {
             height: app.balance.as_ref().map(|balance| balance.height as f64),
             counterparty: Some(app.counterparty.as_str().to_string()),
             entry_seq: app.entry_seq.map(|seq| seq as f64),
+            failed_at: None,
+        }
+    }
+
+    /// A v2 settlement order result; `partial` carries the failing hop.
+    pub(crate) fn settlement(app: &SettlementApplication) -> Self {
+        LedgerEventDto {
+            kind: "order_result".to_string(),
+            order_hash: Some(hash_hex(app.order_hash)),
+            status: Some(app.status.to_string()),
+            reason: app.reason.map(str::to_string),
+            amount: Some(app.amount as f64),
+            balance: app.balance.as_ref().map(|balance| balance.amount as f64),
+            height: app.balance.as_ref().map(|balance| balance.height as f64),
+            counterparty: Some(app.counterparty.as_str().to_string()),
+            entry_seq: app.entry_seq.map(|seq| seq as f64),
+            failed_at: app.failed_at.as_ref().map(|id| id.as_str().to_string()),
         }
     }
 
@@ -417,6 +438,7 @@ impl LedgerEventDto {
             height: Some(balance.height as f64),
             counterparty: None,
             entry_seq: None,
+            failed_at: None,
         }
     }
 
@@ -432,6 +454,7 @@ impl LedgerEventDto {
             height: None,
             counterparty: None,
             entry_seq: None,
+            failed_at: None,
         }
     }
 }
@@ -490,6 +513,12 @@ impl LedgerEventDto {
     #[wasm_bindgen(getter)]
     pub fn entry_seq(&self) -> Option<f64> {
         self.entry_seq
+    }
+
+    /// The failing hop's node id, for a `"partial"` settlement result.
+    #[wasm_bindgen(getter)]
+    pub fn failed_at(&self) -> Option<String> {
+        self.failed_at.clone()
     }
 }
 
@@ -750,6 +779,88 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+/// Scheme of a payment receive URI.
+pub const RECEIVE_SCHEME: &str = "cawala";
+/// Host of a payment receive URI.
+pub const RECEIVE_HOST: &str = "pay";
+
+/// A parsed payment receive URI: the payee's node id and user address.
+#[wasm_bindgen]
+pub struct ReceiveUriInfo {
+    node_id: String,
+    address: String,
+}
+
+#[wasm_bindgen]
+impl ReceiveUriInfo {
+    /// The payee's `EndpointId` string.
+    #[wasm_bindgen(getter)]
+    pub fn node_id(&self) -> String {
+        self.node_id.clone()
+    }
+
+    /// The payee's user `OctAddr` string.
+    #[wasm_bindgen(getter)]
+    pub fn address(&self) -> String {
+        self.address.clone()
+    }
+}
+
+/// Build a `cawala://pay?to=<EndpointId>&addr=<OctAddr>` receive URI.
+///
+/// Both values are query-safe (the endpoint id is base32/hex and an
+/// `OctAddr` is dotted octal digits), so no percent-encoding is needed; this
+/// mirrors the join invite's parameter style.
+pub(crate) fn receive_uri_for(node_id: &str, address: &str) -> String {
+    format!("{RECEIVE_SCHEME}://{RECEIVE_HOST}?to={node_id}&addr={address}")
+}
+
+/// Parse and validate a `cawala://pay?...` receive URI.
+///
+/// Enforces the scheme/host, exactly the `to` and `addr` parameters (no
+/// duplicates or extras), a parseable `EndpointId`, and a parseable `OctAddr`.
+#[wasm_bindgen]
+pub fn parse_receive_uri(uri: &str) -> Result<ReceiveUriInfo, JsError> {
+    let (node_id, address) = parse_receive_uri_inner(uri).map_err(to_js_err)?;
+    Ok(ReceiveUriInfo {
+        node_id,
+        address: address.to_string(),
+    })
+}
+
+/// Pure parse+validate used by [`parse_receive_uri`] and unit tests.
+pub(crate) fn parse_receive_uri_inner(uri: &str) -> Result<(String, OctAddr), String> {
+    let prefix = format!("{RECEIVE_SCHEME}://{RECEIVE_HOST}?");
+    let query = uri
+        .strip_prefix(&prefix)
+        .ok_or_else(|| "not a cawala pay URI".to_string())?;
+
+    let mut node: Option<String> = None;
+    let mut addr: Option<OctAddr> = None;
+    for pair in query.split('&') {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| "malformed pay URI parameter".to_string())?;
+        match key {
+            "to" if node.is_none() => node = Some(value.to_string()),
+            "addr" if addr.is_none() => {
+                let parsed: OctAddr = value
+                    .parse()
+                    .map_err(|_| "invalid payee address".to_string())?;
+                addr = Some(parsed);
+            }
+            "to" | "addr" => return Err("duplicate pay URI parameter".to_string()),
+            _ => return Err("unexpected pay URI parameter".to_string()),
+        }
+    }
+
+    let node = node.ok_or_else(|| "missing 'to' parameter".to_string())?;
+    let addr = addr.ok_or_else(|| "missing 'addr' parameter".to_string())?;
+    node.parse::<iroh::EndpointId>()
+        .map_err(|_| "invalid payee node id".to_string())?;
+    Ok((node, addr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,6 +903,31 @@ mod tests {
     fn parse_invite_rejects_garbage() {
         assert!(parse_invite_inner("not an invite").is_err());
         assert!(parse_invite_inner("https://join?parent=x&op=00").is_err());
+    }
+
+    #[test]
+    fn receive_uri_round_trips_and_rejects_malformed() {
+        let endpoint = iroh::SecretKey::generate().public().to_string();
+        let uri = receive_uri_for(&endpoint, "0.1.3");
+        assert_eq!(uri, format!("cawala://pay?to={endpoint}&addr=0.1.3"));
+
+        let (node, addr) = parse_receive_uri_inner(&uri).unwrap();
+        assert_eq!(node, endpoint);
+        assert_eq!(addr, "0.1.3".parse::<OctAddr>().unwrap());
+
+        for bad in [
+            "not a uri",
+            "https://pay?to=x&addr=0.1.3",
+            "cawala://join?to=x&addr=0.1.3",
+            "cawala://pay?addr=0.1.3",
+            "cawala://pay?to=x",
+            "cawala://pay?to=x&addr=bogus",
+            "cawala://pay?to=x&addr=0.1.8",
+            "cawala://pay?to=x&addr=0.1.3&extra=1",
+            "cawala://pay?to=x&to=y&addr=0.1.3",
+        ] {
+            assert!(parse_receive_uri_inner(bad).is_err(), "accepted {bad:?}");
+        }
     }
 
     #[test]

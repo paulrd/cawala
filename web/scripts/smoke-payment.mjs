@@ -381,10 +381,10 @@ async function browserJoin(label, inviteUri, parentId) {
   }
 }
 
-/** Send `amount` from `node` to `to`, classifying connect failures. */
-async function sendPayment(node, to, amount) {
+/** Send `amount` from `node` to `to` at `toAddress`, classifying connect failures. */
+async function sendPayment(node, to, toAddress, amount) {
   try {
-    return await node.send_payment(to, amount);
+    return await node.send_payment(to, toAddress, amount);
   } catch (err) {
     if (isNetworkConnectError(err)) {
       throw new NetworkUnreachable(`send_payment could not reach the leaf: ${err.message}`);
@@ -516,6 +516,7 @@ async function main() {
       }
     }
 
+    const joinAddresses = {};
     for (const [label, node] of [["A", clientA], ["B", clientB]]) {
       const { status } = await waitForJoinStatus(
         node,
@@ -530,6 +531,7 @@ async function main() {
       if (!/^0\.\d+$/.test(status.address ?? "")) {
         throw new Error(`${label} joined address ${status.address} is not 0.<slot>`);
       }
+      joinAddresses[label] = status.address;
     }
 
     // The `control approve` CLI binds a short-lived endpoint with the node's
@@ -557,8 +559,8 @@ async function main() {
     }
 
     // ---- A pays B 25 -----------------------------------------------------
-    log(`A: send_payment(${b.browserId}, 25)`);
-    const outcome = await sendPayment(clientA, b.browserId, 25);
+    log(`A: send_payment(${b.browserId}, ${joinAddresses.B}, 25)`);
+    const outcome = await sendPayment(clientA, b.browserId, joinAddresses.B, 25);
     log("A: payment outcome:", JSON.stringify({
       orderHash: outcome.order_hash_hex,
       ack: outcome.ack,

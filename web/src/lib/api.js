@@ -457,6 +457,7 @@ function _drainLedgerEvents() {
           height: ev.height ?? null,
           counterparty: ev.counterparty ?? null,
           entrySeq: ev.entry_seq ?? null,
+          failedAt: ev.failed_at ?? null,
         };
       } finally {
         ev.free?.();
@@ -487,6 +488,7 @@ function _applyLedgerEvent(plain) {
       if (pending) {
         pending.status = plain.status ?? pending.status;
         pending.reason = plain.reason ?? pending.reason;
+        pending.failedAt = plain.failedAt ?? pending.failedAt;
         pending.resolvedAt = Date.now();
       }
     }
@@ -803,19 +805,21 @@ export function tryRecvEnvelope() {
 // ── Ledger / value transfer ───────────────────────────────────
 
 /**
- * Send a same-leaf payment to `toEndpointId`.
+ * Send a payment to a payee (cross-leaf or same-leaf).
  *
- * The amount is validated client-side, then `node.send_payment` signs and dials
- * the order. The returned `ack` only reports the routing leaf accepted the
- * envelope; the terminal `applied`/`duplicate`/`rejected` status arrives
- * asynchronously through the ledger-event poller and is reflected in
- * `ledgerState` (and resolvable by hash through the internal pending map).
+ * `to` is the payee's endpoint id (node id) and `toAddress` is their octal
+ * address (both normally from a receive URI). `amount` is in whole Cawala
+ * units. The order is operator-signed and persisted as pending *before* it is
+ * dialed, so a racing `"order_result"` event can always be matched; the
+ * terminal status arrives through the ledger-event poller as an
+ * `applied`/`duplicate`/`partial`/`rejected` status.
  *
- * @param {string} toEndpointId Recipient node id.
+ * @param {string} to Recipient node id.
+ * @param {string} toAddress Recipient octal address (e.g. "0.3.2").
  * @param {number} amount Whole, positive Cawala units.
  * @returns {Promise<{ orderHash: string, ack: string }>}
  */
-export async function sendPayment(toEndpointId, amount) {
+export async function sendPayment(to, toAddress, amount) {
   if (_useMock) {
     await mockDelay(500);
     const numeric = Number(amount);
@@ -824,7 +828,7 @@ export async function sendPayment(toEndpointId, amount) {
       id: orderHash,
       type: ACTIVITY_TYPES.TRANSFER,
       from: getAddress(),
-      to: typeof toEndpointId === 'string' ? toEndpointId : null,
+      to: typeof to === 'string' ? to : null,
       amount: Number.isFinite(numeric) ? numeric : null,
       signedBy: getEndpointId(),
       timestamp: new Date().toISOString(),
@@ -832,8 +836,11 @@ export async function sendPayment(toEndpointId, amount) {
     return { orderHash, ack: ENVELOPE_ACK.DELIVERED };
   }
 
-  if (typeof toEndpointId !== 'string' || !toEndpointId.trim()) {
+  if (typeof to !== 'string' || !to.trim()) {
     throw new Error('Enter the recipient node id.');
+  }
+  if (typeof toAddress !== 'string' || !toAddress.trim()) {
+    throw new Error('Enter the recipient address.');
   }
   const numeric = Number(amount);
   if (!Number.isFinite(numeric)) {
@@ -852,7 +859,7 @@ export async function sendPayment(toEndpointId, amount) {
   const node = _requireNode();
   let outcome;
   try {
-    outcome = await node.send_payment(toEndpointId.trim(), numeric);
+    outcome = await node.send_payment(to.trim(), toAddress.trim(), numeric);
   } catch (err) {
     throw new Error(`Payment failed: ${_errorMessage(err)}`);
   }
@@ -868,11 +875,13 @@ export async function sendPayment(toEndpointId, amount) {
 
   _pendingSends.set(orderHash, {
     orderHash,
-    to: toEndpointId.trim(),
+    to: to.trim(),
+    toAddress: toAddress.trim(),
     amount: numeric,
     ack,
     status: 'pending',
     reason: null,
+    failedAt: null,
     sentAt: Date.now(),
     resolvedAt: null,
   });
@@ -932,6 +941,86 @@ export function getLedgerStatus() {
 }
 
 /**
+ * Parse and validate a `cawala://pay?to=...&addr=...` receive URI.
+ *
+ * @param {string} uri - Raw receive URI from the user.
+ * @returns {Promise<{ nodeId: string, address: string }>}
+ * @throws {Error} With a user-facing message if the URI is invalid.
+ */
+export async function parseReceiveUri(uri) {
+  const trimmed = (uri || '').trim();
+  if (!trimmed) {
+    throw new Error('Paste a receive URI from the payee.');
+  }
+
+  if (_useMock) {
+    await mockDelay(100);
+    return _mockParseReceiveUri(trimmed);
+  }
+
+  if (!_wasmModule) {
+    throw new Error('URI parsing is unavailable: the wasm client is not loaded.');
+  }
+
+  let info;
+  try {
+    info = _wasmModule.parse_receive_uri(trimmed);
+  } catch (err) {
+    throw new Error(`Invalid receive URI: ${_errorMessage(err)}`);
+  }
+
+  try {
+    return {
+      nodeId: info.node_id,
+      address: info.address,
+    };
+  } finally {
+    info.free?.();
+  }
+}
+
+/**
+ * Mock receive URI parser. Recognises `cawala://pay?to=...&addr=...` URIs.
+ */
+function _mockParseReceiveUri(raw) {
+  try {
+    const url = new URL(raw);
+    if (url.protocol === 'cawala:' && url.host === 'pay') {
+      const to = url.searchParams.get('to');
+      const addr = url.searchParams.get('addr');
+      if (!to || !addr) {
+        throw new Error('Receive URI is missing required fields (to, addr).');
+      }
+      return { nodeId: to, address: addr };
+    }
+  } catch (e) {
+    if (e.message && e.message.includes('missing required')) {
+      throw e;
+    }
+  }
+  throw new Error("That doesn't look like a receive URI. Ask the payee to send a fresh one.");
+}
+
+/**
+ * Get this client's payment receive URI.
+ *
+ * @returns {Promise<string>} The `cawala://pay?to=...&addr=...` URI, or null.
+ */
+export async function getReceiveUri() {
+  if (_useMock) {
+    await mockDelay(100);
+    return `cawala://pay?to=z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK&addr=${getAddress()}`;
+  }
+  if (!_clientNode) return null;
+  try {
+    return _clientNode.receive_uri();
+  } catch (err) {
+    _warnOnce('receive-uri', '[api] receive_uri failed', err);
+    return null;
+  }
+}
+
+/**
  * Snapshot of the JS-tracked payments for UI status, keyed by order hash. Each
  * entry starts as `status: 'pending'` and is updated to `applied`/`duplicate`/
  * `rejected` when the matching `order_result` event is drained. The
@@ -941,7 +1030,7 @@ export function getLedgerStatus() {
  * load are not listed even though their orders may still be pending in the
  * wasm ledger state.
  *
- * @returns {Array<{ orderHash: string, to: string, amount: number, ack: string, status: string, reason: string|null, sentAt: number, resolvedAt: number|null }>}
+ * @returns {Array<{ orderHash: string, to: string, toAddress: string, amount: number, ack: string, status: string, reason: string|null, failedAt: string|null, sentAt: number, resolvedAt: number|null }>}
  */
 export function getPendingPayments() {
   return Array.from(_pendingSends.values(), (payment) => ({ ...payment }));
@@ -1166,7 +1255,7 @@ function _mockParseInvite(raw) {
   // Try URI format first
   try {
     const url = new URL(raw);
-    if (url.protocol === 'cawala:' && url.pathname === '/join') {
+    if (url.protocol === 'cawala:' && url.host === 'join') {
       const parent = url.searchParams.get('parent');
       const op = url.searchParams.get('op');
       if (!parent || !op) {

@@ -46,8 +46,8 @@ pub use envelope::{
 pub use ledger_payload::{
     BalanceQueryV1, BalanceReceiptV1, LEDGER_PAYLOAD_V2_VERSION, LEDGER_PAYLOAD_VERSION,
     LedgerPayloadError, LedgerPayloadV1, LedgerPayloadV2, MAX_RECEIPT_HISTORY, OrderRejectV1,
-    OrderResultV1, OrderStatusV1, OrderV1, OrderV2, ValueNoticeV1, VersionedLedgerPayload,
-    decode_versioned,
+    OrderResultV1, OrderResultV2, OrderStatusV1, OrderV1, OrderV2, SettlementStatusV2,
+    ValueNoticeV1, VersionedLedgerPayload, decode_versioned,
 };
 pub use proto::OctAddr;
 pub use replay::{Seen, SeenConfig, SeenSet};

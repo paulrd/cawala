@@ -248,12 +248,18 @@ fn codec_error(err: postcard::Error) -> LedgerPayloadError {
 ///
 /// Variant order is frozen. v2 exists because [`LedgerPayloadV1`] cannot be
 /// extended in place (positional postcard): a new variant requires a new
-/// version-prefixed type. Replies remain v1.
+/// version-prefixed type. v2 also carries settlement-specific results.
+// `OrderResult` embeds an optional full balance receipt, so variant sizes differ;
+// the wire layout is frozen, so keep the declared shape rather than boxing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LedgerPayloadV2 {
     /// Browser -> leaf: submit an operator-signed order with the payee's
     /// address, so the leaf can route a cross-subtree settlement.
     Order(OrderV2),
+    /// Leaf -> browser: the outcome of an [`OrderV2`], including a settlement's
+    /// `Partial` state that names the failing hop.
+    OrderResult(OrderResultV2),
 }
 
 impl LedgerPayloadV2 {
@@ -293,6 +299,66 @@ pub struct OrderV2 {
     pub auth: AuthRef,
     /// The payee's user `OctAddr`, needed to derive the settlement route.
     pub payee_addr: OctAddr,
+}
+
+/// Leaf -> browser: the outcome of an [`OrderV2`].
+///
+/// Field order is frozen. `balance` is the payer's own signed receipt, when the
+/// leaf offers one; the result itself is **advisory**, and the receipt is the
+/// payer's signed ground truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderResultV2 {
+    /// The [`MsgId`] of the triggering order envelope.
+    pub reply_to: MsgId,
+    /// The order's domain-separated hash.
+    pub order_hash: Hash,
+    /// The settlement outcome.
+    pub status: SettlementStatusV2,
+    /// A fresh balance receipt for the payer, when the leaf offers one.
+    pub balance: Option<BalanceReceiptV1>,
+}
+
+/// The terminal state of an [`OrderV2`] and its settlement.
+///
+/// Variant order is frozen. `Partial` is the partial-cascade case: the payer's
+/// own hop applied (so the payer was debited) but a downstream hop failed, so
+/// the payee was not credited. It names the failing hop so the browser never
+/// reports an unproven "paid".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SettlementStatusV2 {
+    /// The payment applied in full.
+    Applied {
+        /// The terminal hop's ledger `seq`.
+        entry_seq: u64,
+        /// The terminal hop's entry hash.
+        entry_hash: Hash,
+    },
+    /// The order was already consumed (replay); no new entry.
+    Duplicate {
+        /// The previously applied entry's ledger `seq`.
+        entry_seq: u64,
+        /// The previously applied entry's hash.
+        entry_hash: Hash,
+    },
+    /// The payer's hop applied but a downstream hop failed.
+    Partial {
+        /// The hop whose hop was refused.
+        failed_at: NodeId,
+        /// The per-hop refusal reason.
+        reason: OrderRejectV1,
+    },
+    /// The payment was refused before the payer's hop applied.
+    Rejected {
+        /// The refusal reason.
+        reason: OrderRejectV1,
+    },
+    /// The outcome is unknown but the payer's hop applied (a debit is
+    /// committed): a timeout, an eviction, or a post-reservation malformed
+    /// terminal. The payer must not assume the funds were returned.
+    Indeterminate {
+        /// The reason the outcome could not be determined.
+        reason: OrderRejectV1,
+    },
 }
 
 /// A ledger payload of any known version, for version-dispatching callers.
@@ -387,6 +453,15 @@ mod tests {
             },
             auth: auth(),
             payee_addr: "0.2.4".parse().expect("valid octal address"),
+        }
+    }
+
+    fn sample_order_result_v2(status: SettlementStatusV2) -> OrderResultV2 {
+        OrderResultV2 {
+            reply_to: MsgId([0x11; 16]),
+            order_hash: Hash::from_bytes([0x22; 32]),
+            status,
+            balance: None,
         }
     }
 
@@ -650,6 +725,100 @@ mod tests {
             let mut trailing = valid.clone();
             trailing.push(0);
             assert!(decode_versioned(&trailing).is_err());
+        }
+    }
+
+    #[test]
+    fn v2_order_result_round_trips_every_status() {
+        let statuses = [
+            SettlementStatusV2::Applied {
+                entry_seq: 7,
+                entry_hash: Hash::from_bytes([0x55; 32]),
+            },
+            SettlementStatusV2::Duplicate {
+                entry_seq: 7,
+                entry_hash: Hash::from_bytes([0x55; 32]),
+            },
+            SettlementStatusV2::Partial {
+                failed_at: node("leaf"),
+                reason: OrderRejectV1::InsufficientBalance,
+            },
+            SettlementStatusV2::Rejected {
+                reason: OrderRejectV1::BadRequest,
+            },
+            SettlementStatusV2::Indeterminate {
+                reason: OrderRejectV1::Internal,
+            },
+        ];
+        for status in statuses {
+            let payload = LedgerPayloadV2::OrderResult(sample_order_result_v2(status));
+            let bytes = payload.to_bytes().unwrap();
+            assert_eq!(bytes[0], LEDGER_PAYLOAD_V2_VERSION);
+            assert_eq!(LedgerPayloadV2::from_bytes(&bytes).unwrap(), payload);
+
+            for cut in 0..bytes.len() {
+                assert!(
+                    LedgerPayloadV2::from_bytes(&bytes[..cut]).is_err(),
+                    "prefix of length {cut} unexpectedly decoded"
+                );
+            }
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert!(LedgerPayloadV2::from_bytes(&trailing).is_err());
+        }
+    }
+
+    #[test]
+    fn v2_discriminant_order_is_frozen() {
+        let order = LedgerPayloadV2::Order(sample_order_v2());
+        let result = LedgerPayloadV2::OrderResult(sample_order_result_v2(
+            SettlementStatusV2::Rejected {
+                reason: OrderRejectV1::BadRequest,
+            },
+        ));
+        assert_eq!(order.to_bytes().unwrap()[1], 0);
+        assert_eq!(result.to_bytes().unwrap()[1], 1);
+
+        for (status, expected) in [
+            (
+                SettlementStatusV2::Applied {
+                    entry_seq: 0,
+                    entry_hash: Hash::ZERO,
+                },
+                0u8,
+            ),
+            (
+                SettlementStatusV2::Duplicate {
+                    entry_seq: 0,
+                    entry_hash: Hash::ZERO,
+                },
+                1,
+            ),
+            (
+                SettlementStatusV2::Partial {
+                    failed_at: node("n"),
+                    reason: OrderRejectV1::Internal,
+                },
+                2,
+            ),
+            (
+                SettlementStatusV2::Rejected {
+                    reason: OrderRejectV1::Internal,
+                },
+                3,
+            ),
+            (
+                SettlementStatusV2::Indeterminate {
+                    reason: OrderRejectV1::Internal,
+                },
+                4,
+            ),
+        ] {
+            assert_eq!(
+                postcard::to_allocvec(&status).unwrap()[0],
+                expected,
+                "status discriminant changed"
+            );
         }
     }
 

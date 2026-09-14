@@ -7,21 +7,38 @@
   import Badge from '../shared/Badge.svelte';
   import EmptyState from '../shared/EmptyState.svelte';
   import { clientState, ledgerState, showToast } from '../../lib/stores.svelte.js';
-  import { isMockMode, sendPayment, getPendingPayments, requestBalance } from '../../lib/api.js';
+  import {
+    isMockMode,
+    sendPayment,
+    getPendingPayments,
+    requestBalance,
+    parseReceiveUri,
+    getReceiveUri,
+  } from '../../lib/api.js';
   import { ORDER_REJECT } from '../../lib/constants.js';
-  import { truncateMiddle, timeAgo, formatTime } from '../../lib/utils.js';
+  import { truncateMiddle, timeAgo, formatTime, copyToClipboard } from '../../lib/utils.js';
 
   let isLive = $derived(!isMockMode());
 
-  // ── Send form state ──────────────────────────────────────
-  let sendTo = $state('');
+  // ── Receive URI state ─────────────────────────────────────
+  let receiveUri = $state(null);
+  let receiveUriCopied = $state(false);
+  let receiveUriLoading = $state(false);
+
+  // ── Send form state ───────────────────────────────────────
+  let sendUriInput = $state('');
   let sendAmount = $state('');
   let sendError = $state('');
   let sending = $state(false);
-  let sendResult = $state(null); // { orderHash, status, reason, ack }
+  let sendResult = $state(null); // { orderHash, status, reason, failedAt, ack }
   let sendPoller = $state(null);
 
-  // ── Balance staleness ────────────────────────────────────
+  // Parsed payee from the receive URI (null until successfully parsed).
+  let parsedPayee = $state(null);
+  let parsingUri = $state(false);
+  let parseError = $state('');
+
+  // ── Balance staleness ─────────────────────────────────────
   let balanceFresh = $derived(
     ledgerState.verifiedAt != null && (Date.now() - ledgerState.verifiedAt) < 30000
   );
@@ -30,13 +47,38 @@
   );
   let balanceUnverified = $derived(ledgerState.balance == null);
 
-  // ── Client-side validation ───────────────────────────────
+  // ── URI parsing ───────────────────────────────────────────
+  let _parseDebounce = null;
+
+  function _onUriInputChange() {
+    parsedPayee = null;
+    parseError = '';
+    if (_parseDebounce) clearTimeout(_parseDebounce);
+    const raw = sendUriInput.trim();
+    if (!raw) return;
+    _parseDebounce = setTimeout(() => _parseUri(raw), 400);
+  }
+
+  async function _parseUri(raw) {
+    parsingUri = true;
+    parseError = '';
+    try {
+      const result = await parseReceiveUri(raw);
+      parsedPayee = result;
+    } catch (err) {
+      parseError = err.message || 'Invalid receive URI.';
+      parsedPayee = null;
+    } finally {
+      parsingUri = false;
+    }
+  }
+
+  // ── Client-side validation ────────────────────────────────
   function validateSend() {
-    const to = sendTo.trim();
     const raw = sendAmount.trim();
 
-    if (!to) {
-      sendError = 'Enter the recipient node id.';
+    if (!parsedPayee) {
+      sendError = 'Paste a valid receive URI first.';
       return false;
     }
     const amount = Number(raw);
@@ -67,17 +109,23 @@
     sendResult = null;
 
     try {
-      const { orderHash, ack } = await sendPayment(sendTo.trim(), Number(sendAmount.trim()));
+      const { orderHash, ack } = await sendPayment(
+        parsedPayee.nodeId,
+        parsedPayee.address,
+        Number(sendAmount.trim()),
+      );
       sendResult = {
         orderHash,
         ack,
         status: 'pending',
         reason: null,
+        failedAt: null,
       };
-      // Clear the form on submission
-      sendTo = '';
+      // Clear the form on submission.
       sendAmount = '';
-      // Start polling for terminal status
+      parsedPayee = null;
+      sendUriInput = '';
+      // Start polling for terminal status.
       _startSendPoller(orderHash);
     } catch (err) {
       sendError = err.message || 'Payment failed.';
@@ -93,22 +141,30 @@
       attempts++;
       const payments = getPendingPayments();
       const match = payments.find((p) => p.orderHash === orderHash);
-      if (match && match.status !== 'pending') {
-        _stopSendPoller();
+      if (match) {
         sendResult = {
           ...sendResult,
           status: match.status,
           reason: match.reason,
+          failedAt: match.failedAt ?? null,
         };
+        // Every non-pending status (including `indeterminate`) is terminal
+        // client-side: stop polling and keep that card.
+        if (match.status !== 'pending') {
+          _stopSendPoller();
+          return;
+        }
       }
-      // Stop after 60s to avoid infinite polling
+      // Stop after 60s to avoid infinite polling. Never overwrite an existing
+      // terminal/indeterminate card with the generic timeout copy.
       if (attempts > 30) {
         _stopSendPoller();
-        sendResult = {
-          ...sendResult,
-          status: 'pending',
-          reason: 'Status check timed out. The order may still be processing.',
-        };
+        if (sendResult?.status === 'pending') {
+          sendResult = {
+            ...sendResult,
+            reason: 'Status check timed out. The order may still be processing.',
+          };
+        }
       }
     }, 2000);
   }
@@ -123,6 +179,10 @@
   function resetSendForm() {
     sendResult = null;
     sendError = '';
+    parsedPayee = null;
+    parseError = '';
+    sendUriInput = '';
+    sendAmount = '';
   }
 
   function rejectionReasonText(reason) {
@@ -133,7 +193,7 @@
       [ORDER_REJECT.BAD_REQUEST]: 'Bad request',
       [ORDER_REJECT.EXPIRED]: 'Order expired',
       [ORDER_REJECT.ACCOUNT_NOT_OPENED]: 'Account not opened',
-      [ORDER_REJECT.NOT_A_CHILD]: 'Recipient is not a child of this leaf',
+      [ORDER_REJECT.NOT_A_CHILD]: 'Recipient could not be reached',
       [ORDER_REJECT.INTERNAL]: 'Internal error',
     };
     return map[reason] || reason;
@@ -149,32 +209,62 @@
     showToast('Balance refresh requested', 'info', 2000);
   }
 
-  // ── Mock transaction history ─────────────────────────────
+  // ── Receive URI ───────────────────────────────────────────
+  async function loadReceiveUri() {
+    receiveUriLoading = true;
+    try {
+      receiveUri = await getReceiveUri();
+    } catch {
+      receiveUri = null;
+    } finally {
+      receiveUriLoading = false;
+    }
+  }
+
+  async function handleCopyUri() {
+    if (!receiveUri) return;
+    const ok = await copyToClipboard(receiveUri);
+    if (ok) {
+      receiveUriCopied = true;
+      showToast('Receive URI copied', 'ok', 2000);
+      setTimeout(() => { receiveUriCopied = false; }, 2000);
+    } else {
+      showToast('Copy failed', 'danger', 3000);
+    }
+  }
+
+  // ── Mock transaction history ──────────────────────────────
   let mockTransactions = $state([
     { id: 1, type: 'transfer', to: '0.3.2', amount: 150, timestamp: new Date(Date.now() - 3600000).toISOString() },
     { id: 2, type: 'transfer', to: '0.3.3', amount: 75, timestamp: new Date(Date.now() - 86400000).toISOString() },
   ]);
 
-  // ── Cleanup ──────────────────────────────────────────────
+  // ── Cleanup ───────────────────────────────────────────────
+  // Reload the receive URI whenever this client becomes joined (its assigned
+  // address appears or changes), so a page opened across the join does not stick
+  // on "unavailable".
+  $effect(() => {
+    if (clientState.address) {
+      loadReceiveUri();
+    }
+  });
 
   onMount(() => {
-    return () => _stopSendPoller();
+    return () => {
+      _stopSendPoller();
+      if (_parseDebounce) clearTimeout(_parseDebounce);
+    };
   });
 </script>
 
 <div class="my-account-page">
-  <!-- ── Identity Card ─────────────────────────────────── -->
+  <!-- ── Identity Card ──────────────────────────────────── -->
   <Card title="My Account">
     <div class="account-info">
       <div class="info-row">
         <span class="info-label muted">Endpoint ID</span>
         <div class="info-value">
           <EndpointId id={clientState.endpointId} full={true} />
-          {#if isLive}
-            <p class="info-hint">
-              Share this id so others can send you payments.
-            </p>
-          {/if}
         </div>
       </div>
 
@@ -199,7 +289,7 @@
     </div>
   </Card>
 
-  <!-- ── Balance Card ──────────────────────────────────── -->
+  <!-- ── Balance Card ───────────────────────────────────── -->
   <Card title="Verified Balance">
     {#if isLive}
       <div class="balance-section">
@@ -283,7 +373,36 @@
     {/if}
   </Card>
 
-  <!-- ── Send Payment Card ─────────────────────────────── -->
+  <!-- ── My Receive URI Card ────────────────────────────── -->
+  {#if isLive}
+    <Card title="Receive payments">
+      <div class="receive-section">
+        {#if receiveUriLoading}
+          <p class="text-sm muted">Loading receive URI&hellip;</p>
+        {:else if receiveUri}
+          <p class="text-sm">
+            Share this link so others can pay you. They paste it into their send form, which resolves your node id and address automatically.
+          </p>
+          <div class="uri-row">
+            <code class="uri-text">{receiveUri}</code>
+            <button
+              type="button"
+              class="btn btn--ghost btn--sm"
+              onclick={handleCopyUri}
+            >
+              {receiveUriCopied ? 'Copied' : 'Copy'}
+            </button>
+          </div>
+        {:else}
+          <p class="text-sm muted">
+            Receive URI unavailable — join a leaf to get one.
+          </p>
+        {/if}
+      </div>
+    </Card>
+  {/if}
+
+  <!-- ── Send Payment Card ──────────────────────────────── -->
   {#if isLive}
     <Card title="Send payment">
       {#if sendResult}
@@ -297,13 +416,68 @@
               <span class="detail-label muted">Order hash</span>
               <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
             </div>
-          {:else if sendResult.status === 'applied' || sendResult.status === 'duplicate'}
+          {:else if sendResult.status === 'applied'}
             <div class="result-row result-success">
-              <Badge variant="ok" label={sendResult.status === 'duplicate' ? 'Duplicate (already applied)' : 'Applied'} />
+              <Badge variant="ok" label="Applied" />
               <span class="text-sm">
-                {sendResult.status === 'duplicate'
-                  ? 'This order was already applied.'
-                  : 'Payment applied.'}
+                The leaf reports this payment applied. Your signed balance receipt is the confirmation.
+              </span>
+            </div>
+            <div class="result-detail">
+              <span class="detail-label muted">Order hash</span>
+              <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
+            </div>
+            <button
+              type="button"
+              class="btn btn--ghost btn--sm"
+              onclick={resetSendForm}
+            >
+              Send another payment
+            </button>
+          {:else if sendResult.status === 'duplicate'}
+            <div class="result-row result-success">
+              <Badge variant="ok" label="Duplicate" />
+              <span class="text-sm">This order was already applied. No double charge.</span>
+            </div>
+            <div class="result-detail">
+              <span class="detail-label muted">Order hash</span>
+              <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
+            </div>
+            <button
+              type="button"
+              class="btn btn--ghost btn--sm"
+              onclick={resetSendForm}
+            >
+              Send another payment
+            </button>
+          {:else if sendResult.status === 'partial'}
+            <div class="result-row result-partial">
+              <Badge variant="warn" label="Sent, not confirmed" />
+              <span class="text-sm">
+                Your debit is committed but the payee was not credited. Reconciliation is in progress.
+              </span>
+            </div>
+            <div class="result-detail">
+              <span class="detail-label muted">Order hash</span>
+              <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
+              {#if sendResult.failedAt}
+                <span class="detail-hint text-xs muted">
+                  Stopped at: {truncateMiddle(sendResult.failedAt, 8)}
+                </span>
+              {/if}
+            </div>
+            <button
+              type="button"
+              class="btn btn--ghost btn--sm"
+              onclick={resetSendForm}
+            >
+              Send another payment
+            </button>
+          {:else if sendResult.status === 'indeterminate'}
+            <div class="result-row result-partial">
+              <Badge variant="warn" label="Outcome unknown" />
+              <span class="text-sm">
+                Outcome unknown &mdash; your debit is committed; do not resend.
               </span>
             </div>
             <div class="result-detail">
@@ -358,18 +532,47 @@
       {:else}
         <form class="send-form" onsubmit={(e) => { e.preventDefault(); handleSubmit(); }} aria-label="Send payment form">
           <div class="form-field">
-            <label class="field-label" for="send-to">Recipient node id</label>
+            <label class="field-label" for="send-uri">Payee receive URI</label>
             <input
-              id="send-to"
+              id="send-uri"
               type="text"
               class="field-input"
-              placeholder="z6Mk..."
-              bind:value={sendTo}
+              placeholder="cawala://pay?to=...&addr=..."
+              value={sendUriInput}
+              oninput={(e) => { sendUriInput = e.target.value; _onUriInputChange(); }}
               disabled={sending}
               autocomplete="off"
               spellcheck="false"
             />
+            <span class="field-hint text-xs muted">
+              Paste the link the payee shared with you.
+            </span>
           </div>
+
+          {#if parsingUri}
+            <div class="parse-status text-xs muted">Resolving&hellip;</div>
+          {/if}
+
+          {#if parseError}
+            <div class="form-error" role="alert" aria-live="assertive">
+              {parseError}
+            </div>
+          {/if}
+
+          {#if parsedPayee}
+            <div class="parsed-recipient">
+              <div class="parsed-row">
+                <span class="detail-label muted">Payee node</span>
+                <div class="detail-value">
+                  <EndpointId id={parsedPayee.nodeId} full={true} />
+                </div>
+              </div>
+              <div class="parsed-row">
+                <span class="detail-label muted">Payee address</span>
+                <Address address={parsedPayee.address} size="sm" />
+              </div>
+            </div>
+          {/if}
 
           <div class="form-field">
             <label class="field-label" for="send-amount">Amount (whole units)</label>
@@ -379,7 +582,7 @@
               class="field-input field-input--narrow"
               placeholder="0"
               bind:value={sendAmount}
-              disabled={sending}
+              disabled={sending || !parsedPayee}
               inputmode="numeric"
               autocomplete="off"
             />
@@ -395,7 +598,7 @@
             <button
               type="submit"
               class="btn btn--primary"
-              disabled={sending || !sendTo.trim() || !sendAmount.trim()}
+              disabled={sending || !parsedPayee || !sendAmount.trim()}
             >
               {#if sending}
                 Sending&hellip;
@@ -404,16 +607,12 @@
               {/if}
             </button>
           </div>
-
-          <p class="form-note text-xs muted">
-            Only same-leaf payments are supported. The recipient must share their node id.
-          </p>
         </form>
       {/if}
     </Card>
   {/if}
 
-  <!-- ── Recent Activity Card ──────────────────────────── -->
+  <!-- ── Recent Activity Card ───────────────────────────── -->
   <Card title="Recent Transactions">
     {#if isLive}
       {#if ledgerState.activity.length === 0 && ledgerState.pending === 0}
@@ -551,6 +750,34 @@
     gap: var(--sp-2);
   }
 
+  /* Receive URI */
+  .receive-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+  }
+  .uri-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    padding: var(--sp-3);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    min-width: 0;
+  }
+  .uri-text {
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--fg);
+    word-break: break-all;
+    flex: 1;
+    min-width: 0;
+    border: none;
+    background: transparent;
+    padding: 0;
+  }
+
   /* Send form */
   .send-form {
     display: flex;
@@ -566,6 +793,9 @@
     font-size: var(--text-sm);
     font-weight: 500;
     color: var(--fg);
+  }
+  .field-hint {
+    line-height: var(--leading-normal);
   }
   .field-input {
     padding: var(--sp-2) var(--sp-3);
@@ -589,6 +819,9 @@
   .field-input--narrow {
     max-width: 200px;
   }
+  .parse-status {
+    line-height: var(--leading-normal);
+  }
   .form-error {
     padding: var(--sp-2) var(--sp-3);
     background: var(--danger-dim);
@@ -600,8 +833,29 @@
     display: flex;
     gap: var(--sp-3);
   }
-  .form-note {
-    line-height: var(--leading-normal);
+
+  /* Parsed recipient confirmation */
+  .parsed-recipient {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+    padding: var(--sp-3);
+    background: var(--ok-dim);
+    border: 1px solid var(--ok);
+    border-radius: var(--radius-md);
+  }
+  .parsed-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+  }
+  .parsed-row .detail-label {
+    min-width: 100px;
+    flex-shrink: 0;
+  }
+  .parsed-row :global(.detail-value) {
+    font-family: var(--mono);
+    font-size: var(--text-sm);
   }
 
   /* Send result */

@@ -30,18 +30,26 @@ use cawala_ledger::{
     verify_balance_attestation,
 };
 use cawala_msg::{
-    BalanceReceiptV1, OrderRejectV1, OrderResultV1, OrderStatusV1, ValueNoticeV1,
+    BalanceReceiptV1, OrderRejectV1, OrderResultV1, OrderResultV2, OrderStatusV1,
+    SettlementStatusV2, ValueNoticeV1,
 };
 use serde::{Deserialize, Serialize};
 
 /// Wire version of [`LedgerStateV1`].
 ///
 /// Bump only for a deliberate, documented change to the exported blob; it is
-/// checked by [`LedgerStateV1::from_bytes`].
-pub const LEDGER_STATE_VERSION: u8 = 1;
+/// checked by [`LedgerStateV1::from_bytes`]. v2 adds the bounded `settlements`
+/// list (v2 settlement outcomes). A version bump discards previously persisted
+/// state on import: the TOFU ledger pin, verified balance, activity, and pending
+/// orders are not migrated across versions.
+pub const LEDGER_STATE_VERSION: u8 = 2;
 
 /// Maximum number of in-flight orders retained; older ones are evicted.
 pub const MAX_PENDING_ORDERS: usize = 32;
+
+/// Maximum number of recent settlement outcomes retained; older ones are
+/// evicted.
+pub const MAX_SETTLEMENT_RECORDS: usize = 64;
 
 /// Maximum number of activity entries retained; older ones are evicted.
 pub const MAX_ACTIVITY_ENTRIES: usize = 200;
@@ -101,6 +109,42 @@ pub struct PendingOrderV1 {
     pub sent_at: u64,
 }
 
+/// The terminal state of a settlement payment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SettlementStateV1 {
+    /// The payment applied in full.
+    Applied,
+    /// The order was already consumed (replay); no new entry.
+    Duplicate,
+    /// The payer's hop applied but a downstream hop failed; the payee was not
+    /// credited.
+    Partial {
+        /// The hop whose hop was refused.
+        failed_at: NodeId,
+    },
+    /// The payment was refused before the payer's hop applied.
+    Rejected {
+        /// Stable rejection reason.
+        reason: String,
+    },
+    /// The outcome is unknown but the payer's hop applied (a debit is
+    /// committed): a timeout or post-reservation malformed terminal. The pending
+    /// order is retained so a later true terminal can still resolve it.
+    Indeterminate {
+        /// Stable reason the outcome could not be determined.
+        reason: String,
+    },
+}
+
+/// A remembered settlement outcome, keyed by the order hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlementRecordV1 {
+    /// The order's domain-separated hash.
+    pub order_hash: Hash,
+    /// The terminal settlement state.
+    pub state: SettlementStateV1,
+}
+
 /// The versioned, postcard-serializable ledger state blob.
 ///
 /// This is exactly what [`crate::ClientNode::export_ledger_state`] emits and
@@ -118,6 +162,8 @@ pub struct LedgerStateV1 {
     pub activity: Vec<ActivityEntryV1>,
     /// Bounded in-flight orders, oldest first.
     pub pending: Vec<PendingOrderV1>,
+    /// Bounded recent settlement outcomes, oldest first.
+    pub settlements: Vec<SettlementRecordV1>,
 }
 
 impl Default for LedgerStateV1 {
@@ -128,6 +174,7 @@ impl Default for LedgerStateV1 {
             balance: None,
             activity: Vec::new(),
             pending: Vec::new(),
+            settlements: Vec::new(),
         }
     }
 }
@@ -285,6 +332,12 @@ impl LedgerStateV1 {
                 state.activity.len()
             ));
         }
+        if state.settlements.len() > MAX_SETTLEMENT_RECORDS {
+            return Err(format!(
+                "ledger state has {} settlement records (max {MAX_SETTLEMENT_RECORDS})",
+                state.settlements.len()
+            ));
+        }
         Ok(state)
     }
 
@@ -327,6 +380,24 @@ impl LedgerStateV1 {
             self.activity.remove(0);
         }
         true
+    }
+
+    /// Record a terminal settlement outcome, replacing any existing record for
+    /// the same order and evicting the oldest beyond
+    /// [`MAX_SETTLEMENT_RECORDS`].
+    pub fn record_settlement(&mut self, order_hash: Hash, state: SettlementStateV1) {
+        if let Some(existing) = self
+            .settlements
+            .iter_mut()
+            .find(|record| record.order_hash == order_hash)
+        {
+            existing.state = state;
+            return;
+        }
+        self.settlements.push(SettlementRecordV1 { order_hash, state });
+        while self.settlements.len() > MAX_SETTLEMENT_RECORDS {
+            self.settlements.remove(0);
+        }
     }
 }
 
@@ -485,6 +556,131 @@ pub fn apply_order_result(
     })
 }
 
+/// The result of applying one v2 settlement `OrderResultV2`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettlementApplication {
+    /// `"applied"`, `"duplicate"`, `"partial"`, `"rejected"`, or
+    /// `"indeterminate"`.
+    pub status: &'static str,
+    /// Stable reason, when the outcome is `"partial"`, `"rejected"`, or
+    /// `"indeterminate"`.
+    pub reason: Option<&'static str>,
+    /// The failing hop, when the outcome is `"partial"`.
+    pub failed_at: Option<NodeId>,
+    /// The order's domain-separated hash.
+    pub order_hash: Hash,
+    /// The amount the order moved.
+    pub amount: u64,
+    /// The payee node.
+    pub counterparty: NodeId,
+    /// The terminal ledger `seq`, when the outcome carries one.
+    pub entry_seq: Option<u64>,
+    /// The verified balance accompanying the result, when the leaf offered one.
+    pub balance: Option<VerifiedBalanceV1>,
+}
+
+/// Match an inbound v2 settlement result against the pending set and apply it
+/// atomically.
+///
+/// The order is found by its domain-separated hash. Any accompanying balance is
+/// verified *before* any mutation, so a verification failure leaves the balance,
+/// pending set, and settlement log unchanged. On success the pending order is
+/// removed and the settlement outcome is recorded — including `Indeterminate`,
+/// which is treated as **terminal client-side**: the origin's timeout sweep
+/// drops its own pending and ignores a later terminal, so retaining the client
+/// pending would only leave an unresolved order that can evict a live one. The
+/// UI keeps the "outcome unknown / debit committed" state from the recorded
+/// outcome. The result is **advisory** (and, for `Partial`/`Indeterminate`,
+/// explicitly not a completed payment); the verified receipt remains the signed
+/// ground truth.
+///
+/// # Known limitation
+///
+/// Settled v2 outcomes are recorded in [`LedgerStateV1::settlements`], but a
+/// reload does not reconstruct them into the activity log (the payer's own hop
+/// entry is not carried in the result).
+pub fn apply_settlement_result(
+    state: &mut LedgerStateV1,
+    result: &OrderResultV2,
+    self_node: &str,
+    expected_parent: &NodeId,
+    _now: u64,
+) -> Result<SettlementApplication, String> {
+    let index = state
+        .pending
+        .iter()
+        .position(|pending| pending.order.hash() == result.order_hash)
+        .ok_or_else(|| "unknown_order".to_string())?;
+
+    // Verify any offered balance before mutating anything.
+    let verified_balance = match &result.balance {
+        Some(receipt) => Some(verify_receipt(state, receipt, self_node, expected_parent)?),
+        None => None,
+    };
+
+    // Every v2 outcome is terminal client-side (see the doc above).
+    let pending = state.pending.remove(index);
+    let (status, reason, failed_at, entry_seq, settlement_state) = match &result.status {
+        SettlementStatusV2::Applied { entry_seq, .. } => (
+            "applied",
+            None,
+            None,
+            Some(*entry_seq),
+            SettlementStateV1::Applied,
+        ),
+        SettlementStatusV2::Duplicate { entry_seq, .. } => (
+            "duplicate",
+            None,
+            None,
+            Some(*entry_seq),
+            SettlementStateV1::Duplicate,
+        ),
+        SettlementStatusV2::Partial { failed_at, reason } => (
+            "partial",
+            Some(order_reject_str(reason)),
+            Some(failed_at.clone()),
+            None,
+            SettlementStateV1::Partial {
+                failed_at: failed_at.clone(),
+            },
+        ),
+        SettlementStatusV2::Rejected { reason } => (
+            "rejected",
+            Some(order_reject_str(reason)),
+            None,
+            None,
+            SettlementStateV1::Rejected {
+                reason: order_reject_str(reason).to_string(),
+            },
+        ),
+        SettlementStatusV2::Indeterminate { reason } => (
+            "indeterminate",
+            Some(order_reject_str(reason)),
+            None,
+            None,
+            SettlementStateV1::Indeterminate {
+                reason: order_reject_str(reason).to_string(),
+            },
+        ),
+    };
+
+    if let Some(balance) = &verified_balance {
+        state.balance = Some(balance.clone());
+    }
+    state.record_settlement(result.order_hash, settlement_state);
+
+    Ok(SettlementApplication {
+        status,
+        reason,
+        failed_at,
+        order_hash: result.order_hash,
+        amount: pending.order.amount.get(),
+        counterparty: pending.order.to.clone(),
+        entry_seq,
+        balance: verified_balance,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,6 +782,15 @@ mod tests {
             entry_seq: Some(7),
             entry_hash: Some(Hash::from_bytes([0x55; 32])),
             reason: None,
+            balance: None,
+        }
+    }
+
+    fn settlement_result(order_hash: Hash, status: SettlementStatusV2) -> OrderResultV2 {
+        OrderResultV2 {
+            reply_to: MsgId([0x11; 16]),
+            order_hash,
+            status,
             balance: None,
         }
     }
@@ -896,6 +1101,207 @@ mod tests {
         );
         assert!(state.pending.is_empty());
         assert!(state.balance.is_none());
+    }
+
+    #[test]
+    fn settlement_result_maps_all_statuses() {
+        let key = ledger(1);
+        let parent = node("parent");
+
+        // applied
+        let order = pending_order(1);
+        let hash = order.hash();
+        let mut state = LedgerStateV1::new();
+        push_pending(&mut state, &key, order);
+        let app = apply_settlement_result(
+            &mut state,
+            &settlement_result(
+                hash,
+                SettlementStatusV2::Applied {
+                    entry_seq: 7,
+                    entry_hash: Hash::from_bytes([0x55; 32]),
+                },
+            ),
+            "n1",
+            &parent,
+            0,
+        )
+        .unwrap();
+        assert_eq!(app.status, "applied");
+        assert_eq!(app.entry_seq, Some(7));
+        assert_eq!(app.failed_at, None);
+        assert!(state.pending.is_empty());
+        assert_eq!(state.settlements.len(), 1);
+        assert_eq!(state.settlements[0].state, SettlementStateV1::Applied);
+
+        // duplicate
+        let order = pending_order(2);
+        let hash = order.hash();
+        let mut state = LedgerStateV1::new();
+        push_pending(&mut state, &key, order);
+        let app = apply_settlement_result(
+            &mut state,
+            &settlement_result(
+                hash,
+                SettlementStatusV2::Duplicate {
+                    entry_seq: 3,
+                    entry_hash: Hash::from_bytes([0x33; 32]),
+                },
+            ),
+            "n1",
+            &parent,
+            0,
+        )
+        .unwrap();
+        assert_eq!(app.status, "duplicate");
+        assert_eq!(app.entry_seq, Some(3));
+        assert!(state.pending.is_empty());
+
+        // partial (payer debited, downstream hop failed)
+        let order = pending_order(3);
+        let hash = order.hash();
+        let mut state = LedgerStateV1::new();
+        push_pending(&mut state, &key, order);
+        let app = apply_settlement_result(
+            &mut state,
+            &settlement_result(
+                hash,
+                SettlementStatusV2::Partial {
+                    failed_at: node("leaf-b"),
+                    reason: OrderRejectV1::InsufficientBalance,
+                },
+            ),
+            "n1",
+            &parent,
+            0,
+        )
+        .unwrap();
+        assert_eq!(app.status, "partial");
+        assert_eq!(app.reason, Some("insufficient_balance"));
+        assert_eq!(app.failed_at, Some(node("leaf-b")));
+        assert!(state.pending.is_empty());
+        assert_eq!(
+            state.settlements[0].state,
+            SettlementStateV1::Partial {
+                failed_at: node("leaf-b")
+            }
+        );
+
+        // rejected (no local hop applied)
+        let order = pending_order(4);
+        let hash = order.hash();
+        let mut state = LedgerStateV1::new();
+        push_pending(&mut state, &key, order);
+        let app = apply_settlement_result(
+            &mut state,
+            &settlement_result(
+                hash,
+                SettlementStatusV2::Rejected {
+                    reason: OrderRejectV1::BadRequest,
+                },
+            ),
+            "n1",
+            &parent,
+            0,
+        )
+        .unwrap();
+        assert_eq!(app.status, "rejected");
+        assert_eq!(app.reason, Some("bad_request"));
+        assert_eq!(app.failed_at, None);
+        assert_eq!(app.entry_seq, None);
+        assert!(state.pending.is_empty());
+
+        // indeterminate (debit committed, outcome unknown) is terminal
+        // client-side: the pending order is removed and the outcome recorded so
+        // the UI keeps the "outcome unknown" state without a stuck pending.
+        let order = pending_order(5);
+        let hash = order.hash();
+        let mut state = LedgerStateV1::new();
+        push_pending(&mut state, &key, order);
+        let app = apply_settlement_result(
+            &mut state,
+            &settlement_result(
+                hash,
+                SettlementStatusV2::Indeterminate {
+                    reason: OrderRejectV1::Internal,
+                },
+            ),
+            "n1",
+            &parent,
+            0,
+        )
+        .unwrap();
+        assert_eq!(app.status, "indeterminate");
+        assert_eq!(app.reason, Some("internal"));
+        assert_eq!(app.failed_at, None);
+        assert!(
+            state.pending.is_empty(),
+            "indeterminate must not leave a stuck pending order"
+        );
+        assert_eq!(
+            state.settlements[0].state,
+            SettlementStateV1::Indeterminate {
+                reason: "internal".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn settlement_result_with_bad_balance_does_not_mutate_state() {
+        let key = ledger(1);
+        let parent = node("parent");
+        let order = pending_order(1);
+        let hash = order.hash();
+        let mut state = LedgerStateV1::new();
+        push_pending(&mut state, &key, order);
+
+        let mut result = settlement_result(
+            hash,
+            SettlementStatusV2::Applied {
+                entry_seq: 7,
+                entry_hash: Hash::from_bytes([0x55; 32]),
+            },
+        );
+        let mut receipt = receipt_for(&key, &parent, &node("n1"));
+        receipt.attestation.balance = Amount::new(999);
+        result.balance = Some(receipt);
+
+        assert!(apply_settlement_result(&mut state, &result, "n1", &parent, 0).is_err());
+        assert_eq!(state.pending.len(), 1, "pending must be untouched");
+        assert!(state.balance.is_none());
+        assert!(state.settlements.is_empty());
+    }
+
+    #[test]
+    fn order_v2_signing_and_serialization_shape() {
+        use cawala_msg::{LedgerPayloadV2, OrderV2};
+
+        let operator = operator(9);
+        let order = build_payment_order(node("alice"), node("bob"), 7, 5, 100);
+        let auth = order.authorize(&operator).unwrap();
+        let payload = LedgerPayloadV2::Order(OrderV2 {
+            order: order.clone(),
+            auth: auth.clone(),
+            payee_addr: "0.2.4".parse().unwrap(),
+        });
+        let bytes = payload.to_bytes().unwrap();
+        assert_eq!(LedgerPayloadV2::from_bytes(&bytes).unwrap(), payload);
+
+        match LedgerPayloadV2::from_bytes(&bytes).unwrap() {
+            LedgerPayloadV2::Order(decoded) => {
+                assert_eq!(decoded.order, order);
+                assert_eq!(decoded.auth, auth);
+                assert_eq!(decoded.payee_addr, "0.2.4".parse().unwrap());
+                assert_eq!(
+                    decoded
+                        .auth
+                        .operator
+                        .verify(decoded.order.hash().as_bytes(), &decoded.auth.signature),
+                    Ok(())
+                );
+            }
+            other => panic!("expected Order, got {other:?}"),
+        }
     }
 
     #[test]

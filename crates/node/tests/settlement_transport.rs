@@ -24,7 +24,8 @@ use cawala_ledger::{
 };
 use cawala_msg::{
     AckStatus, Envelope, LedgerPayloadV1, LedgerPayloadV2, MSG_LEDGER_V1, MSG_SETTLE_V1,
-    OrderRejectV1, OrderStatusV1, OrderV2, SettleForwardV1, SettleHopV1, SettlePayloadV1,
+    OrderRejectV1, OrderResultV2, OrderV2, SettleForwardV1, SettleHopV1, SettlePayloadV1,
+    SettlementStatusV2, VersionedLedgerPayload, decode_versioned,
 };
 use cawala_node::LedgerService;
 use cawala_node::identity;
@@ -166,6 +167,9 @@ enum Mode {
     PayeeUnopened,
     /// The payee leaf never runs its drain loop (its hop is never applied).
     StallTerminal,
+    /// The LCA's liability account for the payer leaf is under-prefunded, so
+    /// the LCA hop rejects after the payer's Ascend applied.
+    LcaUnderfunded,
 }
 
 struct Harness {
@@ -245,7 +249,14 @@ async fn setup(mode: Mode) -> Harness {
     }
 
     p_svc
-        .fund(&NodeId::from(a_id.clone()), ChildKind::Node, 1000, &p_op, 1, now)
+        .fund(
+            &NodeId::from(a_id.clone()),
+            ChildKind::Node,
+            if mode == Mode::LcaUnderfunded { 50 } else { 1000 },
+            &p_op,
+            1,
+            now,
+        )
         .unwrap();
     p_svc
         .fund(&NodeId::from(b_id.clone()), ChildKind::Node, 1000, &p_op, 2, now)
@@ -456,10 +467,14 @@ async fn recv_payload(rx: &mut mpsc::Receiver<Envelope>, what: &str) -> LedgerPa
     LedgerPayloadV1::from_bytes(&env.payload).expect("valid ledger payload")
 }
 
-async fn recv_order_result(rx: &mut mpsc::Receiver<Envelope>) -> cawala_msg::OrderResultV1 {
-    match recv_payload(rx, "order result").await {
-        LedgerPayloadV1::OrderResult(result) => result,
-        other => panic!("expected OrderResult, got {other:?}"),
+async fn recv_order_result(rx: &mut mpsc::Receiver<Envelope>) -> OrderResultV2 {
+    let env = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("order result within timeout")
+        .expect("order result envelope");
+    match decode_versioned(&env.payload).expect("valid ledger payload") {
+        VersionedLedgerPayload::V2(LedgerPayloadV2::OrderResult(result)) => result,
+        other => panic!("expected v2 OrderResult, got {other:?}"),
     }
 }
 
@@ -519,7 +534,11 @@ async fn cross_subtree_settlement_success() {
 
     // uA: Applied with a payer receipt (balance 900).
     let result = recv_order_result(&mut h.ua.sink).await;
-    assert_eq!(result.status, OrderStatusV1::Applied, "reason {:?}", result.reason);
+    assert!(
+        matches!(result.status, SettlementStatusV2::Applied { .. }),
+        "status {:?}",
+        result.status
+    );
     assert_eq!(result.order_hash, order.hash());
     let receipt = result.balance.expect("applied result carries a payer receipt");
     assert_eq!(receipt.attestation.balance, Amount::new(900));
@@ -551,8 +570,13 @@ async fn payee_account_unopened_rejects_but_payer_and_lca_apply() {
     // A Ascend and P Lca land; B has no account and does not move.
     wait_for_len(&h.p, 5).await;
     let result = recv_order_result(&mut h.ua.sink).await;
-    assert_eq!(result.status, OrderStatusV1::Rejected);
-    assert_eq!(result.reason, Some(OrderRejectV1::AccountNotOpened));
+    match &result.status {
+        SettlementStatusV2::Partial { failed_at, reason } => {
+            assert_eq!(*reason, OrderRejectV1::AccountNotOpened);
+            assert_eq!(failed_at, &NodeId::from(h.b.node_id.clone()));
+        }
+        other => panic!("expected Partial, got {other:?}"),
+    }
     {
         let a = h.a.ledger.lock().await;
         assert_eq!(a.ledger().balances().parent_balance(), Some(Amount::new(900)));
@@ -574,8 +598,12 @@ async fn underfunded_payer_rejects_without_forwarding() {
     send_from_user(&h.ua, &env, h.config.hop_timeout).await;
 
     let result = recv_order_result(&mut h.ua.sink).await;
-    assert_eq!(result.status, OrderStatusV1::Rejected);
-    assert_eq!(result.reason, Some(OrderRejectV1::InsufficientBalance));
+    match &result.status {
+        SettlementStatusV2::Rejected { reason } => {
+            assert_eq!(*reason, OrderRejectV1::InsufficientBalance);
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
     // No hop was forwarded: A is unchanged (2 prefund entries), P has only its
     // 4 funding entries, B its 2 prefund entries.
     assert_eq!(ledger_len(&h.p).await, 4);
@@ -592,8 +620,10 @@ async fn expired_order_rejects() {
     send_from_user(&h.ua, &env, h.config.hop_timeout).await;
 
     let result = recv_order_result(&mut h.ua.sink).await;
-    assert_eq!(result.status, OrderStatusV1::Rejected);
-    assert_eq!(result.reason, Some(OrderRejectV1::Expired));
+    match &result.status {
+        SettlementStatusV2::Rejected { reason } => assert_eq!(*reason, OrderRejectV1::Expired),
+        other => panic!("expected Rejected, got {other:?}"),
+    }
     assert_eq!(ledger_len(&h.a).await, 2);
 }
 
@@ -606,7 +636,10 @@ async fn duplicate_order_is_answered_from_the_cached_terminal() {
     let env = order_env_with_auth(&h.ua, "0.1", &order, &auth, "0.2.4");
     send_from_user(&h.ua, &env, h.config.hop_timeout).await;
     let first = recv_order_result(&mut h.ua.sink).await;
-    assert_eq!(first.status, OrderStatusV1::Applied);
+    let first_seq = match first.status {
+        SettlementStatusV2::Applied { entry_seq, .. } => entry_seq,
+        other => panic!("expected Applied, got {other:?}"),
+    };
     wait_for_len(&h.b, 3).await;
 
     let a_len = ledger_len(&h.a).await;
@@ -617,9 +650,11 @@ async fn duplicate_order_is_answered_from_the_cached_terminal() {
     let dup_env = order_env_with_auth(&h.ua, "0.1", &order, &auth, "0.2.4");
     send_from_user(&h.ua, &dup_env, h.config.hop_timeout).await;
     let dup = recv_order_result(&mut h.ua.sink).await;
-    assert_eq!(dup.status, OrderStatusV1::Duplicate);
+    match &dup.status {
+        SettlementStatusV2::Duplicate { entry_seq, .. } => assert_eq!(*entry_seq, first_seq),
+        other => panic!("expected Duplicate, got {other:?}"),
+    }
     assert_eq!(dup.order_hash, order.hash());
-    assert!(dup.entry_seq.is_some());
     assert_eq!(ledger_len(&h.a).await, a_len);
     assert_eq!(ledger_len(&h.p).await, p_len);
     assert_eq!(ledger_len(&h.b).await, b_len);
@@ -638,25 +673,41 @@ async fn stalled_terminal_times_out_then_retry_is_idempotent() {
     let a_len = ledger_len(&h.a).await;
     let p_len = ledger_len(&h.p).await;
 
-    // Sweep far past the deadline: uA gets a synthesized Internal rejection.
+    // Sweep far past the deadline: uA gets a synthesized Indeterminate result
+    // (the payer's debit is committed) carrying a fresh payer receipt.
     sweep_settlements(
         &h.a.endpoint,
         &h.a.source,
         &h.config,
+        &h.a.ledger,
+        h.a._dir.path(),
+        &h.a.node_id,
         &h.a.manager,
         now + SETTLE_TIMEOUT_SECS + 1,
     )
     .await;
     let timeout = recv_order_result(&mut h.ua.sink).await;
-    assert_eq!(timeout.status, OrderStatusV1::Rejected);
-    assert_eq!(timeout.reason, Some(OrderRejectV1::Internal));
+    match &timeout.status {
+        SettlementStatusV2::Indeterminate { reason } => {
+            assert_eq!(*reason, OrderRejectV1::Internal);
+        }
+        other => panic!("expected Indeterminate, got {other:?}"),
+    }
+    assert!(
+        timeout.balance.is_some(),
+        "an indeterminate result must surface the committed debit receipt"
+    );
 
     // A's hop remains; a retry is a duplicate and appends nothing.
     assert_eq!(ledger_len(&h.a).await, a_len);
     let retry = order_env(&h.ua, "0.1", &order, "0.2.4");
     send_from_user(&h.ua, &retry, h.config.hop_timeout).await;
     let dup = recv_order_result(&mut h.ua.sink).await;
-    assert_eq!(dup.status, OrderStatusV1::Duplicate);
+    assert!(
+        matches!(dup.status, SettlementStatusV2::Duplicate { .. }),
+        "expected Duplicate, got {:?}",
+        dup.status
+    );
     assert_eq!(ledger_len(&h.a).await, a_len);
     assert_eq!(ledger_len(&h.p).await, p_len);
 }
@@ -671,10 +722,44 @@ async fn too_deep_route_rejects_without_appending() {
     send_from_user(&h.ua, &env, h.config.hop_timeout).await;
 
     let result = recv_order_result(&mut h.ua.sink).await;
-    assert_eq!(result.status, OrderStatusV1::Rejected);
-    assert_eq!(result.reason, Some(OrderRejectV1::BadRequest));
+    match &result.status {
+        SettlementStatusV2::Rejected { reason } => assert_eq!(*reason, OrderRejectV1::BadRequest),
+        other => panic!("expected Rejected, got {other:?}"),
+    }
     assert_eq!(ledger_len(&h.a).await, 2, "origin guard must not append");
     assert_eq!(ledger_len(&h.p).await, 4);
+}
+
+/// **F1**: when the LCA hop rejects (its child liability for the payer leaf is
+/// under-prefunded), the browser must receive `Partial { failed_at: LCA }` with a
+/// payer receipt — not a timeout `Rejected`/`Indeterminate`.
+#[tokio::test]
+async fn lca_rejection_surfaces_as_partial_with_failed_hop() {
+    let mut h = setup(Mode::LcaUnderfunded).await;
+    let now = unix_now();
+    let order = order(&h.ua, &h.ub.node_id, 100, 5, now + 3600);
+    let env = order_env(&h.ua, "0.1", &order, "0.2.4");
+    send_from_user(&h.ua, &env, h.config.hop_timeout).await;
+
+    let result = recv_order_result(&mut h.ua.sink).await;
+    match &result.status {
+        SettlementStatusV2::Partial { failed_at, reason } => {
+            assert_eq!(*reason, OrderRejectV1::InsufficientBalance);
+            assert_eq!(failed_at, &NodeId::from(h.p.node_id.clone()));
+        }
+        other => panic!("expected Partial at the LCA, got {other:?}"),
+    }
+    assert!(
+        result.balance.is_some(),
+        "a partial result carries the committed debit receipt"
+    );
+
+    // A's Ascend applied (the payer was debited); P's Lca did not.
+    let a = h.a.ledger.lock().await;
+    assert_eq!(
+        a.ledger().balances().parent_balance(),
+        Some(Amount::new(900))
+    );
 }
 
 // ── Adversarial F1: forged settlement forwards from a User child ──────────

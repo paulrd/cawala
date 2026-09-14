@@ -37,9 +37,10 @@ use cawala_ledger::{
 use cawala_msg::{
     Ack, AckStatus, Envelope, LedgerPayloadV1, LedgerPayloadV2, MSG_LEDGER_V1, MSG_SETTLE_V1,
     MessageType, MsgError, MsgId, Neighbor, NeighborKind, OrderRejectV1, OrderResultV1,
-    OrderStatusV1, PeerRef, RejectReason, Routable, RouteDecision, RouteError, Seen, SeenConfig,
-    SeenSet, SettleForwardV1, SettleHopV1, SettleOutcomeV1, SettlePayloadV1, SettleRejectV1,
-    SettleResultV1, ValueNoticeV1, VersionedLedgerPayload, decode_versioned,
+    OrderResultV2, OrderStatusV1, PeerRef, RejectReason, Routable, RouteDecision, RouteError, Seen,
+    SeenConfig, SeenSet, SettleForwardV1, SettleHopV1, SettleOutcomeV1, SettlePayloadV1,
+    SettleRejectV1, SettleResultV1, SettlementStatusV2, ValueNoticeV1, VersionedLedgerPayload,
+    decode_versioned,
 };
 use cawala_topology::ChildKind;
 
@@ -755,17 +756,18 @@ pub async fn dispatch_ledger_envelope(
 
             // The sender must be a local `User` child at the address it claims.
             if user_child_address(&record, &env.src.node) != Some(env.src.addr.clone()) {
-                let result = OrderResultV1 {
-                    reply_to: env.msg_id,
-                    order_hash: order.hash(),
-                    status: OrderStatusV1::Rejected,
-                    entry_seq: None,
-                    entry_hash: None,
-                    reason: Some(OrderRejectV1::NotAChild),
-                    balance: None,
-                };
-                send_ledger_reply(endpoint, source, config, &env, LedgerPayloadV1::OrderResult(result))
-                    .await;
+                send_settlement_reply(
+                    endpoint,
+                    source,
+                    config,
+                    &env,
+                    order.hash(),
+                    SettlementStatusV2::Rejected {
+                        reason: OrderRejectV1::NotAChild,
+                    },
+                    None,
+                )
+                .await;
                 return;
             }
 
@@ -774,8 +776,10 @@ pub async fn dispatch_ledger_envelope(
                 .iter()
                 .any(|child| child.kind == ChildKind::User && child.child_id == order.to.as_str());
             if payee_is_local {
-                apply_same_leaf_order(endpoint, source, config, ledger, &env, &record, &order, &auth)
-                    .await;
+                apply_same_leaf_order(
+                    endpoint, source, config, ledger, &env, &record, &order, &auth, true,
+                )
+                .await;
             } else {
                 handle_settlement_order(
                     endpoint,
@@ -791,6 +795,12 @@ pub async fn dispatch_ledger_envelope(
                 )
                 .await;
             }
+        }
+        Ok(VersionedLedgerPayload::V2(LedgerPayloadV2::OrderResult(_))) => {
+            tracing::debug!(
+                msg_id = %env.msg_id.to_hex(),
+                "ignoring browser-directed v2 order result at a leaf node"
+            );
         }
         Err(err) => {
             tracing::warn!(
@@ -813,6 +823,7 @@ async fn apply_same_leaf_order(
     record: &NodeRecord,
     order: &PaymentOrder,
     auth: &AuthRef,
+    reply_v2: bool,
 ) {
     let order = order.clone();
     let auth = auth.clone();
@@ -873,6 +884,26 @@ async fn apply_same_leaf_order(
         }
     };
 
+    if reply_v2 {
+        // A v2 (`OrderV2`) sender gets a v2 result; a same-leaf move is already
+        // terminal, so `Applied`/`Duplicate`/`Rejected` map directly.
+        let status = match outcome.status {
+            OrderStatusV1::Applied => SettlementStatusV2::Applied {
+                entry_seq: outcome.entry_seq.unwrap_or_default(),
+                entry_hash: outcome.entry_hash.unwrap_or(Hash::ZERO),
+            },
+            OrderStatusV1::Duplicate => SettlementStatusV2::Duplicate {
+                entry_seq: outcome.entry_seq.unwrap_or_default(),
+                entry_hash: outcome.entry_hash.unwrap_or(Hash::ZERO),
+            },
+            OrderStatusV1::Rejected => SettlementStatusV2::Rejected {
+                reason: outcome.reason.unwrap_or(OrderRejectV1::BadRequest),
+            },
+        };
+        send_settlement_reply(endpoint, source, config, env, order_hash, status, balance).await;
+        return;
+    }
+
     let result = OrderResultV1 {
         reply_to: env.msg_id,
         order_hash,
@@ -922,6 +953,7 @@ async fn dispatch_ledger_payload_v1(
                 &record,
                 &order_v1.order,
                 &order_v1.auth,
+                false,
             )
             .await;
         }
@@ -1005,17 +1037,17 @@ async fn handle_settlement_order(
         return;
     };
     let Some(payee_leaf_addr) = payee_addr.parent() else {
-        reject_order(endpoint, source, config, env, order.hash(), OrderRejectV1::BadRequest).await;
+        send_settlement_reject(endpoint, source, config, env, order.hash(), OrderRejectV1::BadRequest).await;
         return;
     };
 
     // v1 depth-1 guard: reject anything deeper without touching the ledger.
     if !route_is_depth_one(&payer_addr, payee_addr) {
-        reject_order(endpoint, source, config, env, order.hash(), OrderRejectV1::BadRequest).await;
+        send_settlement_reject(endpoint, source, config, env, order.hash(), OrderRejectV1::BadRequest).await;
         return;
     }
     let Ok(derived) = derive_hop(record, &this_addr, &payer_addr, payee_addr) else {
-        reject_order(endpoint, source, config, env, order.hash(), OrderRejectV1::BadRequest).await;
+        send_settlement_reject(endpoint, source, config, env, order.hash(), OrderRejectV1::BadRequest).await;
         return;
     };
 
@@ -1066,7 +1098,7 @@ async fn handle_settlement_order(
     match outcome {
         HopOutcome::Applied { seq, hash } => {
             let (Some(payer_key), Some(entry)) = (payer_key, entry) else {
-                reject_order(endpoint, source, config, env, order.hash(), OrderRejectV1::Internal).await;
+                send_settlement_reject(endpoint, source, config, env, order.hash(), OrderRejectV1::Internal).await;
                 return;
             };
             let forward = SettleForwardV1 {
@@ -1081,7 +1113,7 @@ async fn handle_settlement_order(
                 }],
             };
             if !forward.hops_within_bound() {
-                reject_order(endpoint, source, config, env, order.hash(), OrderRejectV1::BadRequest).await;
+                send_settlement_reject(endpoint, source, config, env, order.hash(), OrderRejectV1::BadRequest).await;
                 return;
             }
             let pending = PendingSettlement {
@@ -1095,9 +1127,10 @@ async fn handle_settlement_order(
                 local_seq: seq,
                 local_hash: hash,
                 deadline_secs: now + SETTLE_TIMEOUT_SECS,
+                reply_v2: true,
             };
             if let Some(evicted) = manager.lock().await.reserve(pending) {
-                send_timeout_result(endpoint, source, config, &evicted).await;
+                send_timeout_result(endpoint, source, config, ledger, Some(record), &evicted).await;
             }
             let signers = expected_signers(&payer_addr, payee_addr)
                 .expect("depth-1 route has three signers");
@@ -1111,55 +1144,72 @@ async fn handle_settlement_order(
             .await;
         }
         HopOutcome::Duplicate { seq, hash } => {
-            // The local reservation already exists: answer from the cached
-            // terminal if the cascade finished, else as a duplicate.
-            let terminal = manager.lock().await.terminal(&payment_id).cloned();
-            let (status, reason, entry_seq, entry_hash) = match terminal {
+            // The local reservation already exists. Answer from the cached
+            // terminal if the cascade finished; if it is still in flight, stay
+            // silent so the eventual true terminal can resolve it (answering a
+            // bare `Duplicate` here would let the client drop its pending order
+            // and discard that terminal).
+            let (terminal, in_flight) = {
+                let mgr = manager.lock().await;
+                (
+                    mgr.terminal(&payment_id).cloned(),
+                    mgr.pending(&payment_id).is_some(),
+                )
+            };
+            if terminal.is_none() && in_flight {
+                return;
+            }
+            let status = match terminal {
                 Some(term) => match term.outcome {
                     SettleOutcomeV1::Applied {
                         terminal_seq,
                         terminal_hash,
-                        terminal_entry: _,
-                    } => (
-                        OrderStatusV1::Duplicate,
-                        None,
-                        Some(terminal_seq),
-                        Some(terminal_hash),
-                    ),
-                    SettleOutcomeV1::Rejected { reason } => (
-                        OrderStatusV1::Duplicate,
-                        Some(map_settle_reject(&reason)),
-                        Some(seq),
-                        Some(hash),
-                    ),
+                        ..
+                    } => SettlementStatusV2::Duplicate {
+                        entry_seq: terminal_seq,
+                        entry_hash: terminal_hash,
+                    },
+                    // A cached downstream rejection is surfaced as the real
+                    // partial/rejected state, not a bare duplicate.
+                    SettleOutcomeV1::Rejected { reason } => settle_reject_to_status(&reason),
                 },
-                None => (
-                    OrderStatusV1::Duplicate,
-                    None,
-                    Some(seq),
-                    Some(hash),
-                ),
+                None => SettlementStatusV2::Duplicate {
+                    entry_seq: seq,
+                    entry_hash: hash,
+                },
             };
             let balance = payer_receipt(ledger, record, &order.from).await;
-            let result = OrderResultV1 {
-                reply_to: env.msg_id,
-                order_hash: payment_id,
-                status,
-                entry_seq,
-                entry_hash,
-                reason,
-                balance,
-            };
-            send_ledger_reply(endpoint, source, config, env, LedgerPayloadV1::OrderResult(result)).await;
+            send_settlement_reply(endpoint, source, config, env, payment_id, status, balance).await;
         }
         HopOutcome::Rejected { reason } => {
-            reject_order(endpoint, source, config, env, payment_id, reason).await;
+            send_settlement_reject(endpoint, source, config, env, payment_id, reason).await;
         }
     }
 }
 
-/// Reply `Rejected(reason)` to the browser.
-async fn reject_order(
+/// Reply a v2 settlement result to the browser over `MSG_LEDGER_V1`.
+///
+/// The result is **advisory**; the payer's own signed receipt is ground truth.
+async fn send_settlement_reply(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    env: &Envelope,
+    order_hash: Hash,
+    status: SettlementStatusV2,
+    balance: Option<cawala_msg::BalanceReceiptV1>,
+) {
+    let result = OrderResultV2 {
+        reply_to: env.msg_id,
+        order_hash,
+        status,
+        balance,
+    };
+    send_order_result_v2_to(endpoint, source, config, &env.src, result).await;
+}
+
+/// Reply `Rejected(reason)` to a v2 settlement browser.
+async fn send_settlement_reject(
     endpoint: &Endpoint,
     source: &NeighborSource,
     config: &MsgConfig,
@@ -1167,16 +1217,16 @@ async fn reject_order(
     order_hash: Hash,
     reason: OrderRejectV1,
 ) {
-    let result = OrderResultV1 {
-        reply_to: env.msg_id,
+    send_settlement_reply(
+        endpoint,
+        source,
+        config,
+        env,
         order_hash,
-        status: OrderStatusV1::Rejected,
-        entry_seq: None,
-        entry_hash: None,
-        reason: Some(reason),
-        balance: None,
-    };
-    send_ledger_reply(endpoint, source, config, env, LedgerPayloadV1::OrderResult(result)).await;
+        SettlementStatusV2::Rejected { reason },
+        None,
+    )
+    .await;
 }
 
 /// Build a fresh payer balance receipt, if one can be built.
@@ -1206,13 +1256,43 @@ async fn payer_receipt(
     .flatten()
 }
 
-/// Emit a synthesized timeout `OrderResult` for an expired/evicted settlement.
+/// Emit a synthesized timeout result for an expired/evicted settlement.
+///
+/// The origin only reserves a pending settlement *after* its own hop applied,
+/// so a timeout is never a "rejected before the debit" case: it is
+/// `Indeterminate`, carrying a fresh payer receipt so the committed debit is
+/// surfaced.
 async fn send_timeout_result(
     endpoint: &Endpoint,
     source: &NeighborSource,
     config: &MsgConfig,
+    ledger: &Arc<tokio::sync::Mutex<LedgerService>>,
+    record: Option<&NodeRecord>,
     pending: &PendingSettlement,
 ) {
+    if pending.reply_v2 {
+        let balance = match record {
+            Some(record) => payer_receipt(ledger, record, &pending.order.from).await,
+            None => None,
+        };
+        send_order_result_v2_to(
+            endpoint,
+            source,
+            config,
+            &pending.browser,
+            OrderResultV2 {
+                reply_to: pending.browser_msg_id,
+                order_hash: pending.order.hash(),
+                status: SettlementStatusV2::Indeterminate {
+                    reason: OrderRejectV1::Internal,
+                },
+                balance,
+            },
+        )
+        .await;
+        return;
+    }
+    // v1 fallback (settlements are v2-only today).
     let result = OrderResultV1 {
         reply_to: pending.browser_msg_id,
         order_hash: pending.order.hash(),
@@ -1226,16 +1306,26 @@ async fn send_timeout_result(
 }
 
 /// Sweep timed-out origin settlements and notify their browsers.
+#[allow(clippy::too_many_arguments)]
 pub async fn sweep_settlements(
     endpoint: &Endpoint,
     source: &NeighborSource,
     config: &MsgConfig,
+    ledger: &Arc<tokio::sync::Mutex<LedgerService>>,
+    data_dir: &Path,
+    node_id: &str,
     manager: &Arc<tokio::sync::Mutex<SettlementManager>>,
     now: u64,
 ) {
     let expired = manager.lock().await.sweep_expired(now);
+    if expired.is_empty() {
+        return;
+    }
+    let record = RecordStore::open(data_dir, node_id)
+        .map(|store| store.record().clone())
+        .ok();
     for pending in expired {
-        send_timeout_result(endpoint, source, config, &pending).await;
+        send_timeout_result(endpoint, source, config, ledger, record.as_ref(), &pending).await;
     }
 }
 
@@ -1293,13 +1383,33 @@ async fn handle_settle_result(
         let Some(pending) = mgr.pending(&payment_id).cloned() else {
             return;
         };
-        // The result must come from the payee leaf.
-        if env.src.addr != pending.payee_leaf_addr {
-            tracing::warn!(
-                src = %env.src.node,
-                "settlement result from a non-payee-leaf; ignoring"
-            );
-            return;
+        // Provenance: `Applied`/`Duplicate` must come from the payee leaf;
+        // a downstream `Rejected`/`Indeterminate` (which implies the payer's
+        // reservation applied) may come from any expected signer — the LCA or
+        // the payee leaf. The immediate sender is only authenticated to the
+        // neighbor, so results remain advisory.
+        match &result.outcome {
+            SettleOutcomeV1::Applied { .. } => {
+                if env.src.addr != pending.payee_leaf_addr {
+                    tracing::warn!(
+                        src = %env.src.node,
+                        "applied settlement result from a non-payee-leaf; ignoring"
+                    );
+                    return;
+                }
+            }
+            SettleOutcomeV1::Rejected { .. } => {
+                let expected = expected_signers(&pending.payer_addr, &pending.payee_addr)
+                    .map(|signers| signers.iter().any(|addr| addr == &env.src.addr))
+                    .unwrap_or(false);
+                if !expected {
+                    tracing::warn!(
+                        src = %env.src.node,
+                        "settlement rejection from a non-signer; ignoring"
+                    );
+                    return;
+                }
+            }
         }
         // A carried terminal entry is advisory evidence, not authentication:
         // accept it only if it is the `Descend` this pending order expects.
@@ -1335,26 +1445,25 @@ async fn handle_settle_result(
         pending
     };
 
-    let (status, reason, entry_seq, entry_hash) = match &result.outcome {
+    // Map the terminal outcome: `IntermediateRejected` means the payer's local
+    // hop (the origin reservation) already applied, so it is a `Partial`
+    // cascade rather than a plain rejection.
+    let status = match &result.outcome {
         SettleOutcomeV1::Applied {
             terminal_seq,
             terminal_hash,
-            terminal_entry: _,
-        } => (
-            OrderStatusV1::Applied,
-            None,
-            Some(*terminal_seq),
-            Some(*terminal_hash),
-        ),
-        SettleOutcomeV1::Rejected { reason } => (
-            OrderStatusV1::Rejected,
-            Some(map_settle_reject(reason)),
-            None,
-            None,
-        ),
+            ..
+        } => SettlementStatusV2::Applied {
+            entry_seq: *terminal_seq,
+            entry_hash: *terminal_hash,
+        },
+        SettleOutcomeV1::Rejected { reason } => settle_reject_to_status(reason),
     };
 
-    let balance = if status == OrderStatusV1::Applied {
+    // Any outcome other than a pre-reservation `Rejected` implies the payer's
+    // hop applied, so surface a fresh payer receipt as signed ground truth.
+    let needs_receipt = !matches!(status, SettlementStatusV2::Rejected { .. });
+    let balance = if needs_receipt {
         let record = RecordStore::open(data_dir, node_id)
             .map(|store| store.record().clone())
             .ok();
@@ -1366,16 +1475,45 @@ async fn handle_settle_result(
         None
     };
 
-    let order_result = OrderResultV1 {
-        reply_to: pending.browser_msg_id,
-        order_hash: pending.order.hash(),
-        status,
-        entry_seq,
-        entry_hash,
-        reason,
-        balance,
-    };
-    send_order_result_to(endpoint, source, config, &pending.browser, order_result).await;
+    if pending.reply_v2 {
+        send_order_result_v2_to(
+            endpoint,
+            source,
+            config,
+            &pending.browser,
+            OrderResultV2 {
+                reply_to: pending.browser_msg_id,
+                order_hash: pending.order.hash(),
+                status,
+                balance,
+            },
+        )
+        .await;
+    } else {
+        // v1 fallback (settlements are v2-only today).
+        let (status_v1, reason) = settlement_status_to_v1(&status);
+        let (entry_seq, entry_hash) = match &status {
+            SettlementStatusV2::Applied {
+                entry_seq,
+                entry_hash,
+            }
+            | SettlementStatusV2::Duplicate {
+                entry_seq,
+                entry_hash,
+            } => (Some(*entry_seq), Some(*entry_hash)),
+            _ => (None, None),
+        };
+        let order_result = OrderResultV1 {
+            reply_to: pending.browser_msg_id,
+            order_hash: pending.order.hash(),
+            status: status_v1,
+            entry_seq,
+            entry_hash,
+            reason,
+            balance,
+        };
+        send_order_result_to(endpoint, source, config, &pending.browser, order_result).await;
+    }
 }
 
 /// Handle a settlement `Forward` at an intermediate or terminal signer.
@@ -1830,6 +1968,41 @@ async fn send_ledger_payload_to(
     }
 }
 
+/// Encode a v2 ledger `payload` and send it to `dst` over `MSG_LEDGER_V1`.
+/// Replies for v2 senders stay on the ledger message type.
+async fn send_ledger_payload_v2_to(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    dst: cawala_msg::OctAddr,
+    payload: LedgerPayloadV2,
+) {
+    let bytes = match payload.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(%err, "failed to encode v2 ledger payload");
+            return;
+        }
+    };
+    let snapshot = source.snapshot();
+    let src = snapshot.routable.this.clone();
+    let env = match build_envelope(&src, dst, MSG_LEDGER_V1, bytes, config.ttl) {
+        Ok(env) => env,
+        Err(err) => {
+            tracing::warn!(%err, "failed to build v2 ledger envelope");
+            return;
+        }
+    };
+    match send_envelope(endpoint, &snapshot, &env, config.hop_timeout).await {
+        Ok(ack) => tracing::debug!(
+            msg_id = %env.msg_id.to_hex(),
+            status = ack.status_str(),
+            "sent v2 ledger payload"
+        ),
+        Err(err) => tracing::warn!(%err, "failed to send v2 ledger payload"),
+    }
+}
+
 /// Encode a settlement `payload` and send it to `dst` over `MSG_SETTLE_V1`.
 async fn send_settle_payload_to(
     endpoint: &Endpoint,
@@ -1906,7 +2079,7 @@ async fn relay_settle_forward(
     }
 }
 
-/// Send an `OrderResultV1` to a browser over `MSG_LEDGER_V1`.
+/// Send an `OrderResultV1` to a v1 browser over `MSG_LEDGER_V1`.
 async fn send_order_result_to(
     endpoint: &Endpoint,
     source: &NeighborSource,
@@ -1920,6 +2093,24 @@ async fn send_order_result_to(
         config,
         browser.addr.clone(),
         LedgerPayloadV1::OrderResult(result),
+    )
+    .await;
+}
+
+/// Send an `OrderResultV2` to a v2 browser over `MSG_LEDGER_V1`.
+async fn send_order_result_v2_to(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    browser: &PeerRef,
+    result: OrderResultV2,
+) {
+    send_ledger_payload_v2_to(
+        endpoint,
+        source,
+        config,
+        browser.addr.clone(),
+        LedgerPayloadV2::OrderResult(result),
     )
     .await;
 }
@@ -1948,15 +2139,39 @@ fn terminal_entry_is_valid(entry: &SignedEntry, order: &PaymentOrder) -> bool {
     )
 }
 
-/// Map a settlement rejection onto the browser-facing `OrderRejectV1`.
-fn map_settle_reject(reason: &SettleRejectV1) -> OrderRejectV1 {
+/// Map a downstream `SettleRejectV1` to a browser settlement status, preserving
+/// the failing hop: an `IntermediateRejected` after the payer's reservation is a
+/// `Partial` cascade; a post-reservation `Malformed` is `Indeterminate` (the
+/// debit is committed but the outcome is unknown); everything else is a plain
+/// `Rejected` (pre-reservation refusal).
+fn settle_reject_to_status(reason: &SettleRejectV1) -> SettlementStatusV2 {
     match reason {
-        // TODO(P4): `OrderResultV1` is frozen v1 and cannot carry the failing
-        // hop's `at`; surface it at the browser boundary in a P4 payload.
-        SettleRejectV1::IntermediateRejected { reason, .. } => reason.clone(),
-        SettleRejectV1::PayerRejected
-        | SettleRejectV1::RouteTooDeep
-        | SettleRejectV1::Malformed => OrderRejectV1::BadRequest,
+        SettleRejectV1::IntermediateRejected { at, reason } => SettlementStatusV2::Partial {
+            failed_at: at.clone(),
+            reason: reason.clone(),
+        },
+        SettleRejectV1::Malformed => SettlementStatusV2::Indeterminate {
+            reason: OrderRejectV1::BadRequest,
+        },
+        SettleRejectV1::PayerRejected | SettleRejectV1::RouteTooDeep => {
+            SettlementStatusV2::Rejected {
+                reason: OrderRejectV1::BadRequest,
+            }
+        }
+    }
+}
+
+/// Map a v2 settlement status onto the v1 `OrderStatusV1` + reason pair (used
+/// only for the theoretical v1 settlement sender).
+fn settlement_status_to_v1(status: &SettlementStatusV2) -> (OrderStatusV1, Option<OrderRejectV1>) {
+    match status {
+        SettlementStatusV2::Applied { .. } => (OrderStatusV1::Applied, None),
+        SettlementStatusV2::Duplicate { .. } => (OrderStatusV1::Duplicate, None),
+        SettlementStatusV2::Partial { reason, .. }
+        | SettlementStatusV2::Rejected { reason }
+        | SettlementStatusV2::Indeterminate { reason } => {
+            (OrderStatusV1::Rejected, Some(reason.clone()))
+        }
     }
 }
 

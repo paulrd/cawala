@@ -168,6 +168,9 @@ pub struct PendingSettlement {
     pub local_hash: Hash,
     /// Unix seconds after which the origin synthesizes a timeout.
     pub deadline_secs: u64,
+    /// Whether the browser sent a v2 (`OrderV2`) order and must receive a v2
+    /// (`OrderResultV2`) result; v1 senders keep the v1 result shape.
+    pub reply_v2: bool,
 }
 
 /// A completed settlement outcome remembered for duplicate answers.
@@ -524,6 +527,7 @@ mod tests {
             local_seq: nonce,
             local_hash: Hash::from_bytes([nonce as u8; 32]),
             deadline_secs,
+            reply_v2: true,
         }
     }
 

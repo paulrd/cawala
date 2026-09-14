@@ -311,20 +311,43 @@
         -D warnings`; `cargo test --workspace`; `npm run build`; and an
         end-to-end `web/scripts/smoke-join.mjs` (browser join -> CLI approve ->
         joined at `0.<slot>`, plus the reject path), network-dependent on N0.
-      - Deferred: cross-subtree/multi-hop value movement (a browser order is
-        same-leaf `Direct` only; paying a user under another leaf, cascade
-        settlement, and tree-routed indirect multi-node control are all
-        unimplemented); browser issue/burn (value creation/destruction stays an
+      - Cross-subtree settlement (DONE, `66500f1` + the P4 web increment): a
+        browser user under one leaf can pay a user under another leaf, settled
+        at the least common ancestor. Ledger reworked to boundary ops + derived
+        equity (`ENTRY_FORMAT_VERSION` 3; node ledger `format_version` 2): every
+        ledger stores `{Parent, Child}`, `Issue`/`Burn` are child-only boundary
+        ops, there is no internal equity account, and rootness is dynamic
+        (attach/detach never bricks replay; a stranded `Parent` is preserved).
+        Transport is `MSG_SETTLE_V1` over `cawala/msg/0` with `LedgerPayloadV2`
+        (`OrderV2` carries the payee address; `OrderResultV2` /
+        `SettlementStatusV2` expose applied/duplicate/partial/rejected/
+        indeterminate); each expected signer derives and applies its own hop
+        (never wire input) with neighbor-verified sender authentication; a
+        bounded pending/terminal manager plus a 5 s timeout sweep; and
+        per-transaction single-writer locking. Web: a receive-URI send form and
+        truthful settlement states. Verification: the hermetic
+        `crates/node/tests/settlement_transport.rs` (real transport; success +
+        LCA/terminal rejection + forged-hop adversarial + timeout), the hop
+        executor differential test vs `execute_plan`, `clippy`, the wasm check,
+        `npm run build`, and the network-dependent `smoke-crossleaf.mjs`.
+      - Deferred: browser issue/burn (value creation/destruction stays an
         explicit operator-only act - `ledger fund` - and is deliberately not
-        reachable from a browser order); and remote admin from the browser
+        reachable from a browser order); remote admin from the browser
         (pending-join listing + approve/reject would need a
         `CONTROL_FORMAT_VERSION` bump and a node operator-key custody
-        decision). `MoveChild` remains limited to re-slotting under the same
-        node; no control replay nonce (authority is re-evaluated live per
-        request). The location suggestion service is out of scope for now: a
-        separate, independently hostable, non-authoritative companion (lat/lon
-        or map click -> suggested octal address); the leaf still validates and
-        issues the final address.
+        decision); and tree-routed indirect multi-node control. `MoveChild`
+        remains limited to re-slotting under the same node; no control replay
+        nonce (authority is re-evaluated live per request). The location
+        suggestion service is out of scope for now: a separate, independently
+        hostable, non-authoritative companion (lat/lon or map click -> suggested
+        octal address); the leaf still validates and issues the final address.
+      - Cross-subtree hardening still owed (P5): parent<->child ledger-key
+        distribution + full carried-prefix signature verification (settlement
+        results are advisory - a rogue LCA/parent can misreport but cannot move
+        funds); commitment-chain assembly + `net`/`verify_cascade` operator
+        tooling; the `MirrorMismatch` direction split; no global supply anchor
+        by design; manual prefund liquidity (an underfunded LCA parent yields a
+        `Partial`: payer debited, payee not credited).
   6. *M5 - Hardening*: exit rights, foster-parent recovery, compromise-path
      docs, audit tooling, governance/regulatory surface (Hawala exposure is
      real - community question, not code).

@@ -450,6 +450,9 @@ async fn run(data_dir: PathBuf) -> Result<()> {
         let sweep_source = source.clone();
         let sweep_config = config.clone();
         let sweep_manager = Arc::clone(&manager);
+        let sweep_ledger = Arc::clone(&ledger);
+        let sweep_dir = data_dir.clone();
+        let sweep_node = node_id.clone();
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         loop {
             ticker.tick().await;
@@ -457,6 +460,9 @@ async fn run(data_dir: PathBuf) -> Result<()> {
                 &sweep_endpoint,
                 &sweep_source,
                 &sweep_config,
+                &sweep_ledger,
+                &sweep_dir,
+                &sweep_node,
                 &sweep_manager,
                 now_unix_seconds(),
             )
