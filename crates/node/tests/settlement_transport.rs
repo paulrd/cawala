@@ -18,18 +18,18 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cawala_ledger::{
-    AccountRef, Amount, AuthRef, Balances, Entry, EntryBody, Hash, HopRole, LedgerSecretKey, NodeId,
-    OperatorSecretKey, PaymentOrder, PeerKeys, PeerRegistry, PeerRole, Posting, SignedAmount,
-    SignedEntry, verify_balance_attestation,
+    AccountRef, Amount, AuthRef, Balances, Entry, EntryBody, Hash, HopRole, LedgerPubKey,
+    LedgerSecretKey, NodeId, OperatorSecretKey, PaymentOrder, PeerKeys, PeerRegistry, PeerRole,
+    Posting, SignedAmount, SignedEntry, verify_balance_attestation,
 };
 use cawala_msg::{
     AckStatus, Envelope, LedgerPayloadV1, LedgerPayloadV2, MSG_LEDGER_V1, MSG_SETTLE_V1,
-    OrderRejectV1, OrderResultV2, OrderV2, SettleForwardV1, SettleHopV1, SettlePayloadV1,
-    SettlementStatusV2, VersionedLedgerPayload, decode_versioned,
+    OrderRejectV1, OrderResultV2, OrderV2, PeerRef, SettleForwardV1, SettleHopV1, SettlePayloadV1,
+    SettlementStatusV2, VersionedLedgerPayload, append_hop, decode_versioned,
 };
 use cawala_node::LedgerService;
 use cawala_node::identity;
-use cawala_node::ledger_peers::save_peers;
+use cawala_node::ledger_peers::{load_peers, save_peers};
 use cawala_node::msg::{
     MsgConfig, NeighborSource, RoutableSnapshot, SETTLE_TIMEOUT_SECS, build_envelope,
     dispatch_ledger_envelope, dispatch_settle_envelope, send_envelope, spawn_msg_node_on,
@@ -127,16 +127,31 @@ fn write_record(dir: &Path, rec: &NodeRecord) {
     store.save().unwrap();
 }
 
-fn register_user(dir: &Path, node_id: &str, operator: &OperatorSecretKey) {
+fn user_row(node_id: &str, operator: &OperatorSecretKey) -> PeerKeys {
+    PeerKeys {
+        node_id: NodeId::from(node_id),
+        operator: operator.public(),
+        ledger: None,
+        role: PeerRole::User,
+    }
+}
+
+fn node_row(node_id: &str, operator: &OperatorSecretKey, ledger: &LedgerPubKey) -> PeerKeys {
+    PeerKeys {
+        node_id: NodeId::from(node_id),
+        operator: operator.public(),
+        ledger: Some(*ledger),
+        role: PeerRole::Node,
+    }
+}
+
+/// Write a peer registry from `rows` (as `control approve`/`create-child`
+/// persist, plus the P5a parent row a child learns on join).
+fn register_peers(dir: &Path, rows: &[PeerKeys]) {
     let mut registry = PeerRegistry::new();
-    registry
-        .insert(PeerKeys {
-            node_id: NodeId::from(node_id),
-            operator: operator.public(),
-            ledger: None,
-            role: PeerRole::User,
-        })
-        .unwrap();
+    for row in rows {
+        registry.insert(row.clone()).unwrap();
+    }
     save_peers(dir, &registry).unwrap();
 }
 
@@ -234,15 +249,34 @@ async fn setup(mode: Mode) -> Harness {
     write_record(a_dir.path(), &a_rec);
     write_record(b_dir.path(), &b_rec);
 
-    // User rows in the leaves' peer registries.
-    register_user(a_dir.path(), &ua_id, &ua_op);
-    register_user(b_dir.path(), &ub_id, &ub_op);
-
-    // Ledger services + prefund.
+    // Ledger services (opened before the peer rows so we can distribute each
+    // node's ledger public key, as P5a does on join).
     let now = unix_now();
     let mut p_svc = LedgerService::open(p_dir.path(), &p_id).unwrap();
     let mut a_svc = LedgerService::open(a_dir.path(), &a_id).unwrap();
     let mut b_svc = LedgerService::open(b_dir.path(), &b_id).unwrap();
+    let p_ledger = p_svc.ledger_key_public();
+    let a_ledger = a_svc.ledger_key_public();
+    let b_ledger = b_svc.ledger_key_public();
+
+    // Peer rows: each leaf knows its parent (the row a child persists from its
+    // `JoinApproval`) and its own users; the LCA knows its node children.
+    register_peers(
+        a_dir.path(),
+        &[user_row(&ua_id, &ua_op), node_row(&p_id, &p_op, &p_ledger)],
+    );
+    register_peers(
+        b_dir.path(),
+        &[user_row(&ub_id, &ub_op), node_row(&p_id, &p_op, &p_ledger)],
+    );
+    register_peers(
+        p_dir.path(),
+        &[
+            node_row(&a_id, &a_op, &a_ledger),
+            node_row(&b_id, &b_op, &b_ledger),
+        ],
+    );
+
     assert!(a_svc.ensure_account_open(&NodeId::from(ua_id.clone()), ChildKind::User).unwrap());
     if mode != Mode::PayeeUnopened {
         assert!(b_svc.ensure_account_open(&NodeId::from(ub_id.clone()), ChildKind::User).unwrap());
@@ -942,6 +976,97 @@ async fn forged_handoff_from_non_signer_is_rejected() {
     let hops = vec![fabricated_hop("0.1", &order, HopRole::Ascend, 44)];
     // Addressed to the LCA; the transport relays it through the payer leaf.
     send_forged(&h, &h.ua, &order, "0.1.3", "0.2.4", hops, "0").await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    assert_eq!(ledger_len(&h.a).await, a_len);
+    assert_eq!(ledger_len(&h.p).await, p_len);
+    assert_eq!(ledger_len(&h.b).await, b_len);
+    assert_eq!(balances(&h.a).await, a_before);
+    assert_eq!(balances(&h.p).await, p_before);
+    assert_eq!(balances(&h.b).await, b_before);
+
+    for router in h.routers.drain(..) {
+        router.shutdown().await.unwrap();
+    }
+}
+
+/// **F4**: a Forward relayed by the LCA to the terminal leaf carries a tampered
+/// LCA hop — the right signer address (`0`) but signed by a *different
+/// registered* node key. The terminal resolves the signer under the known
+/// parent key and must reject without touching any ledger. The unit tests in
+/// `msg.rs` pin the resolution logic; this exercises it over the real
+/// transport, with the terminal authenticating the relaying LCA as its QUIC
+/// predecessor.
+#[tokio::test]
+async fn relayed_tampered_lca_hop_is_rejected_at_terminal() {
+    let mut h = setup(Mode::Full).await;
+    let now = unix_now();
+    let order = order(&h.ua, &h.ub.node_id, 100, 31, now + 3600);
+
+    // A second *registered* node row at the terminal, so the tampered hop is
+    // signed by a key B can resolve — just not the key bound to the LCA.
+    let decoy_key = LedgerSecretKey::from_bytes([77u8; 32]);
+    let decoy_op = OperatorSecretKey::from_bytes([77u8; 32]);
+    {
+        let mut peers = load_peers(h.b._dir.path()).unwrap();
+        peers
+            .insert(PeerKeys {
+                node_id: NodeId::from("decoy"),
+                operator: decoy_op.public(),
+                ledger: Some(decoy_key.public()),
+                role: PeerRole::Node,
+            })
+            .unwrap();
+        save_peers(h.b._dir.path(), &peers).unwrap();
+    }
+
+    let (a_before, p_before, b_before) = (
+        balances(&h.a).await,
+        balances(&h.p).await,
+        balances(&h.b).await,
+    );
+    let (a_len, p_len, b_len) = (
+        ledger_len(&h.a).await,
+        ledger_len(&h.p).await,
+        ledger_len(&h.b).await,
+    );
+
+    // signers = [0.1, 0, 0.2]; hop[0] has the honest payer shape, hop[1] names
+    // the LCA address `0` but is signed by the decoy ledger key (`77`).
+    let hops = vec![
+        fabricated_hop("0.1", &order, HopRole::Ascend, 43),
+        fabricated_hop("0", &order, HopRole::Lca, 77),
+    ];
+    let forward = forged_forward(&h.ua, &order, "0.1.3", "0.2.4", hops);
+    let bytes = SettlePayloadV1::Forward(forward).to_bytes().unwrap();
+
+    // Relay it as if it had travelled A -> P -> B: the envelope's origin is the
+    // payer leaf, its chain carries the payer hop then the LCA hop, and it is
+    // *sent by P* so the terminal authenticates the preceding signer over QUIC.
+    let a_ref = PeerRef {
+        addr: "0.1".parse().unwrap(),
+        node: h.a.node_id.clone(),
+    };
+    let p_ref = PeerRef {
+        addr: "0".parse().unwrap(),
+        node: h.p.node_id.clone(),
+    };
+    let mut env = build_envelope(
+        &a_ref,
+        "0.2".parse().unwrap(),
+        MSG_SETTLE_V1,
+        bytes,
+        // One hop is consumed by the relay below (mirroring the transport's
+        // per-forward TTL decrement).
+        config().ttl - 1,
+    )
+    .unwrap();
+    append_hop(&mut env, &p_ref).unwrap();
+    let p_snap = h.p.source.snapshot();
+    let ack = send_envelope(&h.p.endpoint, &p_snap, &env, h.config.hop_timeout)
+        .await
+        .expect("relay");
+    assert_eq!(ack.status, AckStatus::Delivered);
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     assert_eq!(ledger_len(&h.a).await, a_len);

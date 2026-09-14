@@ -23,7 +23,11 @@ use cawala_ledger::{
 use crate::request::ControlRequest;
 
 /// Wire format version for [`SignedControl`].
-pub const CONTROL_FORMAT_VERSION: u8 = 1;
+///
+/// Bumped to 2 when [`JoinApproval`](crate::JoinApproval) gained
+/// `parent_ledger`: the signed preimage changed, so a v1 verifier must reject a
+/// v2 message rather than misparse it.
+pub const CONTROL_FORMAT_VERSION: u8 = 2;
 
 /// BLAKE3 derive-key context for the control signing hash.
 pub const CONTROL_CONTEXT: &str = "cawala-control/request/v1";
@@ -313,15 +317,36 @@ mod tests {
     }
 
     #[test]
+    fn verify_control_rejects_v1_version() {
+        // The format is now 2 (v1 predates `JoinApproval::parent_ledger`). A v1
+        // envelope must be rejected up front rather than parsed with the new
+        // shape; the check is version-exact, not `>=`.
+        assert_ne!(CONTROL_FORMAT_VERSION, 1, "this test assumes format 2");
+        let op = operator(1);
+        let registry = registry_with(&[("origin", &op, &ledger(11))]);
+        let mut signed = signed_with(&op);
+        signed.version = 1;
+        assert_eq!(
+            verify_control(&signed, &registry),
+            Err(ControlError::UnsupportedVersion(1))
+        );
+        assert_eq!(
+            verify_control(&signed, &PeerRegistry::new()),
+            Err(ControlError::UnsupportedVersion(1))
+        );
+    }
+
+    #[test]
     fn signing_hash_is_stable() {
         // Golden vector. This pins the frozen field order and domain-separated
         // encoding of `(version, origin, controller, request)`: a reordered,
         // added, or removed field changes this hash, so the pinned value must
-        // only ever change as part of a deliberate protocol version bump.
+        // only ever change as part of a deliberate protocol version bump. It
+        // changed at version 2 when `JoinApproval` gained `parent_ledger`.
         let signed = signed_with(&operator(7));
         assert_eq!(
             signed.signing_hash().to_hex(),
-            "9bcd93d429e811e1116fce110be116c955ffb8ac3d2d29f2508988211855ceea"
+            "a65d7f4f6da383ef7aa82682603daea8e2dad3fdb80571e6fe87978773818123"
         );
     }
 

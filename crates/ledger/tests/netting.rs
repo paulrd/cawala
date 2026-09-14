@@ -20,10 +20,10 @@ use std::collections::BTreeMap;
 
 use cawala_ledger::{
     AccountRef, Amount, AuthRef, EdgeAccount, Entry, EntryBody, Finding, Hash, HopRole, Ledger,
-    LedgerLog, LedgerSecretKey, LedgerSet, MemLog, NetTransfer, NodeId, OperatorSecretKey,
-    PaymentOrder, PeerKeys, PeerRegistry, PeerRole, PlannedHop, Posting, SettlementPlan,
-    SignedAmount, SignedCommitment, SignedEntry, build_commitment, execute_plan, net, plan_transfer,
-    verify_cascade,
+    LedgerLog, LedgerSecretKey, LedgerSet, MemLog, MirrorDirection, NetTransfer, NodeId,
+    OperatorSecretKey, PaymentOrder, PeerKeys, PeerRegistry, PeerRole, PlannedHop, Posting,
+    SettlementPlan, SignedAmount, SignedCommitment, SignedEntry, build_commitment, execute_plan,
+    net, plan_transfer, verify_cascade,
 };
 use cawala_topology::{ChildKind, Topology};
 
@@ -606,12 +606,19 @@ fn mirror_tamper_is_detected() {
             edge,
             parent_view,
             child_view,
-        } if edge.parent == n("R") && edge.child == n("A") => Some((*parent_view, *child_view)),
+            direction,
+        } if edge.parent == n("R") && edge.child == n("A") => {
+            Some((*parent_view, *child_view, *direction))
+        }
         _ => None,
     });
     assert_eq!(
         mismatch,
-        Some((Amount::new(1000), Amount::new(1050))),
+        Some((
+            Amount::new(1000),
+            Amount::new(1050),
+            MirrorDirection::UnbackedClaim,
+        )),
         "culprit ledger A: R still sees 1000 but A claims 1050"
     );
     assert!(
@@ -903,6 +910,7 @@ fn stranded_parent_on_reattach_is_a_mirror_mismatch() {
             },
             parent_view: Amount::ZERO,
             child_view: Amount::new(100),
+            direction: MirrorDirection::UnbackedClaim,
         }],
         "expected the stranded Parent claim to surface as MirrorMismatch"
     );
@@ -940,15 +948,63 @@ fn descend_without_parent_extension_is_mirror_mismatch() {
     assert!(
         report.findings.iter().any(|f| matches!(
             f,
-            Finding::MirrorMismatch { edge, parent_view, child_view }
+            Finding::MirrorMismatch { edge, parent_view, child_view, direction }
                 if edge.parent == n("R")
                     && edge.child == n("A")
                     && *parent_view == Amount::ZERO
                     && *child_view == Amount::new(100)
+                    && *direction == MirrorDirection::UnbackedClaim
         )),
-        "expected a MirrorMismatch for the un-extended R->A edge, got {:?}",
+        "expected an unbacked-claim MirrorMismatch for the un-extended R->A edge, got {:?}",
         report.findings
     );
+}
+
+/// The opposite direction: the parent has extended `Child(node)` but the child
+/// has not mirrored it yet (`parent_view > child_view`). This is a **transient
+/// pending handoff**, not an unbacked claim.
+#[test]
+fn unmirrored_extension_is_mirror_mismatch() {
+    let mut topo = Topology::new_root("R");
+    topo.add_node("A", ChildKind::Node).unwrap();
+    topo.attach("R", "A", Some(0)).unwrap();
+
+    let r_key = k(101);
+    let a_key = k(102);
+    let mut set = LedgerSet::new();
+    set.insert(n("R"), Ledger::new_root(r_key.public()))
+        .unwrap();
+    set.insert(n("A"), Ledger::new_non_root(a_key.public()))
+        .unwrap();
+
+    // R opens and issues to Child(A): R's liability exists, but A has not yet
+    // recorded the mirroring `Parent` asset.
+    open(set.get_mut(&n("R")).unwrap(), &r_key, "A", ChildKind::Node);
+    issue(set.get_mut(&n("R")).unwrap(), &r_key, "A", 100);
+    assert_eq!(
+        set.get(&n("R")).unwrap().balances().child_balance(&n("A")),
+        Amount::new(100)
+    );
+    assert_eq!(
+        set.get(&n("A")).unwrap().balances().parent_balance(),
+        Some(Amount::ZERO)
+    );
+
+    let report = net(&topo, &set, &PeerRegistry::new(), &[], &BTreeMap::new());
+    assert_eq!(
+        report.findings,
+        vec![Finding::MirrorMismatch {
+            edge: EdgeAccount {
+                parent: n("R"),
+                child: n("A"),
+            },
+            parent_view: Amount::new(100),
+            child_view: Amount::ZERO,
+            direction: MirrorDirection::UnmirroredExtension,
+        }],
+        "expected the un-mirrored extension to surface as an UnmirroredExtension"
+    );
+    assert!(report.nets.is_empty());
 }
 
 /// A local `Issue` (boundary op on a child liability) is externally backed and

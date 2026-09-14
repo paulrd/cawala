@@ -68,7 +68,7 @@ pub use merkle::{
     entry_root, inclusion_proof, root as merkle_root, state_inclusion_proof, state_root,
     verify_inclusion, verify_state_inclusion,
 };
-pub use netting::{Finding, NetTransfer, NettingReport, net, verify_cascade};
+pub use netting::{Finding, MirrorDirection, NetTransfer, NettingReport, net, verify_cascade};
 pub use registry::{PeerKeys, PeerRegistry, PeerRole};
 pub use settlement::{
     ExpectedHop, LedgerSet, PlannedHop, SettlementPlan, classify_hop, execute_plan, expected_hops,

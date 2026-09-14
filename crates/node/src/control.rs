@@ -32,7 +32,7 @@ use cawala_control::{
     MAX_CONTROL_FRAME, MoveChild, NodeId, NodeSnapshot, OperatorPubKey, OperatorSecretKey,
     ParentSnapshot, RejectCode, SetAddress, SignedControl, senior_child, verify_control,
 };
-use cawala_ledger::{PeerKeys, PeerRegistry, PeerRole};
+use cawala_ledger::{LedgerPubKey, PeerKeys, PeerRegistry, PeerRole};
 
 use crate::control_store::ControlStore;
 use crate::ledger_peers;
@@ -241,12 +241,18 @@ impl ControlNode {
     /// attach it to this node's record, register its peer keys, and return the
     /// [`JoinApproval`] to send back to the applicant.
     ///
+    /// `parent_ledger` is this node's own ledger public key (from
+    /// [`LedgerService::ledger_key_public`](crate::LedgerService::ledger_key_public)).
+    /// It is carried in the approval so the child can persist the parent's row
+    /// and later verify the parent's signed settlement hops.
+    ///
     /// Requires this node to have an asserted [`NodeRecord::address`].
     pub fn approve_pending(
         &mut self,
         node: &str,
         slot: Option<u8>,
         now: u64,
+        parent_ledger: LedgerPubKey,
     ) -> Result<JoinApproval, ControlError> {
         let node_id = NodeId::from(node);
         let Some(request) = self.pending.pending_for(&node_id).cloned() else {
@@ -318,6 +324,7 @@ impl ControlNode {
             address: child_address,
             date_joined: now,
             nonce: request.nonce,
+            parent_ledger,
         })
     }
 
@@ -416,7 +423,12 @@ impl ControlNode {
     }
 
     /// Applicant side: apply a parent's [`JoinApproval`] by setting the parent
-    /// link and the assigned address.
+    /// link and the assigned address, and persist the parent's row (operator
+    /// and ledger keys) to `ledger_peers.json`.
+    ///
+    /// The approval must answer the *current* outbound request: `approval.nonce`
+    /// must equal the outstanding request's nonce, so an authentic but stale
+    /// approval cannot be replayed onto a later re-join.
     ///
     /// # Pinning closes the trust-on-first-use gap
     ///
@@ -453,6 +465,14 @@ impl ControlNode {
         if outbound.parent != signed.origin || outbound.request.node != approval.child {
             return ControlReply::Rejected(RejectCode::Unauthorized);
         }
+        // The approval must answer the *current* outbound request. An authentic
+        // but stale approval (an earlier join's nonce) must not be applied to a
+        // later re-join: it would reset the parent link/address/slot and, now
+        // that the approval carries the parent ledger key, replace a newer key
+        // with an old one.
+        if approval.nonce != outbound.request.nonce {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
         // An invite pins the parent's operator key: the approval must be signed
         // by exactly that key, not merely by any self-consistent one.
         if let Some(expected) = outbound.pinned_operator
@@ -460,8 +480,14 @@ impl ControlNode {
         {
             return ControlReply::Rejected(RejectCode::Unauthorized);
         }
+        // The parent's ledger key must be present and non-degenerate; a zero
+        // key would install an unusable registry row.
+        if approval.parent_ledger.to_bytes() == [0u8; 32] {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
 
-        let backup = self.record.clone();
+        let record_backup = self.record.clone();
+        let peers_backup = self.peers.clone();
         if let Err(err) = self
             .record
             .set_parent(signed.origin.as_str(), approval.slot)
@@ -469,10 +495,22 @@ impl ControlNode {
             return ControlReply::Rejected(map_record_error(&err));
         }
         if let Err(err) = self.record.set_address(approval.address.clone()) {
-            self.record = backup;
+            self.record = record_backup;
             return ControlReply::Rejected(map_record_error(&err));
         }
-        if self.record.save().is_err() {
+        // Persist the parent's row (from the signed approval) so the parent's
+        // carried settlement hops become resolvable. A conflicting pre-existing
+        // row is refused; an identical row is idempotent.
+        if let Err(code) = self.remember_parent_peer(signed, approval) {
+            self.record = record_backup;
+            self.peers = peers_backup;
+            return ControlReply::Rejected(code);
+        }
+        if self.record.save().is_err()
+            || ledger_peers::save_peers(&self.data_dir, &self.peers).is_err()
+        {
+            self.record = record_backup;
+            self.peers = peers_backup;
             return ControlReply::Rejected(RejectCode::Internal);
         }
         self.pending.clear_outbound();
@@ -480,6 +518,71 @@ impl ControlNode {
             return ControlReply::Rejected(RejectCode::Internal);
         }
         ControlReply::Accepted
+    }
+
+    /// Record the approving parent in this node's peer registry.
+    ///
+    /// The row binds the parent's node id to the operator key that signed the
+    /// approval and the ledger key the approval carries. Idempotent: an
+    /// existing identical row is kept.
+    ///
+    /// A row with the **same operator** (and role) but a different ledger key is
+    /// *updated* to the approval's `parent_ledger`: the signed approval is
+    /// authoritative, and a parent that legitimately regenerated its ledger key
+    /// (restored `node.json`, lost ledger key) must not be permanently locked
+    /// out of re-attaching its child. A conflicting operator or role is still
+    /// refused. The caller persists the registry and rolls it back on error.
+    fn remember_parent_peer(
+        &mut self,
+        signed: &SignedControl,
+        approval: &JoinApproval,
+    ) -> Result<(), RejectCode> {
+        let expected = PeerKeys {
+            node_id: signed.origin.clone(),
+            operator: signed.controller,
+            ledger: Some(approval.parent_ledger),
+            role: PeerRole::Node,
+        };
+        let existing = self.peers.get(&signed.origin).cloned();
+        match existing {
+            Some(existing) if existing == expected => Ok(()),
+            Some(existing)
+                if existing.operator == expected.operator && existing.role == expected.role =>
+            {
+                self.replace_parent_ledger(&signed.origin, approval.parent_ledger)
+            }
+            Some(_) => Err(RejectCode::Unauthorized),
+            None => self
+                .peers
+                .insert(expected)
+                .map_err(|_| RejectCode::Unauthorized),
+        }
+    }
+
+    /// Replace an existing parent row's ledger key, preserving its operator.
+    ///
+    /// `PeerRegistry` exposes no in-place update or removal (and the ledger
+    /// crate is out of scope here), so rebuild it from its canonical
+    /// seq-of-rows serde form with the one key swapped. The rebuild is into a
+    /// fresh registry, so a failure (e.g. a ledger-key collision) leaves
+    /// `self.peers` untouched.
+    fn replace_parent_ledger(
+        &mut self,
+        parent: &NodeId,
+        ledger: LedgerPubKey,
+    ) -> Result<(), RejectCode> {
+        let value = serde_json::to_value(&self.peers).map_err(|_| RejectCode::Internal)?;
+        let rows =
+            serde_json::from_value::<Vec<PeerKeys>>(value).map_err(|_| RejectCode::Internal)?;
+        let mut rebuilt = PeerRegistry::new();
+        for mut row in rows {
+            if &row.node_id == parent {
+                row.ledger = Some(ledger);
+            }
+            rebuilt.insert(row).map_err(|_| RejectCode::Unauthorized)?;
+        }
+        self.peers = rebuilt;
+        Ok(())
     }
 
     fn handle_join_rejected(
@@ -901,6 +1004,7 @@ fn map_ledger_error(err: &cawala_ledger::LedgerError) -> RejectCode {
 mod tests {
     use super::*;
     use crate::record::ChildEntry;
+    use cawala_ledger::{LedgerPubKey, LedgerSecretKey};
     use iroh::SecretKey;
 
     fn record(node_id: &str, address: Option<&str>) -> NodeRecord {
@@ -919,6 +1023,10 @@ mod tests {
             slot,
             date_joined,
         }
+    }
+
+    fn ledger(seed: u8) -> LedgerPubKey {
+        LedgerSecretKey::from_bytes([seed; 32]).public()
     }
 
     #[test]
@@ -1058,6 +1166,7 @@ mod tests {
             address: "0.2".parse().unwrap(),
             date_joined: 10,
             nonce: request.nonce,
+            parent_ledger: ledger(77),
         }
     }
 
@@ -1119,5 +1228,206 @@ mod tests {
         );
         assert_eq!(engine.record().parent.as_ref().unwrap().parent_id, "parent");
         assert!(engine.pending().outbound().is_none());
+    }
+
+    /// **P5a**: an accepted approval persists the parent's operator + ledger
+    /// keys so the parent's carried settlement hops become resolvable, and a
+    /// re-delivered approval is idempotent.
+    #[tokio::test]
+    async fn approval_persists_parent_peer_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = OperatorSecretKey::from_bytes([3u8; 32]);
+        let (mut engine, request) = outbound_applicant(dir.path(), None);
+        let approval = approval_for(&request);
+        let remote = EndpointId::from(SecretKey::generate().public());
+
+        let signed = SignedControl::authorize(
+            NodeId::from("parent"),
+            &parent_op,
+            ControlRequest::JoinApproved(approval.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            engine.receive_at(remote, signed, 0).await,
+            ControlReply::Accepted
+        );
+
+        let expected = PeerKeys {
+            node_id: NodeId::from("parent"),
+            operator: parent_op.public(),
+            ledger: Some(ledger(77)),
+            role: PeerRole::Node,
+        };
+        let peers = ledger_peers::load_peers(dir.path()).unwrap();
+        assert_eq!(peers.get(&NodeId::from("parent")), Some(&expected));
+
+        // Re-delivering the same approval (e.g. after a lost ack) rewrites the
+        // identical row: no duplicate, no corruption.
+        engine
+            .begin_outbound_join(request.clone(), NodeId::from("parent"), None)
+            .unwrap();
+        let signed = SignedControl::authorize(
+            NodeId::from("parent"),
+            &parent_op,
+            ControlRequest::JoinApproved(approval),
+        )
+        .unwrap();
+        assert_eq!(
+            engine.receive_at(remote, signed, 0).await,
+            ControlReply::Accepted
+        );
+        let peers_again = ledger_peers::load_peers(dir.path()).unwrap();
+        assert_eq!(peers_again, peers);
+        assert_eq!(peers_again.len(), 1);
+    }
+
+    /// **F**: an authentic but *stale* approval (the nonce from an earlier
+    /// outbound request) must not be applied to a later re-join. Without the
+    /// nonce binding it could reset the address/slot and, now that the approval
+    /// carries the parent ledger key, replace a newer key with an old one.
+    #[tokio::test]
+    async fn stale_approval_nonce_is_rejected_without_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = OperatorSecretKey::from_bytes([3u8; 32]);
+        let (mut engine, request) = outbound_applicant(dir.path(), None);
+        let approval = approval_for(&request);
+        let remote = EndpointId::from(SecretKey::generate().public());
+
+        // First join completes with the request's nonce and installs the row.
+        let signed = SignedControl::authorize(
+            NodeId::from("parent"),
+            &parent_op,
+            ControlRequest::JoinApproved(approval.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            engine.receive_at(remote, signed, 0).await,
+            ControlReply::Accepted
+        );
+        let peers_after_first = ledger_peers::load_peers(dir.path()).unwrap();
+        let record_after_first = engine.record().clone();
+
+        // A later re-join to the same parent carries a fresh nonce.
+        let mut new_request = request.clone();
+        new_request.nonce += 100;
+        engine
+            .begin_outbound_join(new_request, NodeId::from("parent"), None)
+            .unwrap();
+
+        // Replaying the old approval is refused before any mutation.
+        let replay = SignedControl::authorize(
+            NodeId::from("parent"),
+            &parent_op,
+            ControlRequest::JoinApproved(approval),
+        )
+        .unwrap();
+        assert_eq!(
+            engine.receive_at(remote, replay, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+        assert_eq!(
+            ledger_peers::load_peers(dir.path()).unwrap(),
+            peers_after_first,
+            "the parent row must be untouched"
+        );
+        assert_eq!(
+            *engine.record(),
+            record_after_first,
+            "the record must be untouched"
+        );
+        assert!(
+            engine.pending().outbound().is_some(),
+            "the current outbound join is retained for a matching approval"
+        );
+    }
+
+    /// A pre-existing row for the parent node id with a **different operator**
+    /// is refused, and the record/registry are rolled back.
+    #[tokio::test]
+    async fn approval_different_operator_conflict_is_refused_without_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = OperatorSecretKey::from_bytes([3u8; 32]);
+        let (mut engine, request) = outbound_applicant(dir.path(), None);
+        let approval = approval_for(&request);
+
+        let conflicting = PeerKeys {
+            node_id: NodeId::from("parent"),
+            operator: OperatorSecretKey::from_bytes([4u8; 32]).public(),
+            ledger: Some(ledger(5)),
+            role: PeerRole::Node,
+        };
+        engine.peers.insert(conflicting.clone()).unwrap();
+        ledger_peers::save_peers(dir.path(), &engine.peers).unwrap();
+
+        let signed = SignedControl::authorize(
+            NodeId::from("parent"),
+            &parent_op,
+            ControlRequest::JoinApproved(approval),
+        )
+        .unwrap();
+        let remote = EndpointId::from(SecretKey::generate().public());
+        assert_eq!(
+            engine.receive_at(remote, signed, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+        assert!(
+            engine.record().parent.is_none(),
+            "the record must be rolled back"
+        );
+        let peers = ledger_peers::load_peers(dir.path()).unwrap();
+        assert_eq!(peers.get(&NodeId::from("parent")), Some(&conflicting));
+        assert_eq!(peers.len(), 1);
+    }
+
+    /// **F2**: the parent keeps its operator key but regenerates its ledger key
+    /// (restored `node.json`, lost ledger key). The signed approval is
+    /// authoritative, so the existing row's ledger key is replaced rather than
+    /// permanently blocking re-attach.
+    #[tokio::test]
+    async fn approval_same_operator_new_ledger_updates_parent_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = OperatorSecretKey::from_bytes([3u8; 32]);
+        let (mut engine, request) = outbound_applicant(dir.path(), None);
+        let approval = approval_for(&request);
+
+        // The child already knows the parent under the same operator with an
+        // older ledger key.
+        engine
+            .peers
+            .insert(PeerKeys {
+                node_id: NodeId::from("parent"),
+                operator: parent_op.public(),
+                ledger: Some(ledger(5)),
+                role: PeerRole::Node,
+            })
+            .unwrap();
+        ledger_peers::save_peers(dir.path(), &engine.peers).unwrap();
+
+        let signed = SignedControl::authorize(
+            NodeId::from("parent"),
+            &parent_op,
+            ControlRequest::JoinApproved(approval),
+        )
+        .unwrap();
+        let remote = EndpointId::from(SecretKey::generate().public());
+        assert_eq!(
+            engine.receive_at(remote, signed, 0).await,
+            ControlReply::Accepted
+        );
+
+        let peers = ledger_peers::load_peers(dir.path()).unwrap();
+        let row = peers.get(&NodeId::from("parent")).expect("parent row");
+        assert_eq!(row.operator, parent_op.public(), "operator is preserved");
+        assert_eq!(
+            row.ledger,
+            Some(ledger(77)),
+            "the ledger key must be replaced with the signed approval's"
+        );
+        assert_eq!(row.role, PeerRole::Node);
+        assert_eq!(peers.len(), 1, "the replacement must not add a second row");
+        assert!(
+            engine.record().parent.is_some(),
+            "the link is installed once the row is updated"
+        );
     }
 }

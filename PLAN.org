@@ -341,13 +341,20 @@
         suggestion service is out of scope for now: a separate, independently
         hostable, non-authoritative companion (lat/lon or map click -> suggested
         octal address); the leaf still validates and issues the final address.
-      - Cross-subtree hardening still owed (P5): parent<->child ledger-key
-        distribution + full carried-prefix signature verification (settlement
-        results are advisory - a rogue LCA/parent can misreport but cannot move
-        funds); commitment-chain assembly + `net`/`verify_cascade` operator
-        tooling; the `MirrorMismatch` direction split; no global supply anchor
-        by design; manual prefund liquidity (an underfunded LCA parent yields a
-        `Partial`: payer debited, payee not credited).
+      - Cross-subtree hardening (P5, DONE): `CONTROL_FORMAT_VERSION` 2 carries
+        the parent's ledger key in `JoinApproval`; a child persists the parent
+        `PeerKeys` row on join, so `carried_hops_match` verifies each carried
+        settlement hop under an **address-bound** signer->ledger-key resolver
+        (rejecting an entry that names one signer but is signed by another
+        registered key); `MirrorMismatch` now carries a
+        `MirrorDirection` (unbacked claim vs unmirrored extension).
+      - Still owed: result-path signature verification (settlement results
+        remain advisory - a rogue parent/LCA can misreport but cannot move
+        funds); route-wide carried-prefix verification beyond direct neighbors;
+        commitment-chain assembly + `net`/`verify_cascade` operator harness;
+        no global supply anchor by design; manual prefund liquidity (an
+        underfunded LCA parent yields a `Partial`: payer debited, payee not
+        credited); control-format v2 is a hard fleet break.
   6. *M5 - Hardening*: exit rights, foster-parent recovery, compromise-path
      docs, audit tooling, governance/regulatory surface (Hawala exposure is
      real - community question, not code).

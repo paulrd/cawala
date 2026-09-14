@@ -101,6 +101,24 @@ impl JoinRequest {
 ///
 /// `nonce` echoes the request so the applicant can match the reply; it is not
 /// a replay defence on its own.
+///
+/// `parent_ledger` is the *parent's* ledger public key. The child persists it
+/// as the parent's [`PeerKeys`](cawala_ledger::PeerKeys) row so the parent's
+/// signed settlement hops become resolvable. It is covered by the operator
+/// signature on the enclosing [`SignedControl`](crate::SignedControl), so an
+/// applicant learns the key only from the parent itself. Added in
+/// [`CONTROL_FORMAT_VERSION`](crate::CONTROL_FORMAT_VERSION) 2 (the field is
+/// appended so the v1 layout remains a prefix).
+///
+/// # Trust on first use
+///
+/// For a direct (`--parent`) join the parent's operator key is
+/// **trust-on-first-use**: the applicant has no prior knowledge of it, so the
+/// first self-consistent approval it sees is trusted, and `parent_ledger`
+/// inherits that TOFU caveat. An [`Invite`](crate::Invite) pins the parent's
+/// operator key out-of-band; when the join was invite-initiated the approval
+/// must be signed by exactly that key, which closes the TOFU gap (and thereby
+/// authenticates `parent_ledger`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinApproval {
     /// The accepted child.
@@ -119,6 +137,8 @@ pub struct JoinApproval {
     pub date_joined: u64,
     /// Echo of the request nonce.
     pub nonce: u64,
+    /// The parent's ledger public key (P5a key distribution).
+    pub parent_ledger: LedgerPubKey,
 }
 
 /// A parent's refusal of a [`JoinRequest`].
@@ -285,6 +305,7 @@ mod tests {
                 address: "0.3".parse().unwrap(),
                 date_joined: 50,
                 nonce: 1,
+                parent_ledger: ledger(12),
             }),
             ControlRequest::JoinRejected(JoinRejection {
                 child: node("applicant"),
@@ -441,5 +462,24 @@ mod tests {
             assert_eq!(back, request);
             assert_eq!(back.kind(), request.kind());
         }
+    }
+
+    #[test]
+    fn join_approval_round_trips_parent_ledger() {
+        let approval = JoinApproval {
+            child: node("applicant"),
+            child_operator: operator(1),
+            child_ledger: Some(ledger(11)),
+            kind: ChildKind::Node,
+            slot: 3,
+            address: "0.3".parse().unwrap(),
+            date_joined: 50,
+            nonce: 1,
+            parent_ledger: ledger(12),
+        };
+        let bytes = postcard::to_allocvec(&approval).unwrap();
+        let back: JoinApproval = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, approval);
+        assert_eq!(back.parent_ledger, ledger(12));
     }
 }

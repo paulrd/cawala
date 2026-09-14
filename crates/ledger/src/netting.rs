@@ -15,6 +15,24 @@
 //! [`NetTransfer`]s. Detection happens at reconciliation time, not acceptance
 //! time.
 //!
+//! # Mirror mismatches have a direction
+//!
+//! A disagreement between a parent's `Child(node)` liability and the child's
+//! `Parent` asset is reported as [`Finding::MirrorMismatch`] with a
+//! [`MirrorDirection`]:
+//!
+//! - [`MirrorDirection::UnbackedClaim`] (`child_view > parent_view`) is the
+//!   signal for a value claim the parent never extended — a local, unmirrored
+//!   issuance/descend, or a stranded claim after re-attach. The parent owes an
+//!   eventual honour/settlement (the M5 "exit rights" obligation). Local
+//!   issuance is externally backed and normal under the no-Equity model, so this
+//!   is an edge-level signal, **not** a global-supply or `UnbackedLiability`
+//!   finding.
+//! - [`MirrorDirection::UnmirroredExtension`] (`parent_view > child_view`) is a
+//!   **transient pending handoff**: the parent has extended credit the child has
+//!   not mirrored yet (expected mid-flight between a parent `Descend`/`Issue`
+//!   and the child recording it).
+//!
 //! Everything here is pure, synchronous, and wasm-safe: no I/O, no RNG.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,6 +77,32 @@ pub struct NetTransfer {
     pub amount: Amount,
 }
 
+/// Which way an edge's two balance views disagree.
+///
+/// The two directions are economically distinct and are **not** equivalent:
+///
+/// - [`UnbackedClaim`](MirrorDirection::UnbackedClaim): the child's `Parent`
+///   asset is larger than the parent's `Child(node)` liability. The child (or
+///   its subtree) holds a claim the parent never extended — a local, unmirrored
+///   issuance/descend, or a stranded claim after re-attach. This is the signal
+///   that the parent must eventually honour or settle (the M5 "exit rights"
+///   obligation). Local issuance is externally backed and normal under the
+///   no-Equity model; that it appears here as an unbacked *edge* claim is what
+///   matters, not a global-supply anomaly.
+/// - [`UnmirroredExtension`](MirrorDirection::UnmirroredExtension): the parent's
+///   `Child(node)` liability is larger than the child's `Parent` asset. The
+///   parent has extended credit the child has not recorded yet — a **transient
+///   pending handoff**, expected in flight between a parent's `Descend`/`Issue`
+///   and the child mirroring it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MirrorDirection {
+    /// `child_view > parent_view`: the child claims more than the parent owes.
+    UnbackedClaim,
+    /// `parent_view > child_view`: the parent credited more than the child has
+    /// mirrored (a transient pending handoff).
+    UnmirroredExtension,
+}
+
 /// A detected reconciliation anomaly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Finding {
@@ -82,7 +126,7 @@ pub enum Finding {
         reason: String,
     },
     /// A parent's liability view of a child disagrees with the child's asset
-    /// view of its parent.
+    /// view of its parent. See [`MirrorDirection`] for the two directions.
     MirrorMismatch {
         /// The topology edge whose two views disagree.
         edge: EdgeAccount,
@@ -90,6 +134,8 @@ pub enum Finding {
         parent_view: Amount,
         /// The child ledger's view of its parent asset.
         child_view: Amount,
+        /// Which view is larger; see [`MirrorDirection`].
+        direction: MirrorDirection,
     },
     /// An order's on-ledger cascade does not match the unique topology route.
     RouteInvalid {
@@ -444,6 +490,11 @@ fn audit_mirrors(topology: &Topology, ledgers: &LedgerSet, findings: &mut Vec<Fi
                 .parent_balance()
                 .unwrap_or(Amount::ZERO);
             if parent_view != child_view {
+                let direction = if child_view > parent_view {
+                    MirrorDirection::UnbackedClaim
+                } else {
+                    MirrorDirection::UnmirroredExtension
+                };
                 findings.push(Finding::MirrorMismatch {
                     edge: EdgeAccount {
                         parent: parent_id.clone(),
@@ -451,6 +502,7 @@ fn audit_mirrors(topology: &Topology, ledgers: &LedgerSet, findings: &mut Vec<Fi
                     },
                     parent_view,
                     child_view,
+                    direction,
                 });
             }
         }

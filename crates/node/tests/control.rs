@@ -16,6 +16,7 @@ use cawala_control::{
 use cawala_ledger::{LedgerPubKey, LedgerSecretKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_node::control::{ControlNode, spawn_control_only_on};
 use cawala_node::control_store::ControlStore;
+use cawala_node::ledger_peers::load_peers;
 use cawala_node::record::RecordStore;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
@@ -241,10 +242,11 @@ async fn join_request_then_approve_assigns_address() {
     let approval = parent
         .engine()
         .await
-        .approve_pending(&applicant_id, None, 1_000)
+        .approve_pending(&applicant_id, None, 1_000, ledger(55).public())
         .expect("approve");
     assert_eq!(approval.slot, 0);
     assert_eq!(approval.address.to_string(), "0.0");
+    assert_eq!(approval.parent_ledger, ledger(55).public());
 
     let signed_approval = SignedControl::authorize(
         node(&parent_id),
@@ -265,6 +267,17 @@ async fn join_request_then_approve_assigns_address() {
         record.validate().unwrap();
     }
     {
+        // **P5a**: the child persisted the parent's operator + ledger keys so
+        // the parent's carried settlement hops become resolvable.
+        let peers = load_peers(applicant_dir.path()).expect("applicant peers");
+        let parent_row = peers
+            .get(&node(&parent_id))
+            .expect("parent row persisted from the approval");
+        assert_eq!(parent_row.operator, parent_op.public());
+        assert_eq!(parent_row.ledger, Some(ledger(55).public()));
+        assert_eq!(parent_row.role, PeerRole::Node);
+    }
+    {
         let engine = parent.engine().await;
         let record = engine.record();
         assert_eq!(record.children.len(), 1);
@@ -276,6 +289,16 @@ async fn join_request_then_approve_assigns_address() {
             Some(&applicant_op.public())
         );
     }
+
+    // Redelivering the approval after the outbound join is cleared is a no-op
+    // and must not corrupt the persisted parent row.
+    let reply = send(&parent.endpoint, &applicant.addr, &signed_approval).await;
+    assert_eq!(reply, ControlReply::Rejected(RejectCode::NotAttached));
+    let peers = load_peers(applicant_dir.path()).expect("applicant peers");
+    assert_eq!(
+        peers.get(&node(&parent_id)).map(|row| row.ledger),
+        Some(Some(ledger(55).public()))
+    );
 
     parent.shutdown().await;
     applicant.shutdown().await;

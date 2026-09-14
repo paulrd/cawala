@@ -31,8 +31,8 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 
 use cawala_ledger::{
-    AuthRef, Hash, HopRole, PaymentOrder, PeerKeys, PeerRegistry, PeerRole, SignedEntry,
-    classify_hop, hop_postings,
+    AuthRef, Hash, HopRole, LedgerPubKey, NodeId, PaymentOrder, PeerKeys, PeerRegistry, PeerRole,
+    SignedEntry, classify_hop, hop_postings,
 };
 use cawala_msg::{
     Ack, AckStatus, Envelope, LedgerPayloadV1, LedgerPayloadV2, MSG_LEDGER_V1, MSG_SETTLE_V1,
@@ -1533,6 +1533,15 @@ async fn handle_settle_forward(
     }
     let snapshot = source.snapshot();
     let this = snapshot.routable.this.clone();
+    // Addresses of our direct neighbors, so a carried hop can be resolved to
+    // the registry row of the node that signed it (when that row is known).
+    let neighbors: Vec<(cawala_msg::OctAddr, NodeId)> = snapshot
+        .routable
+        .parent
+        .iter()
+        .chain(snapshot.routable.children.iter())
+        .map(|neighbor| (neighbor.addr.clone(), NodeId::from(neighbor.node.clone())))
+        .collect();
 
     let Some(signers) = expected_signers(&forward.payer_addr, &forward.payee_addr) else {
         return;
@@ -1639,6 +1648,7 @@ async fn handle_settle_forward(
     let now = unix_now();
     let applied = tokio::task::spawn_blocking(move || {
         let mut service = ledger_arc.blocking_lock();
+        let self_key = service.ledger_key_public();
         let registry = match assemble_settlement_registry(&service, &payer_key, &order, &auth) {
             Ok(registry) => registry,
             Err(reason) => {
@@ -1655,7 +1665,8 @@ async fn handle_settle_forward(
             &payee_addr,
             &this_addr,
             &order,
-            &service,
+            &self_key,
+            &neighbors,
             &registry,
         ) {
             return Err(HopOutcome::Rejected {
@@ -1779,9 +1790,18 @@ async fn handle_settle_forward(
 ///
 /// Every carried hop must name the expected signer, be a canonical transfer of
 /// this order with the role the classifier derives for that signer, and pass
-/// conservation. Where the signer's ledger key is resolvable (this node's own
-/// key), the entry signature is verified too; unregistered peer keys keep the
-/// name/role/shape checks.
+/// conservation. Where the signer is resolvable — this node itself, or a
+/// direct neighbor whose registry row (with a ledger key) is known — the entry
+/// signature is verified under exactly that signer's key; a mismatch rejects.
+///
+/// In the depth-1 route the immediately-preceding hop (`signers[index-1]`,
+/// already authenticated as the transport sender) is a direct neighbor of this
+/// node, so its signature is required at the terminal leaf and at the LCA.
+///
+/// Residual: a carried hop naming a node that is neither us nor a known direct
+/// neighbor cannot be verified here, so a malicious parent/LCA can still author
+/// a chain it signs with its own registered key. Full route verification is
+/// deferred.
 #[allow(clippy::too_many_arguments)]
 fn carried_hops_match(
     hops: &[SettleHopV1],
@@ -1790,10 +1810,10 @@ fn carried_hops_match(
     payee_addr: &cawala_msg::OctAddr,
     this_addr: &cawala_msg::OctAddr,
     order: &PaymentOrder,
-    service: &LedgerService,
+    self_key: &LedgerPubKey,
+    neighbors: &[(cawala_msg::OctAddr, NodeId)],
     registry: &PeerRegistry,
 ) -> bool {
-    let self_key = service.ledger_key_public();
     for (i, hop) in hops.iter().enumerate() {
         if i >= signers.len() || hop.signer_addr != signers[i] {
             return false;
@@ -1816,12 +1836,25 @@ fn carried_hops_match(
             return false;
         }
         if hop.signer_addr == *this_addr {
-            if entry.ledger_id != self_key || hop.entry.verify(&self_key).is_err() {
+            if entry.ledger_id != *self_key || hop.entry.verify(self_key).is_err() {
                 return false;
             }
-        } else if registry.verify_entry(&hop.entry).is_ok() {
-            // Resolvable registered key: the signature already verified.
+        } else if let Some(expected_node) = neighbors
+            .iter()
+            .find(|(addr, _)| addr == &hop.signer_addr)
+            .map(|(_, node)| node)
+        {
+            // The signer is a direct neighbor: when we hold its row, the
+            // carried entry must be signed by exactly that node's ledger key.
+            // (`verify` also rejects a `ledger_id` that is not that key.)
+            if let Some(expected_key) = registry.ledger_of(expected_node)
+                && hop.entry.verify(expected_key).is_err()
+            {
+                return false;
+            }
         }
+        // Otherwise the signer's key is not resolvable here; only the
+        // name/role/shape checks above apply.
     }
     true
 }
@@ -2908,5 +2941,248 @@ mod tests {
         assert!(result.balance.is_none());
 
         leaf_router.shutdown().await.unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // P5a: carried-prefix verification where the signer's key is resolvable
+    // ---------------------------------------------------------------------
+
+    fn carried_order() -> PaymentOrder {
+        PaymentOrder {
+            from: NodeId::from("uA"),
+            to: NodeId::from("uB"),
+            amount: cawala_ledger::Amount::new(100),
+            nonce: 1,
+            expiry: u64::MAX,
+        }
+    }
+
+    fn signer_addrs() -> [cawala_msg::OctAddr; 3] {
+        expected_signers(&"0.1.3".parse().unwrap(), &"0.2.4".parse().unwrap())
+            .expect("depth-1 route has three signers")
+    }
+
+    fn node_row(
+        id: &str,
+        operator: &OperatorSecretKey,
+        key: &cawala_ledger::LedgerSecretKey,
+    ) -> PeerKeys {
+        PeerKeys {
+            node_id: NodeId::from(id),
+            operator: operator.public(),
+            ledger: Some(key.public()),
+            role: PeerRole::Node,
+        }
+    }
+
+    fn make_hop(
+        signer_addr: &str,
+        order: &PaymentOrder,
+        ledger_key: &cawala_ledger::LedgerSecretKey,
+        role: HopRole,
+        first: cawala_ledger::AccountRef,
+        second: cawala_ledger::AccountRef,
+    ) -> SettleHopV1 {
+        let m = i64::try_from(order.amount.get()).unwrap();
+        let entry = cawala_ledger::Entry {
+            ledger_id: ledger_key.public(),
+            seq: 0,
+            height: 0,
+            prev_hash: Hash::ZERO,
+            issued_at: 0,
+            body: cawala_ledger::EntryBody::Transfer {
+                payment_id: order.hash(),
+                amount: order.amount,
+                role,
+            },
+            postings: hop_postings(role, &first, &second, m),
+            auth: Some(
+                order
+                    .authorize(&OperatorSecretKey::from_bytes([1u8; 32]))
+                    .unwrap(),
+            ),
+        };
+        SettleHopV1 {
+            signer_addr: signer_addr.parse().unwrap(),
+            entry: SignedEntry::sign(entry, ledger_key).unwrap(),
+        }
+    }
+
+    fn ascend_hop(order: &PaymentOrder, key: &cawala_ledger::LedgerSecretKey) -> SettleHopV1 {
+        make_hop(
+            "0.1",
+            order,
+            key,
+            HopRole::Ascend,
+            cawala_ledger::AccountRef::Parent,
+            cawala_ledger::AccountRef::Child(NodeId::from("0.1.3")),
+        )
+    }
+
+    fn lca_hop(order: &PaymentOrder, key: &cawala_ledger::LedgerSecretKey) -> SettleHopV1 {
+        make_hop(
+            "0",
+            order,
+            key,
+            HopRole::Lca,
+            cawala_ledger::AccountRef::Child(NodeId::from("0.1")),
+            cawala_ledger::AccountRef::Child(NodeId::from("0.2")),
+        )
+    }
+
+    /// Terminal leaf `0.2`: the LCA's carried hop (`signers[1]`) is verified
+    /// under the now-known parent key; a tampered LCA entry is rejected.
+    #[test]
+    fn carried_prefix_verifies_lca_hop_at_terminal() {
+        let order = carried_order();
+        let a_key = cawala_ledger::LedgerSecretKey::from_bytes([11u8; 32]);
+        let p_key = cawala_ledger::LedgerSecretKey::from_bytes([22u8; 32]);
+        let b_key = cawala_ledger::LedgerSecretKey::from_bytes([33u8; 32]);
+        let hops = vec![ascend_hop(&order, &a_key), lca_hop(&order, &p_key)];
+        let signers = signer_addrs();
+        let payer = "0.1.3".parse().unwrap();
+        let payee = "0.2.4".parse().unwrap();
+        let this = "0.2".parse().unwrap();
+        // B knows its parent P; sibling A is not resolvable at B.
+        let neighbors = vec![("0".parse().unwrap(), NodeId::from("P"))];
+        let mut registry = PeerRegistry::new();
+        registry
+            .insert(node_row(
+                "P",
+                &OperatorSecretKey::from_bytes([2u8; 32]),
+                &p_key,
+            ))
+            .unwrap();
+
+        assert!(carried_hops_match(
+            &hops,
+            &signers,
+            &payer,
+            &payee,
+            &this,
+            &order,
+            &b_key.public(),
+            &neighbors,
+            &registry,
+        ));
+
+        let mut tampered = hops.clone();
+        tampered[1].entry.signature = b_key.sign(b"forged");
+        assert!(
+            !carried_hops_match(
+                &tampered,
+                &signers,
+                &payer,
+                &payee,
+                &this,
+                &order,
+                &b_key.public(),
+                &neighbors,
+                &registry,
+            ),
+            "a tampered LCA signature must be rejected"
+        );
+    }
+
+    /// LCA `0`: the payer leaf's carried hop (`signers[0]`) is verified under
+    /// the known child key, and an entry naming that child but signed by a
+    /// different registered neighbor is rejected.
+    #[test]
+    fn carried_prefix_verifies_payer_leaf_hop_at_lca() {
+        let order = carried_order();
+        let a_key = cawala_ledger::LedgerSecretKey::from_bytes([11u8; 32]);
+        let p_key = cawala_ledger::LedgerSecretKey::from_bytes([22u8; 32]);
+        let b_key = cawala_ledger::LedgerSecretKey::from_bytes([33u8; 32]);
+        let signers = signer_addrs();
+        let payer = "0.1.3".parse().unwrap();
+        let payee = "0.2.4".parse().unwrap();
+        let this = "0".parse().unwrap();
+        let neighbors = vec![
+            ("0.1".parse().unwrap(), NodeId::from("A")),
+            ("0.2".parse().unwrap(), NodeId::from("B")),
+        ];
+        let mut registry = PeerRegistry::new();
+        registry
+            .insert(node_row(
+                "A",
+                &OperatorSecretKey::from_bytes([1u8; 32]),
+                &a_key,
+            ))
+            .unwrap();
+        registry
+            .insert(node_row(
+                "B",
+                &OperatorSecretKey::from_bytes([3u8; 32]),
+                &b_key,
+            ))
+            .unwrap();
+
+        let honest = vec![ascend_hop(&order, &a_key)];
+        assert!(carried_hops_match(
+            &honest,
+            &signers,
+            &payer,
+            &payee,
+            &this,
+            &order,
+            &p_key.public(),
+            &neighbors,
+            &registry,
+        ));
+
+        // Names the payer leaf `A` but is signed by the registered B key: the
+        // address is bound to A's row, not merely to any registered key.
+        let forged = vec![make_hop(
+            "0.1",
+            &order,
+            &b_key,
+            HopRole::Ascend,
+            cawala_ledger::AccountRef::Parent,
+            cawala_ledger::AccountRef::Child(NodeId::from("0.1.3")),
+        )];
+        assert!(
+            !carried_hops_match(
+                &forged,
+                &signers,
+                &payer,
+                &payee,
+                &this,
+                &order,
+                &p_key.public(),
+                &neighbors,
+                &registry,
+            ),
+            "a non-neighbor key must not vouch for another signer's address"
+        );
+    }
+
+    /// A signer whose row is genuinely absent keeps the name/role/shape checks
+    /// (the documented residual until full route verification lands).
+    #[test]
+    fn carried_prefix_defers_unresolvable_signer() {
+        let order = carried_order();
+        let a_key = cawala_ledger::LedgerSecretKey::from_bytes([11u8; 32]);
+        let p_key = cawala_ledger::LedgerSecretKey::from_bytes([22u8; 32]);
+        let b_key = cawala_ledger::LedgerSecretKey::from_bytes([33u8; 32]);
+        let hops = vec![ascend_hop(&order, &a_key), lca_hop(&order, &p_key)];
+        let signers = signer_addrs();
+        let payer = "0.1.3".parse().unwrap();
+        let payee = "0.2.4".parse().unwrap();
+        let this = "0.2".parse().unwrap();
+        let neighbors = vec![("0".parse().unwrap(), NodeId::from("P"))];
+
+        // No registry rows at all: the keys are unavailable here, so only the
+        // shape/role checks apply.
+        assert!(carried_hops_match(
+            &hops,
+            &signers,
+            &payer,
+            &payee,
+            &this,
+            &order,
+            &b_key.public(),
+            &neighbors,
+            &PeerRegistry::new(),
+        ));
     }
 }

@@ -224,6 +224,8 @@ impl LocalStateV1 {
     ///
     /// - the parent must equal the outbound parent,
     /// - the approved child must be this client,
+    /// - the approval's nonce must match the outstanding request (so a stale
+    ///   approval cannot be replayed onto a later re-join),
     /// - if the join pinned an operator key, the signer must match it.
     ///
     /// On success the parent link and asserted address are installed, the
@@ -239,6 +241,9 @@ impl LocalStateV1 {
             return Transition::NotAttached;
         };
         if &outbound.parent != origin || approval.child.as_str() != self_node_id {
+            return Transition::Denied(RejectCode::Unauthorized);
+        }
+        if approval.nonce != outbound.request.nonce {
             return Transition::Denied(RejectCode::Unauthorized);
         }
         if let Some(expected) = &outbound.pinned_operator
@@ -340,6 +345,7 @@ impl LocalStateV1 {
 mod tests {
     use super::*;
     use cawala_control::OperatorSecretKey;
+    use cawala_ledger::{LedgerPubKey, LedgerSecretKey};
 
     fn node(id: &str) -> NodeId {
         NodeId::from(id)
@@ -347,6 +353,10 @@ mod tests {
 
     fn operator(seed: u8) -> OperatorSecretKey {
         OperatorSecretKey::from_bytes([seed; 32])
+    }
+
+    fn ledger(seed: u8) -> LedgerPubKey {
+        LedgerSecretKey::from_bytes([seed; 32]).public()
     }
 
     fn join_request(me: &str, operator: &OperatorSecretKey) -> JoinRequest {
@@ -372,6 +382,7 @@ mod tests {
             address: "0.2".parse().unwrap(),
             date_joined: 10,
             nonce: request.nonce,
+            parent_ledger: ledger(9),
         }
     }
 
@@ -421,6 +432,23 @@ mod tests {
         );
         assert_eq!(wrong_child, Transition::Denied(RejectCode::Unauthorized));
         assert!(state.outbound.is_some(), "outbound is retained on denial");
+    }
+
+    #[test]
+    fn stale_approval_nonce_is_denied() {
+        let (mut state, request) = pending(None);
+        // A later re-join to the same parent uses a fresh nonce.
+        let mut newer = request.clone();
+        newer.nonce = 99;
+        state.set_outbound(newer, node("parent"), None, 6);
+
+        // The old approval (nonce 7) no longer answers the outstanding request.
+        let stale = approval_for(&request);
+        let transition =
+            state.on_join_approved("me", &stale, &node("parent"), &operator(9).public());
+        assert_eq!(transition, Transition::Denied(RejectCode::Unauthorized));
+        assert!(state.record.parent.is_none(), "no link was installed");
+        assert!(state.outbound.is_some(), "the current outbound is retained");
     }
 
     #[test]

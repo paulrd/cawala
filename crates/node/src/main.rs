@@ -957,7 +957,9 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
         }
         ControlCommand::Approve { node, slot } => {
             let mut engine = ControlNode::open(data_dir, &node_id, operator.clone())?;
-            // Open the applicant's ledger account BEFORE `approve_pending`
+            // Open the parent's ledger unconditionally: its public key is
+            // distributed to the child in the approval (P5a), and for a user
+            // applicant the account must be opened BEFORE `approve_pending`
             // consumes the pending row. Otherwise a transient ledger-lock
             // contention error would leave the join half-approved (control
             // state written, account missing) and a retry would report "no
@@ -967,11 +969,13 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
                 .pending()
                 .pending_for(&NodeId::from(node.clone()))
                 .map(|request| request.kind);
+            let mut service = LedgerService::open(data_dir, &node_id)?;
             if applicant_kind == Some(ChildKind::User) {
-                let mut service = LedgerService::open(data_dir, &node_id)?;
                 service.ensure_account_open(&NodeId::from(node.clone()), ChildKind::User)?;
             }
-            let approval = engine.approve_pending(&node, slot, now_unix_seconds())?;
+            let parent_ledger = service.ledger_key_public();
+            let approval =
+                engine.approve_pending(&node, slot, now_unix_seconds(), parent_ledger)?;
             let signed = SignedControl::authorize(
                 me.clone(),
                 &operator,
