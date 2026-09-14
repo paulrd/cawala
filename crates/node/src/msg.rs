@@ -20,8 +20,10 @@
 //! hop, and it verifies only that the last recorded hop matches that peer and
 //! is a configured neighbor.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::endpoint::Connection;
@@ -29,11 +31,14 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 
 use cawala_msg::{
-    Ack, AckStatus, Envelope, MessageType, MsgError, MsgId, Neighbor, NeighborKind, PeerRef,
-    RejectReason, Routable, RouteDecision, RouteError, Seen, SeenConfig, SeenSet,
+    Ack, AckStatus, Envelope, LedgerPayloadV1, MSG_LEDGER_V1, MessageType, MsgError, MsgId,
+    Neighbor, NeighborKind, OrderRejectV1, OrderResultV1, OrderStatusV1, PeerRef, RejectReason,
+    Routable, RouteDecision, RouteError, Seen, SeenConfig, SeenSet,
 };
+use cawala_topology::ChildKind;
 
-use crate::record::NodeRecord;
+use crate::ledger_service::{ApplyOutcome, LedgerService};
+use crate::record::{NodeRecord, RecordStore};
 
 /// ALPN negotiated on every `cawala/msg/0` connection.
 pub use cawala_msg::ALPN as MSG_ALPN;
@@ -166,6 +171,114 @@ impl RoutableSnapshot {
     }
 }
 
+/// Where a [`MsgHandler`] gets its routing view.
+///
+/// The handler stores this instead of a bare [`RoutableSnapshot`] so a running
+/// node can observe a topology change made by a *separate* process. `control
+/// approve` rewrites `<data-dir>/node.json`; a [`NeighborSource::Live`] source
+/// re-reads that file for every message and so accepts a just-approved child
+/// without a restart.
+#[derive(Debug, Clone)]
+pub enum NeighborSource {
+    /// A fixed routing view. Used by tests and the simple spawn paths.
+    Static(RoutableSnapshot),
+    /// Re-reads the persisted record on each message, falling back to the last
+    /// good snapshot when the file is unreadable or invalid.
+    Live {
+        data_dir: PathBuf,
+        node_id: String,
+        /// Explicit `node id -> network address` overrides applied to every
+        /// reloaded snapshot. Usually empty outside tests.
+        hints: HashMap<String, EndpointAddr>,
+        /// The most recent successfully derived snapshot.
+        last_good: Arc<Mutex<RoutableSnapshot>>,
+    },
+}
+
+impl NeighborSource {
+    /// A live source rooted at `<data_dir>/node.json`.
+    ///
+    /// Fails only if the *initial* record cannot be loaded/derived; the live
+    /// reload path itself never fails (it falls back to the last good view).
+    pub fn live(
+        data_dir: impl Into<PathBuf>,
+        node_id: impl Into<String>,
+        hints: HashMap<String, EndpointAddr>,
+    ) -> anyhow::Result<Self> {
+        use anyhow::Context;
+
+        let data_dir = data_dir.into();
+        let node_id = node_id.into();
+        let store = RecordStore::open(&data_dir, &node_id).with_context(|| {
+            format!(
+                "live neighbor source: opening {}",
+                data_dir.join(crate::record::NODE_RECORD_FILE).display()
+            )
+        })?;
+        let mut initial = RoutableSnapshot::from_record(store.record())
+            .context("live neighbor source: deriving routing snapshot from record")?;
+        initial.hints = hints.clone();
+        Ok(NeighborSource::Live {
+            data_dir,
+            node_id,
+            hints,
+            last_good: Arc::new(Mutex::new(initial)),
+        })
+    }
+
+    /// The current routing view.
+    ///
+    /// [`NeighborSource::Static`] clones its fixed snapshot. `Live` reloads and
+    /// rebuilds from disk; on a load/parse error it logs and returns the last
+    /// good snapshot rather than failing the message.
+    pub fn snapshot(&self) -> RoutableSnapshot {
+        match self {
+            NeighborSource::Static(snapshot) => snapshot.clone(),
+            NeighborSource::Live {
+                data_dir,
+                node_id,
+                hints,
+                last_good,
+            } => {
+                let loaded = RecordStore::open(data_dir, node_id)
+                    .map_err(|err| err.to_string())
+                    .and_then(|store| {
+                        RoutableSnapshot::from_record(store.record()).map_err(|err| err.to_string())
+                    });
+                match loaded {
+                    Ok(mut snapshot) => {
+                        snapshot.hints = hints.clone();
+                        if let Ok(mut guard) = last_good.lock() {
+                            *guard = snapshot.clone();
+                        }
+                        snapshot
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "live neighbor snapshot reload failed; using last good snapshot"
+                        );
+                        last_good
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone()
+                    }
+                }
+            }
+        }
+    }
+
+    /// See [`RoutableSnapshot::is_neighbor`].
+    pub fn is_neighbor(&self, node: &str, addr: &cawala_msg::OctAddr) -> bool {
+        self.snapshot().is_neighbor(node, addr)
+    }
+
+    /// See [`RoutableSnapshot::endpoint_addr`].
+    pub fn endpoint_addr(&self, node: &str) -> Result<EndpointAddr, RoutingSetupError> {
+        self.snapshot().endpoint_addr(node)
+    }
+}
+
 fn parse_endpoint_id(node_id: &str) -> Result<EndpointId, RoutingSetupError> {
     EndpointId::from_str(node_id).map_err(|err| RoutingSetupError::BadEndpointId {
         node_id: node_id.to_string(),
@@ -205,25 +318,38 @@ pub enum MsgSendError {
 #[derive(Debug)]
 pub struct MsgHandler {
     endpoint: Endpoint,
-    snapshot: RoutableSnapshot,
+    neighbors: NeighborSource,
     config: MsgConfig,
     seen: Mutex<SeenSet>,
     sink: tokio::sync::mpsc::Sender<Envelope>,
 }
 
 impl MsgHandler {
-    /// Build a handler that delivers locally destined envelopes to `sink` and
-    /// forwards the rest through `endpoint`.
+    /// Build a handler with a fixed routing view that delivers locally destined
+    /// envelopes to `sink` and forwards the rest through `endpoint`.
     pub fn new(
         endpoint: Endpoint,
         snapshot: RoutableSnapshot,
         config: MsgConfig,
         sink: tokio::sync::mpsc::Sender<Envelope>,
     ) -> Self {
+        Self::with_source(endpoint, NeighborSource::Static(snapshot), config, sink)
+    }
+
+    /// Build a handler whose routing view comes from `source`. A
+    /// [`NeighborSource::Live`] source re-reads `<data-dir>/node.json` per
+    /// message, so a child approved by a separate `control` process is accepted
+    /// without a restart.
+    pub fn with_source(
+        endpoint: Endpoint,
+        source: NeighborSource,
+        config: MsgConfig,
+        sink: tokio::sync::mpsc::Sender<Envelope>,
+    ) -> Self {
         let seen = Mutex::new(SeenSet::new(config.seen));
         MsgHandler {
             endpoint,
-            snapshot,
+            neighbors: source,
             config,
             seen,
             sink,
@@ -237,7 +363,22 @@ impl MsgHandler {
     /// transient rejection rolls the replay mark back.
     pub fn set_hint(&mut self, node: &str, addr: EndpointAddr) -> Result<(), RoutingSetupError> {
         let id = parse_endpoint_id(node)?;
-        self.snapshot.hints.insert(id.to_string(), addr);
+        let canonical = id.to_string();
+        match &mut self.neighbors {
+            NeighborSource::Static(snapshot) => {
+                snapshot.hints.insert(canonical, addr);
+            }
+            NeighborSource::Live {
+                hints, last_good, ..
+            } => {
+                hints.insert(canonical.clone(), addr.clone());
+                last_good
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .hints
+                    .insert(canonical, addr);
+            }
+        }
         Ok(())
     }
 
@@ -292,7 +433,10 @@ impl MsgHandler {
             return reject(RejectReason::BadHopChain);
         }
 
-        let this = &self.snapshot.routable.this;
+        // Resolve the routing view once per envelope. A live source reloads the
+        // persisted record here, so a child approved after spawn is seen.
+        let snapshot = self.neighbors.snapshot();
+        let this = &snapshot.routable.this;
 
         // 3. Reject any chain that already visited this node (loop).
         if env
@@ -307,7 +451,7 @@ impl MsgHandler {
         let Some(last) = env.hop_chain.last() else {
             return reject(RejectReason::BadHopChain);
         };
-        if last.node != remote.to_string() || !self.snapshot.is_neighbor(&last.node, &last.addr) {
+        if last.node != remote.to_string() || !snapshot.is_neighbor(&last.node, &last.addr) {
             return reject(RejectReason::NotNeighbor);
         }
 
@@ -328,7 +472,7 @@ impl MsgHandler {
 
         // 6. Route. Transient outcomes roll the mark back via `settle`; the
         // deterministic rejections keep it (a retry of those changes nothing).
-        let status = match cawala_msg::route(&self.snapshot.routable, &env.dst) {
+        let status = match cawala_msg::route(&snapshot.routable, &env.dst) {
             RouteDecision::Local => match self.sink.try_send(env) {
                 Ok(()) => AckStatus::Delivered,
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -350,7 +494,7 @@ impl MsgHandler {
                     } else {
                         env.ttl -= 1;
 
-                        match self.snapshot.endpoint_addr(&next_node) {
+                        match snapshot.endpoint_addr(&next_node) {
                             Err(_) => AckStatus::Rejected(RejectReason::Unreachable),
                             Ok(addr) => match forward_once(
                                 &self.endpoint,
@@ -468,8 +612,18 @@ pub fn spawn_msg_node_on(
     snapshot: RoutableSnapshot,
     config: MsgConfig,
 ) -> (Router, tokio::sync::mpsc::Receiver<Envelope>) {
+    spawn_msg_node_with_source_on(endpoint, NeighborSource::Static(snapshot), config)
+}
+
+/// Like [`spawn_msg_node_on`], but with an explicit [`NeighborSource`] so the
+/// handler can use a live routing view.
+pub fn spawn_msg_node_with_source_on(
+    endpoint: Endpoint,
+    source: NeighborSource,
+    config: MsgConfig,
+) -> (Router, tokio::sync::mpsc::Receiver<Envelope>) {
     let (sink, receiver) = tokio::sync::mpsc::channel(SINK_CAPACITY);
-    let handler = MsgHandler::new(endpoint.clone(), snapshot, config, sink);
+    let handler = MsgHandler::with_source(endpoint.clone(), source, config, sink);
     let router = Router::builder(endpoint)
         .accept(proto::ALPN, crate::PingHandler)
         .accept(MSG_ALPN, handler)
@@ -543,10 +697,234 @@ pub async fn send_envelope(
     }
 }
 
+/// Current unix time in seconds, the caller-supplied clock for ledger ops.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// Process one locally delivered `MSG_LEDGER_V1` envelope at a leaf node.
+///
+/// This is the node's **drain-loop** half of the ledger protocol: it runs after
+/// [`MsgHandler`] has queued the envelope (`Delivered` means "queued", not
+/// "applied"). Dispatch deliberately lives outside [`MsgHandler`] so the
+/// transport never blocks on ledger IO.
+///
+/// `Order` payloads are applied to the shared [`LedgerService`] and answered
+/// with an [`OrderResultV1`] carrying a fresh balance receipt for the payer.
+/// `BalanceQuery` payloads from a `User` child are answered with a signed
+/// [`BalanceReceiptV1`]. Inbound results/receipts at a leaf and malformed
+/// payloads are logged and skipped. No failure path panics: a bad payload or an
+/// unreachable reply must not kill the drain task.
+pub async fn dispatch_ledger_envelope(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    ledger: &Arc<tokio::sync::Mutex<LedgerService>>,
+    data_dir: &Path,
+    node_id: &str,
+    env: Envelope,
+) {
+    let payload = match LedgerPayloadV1::from_bytes(&env.payload) {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::warn!(
+                msg_id = %env.msg_id.to_hex(),
+                %err,
+                "malformed MSG_LEDGER_V1 payload; skipping"
+            );
+            return;
+        }
+    };
+
+    match payload {
+        LedgerPayloadV1::Order(order_v1) => {
+            let order = order_v1.order;
+            let auth = order_v1.auth;
+            let order_hash = order.hash();
+            let sender = env.src.node.clone();
+
+            let record = match RecordStore::open(data_dir, node_id) {
+                Ok(store) => store.record().clone(),
+                Err(err) => {
+                    tracing::warn!(%err, "cannot reload node record to apply an order; skipping");
+                    return;
+                }
+            };
+
+            // `apply_order` alone cannot distinguish "not a child" from other
+            // structural failures, so reject a non-user-child sender up front
+            // and always answer with a result (never drop silently).
+            let ledger = Arc::clone(ledger);
+            let now = unix_now();
+            let applied = tokio::task::spawn_blocking(move || {
+                let mut service = ledger.blocking_lock();
+                let sender_is_user_child = record
+                    .children
+                    .iter()
+                    .any(|child| child.kind == ChildKind::User && child.child_id == sender);
+                if !sender_is_user_child {
+                    return (
+                        ApplyOutcome {
+                            status: OrderStatusV1::Rejected,
+                            entry_seq: None,
+                            entry_hash: None,
+                            reason: Some(OrderRejectV1::NotAChild),
+                        },
+                        None,
+                    );
+                }
+                let outcome = service.apply_order(
+                    &order,
+                    &auth,
+                    &cawala_ledger::NodeId::from(sender),
+                    &record,
+                    now,
+                );
+                let balance = match &outcome.status {
+                    OrderStatusV1::Applied | OrderStatusV1::Duplicate => service
+                        .balance_receipt(&order.from, &record, None, None, None)
+                        .ok(),
+                    OrderStatusV1::Rejected => None,
+                };
+                (outcome, balance)
+            })
+            .await;
+
+            let (outcome, balance) = match applied {
+                Ok(applied) => applied,
+                Err(err) => {
+                    tracing::warn!(%err, "ledger apply task failed; skipping order");
+                    return;
+                }
+            };
+
+            let result = OrderResultV1 {
+                reply_to: env.msg_id,
+                order_hash,
+                status: outcome.status,
+                entry_seq: outcome.entry_seq,
+                entry_hash: outcome.entry_hash,
+                reason: outcome.reason,
+                balance,
+            };
+            send_ledger_reply(
+                endpoint,
+                source,
+                config,
+                &env,
+                LedgerPayloadV1::OrderResult(result),
+            )
+            .await;
+        }
+        LedgerPayloadV1::BalanceQuery(query) => {
+            let record = match RecordStore::open(data_dir, node_id) {
+                Ok(store) => store.record().clone(),
+                Err(err) => {
+                    tracing::warn!(%err, "cannot reload node record to answer a balance query");
+                    return;
+                }
+            };
+
+            // Only this leaf's own users get receipts, and only at the address
+            // their slot derives. This mirrors the `is_neighbor` check in the
+            // handler with an explicit record lookup.
+            let derived = record.address.as_ref().and_then(|address| {
+                record
+                    .children
+                    .iter()
+                    .find(|child| child.child_id == env.src.node && child.kind == ChildKind::User)
+                    .map(|child| address.child(child.slot))
+            });
+            if derived.as_ref() != Some(&env.src.addr) {
+                tracing::warn!(
+                    src = %env.src.node,
+                    "BalanceQuery from a non-user-child or mismatched address; ignoring"
+                );
+                return;
+            }
+
+            let user = cawala_ledger::NodeId::from(env.src.node.clone());
+            let reply_to = env.msg_id;
+            let query_id = query.query_id;
+            let ledger = Arc::clone(ledger);
+            let receipt = tokio::task::spawn_blocking(move || {
+                let mut service = ledger.blocking_lock();
+                service.balance_receipt(&user, &record, Some(reply_to), Some(query_id), None)
+            })
+            .await;
+
+            let receipt = match receipt {
+                Ok(Ok(receipt)) => receipt,
+                Ok(Err(err)) => {
+                    tracing::warn!(%err, "failed to build balance receipt");
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "balance receipt task failed");
+                    return;
+                }
+            };
+            send_ledger_reply(
+                endpoint,
+                source,
+                config,
+                &env,
+                LedgerPayloadV1::BalanceReceipt(receipt),
+            )
+            .await;
+        }
+        LedgerPayloadV1::OrderResult(_) | LedgerPayloadV1::BalanceReceipt(_) => {
+            tracing::debug!(
+                msg_id = %env.msg_id.to_hex(),
+                "ignoring leaf-directed ledger reply at a leaf node"
+            );
+        }
+    }
+}
+
+/// Encode `payload`, build a reply envelope to `env.src`, and send it. Failures
+/// are logged and dropped so the drain loop keeps running.
+async fn send_ledger_reply(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    env: &Envelope,
+    payload: LedgerPayloadV1,
+) {
+    let bytes = match payload.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(%err, "failed to encode ledger reply");
+            return;
+        }
+    };
+    let snapshot = source.snapshot();
+    let src = snapshot.routable.this.clone();
+    let reply = match build_envelope(&src, env.src.addr.clone(), MSG_LEDGER_V1, bytes, config.ttl) {
+        Ok(reply) => reply,
+        Err(err) => {
+            tracing::warn!(%err, "failed to build ledger reply envelope");
+            return;
+        }
+    };
+    match send_envelope(endpoint, &snapshot, &reply, config.hop_timeout).await {
+        Ok(ack) => tracing::debug!(
+            msg_id = %reply.msg_id.to_hex(),
+            status = ack.status_str(),
+            "sent ledger reply"
+        ),
+        Err(err) => tracing::warn!(%err, "failed to send ledger reply"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::record::{ChildEntry, ParentLink};
+    use cawala_ledger::OperatorSecretKey;
     use cawala_msg::{MAX_PAYLOAD, MSG_LEDGER_V1, PROTOCOL_VERSION};
     use cawala_topology::ChildKind;
     use iroh::SecretKey;
@@ -782,5 +1160,453 @@ mod tests {
             out.push(ALPHABET[((buffer << (5 - bits)) & 0x1f) as usize] as char);
         }
         out
+    }
+
+    // ---------------------------------------------------------------------
+    // End-to-end ledger dispatch tests
+    // ---------------------------------------------------------------------
+
+    /// Bind a hermetic endpoint on IPv4 loopback with relays disabled.
+    async fn hermetic_endpoint(secret: &SecretKey) -> Endpoint {
+        Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(secret.clone())
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("valid loopback bind address")
+            .bind()
+            .await
+            .expect("bind endpoint")
+    }
+
+    fn ledger_test_config() -> MsgConfig {
+        MsgConfig {
+            hop_timeout: Duration::from_secs(2),
+            ..MsgConfig::default()
+        }
+    }
+
+    /// Attach a `User` child to a persisted leaf record (the write `control
+    /// approve` performs).
+    fn attach_user_child(dir: &Path, node_id: &str, child_id: &str, slot: u8) {
+        let mut store = RecordStore::open(dir, node_id).unwrap();
+        store
+            .attach_child(child_id, ChildKind::User, Some(slot), 1)
+            .unwrap();
+        store.save().unwrap();
+    }
+
+    /// Register a `User` peer row, as `control approve` does.
+    fn register_user_peer(dir: &Path, user_id: &str, operator: &OperatorSecretKey) {
+        use crate::ledger_peers::{load_peers, save_peers};
+        use cawala_ledger::{NodeId, PeerKeys, PeerRole};
+        let mut registry = load_peers(dir).unwrap();
+        registry
+            .insert(PeerKeys {
+                node_id: NodeId::from(user_id.to_string()),
+                operator: operator.public(),
+                ledger: None,
+                role: PeerRole::User,
+            })
+            .unwrap();
+        save_peers(dir, &registry).unwrap();
+    }
+
+    /// Build an `Order` envelope from `snap`'s node to the root leaf (`0`).
+    fn order_envelope(
+        snap: &RoutableSnapshot,
+        order: &cawala_ledger::PaymentOrder,
+        operator: &OperatorSecretKey,
+        config: &MsgConfig,
+        dst: cawala_msg::OctAddr,
+    ) -> Envelope {
+        use cawala_msg::OrderV1;
+        let auth = order.authorize(operator).unwrap();
+        let payload = LedgerPayloadV1::Order(OrderV1 {
+            order: order.clone(),
+            auth,
+        })
+        .to_bytes()
+        .unwrap();
+        build_envelope(&snap.routable.this, dst, MSG_LEDGER_V1, payload, config.ttl).unwrap()
+    }
+
+    fn balance_query_envelope(
+        snap: &RoutableSnapshot,
+        query_id: u64,
+        config: &MsgConfig,
+        dst: cawala_msg::OctAddr,
+    ) -> Envelope {
+        let payload = LedgerPayloadV1::BalanceQuery(cawala_msg::BalanceQueryV1 { query_id })
+            .to_bytes()
+            .unwrap();
+        build_envelope(&snap.routable.this, dst, MSG_LEDGER_V1, payload, config.ttl).unwrap()
+    }
+
+    /// A leaf whose `node.json` initially lists no children: the live source
+    /// must observe children added *after* the handler is spawned.
+    #[tokio::test]
+    async fn live_source_accepts_user_approved_after_spawn_and_applies_order() {
+        use cawala_ledger::{
+            Amount, NodeId, OperatorSecretKey, PaymentOrder, verify_balance_attestation,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let node_secret = crate::identity::load_or_create_secret_key(dir.path()).unwrap();
+        let node_id = node_secret.public().to_string();
+
+        let payer_secret = SecretKey::generate();
+        let payer_id = payer_secret.public().to_string();
+        let payer_op = OperatorSecretKey::from_bytes([31u8; 32]);
+        let payee_id = SecretKey::generate().public().to_string();
+        let payee_op = OperatorSecretKey::from_bytes([32u8; 32]);
+        let payer = NodeId::from(payer_id.clone());
+        let payee = NodeId::from(payee_id.clone());
+
+        // The leaf starts as a root with no children.
+        let mut store = RecordStore::open(dir.path(), &node_id).unwrap();
+        store.set_address("0".parse().unwrap()).unwrap();
+        store.save().unwrap();
+
+        // Ledger: open both user accounts and fund the payer before the order.
+        let mut service = LedgerService::open(dir.path(), &node_id).unwrap();
+        service.ensure_account_open(&payer, ChildKind::User).unwrap();
+        service.ensure_account_open(&payee, ChildKind::User).unwrap();
+        let node_operator = OperatorSecretKey::from_bytes(node_secret.to_bytes());
+        service.fund(&payer, 100, &node_operator, 1, 1_000).unwrap();
+
+        let leaf_endpoint = hermetic_endpoint(&node_secret).await;
+        let payer_endpoint = hermetic_endpoint(&payer_secret).await;
+
+        // The live source carries a hint for the payer (replies need a dial
+        // target); neighbor status itself comes from node.json.
+        let mut leaf_hints = HashMap::new();
+        leaf_hints.insert(payer_id.clone(), payer_endpoint.addr());
+        let source = NeighborSource::live(dir.path(), &node_id, leaf_hints).unwrap();
+
+        let config = ledger_test_config();
+        let (leaf_router, mut leaf_rx) =
+            spawn_msg_node_with_source_on(leaf_endpoint.clone(), source.clone(), config.clone());
+
+        // Dispatch task mirrors `run()`'s sink drain loop.
+        let ledger = Arc::new(tokio::sync::Mutex::new(service));
+        let dispatch_dir = dir.path().to_path_buf();
+        let dispatch_node = node_id.clone();
+        let dispatch_source = source.clone();
+        let dispatch_ledger = Arc::clone(&ledger);
+        let dispatch_endpoint = leaf_endpoint.clone();
+        let dispatch_config = config.clone();
+        tokio::spawn(async move {
+            while let Some(env) = leaf_rx.recv().await {
+                dispatch_ledger_envelope(
+                    &dispatch_endpoint,
+                    &dispatch_source,
+                    &dispatch_config,
+                    &dispatch_ledger,
+                    &dispatch_dir,
+                    &dispatch_node,
+                    env,
+                )
+                .await;
+            }
+        });
+
+        // The payer's own view: a child of the leaf at slot 3 (address 0.3).
+        let payer_record = record(&payer_id, "0.3", Some((&node_id, 3)), vec![]);
+        let mut payer_snap = RoutableSnapshot::from_record(&payer_record).unwrap();
+        payer_snap
+            .hints
+            .insert(node_id.clone(), leaf_endpoint.addr());
+        let (_payer_router, mut payer_rx) =
+            spawn_msg_node_on(payer_endpoint.clone(), payer_snap.clone(), config.clone());
+
+        let leaf_addr: cawala_msg::OctAddr = "0".parse().unwrap();
+        let expiry = unix_now() + 3_600;
+        let order = PaymentOrder {
+            from: payer.clone(),
+            to: payee.clone(),
+            amount: Amount::new(30),
+            nonce: 7,
+            expiry,
+        };
+
+        // Before approval the leaf does not list the payer -> not a neighbor,
+        // so the handler refuses and no result is produced.
+        let pre = order_envelope(&payer_snap, &order, &payer_op, &config, leaf_addr.clone());
+        let ack = send_envelope(&payer_endpoint, &payer_snap, &pre, config.hop_timeout)
+            .await
+            .unwrap();
+        assert_eq!(ack.status, AckStatus::Rejected(RejectReason::NotNeighbor));
+        assert!(payer_rx.try_recv().is_err());
+
+        // Control-style approval: persist the child rows and peer registrations.
+        attach_user_child(dir.path(), &node_id, &payer_id, 3);
+        attach_user_child(dir.path(), &node_id, &payee_id, 4);
+        register_user_peer(dir.path(), &payer_id, &payer_op);
+        register_user_peer(dir.path(), &payee_id, &payee_op);
+
+        // The *same* running handler now accepts the payer: the live source
+        // re-read node.json, and the order is applied end to end.
+        let post = order_envelope(&payer_snap, &order, &payer_op, &config, leaf_addr);
+        let ack = send_envelope(&payer_endpoint, &payer_snap, &post, config.hop_timeout)
+            .await
+            .unwrap();
+        assert_eq!(ack.status, AckStatus::Delivered);
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), payer_rx.recv())
+            .await
+            .expect("order result within timeout")
+            .expect("order result envelope");
+        let LedgerPayloadV1::OrderResult(result) =
+            LedgerPayloadV1::from_bytes(&reply.payload).unwrap()
+        else {
+            panic!("expected an OrderResult");
+        };
+        assert_eq!(result.reply_to, post.msg_id);
+        assert_eq!(result.order_hash, order.hash());
+        assert_eq!(result.status, OrderStatusV1::Applied);
+        assert_eq!(result.reason, None);
+
+        let receipt = result.balance.expect("a payer balance receipt");
+        verify_balance_attestation(
+            &receipt.attestation,
+            &receipt.commitment,
+            &receipt.ledger_pubkey,
+        )
+        .unwrap();
+        assert_eq!(receipt.attestation.balance, Amount::new(70));
+
+        {
+            let svc = ledger.lock().await;
+            assert_eq!(svc.balance_of(&payer), Amount::new(70));
+            assert_eq!(svc.balance_of(&payee), Amount::new(30));
+        }
+
+        // Restart recovery: a fresh service replays the log and sees the
+        // post-transfer balances.
+        let reopened = LedgerService::open(dir.path(), &node_id).unwrap();
+        assert_eq!(reopened.balance_of(&payer), Amount::new(70));
+        assert_eq!(reopened.balance_of(&payee), Amount::new(30));
+
+        leaf_router.shutdown().await.unwrap();
+    }
+
+    /// A `BalanceQuery` from an approved user returns a receipt that verifies
+    /// under the leaf's ledger key, echoing the query/reply correlation ids.
+    #[tokio::test]
+    async fn balance_query_returns_verifiable_receipt() {
+        use cawala_ledger::{Amount, NodeId, OperatorSecretKey, verify_balance_attestation};
+
+        let dir = tempfile::tempdir().unwrap();
+        let node_secret = crate::identity::load_or_create_secret_key(dir.path()).unwrap();
+        let node_id = node_secret.public().to_string();
+
+        let user_secret = SecretKey::generate();
+        let user_id = user_secret.public().to_string();
+        let user = NodeId::from(user_id.clone());
+
+        // Persist a leaf record that already lists the user (approval happened
+        // before spawn).
+        let mut store = RecordStore::open(dir.path(), &node_id).unwrap();
+        store.set_address("0".parse().unwrap()).unwrap();
+        store
+            .attach_child(user_id.clone(), ChildKind::User, Some(5), 1)
+            .unwrap();
+        store.save().unwrap();
+        register_user_peer(
+            dir.path(),
+            &user_id,
+            &OperatorSecretKey::from_bytes([51u8; 32]),
+        );
+
+        let mut service = LedgerService::open(dir.path(), &node_id).unwrap();
+        service.ensure_account_open(&user, ChildKind::User).unwrap();
+        let node_operator = OperatorSecretKey::from_bytes(node_secret.to_bytes());
+        service.fund(&user, 42, &node_operator, 1, 1_000).unwrap();
+
+        let leaf_endpoint = hermetic_endpoint(&node_secret).await;
+        let user_endpoint = hermetic_endpoint(&user_secret).await;
+
+        let leaf_record = RecordStore::open(dir.path(), &node_id).unwrap();
+        let mut leaf_snap = RoutableSnapshot::from_record(leaf_record.record()).unwrap();
+        leaf_snap
+            .hints
+            .insert(user_id.clone(), user_endpoint.addr());
+        let source = NeighborSource::Static(leaf_snap);
+
+        let config = ledger_test_config();
+        let (leaf_router, mut leaf_rx) =
+            spawn_msg_node_with_source_on(leaf_endpoint.clone(), source.clone(), config.clone());
+
+        let ledger = Arc::new(tokio::sync::Mutex::new(service));
+        let dispatch_dir = dir.path().to_path_buf();
+        let dispatch_node = node_id.clone();
+        let dispatch_source = source;
+        let dispatch_ledger = Arc::clone(&ledger);
+        let dispatch_endpoint = leaf_endpoint.clone();
+        let dispatch_config = config.clone();
+        tokio::spawn(async move {
+            while let Some(env) = leaf_rx.recv().await {
+                dispatch_ledger_envelope(
+                    &dispatch_endpoint,
+                    &dispatch_source,
+                    &dispatch_config,
+                    &dispatch_ledger,
+                    &dispatch_dir,
+                    &dispatch_node,
+                    env,
+                )
+                .await;
+            }
+        });
+
+        let user_record = record(&user_id, "0.5", Some((&node_id, 5)), vec![]);
+        let mut user_snap = RoutableSnapshot::from_record(&user_record).unwrap();
+        user_snap
+            .hints
+            .insert(node_id.clone(), leaf_endpoint.addr());
+        let (_user_router, mut user_rx) =
+            spawn_msg_node_on(user_endpoint.clone(), user_snap.clone(), config.clone());
+
+        let query = balance_query_envelope(
+            &user_snap,
+            99,
+            &config,
+            "0".parse().unwrap(),
+        );
+        let ack = send_envelope(&user_endpoint, &user_snap, &query, config.hop_timeout)
+            .await
+            .unwrap();
+        assert_eq!(ack.status, AckStatus::Delivered);
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), user_rx.recv())
+            .await
+            .expect("balance receipt within timeout")
+            .expect("balance receipt envelope");
+        let LedgerPayloadV1::BalanceReceipt(receipt) =
+            LedgerPayloadV1::from_bytes(&reply.payload).unwrap()
+        else {
+            panic!("expected a BalanceReceipt");
+        };
+        assert_eq!(receipt.reply_to, Some(query.msg_id));
+        assert_eq!(receipt.query_id, Some(99));
+        assert!(receipt.history_within_bound());
+        verify_balance_attestation(
+            &receipt.attestation,
+            &receipt.commitment,
+            &receipt.ledger_pubkey,
+        )
+        .unwrap();
+        assert_eq!(receipt.attestation.balance, Amount::new(42));
+        assert_eq!(receipt.attestation.edge.child, user);
+
+        leaf_router.shutdown().await.unwrap();
+    }
+
+    /// An `Order` from a direct neighbor that is a `Node` child (not a leaf
+    /// `User` child) is answered `Rejected(NotAChild)` rather than dropped.
+    #[tokio::test]
+    async fn order_from_non_user_child_is_rejected_with_result() {
+        use cawala_ledger::{Amount, NodeId, OperatorSecretKey, PaymentOrder};
+
+        let dir = tempfile::tempdir().unwrap();
+        let node_secret = crate::identity::load_or_create_secret_key(dir.path()).unwrap();
+        let node_id = node_secret.public().to_string();
+        let _service = LedgerService::open(dir.path(), &node_id).unwrap();
+
+        let child_secret = SecretKey::generate();
+        let child_id = child_secret.public().to_string();
+        let child = NodeId::from(child_id.clone());
+
+        // Leaf record lists the sender as a *Node* child in slot 1.
+        let mut store = RecordStore::open(dir.path(), &node_id).unwrap();
+        store.set_address("0".parse().unwrap()).unwrap();
+        store
+            .attach_child(child_id.clone(), ChildKind::Node, Some(1), 1)
+            .unwrap();
+        store.save().unwrap();
+
+        let leaf_endpoint = hermetic_endpoint(&node_secret).await;
+        let child_endpoint = hermetic_endpoint(&child_secret).await;
+
+        let leaf_record = RecordStore::open(dir.path(), &node_id).unwrap();
+        let mut leaf_snap = RoutableSnapshot::from_record(leaf_record.record()).unwrap();
+        leaf_snap
+            .hints
+            .insert(child_id.clone(), child_endpoint.addr());
+        let source = NeighborSource::Static(leaf_snap);
+
+        let config = ledger_test_config();
+        let (leaf_router, mut leaf_rx) =
+            spawn_msg_node_with_source_on(leaf_endpoint.clone(), source.clone(), config.clone());
+
+        let ledger = Arc::new(tokio::sync::Mutex::new(
+            LedgerService::open(dir.path(), &node_id).unwrap(),
+        ));
+        let dispatch_dir = dir.path().to_path_buf();
+        let dispatch_node = node_id.clone();
+        let dispatch_source = source;
+        let dispatch_ledger = Arc::clone(&ledger);
+        let dispatch_endpoint = leaf_endpoint.clone();
+        let dispatch_config = config.clone();
+        tokio::spawn(async move {
+            while let Some(env) = leaf_rx.recv().await {
+                dispatch_ledger_envelope(
+                    &dispatch_endpoint,
+                    &dispatch_source,
+                    &dispatch_config,
+                    &dispatch_ledger,
+                    &dispatch_dir,
+                    &dispatch_node,
+                    env,
+                )
+                .await;
+            }
+        });
+
+        // The node child's own view: address 0.1, parent is the leaf.
+        let child_record = record(&child_id, "0.1", Some((&node_id, 1)), vec![]);
+        let mut child_snap = RoutableSnapshot::from_record(&child_record).unwrap();
+        child_snap
+            .hints
+            .insert(node_id.clone(), leaf_endpoint.addr());
+        let (_child_router, mut child_rx) =
+            spawn_msg_node_on(child_endpoint.clone(), child_snap.clone(), config.clone());
+
+        let stranger = NodeId::from("stranger");
+        let order = PaymentOrder {
+            from: child.clone(),
+            to: stranger,
+            amount: Amount::new(1),
+            nonce: 1,
+            expiry: unix_now() + 3_600,
+        };
+        let op = OperatorSecretKey::from_bytes([61u8; 32]);
+        let env = order_envelope(
+            &child_snap,
+            &order,
+            &op,
+            &config,
+            "0".parse().unwrap(),
+        );
+        let ack = send_envelope(&child_endpoint, &child_snap, &env, config.hop_timeout)
+            .await
+            .unwrap();
+        assert_eq!(ack.status, AckStatus::Delivered);
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), child_rx.recv())
+            .await
+            .expect("order result within timeout")
+            .expect("order result envelope");
+        let LedgerPayloadV1::OrderResult(result) =
+            LedgerPayloadV1::from_bytes(&reply.payload).unwrap()
+        else {
+            panic!("expected an OrderResult");
+        };
+        assert_eq!(result.status, OrderStatusV1::Rejected);
+        assert_eq!(result.reason, Some(OrderRejectV1::NotAChild));
+        assert!(result.balance.is_none());
+
+        leaf_router.shutdown().await.unwrap();
     }
 }

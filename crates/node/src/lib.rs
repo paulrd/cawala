@@ -20,6 +20,7 @@ pub mod control_store;
 pub mod identity;
 pub mod ledger_keys;
 pub mod ledger_peers;
+pub mod ledger_service;
 pub mod ledger_store;
 pub mod msg;
 pub mod record;
@@ -31,6 +32,7 @@ pub use control::{
 pub use control_store::{ControlStore, OUTBOUND_JOIN_FILE, OutboundJoin, PENDING_JOINS_FILE};
 pub use ledger_keys::{LEDGER_KEY_FILE, load_or_create_ledger_key, persist_ledger_key};
 pub use ledger_peers::{PEERS_FILE, load_peers, save_peers};
+pub use ledger_service::{ApplyOutcome, LedgerService};
 pub use ledger_store::{
     FileLog, LEDGER_FORMAT_VERSION, LedgerMeta, load_or_create_meta, open_ledger,
 };

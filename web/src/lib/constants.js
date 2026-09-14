@@ -64,6 +64,40 @@ export const CONTROL_EVENT = {
   REJECTED: 'rejected',
 };
 
+/**
+ * Real kinds of ledger events drained from the live wasm ledger loop
+ * (`LedgerEventDto.kind`).
+ */
+export const LEDGER_EVENT = {
+  ORDER_RESULT: 'order_result',
+  BALANCE_RECEIPT: 'balance_receipt',
+  INVALID: 'invalid',
+};
+
+/**
+ * Real terminal order statuses from the live wasm ledger (`LedgerEventDto.status`,
+ * Rust `OrderStatusV1`).
+ */
+export const ORDER_STATUS = {
+  APPLIED: 'applied',
+  DUPLICATE: 'duplicate',
+  REJECTED: 'rejected',
+};
+
+/**
+ * Stable order-rejection reasons surfaced on a rejected `order_result`
+ * (`LedgerEventDto.reason`, Rust `OrderRejectV1`).
+ */
+export const ORDER_REJECT = {
+  UNAUTHORIZED: 'unauthorized',
+  BAD_REQUEST: 'bad_request',
+  EXPIRED: 'expired',
+  INSUFFICIENT_BALANCE: 'insufficient_balance',
+  ACCOUNT_NOT_OPENED: 'account_not_opened',
+  NOT_A_CHILD: 'not_a_child',
+  INTERNAL: 'internal',
+};
+
 /** ALPN the live browser control client speaks to its parent node. */
 export const CONTROL_ALPN = 'cawala/control/0';
 

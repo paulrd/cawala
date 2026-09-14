@@ -14,6 +14,7 @@ crate-type = ["cdylib", "rlib"]
 # pulls getrandom 0.4 with its own `wasm_js` feature.
 [dependencies]
 cawala-control = { path = "../control" }
+cawala-ledger = { path = "../ledger" }
 cawala-msg = { path = "../msg" }
 console_error_panic_hook = "0.1.7"
 getrandom = { version = "0.3", features = ["wasm_js"] }
@@ -29,3 +30,8 @@ tracing-subscriber-wasm = "0.1.0"
 wasm-bindgen = "=0.2.122"
 wasm-bindgen-futures = "0.4.50"
 web-time = "1.1"
+
+[dev-dependencies]
+# Native tests build ledger fixtures whose `OpenAccount` body needs the
+# topology `ChildKind`; not part of the wasm dependency graph.
+cawala-topology = { path = "../topology" }

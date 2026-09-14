@@ -14,7 +14,9 @@
 //! the root address `"0"` may stand alone), and the kind is restricted to
 //! `node`/`user` at (de)serialization time.
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -212,6 +214,10 @@ impl RecordStore {
 
     /// Persist the record to `<data_dir>/node.json` (pretty JSON), after
     /// re-validating.
+    ///
+    /// The write is atomic (temp file + fsync + rename), so a concurrent reader
+    /// observes either the previous complete document or the new one, never a
+    /// torn `node.json`.
     pub fn save(&self) -> Result<(), RecordError> {
         self.record.validate()?;
         std::fs::create_dir_all(&self.data_dir).map_err(|err| RecordError::WriteFailed {
@@ -224,10 +230,7 @@ impl RecordStore {
                 path: path.display().to_string(),
                 detail: err.to_string(),
             })?;
-        std::fs::write(&path, json).map_err(|err| RecordError::WriteFailed {
-            path: path.display().to_string(),
-            detail: err.to_string(),
-        })
+        write_json_atomic(&path, &json)
     }
 
     /// Add a child link. `slot: None` picks the lowest free slot.
@@ -335,6 +338,30 @@ impl RecordStore {
     }
 }
 
+/// Write `json` to `path` atomically: create a sibling temp file, fsync it,
+/// then rename it over `path` (same directory, so the rename cannot cross a
+/// filesystem boundary). A reader therefore sees either the old complete
+/// document or the new one, never a partially written file.
+fn write_json_atomic(path: &Path, json: &str) -> Result<(), RecordError> {
+    let tmp = path.with_extension("tmp");
+    let write_failed = |target: &Path, err: std::io::Error| RecordError::WriteFailed {
+        path: target.display().to_string(),
+        detail: err.to_string(),
+    };
+    {
+        let mut file = File::create(&tmp).map_err(|err| write_failed(&tmp, err))?;
+        file.write_all(json.as_bytes())
+            .map_err(|err| write_failed(&tmp, err))?;
+        file.sync_all().map_err(|err| write_failed(&tmp, err))?;
+    }
+    // Preserve any existing file permissions across the rename (best effort).
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, metadata.permissions());
+    }
+    std::fs::rename(&tmp, path).map_err(|err| write_failed(path, err))?;
+    Ok(())
+}
+
 /// Serialize [`ChildKind`] as `"node"`/`"user"` (the topology crate's default
 /// serde output is `"Node"`/`"User"`).
 mod kind_serde {
@@ -398,6 +425,58 @@ mod tests {
             "parent-x"
         );
         assert_eq!(loaded.record().children.len(), 2);
+    }
+
+    #[test]
+    fn save_replaces_existing_file_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(dir.path());
+        store.set_parent("parent-x", 1).unwrap();
+        store.save().unwrap();
+
+        store.set_parent("parent-y", 2).unwrap();
+        store
+            .attach_child("c1", ChildKind::Node, Some(0), JOINED)
+            .unwrap();
+        store.save().unwrap();
+
+        let loaded = RecordStore::open(dir.path(), "node-a").unwrap();
+        assert_eq!(loaded.record(), store.record());
+        assert_eq!(
+            loaded.record().parent.as_ref().unwrap().parent_id,
+            "parent-y"
+        );
+        assert_eq!(loaded.record().children.len(), 1);
+        // A successful atomic save leaves no temp file behind.
+        assert!(!dir.path().join("node.tmp").exists());
+    }
+
+    #[test]
+    fn failed_save_leaves_previous_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(dir.path());
+        store.set_parent("parent-x", 1).unwrap();
+        store.save().unwrap();
+        let before = std::fs::read(dir.path().join(NODE_RECORD_FILE)).unwrap();
+
+        // Occupy the temp path with a directory so the write fails before any
+        // rename; the destination must be left exactly as it was.
+        std::fs::create_dir(dir.path().join("node.tmp")).unwrap();
+
+        store.set_parent("parent-y", 2).unwrap();
+        let err = store.save().unwrap_err();
+        assert!(
+            matches!(err, RecordError::WriteFailed { .. }),
+            "unexpected error: {err}"
+        );
+
+        let after = std::fs::read(dir.path().join(NODE_RECORD_FILE)).unwrap();
+        assert_eq!(before, after);
+        let loaded = RecordStore::open(dir.path(), "node-a").unwrap();
+        assert_eq!(
+            loaded.record().parent.as_ref().unwrap().parent_id,
+            "parent-x"
+        );
     }
 
     #[test]

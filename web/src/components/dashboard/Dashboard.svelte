@@ -8,11 +8,11 @@
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
   import EmptyState from '../shared/EmptyState.svelte';
   import ErrorState from '../shared/ErrorState.svelte';
-  import { clientState, nodeState, loadingState, errorState, apiCapabilities } from '../../lib/stores.js';
+  import { clientState, ledgerState, nodeState, loadingState, errorState, apiCapabilities } from '../../lib/stores.svelte.js';
   import { getChildren, getAccounts, getJoinRequests, isMockMode } from '../../lib/api.js';
   import { ROUTES } from '../../lib/constants.js';
-  import { navigate } from '../../lib/router.js';
-  import { formatDate } from '../../lib/utils.js';
+  import { navigate } from '../../lib/router.svelte.js';
+  import { formatDate, timeAgo } from '../../lib/utils.js';
 
   let loaded = $state(false);
 
@@ -63,8 +63,9 @@
 
   let isLive = $derived(!isMockMode());
 
-  // In live mode, balance is always null and online is always false.
-  // Render em-dash for null balance, "Unknown" for online status.
+  // Live mode: balance availability
+  let balanceReady = $derived(isLive && ledgerState.balance != null);
+
   const childColumns = [
     { key: 'address', label: 'Address', mono: true, sortable: true },
     { key: 'balance', label: 'Balance', align: 'right', mono: true, sortable: true,
@@ -76,7 +77,6 @@
       render: (v) => `<span class="text-sm">${formatDate(v)}</span>` },
     { key: 'online', label: 'Status',
       render: (v, row) => {
-        // In live mode, show "Unknown" instead of lying about online status
         const label = isLive && !v ? 'Unknown' : v ? 'Online' : 'Offline';
         const color = v ? 'var(--ok)' : 'var(--muted)';
         const bg = v ? 'var(--ok-dim)' : 'var(--bg-hover)';
@@ -99,88 +99,193 @@
       </div>
     {/if}
 
-    <div class="summary-grid">
-      <Card title="Node Address">
-        <div class="summary-value">
-          <Address address={clientState.address} size="lg" />
-        </div>
-        <div class="summary-meta">
-          <EndpointId id={clientState.endpointId} />
-        </div>
-      </Card>
+    {#if isLive}
+      <!-- ── Live mode: user-leaf dashboard ──────────── -->
+      <div class="summary-grid">
+        <Card title="My Balance">
+          <div class="summary-value">
+            {#if balanceReady}
+              <Balance amount={ledgerState.balance} size="lg" showSign={false} />
+            {:else}
+              <span class="muted">&mdash;</span>
+            {/if}
+          </div>
+          <div class="summary-meta">
+            {#if balanceReady}
+              <div class="meta-row">
+                <Badge variant="ok" label="Verified" />
+                {#if ledgerState.height != null}
+                  <span class="text-sm muted">Height {ledgerState.height}</span>
+                {/if}
+              </div>
+              {#if ledgerState.verifiedAt}
+                <span class="text-xs muted">Last verified: {timeAgo(new Date(ledgerState.verifiedAt))}</span>
+              {/if}
+            {:else}
+              <span class="text-sm muted">Balance not yet verified. Waiting for a receipt from your leaf.</span>
+            {/if}
+          </div>
+        </Card>
 
-      <Card title="Equity">
-        <div class="summary-value">
-          {#if isLive && nodeState.accounts.length === 0}
-            <span class="muted">&mdash;</span>
-          {:else}
-            <Balance amount={equity} size="lg" />
-          {/if}
-        </div>
-        <div class="summary-meta muted text-sm">
-          {#if isLive && nodeState.accounts.length === 0}
-            No accounting data from this node
-          {:else}
-            Node equity (assets &minus; liabilities)
-          {/if}
-        </div>
-      </Card>
+        <Card title="My Address">
+          <div class="summary-value">
+            <Address address={clientState.address} size="lg" />
+          </div>
+          <div class="summary-meta">
+            <EndpointId id={clientState.endpointId} />
+          </div>
+        </Card>
+
+        <Card title="Pending">
+          <div class="summary-value">
+            <span class="children-count">{ledgerState.pending}</span>
+          </div>
+          <div class="summary-meta muted text-sm">
+            {#if ledgerState.pending > 0}
+              Orders awaiting confirmation
+            {:else}
+              No pending orders
+            {/if}
+          </div>
+        </Card>
+
+        <Card title="Children">
+          <div class="summary-value">
+            <span class="children-count">{nodeState.children.length}<span class="children-max">/8</span></span>
+          </div>
+          <div class="summary-meta muted text-sm">
+            {#if pendingJoins > 0}
+              <button type="button" class="link-btn" onclick={() => navigate(ROUTES.JOINS)}>
+                {pendingJoins} pending join{pendingJoins !== 1 ? 's' : ''}
+              </button>
+            {:else if isLive}
+              Pending joins not available in the web client
+            {:else}
+              No pending joins
+            {/if}
+          </div>
+        </Card>
+      </div>
+
+      <!-- Quick actions -->
+      <div class="quick-actions">
+        <button
+          type="button"
+          class="btn btn--primary"
+          onclick={() => navigate(ROUTES.MY_ACCOUNT)}
+        >
+          Go to My Account
+        </button>
+        <button
+          type="button"
+          class="btn btn--ghost"
+          onclick={() => navigate(ROUTES.ACTIVITY)}
+        >
+          View Activity
+        </button>
+      </div>
 
       <Card title="Children">
-        <div class="summary-value">
-          <span class="children-count">{nodeState.children.length}<span class="children-max">/8</span></span>
-        </div>
-        <div class="summary-meta muted text-sm">
-          {#if pendingJoins > 0}
-            <button type="button" class="link-btn" onclick={() => navigate(ROUTES.JOINS)}>
-              {pendingJoins} pending join{pendingJoins !== 1 ? 's' : ''}
-            </button>
-          {:else if isLive}
-            Pending joins not available in the web client
-          {:else}
-            No pending joins
-          {/if}
-        </div>
+        {#if nodeState.children.length === 0}
+          <EmptyState
+            title="No children yet"
+            message="This node has no children in its local topology snapshot."
+          />
+        {:else}
+          <DataTable
+            columns={childColumns}
+            rows={nodeState.children}
+            emptyMessage="No children"
+          />
+        {/if}
       </Card>
 
-      <Card title="Total Liability">
-        <div class="summary-value">
-          {#if isLive && nodeState.accounts.length === 0}
-            <span class="muted">&mdash;</span>
-          {:else}
-            <Balance amount={totalLiability} size="lg" />
-          {/if}
-        </div>
-        <div class="summary-meta muted text-sm">
-          {#if isLive && nodeState.accounts.length === 0}
-            No accounting data from this node
-          {:else}
-            Owed to children
-          {/if}
-        </div>
+      <!-- Node accounting info (collapsed) -->
+      <Card title="Node Accounting" compact>
+        <p class="text-sm muted">
+          The node accounting equation (assets &minus; liabilities = equity) applies to node operators. As a leaf user, your balance is managed by your parent node and shown above.
+        </p>
       </Card>
-    </div>
 
-    <Card title="Children">
-      {#if nodeState.children.length === 0}
-        <EmptyState
-          title="No children yet"
-          message={isLive
-            ? "This node has no children in its local topology snapshot."
-            : "Create a child node or approve a pending join request."}
-          actionLabel={isLive ? undefined : "View Join Requests"}
-          onAction={isLive ? undefined : () => navigate(ROUTES.JOINS)}
-        />
-      {:else}
-        <DataTable
-          columns={childColumns}
-          rows={nodeState.children}
-          emptyMessage="No children"
-        />
-      {/if}
-    </Card>
+    {:else}
+      <!-- ── Mock mode: original dashboard ───────────── -->
+      <div class="summary-grid">
+        <Card title="Node Address">
+          <div class="summary-value">
+            <Address address={clientState.address} size="lg" />
+          </div>
+          <div class="summary-meta">
+            <EndpointId id={clientState.endpointId} />
+          </div>
+        </Card>
 
-    {#if isMockMode()}
+        <Card title="Equity">
+          <div class="summary-value">
+            {#if nodeState.accounts.length === 0}
+              <span class="muted">&mdash;</span>
+            {:else}
+              <Balance amount={equity} size="lg" />
+            {/if}
+          </div>
+          <div class="summary-meta muted text-sm">
+            {#if nodeState.accounts.length === 0}
+              No accounting data from this node
+            {:else}
+              Node equity (assets &minus; liabilities)
+            {/if}
+          </div>
+        </Card>
+
+        <Card title="Children">
+          <div class="summary-value">
+            <span class="children-count">{nodeState.children.length}<span class="children-max">/8</span></span>
+          </div>
+          <div class="summary-meta muted text-sm">
+            {#if pendingJoins > 0}
+              <button type="button" class="link-btn" onclick={() => navigate(ROUTES.JOINS)}>
+                {pendingJoins} pending join{pendingJoins !== 1 ? 's' : ''}
+              </button>
+            {:else}
+              No pending joins
+            {/if}
+          </div>
+        </Card>
+
+        <Card title="Total Liability">
+          <div class="summary-value">
+            {#if nodeState.accounts.length === 0}
+              <span class="muted">&mdash;</span>
+            {:else}
+              <Balance amount={totalLiability} size="lg" />
+            {/if}
+          </div>
+          <div class="summary-meta muted text-sm">
+            {#if nodeState.accounts.length === 0}
+              No accounting data from this node
+            {:else}
+              Owed to children
+            {/if}
+          </div>
+        </Card>
+      </div>
+
+      <Card title="Children">
+        {#if nodeState.children.length === 0}
+          <EmptyState
+            title="No children yet"
+            message="Create a child node or approve a pending join request."
+            actionLabel="View Join Requests"
+            onAction={() => navigate(ROUTES.JOINS)}
+          />
+        {:else}
+          <DataTable
+            columns={childColumns}
+            rows={nodeState.children}
+            emptyMessage="No children"
+          />
+        {/if}
+      </Card>
+
       <div class="mock-banner">
         <Badge variant="info" label="Mock mode" />
         <span>Showing sample data. Connect a node for live data.</span>
@@ -208,6 +313,12 @@
   .summary-meta {
     font-size: var(--text-sm);
   }
+  .meta-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    margin-bottom: var(--sp-1);
+  }
   .children-count {
     font-family: var(--mono);
     font-size: var(--text-xl);
@@ -230,6 +341,11 @@
   .link-btn:hover {
     color: var(--accent-hover);
   }
+  .quick-actions {
+    display: flex;
+    gap: var(--sp-3);
+    flex-wrap: wrap;
+  }
   .mock-banner {
     display: flex;
     align-items: center;
@@ -251,6 +367,33 @@
     border-radius: var(--radius-md);
     font-size: var(--text-sm);
     color: var(--muted);
+  }
+
+  /* Shared button styles */
+  .btn {
+    padding: var(--sp-2) var(--sp-4);
+    border: none;
+    border-radius: var(--radius-md);
+    font: inherit;
+    font-weight: 600;
+    font-size: var(--text-sm);
+    cursor: pointer;
+    transition: background var(--duration-fast) var(--ease);
+  }
+  .btn--primary {
+    background: var(--accent);
+    color: var(--fg);
+  }
+  .btn--primary:hover {
+    background: var(--accent-hover);
+  }
+  .btn--ghost {
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--border);
+  }
+  .btn--ghost:hover {
+    background: var(--bg-hover);
   }
 
   @media (max-width: 767px) {

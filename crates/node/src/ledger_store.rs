@@ -213,13 +213,29 @@ impl FileLog {
             .with_context(|| format!("failed to open {}", path.display()))?;
         let data =
             std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        let (entries, heads) = parse_frames(&path, &data)?;
-        let cursor = if replay { 0 } else { entries.len() };
+        let parsed = parse_frames(&path, &data)?;
+        if parsed.complete_len < data.len() {
+            // A torn final append left a partial frame after the last complete
+            // one. Discard only that tail (the surviving prefix was already
+            // validated frame-by-frame) so the log stays appendable and the
+            // next frame lands on the correct boundary.
+            tracing::warn!(
+                path = %path.display(),
+                complete_frames = parsed.entries.len(),
+                discarded_bytes = data.len() - parsed.complete_len,
+                "discarding trailing partial ledger frame from a torn append"
+            );
+            file.set_len(parsed.complete_len as u64)
+                .with_context(|| format!("failed to truncate {}", path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("failed to sync {}", path.display()))?;
+        }
+        let cursor = if replay { 0 } else { parsed.entries.len() };
         Ok(FileLog {
             path,
             file,
-            entries,
-            heads,
+            entries: parsed.entries,
+            heads: parsed.heads,
             cursor,
         })
     }
@@ -235,26 +251,41 @@ impl FileLog {
     }
 }
 
-/// Parse and validate every frame in `data`.
+/// The validated prefix of a frame log, plus the byte length of that prefix.
+struct ParsedFrames {
+    entries: Vec<SignedEntry>,
+    heads: Vec<Hash>,
+    /// Byte offset just past the last complete, validated frame. Any bytes at
+    /// or after this offset are a torn final append.
+    complete_len: usize,
+}
+
+/// Parse and validate the complete frames in `data`.
 ///
-/// A partial length prefix or body is reported as a truncation error (never
-/// silently ignored). Each decoded entry must have the next dense `seq` and a
-/// `prev_hash` matching the running head, which also catches field tampering in
-/// any non-final frame.
-fn parse_frames(path: &Path, data: &[u8]) -> Result<(Vec<SignedEntry>, Vec<Hash>)> {
+/// The truncation rule: frames are read sequentially. Parsing stops *without
+/// error*, leaving [`ParsedFrames::complete_len`] at the last complete frame
+/// boundary, only when the remaining bytes cannot form a full frame — fewer
+/// than 4 bytes for the length prefix, or fewer body bytes than the declared
+/// (and bounded) length. Both conditions require the frame to run past
+/// end-of-file, so they can only describe a torn final append; the caller
+/// truncates the tail. Every other problem is a hard error, even at
+/// end-of-file: a length prefix above [`MAX_ENTRY_FRAME_SIZE`], a postcard
+/// decode failure, a non-dense `seq`, or a `prev_hash` mismatch. Corrupt bytes
+/// in the middle of the log are therefore never silently dropped.
+///
+/// Each decoded entry must have the next dense `seq` and a `prev_hash` matching
+/// the running head, which also catches field tampering in any non-final frame.
+fn parse_frames(path: &Path, data: &[u8]) -> Result<ParsedFrames> {
     let mut entries = Vec::new();
     let mut heads = vec![Hash::ZERO];
     let mut offset = 0usize;
 
     while offset < data.len() {
         if data.len() - offset < 4 {
-            bail!(
-                "{}: truncated frame length prefix at offset {offset}",
-                path.display()
-            );
+            // Partial length prefix at end-of-file: a torn final append.
+            break;
         }
         let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-        offset += 4;
         if len > MAX_ENTRY_FRAME_SIZE {
             bail!(
                 "{}: frame length {len} exceeds max {MAX_ENTRY_FRAME_SIZE}",
@@ -262,21 +293,19 @@ fn parse_frames(path: &Path, data: &[u8]) -> Result<(Vec<SignedEntry>, Vec<Hash>
             );
         }
         let len = len as usize;
-        if data.len() - offset < len {
-            bail!(
-                "{}: truncated frame body at offset {offset} (need {len} bytes, have {})",
-                path.display(),
-                data.len() - offset
-            );
+        let body_start = offset + 4;
+        if data.len() - body_start < len {
+            // Declared body runs past end-of-file: a torn final append.
+            break;
         }
         let entry: SignedEntry =
-            postcard::from_bytes(&data[offset..offset + len]).with_context(|| {
+            postcard::from_bytes(&data[body_start..body_start + len]).with_context(|| {
                 format!(
-                    "{}: invalid signed entry frame at offset {offset}",
+                    "{}: invalid signed entry frame at offset {body_start}",
                     path.display()
                 )
             })?;
-        offset += len;
+        offset = body_start + len;
 
         let expected_seq = entries.len() as u64;
         if entry.entry.seq != expected_seq {
@@ -304,7 +333,11 @@ fn parse_frames(path: &Path, data: &[u8]) -> Result<(Vec<SignedEntry>, Vec<Hash>
         entries.push(entry);
     }
 
-    Ok((entries, heads))
+    Ok(ParsedFrames {
+        entries,
+        heads,
+        complete_len: offset,
+    })
 }
 
 impl LedgerLog for FileLog {
@@ -526,26 +559,136 @@ mod tests {
     }
 
     #[test]
-    fn truncated_tail_frame_is_detected() {
+    fn truncated_tail_frame_is_discarded_on_open() {
         let dir = tempfile::tempdir().unwrap();
         let key = ledger_key();
         let _ = build_two_entry_ledger(dir.path(), &key);
 
         let path = entries_path(dir.path());
         let bytes = std::fs::read(&path).unwrap();
-        // Drop the last two bytes of the final frame.
+        // Drop the last two bytes of the final frame: a torn final append.
         std::fs::write(&path, &bytes[..bytes.len() - 2]).unwrap();
+
+        // Only the incomplete final frame is discarded; the first stays valid.
+        let log = FileLog::open(dir.path()).unwrap();
+        assert_eq!(log.entry_count(), 1);
+        assert_eq!(log.len(), 1);
+        drop(log);
+
+        // The file was truncated back to the last complete frame boundary.
+        let frame0_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(after.len(), 4 + frame0_len);
+
+        // Replay of the surviving prefix succeeds.
+        let reopened = open_ledger(dir.path(), NODE, &key).unwrap();
+        assert_eq!(reopened.len(), 1);
+    }
+
+    /// Append `n` valid entries (distinct accounts) to a fresh log and return
+    /// them with the final head hash.
+    fn build_n_entry_ledger(
+        data_dir: &Path,
+        key: &LedgerSecretKey,
+        n: u64,
+    ) -> (Vec<SignedEntry>, Hash) {
+        let mut ledger = open_ledger(data_dir, NODE, key).unwrap();
+        let mut prev = Hash::ZERO;
+        let mut entries = Vec::new();
+        for i in 0..n {
+            let entry = open_account(key, i, prev, &format!("c{i}"));
+            prev = entry_hash(&entry.entry).unwrap();
+            ledger.append(entry.clone()).unwrap();
+            entries.push(entry);
+        }
+        (entries, prev)
+    }
+
+    #[test]
+    fn torn_tail_body_is_discarded_and_append_is_dense() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ledger_key();
+        let (_, prev) = build_n_entry_ledger(dir.path(), &key, 3);
+
+        let path = entries_path(dir.path());
+        let complete = std::fs::read(&path).unwrap();
+        // Torn final append: a full 4-byte length prefix claiming 16 body bytes,
+        // but only 3 body bytes reached the disk.
+        let mut torn = complete.clone();
+        torn.extend_from_slice(&16u32.to_le_bytes());
+        torn.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
+        std::fs::write(&path, &torn).unwrap();
+
+        let mut log = FileLog::open(dir.path()).unwrap();
+        assert_eq!(log.entry_count(), 3);
+        // The partial tail was truncated back to the last complete frame.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() as usize,
+            complete.len()
+        );
+
+        // The next append continues the dense sequence at the correct offset.
+        let next = open_account(&key, 3, prev, "c3");
+        log.append(next).unwrap();
+        assert_eq!(log.len(), 4);
+        assert_eq!(log.entry_count(), 4);
+        drop(log);
+
+        // A fresh open sees exactly the four dense frames, and replay succeeds.
+        let reopened = FileLog::open(dir.path()).unwrap();
+        assert_eq!(reopened.entry_count(), 4);
+        drop(reopened);
+        let replayed = open_ledger(dir.path(), NODE, &key).unwrap();
+        assert_eq!(replayed.len(), 4);
+    }
+
+    #[test]
+    fn torn_tail_prefix_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ledger_key();
+        let _ = build_n_entry_ledger(dir.path(), &key, 2);
+
+        let path = entries_path(dir.path());
+        let complete = std::fs::read(&path).unwrap();
+        // Only 2 of the 4 length-prefix bytes of the next frame were written.
+        let mut torn = complete.clone();
+        torn.extend_from_slice(&[0x01, 0x02]);
+        std::fs::write(&path, &torn).unwrap();
+
+        let log = FileLog::open(dir.path()).unwrap();
+        assert_eq!(log.entry_count(), 2);
+        assert_eq!(log.len(), 2);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() as usize,
+            complete.len()
+        );
+    }
+
+    #[test]
+    fn corrupt_middle_frame_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ledger_key();
+        let (entries, _) = build_n_entry_ledger(dir.path(), &key, 3);
+
+        // Corrupt the *middle* frame's length prefix to a small, bounded value
+        // that is still followed by more bytes. That must not be mistaken for a
+        // torn tail: the frame is indistinguishable from full-length garbage.
+        let mut bytes = encode_frames(&entries);
+        let frame0_len = {
+            let body = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+            4 + body
+        };
+        bytes[frame0_len..frame0_len + 4].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(entries_path(dir.path()), &bytes).unwrap();
 
         let err = FileLog::open(dir.path()).unwrap_err();
         assert!(
-            err.to_string().contains("truncated"),
+            err.to_string().contains("invalid signed entry frame"),
             "unexpected error: {err}"
         );
-
-        let err = open_ledger(dir.path(), NODE, &key).unwrap_err();
         assert!(
-            err.to_string().contains("truncated"),
-            "unexpected error: {err}"
+            !err.to_string().contains("truncated"),
+            "middle corruption must not be classified as truncation: {err}"
         );
     }
 

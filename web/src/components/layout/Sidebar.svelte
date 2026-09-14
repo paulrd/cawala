@@ -1,7 +1,7 @@
 <script>
   import { NAV_ITEMS, ROUTES } from '../../lib/constants.js';
-  import { navigate, isActive } from '../../lib/router.js';
-  import { clientState, nodeState } from '../../lib/stores.js';
+  import { navigate, isActive } from '../../lib/router.svelte.js';
+  import { clientState, nodeState } from '../../lib/stores.svelte.js';
   import ConnectionIndicator from '../shared/ConnectionIndicator.svelte';
   import EndpointId from '../shared/EndpointId.svelte';
   import Badge from '../shared/Badge.svelte';

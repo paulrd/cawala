@@ -1,5 +1,5 @@
 <script>
-  import { getToasts, dismissToast } from '../../lib/stores.js';
+  import { getToasts, dismissToast } from '../../lib/stores.svelte.js';
 
   /**
    * Toast — notification toasts.

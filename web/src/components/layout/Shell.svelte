@@ -1,6 +1,6 @@
 <script>
-  import { currentRoute } from '../../lib/router.js';
-  import { clientState, uiState } from '../../lib/stores.js';
+  import { currentRoute } from '../../lib/router.svelte.js';
+  import { clientState, uiState } from '../../lib/stores.svelte.js';
   import Sidebar from './Sidebar.svelte';
   import TopBar from './TopBar.svelte';
   import MobileNav from './MobileNav.svelte';

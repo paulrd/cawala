@@ -36,7 +36,7 @@ use cawala_ledger::{PeerKeys, PeerRegistry, PeerRole};
 
 use crate::control_store::ControlStore;
 use crate::ledger_peers;
-use crate::msg::{MSG_ALPN, MsgConfig, MsgHandler, RoutableSnapshot};
+use crate::msg::{MSG_ALPN, MsgConfig, MsgHandler, NeighborSource, RoutableSnapshot};
 use crate::record::{NodeRecord, RecordError, RecordStore};
 
 /// Default sink capacity for locally delivered envelopes when control is
@@ -793,8 +793,36 @@ pub fn spawn_control_node_on(
     config: MsgConfig,
     node: Arc<Mutex<ControlNode>>,
 ) -> (Router, tokio::sync::mpsc::Receiver<cawala_msg::Envelope>) {
+    spawn_control_node_live_on(endpoint, NeighborSource::Static(snapshot), config, node)
+}
+
+/// Bind a node endpoint with ping + msg + control and register all handlers,
+/// using a [`NeighborSource::Live`] routing view.
+///
+/// Used by the long-running `run()` path so a child approved by a separate
+/// `control approve` process is accepted without restarting the node.
+pub async fn spawn_control_node_live(
+    secret_key: iroh::SecretKey,
+    source: NeighborSource,
+    config: MsgConfig,
+    node: Arc<Mutex<ControlNode>>,
+) -> anyhow::Result<(Router, tokio::sync::mpsc::Receiver<cawala_msg::Envelope>)> {
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(secret_key)
+        .bind()
+        .await?;
+    Ok(spawn_control_node_live_on(endpoint, source, config, node))
+}
+
+/// Like [`spawn_control_node_live`], but on an already-bound endpoint.
+pub fn spawn_control_node_live_on(
+    endpoint: Endpoint,
+    source: NeighborSource,
+    config: MsgConfig,
+    node: Arc<Mutex<ControlNode>>,
+) -> (Router, tokio::sync::mpsc::Receiver<cawala_msg::Envelope>) {
     let (sink, receiver) = tokio::sync::mpsc::channel(SINK_CAPACITY);
-    let handler = MsgHandler::new(endpoint.clone(), snapshot, config, sink);
+    let handler = MsgHandler::with_source(endpoint.clone(), source, config, sink);
     let router = Router::builder(endpoint)
         .accept(proto::ALPN, crate::PingHandler)
         .accept(MSG_ALPN, handler)

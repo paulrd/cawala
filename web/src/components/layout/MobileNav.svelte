@@ -1,7 +1,7 @@
 <script>
   import { NAV_ITEMS, ROUTES } from '../../lib/constants.js';
-  import { navigate, isActive } from '../../lib/router.js';
-  import { nodeState } from '../../lib/stores.js';
+  import { navigate, isActive } from '../../lib/router.svelte.js';
+  import { nodeState } from '../../lib/stores.svelte.js';
 
   /**
    * @param {string} route - Current route path.

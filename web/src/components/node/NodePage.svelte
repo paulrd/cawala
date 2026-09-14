@@ -6,11 +6,11 @@
   import DataTable from '../shared/DataTable.svelte';
   import EmptyState from '../shared/EmptyState.svelte';
   import Badge from '../shared/Badge.svelte';
-  import { clientState, nodeState } from '../../lib/stores.js';
+  import { clientState, nodeState } from '../../lib/stores.svelte.js';
   import { isMockMode } from '../../lib/api.js';
   import { formatDate } from '../../lib/utils.js';
   import { ROUTES } from '../../lib/constants.js';
-  import { navigate } from '../../lib/router.js';
+  import { navigate } from '../../lib/router.svelte.js';
 
   let isLive = $derived(!isMockMode());
 

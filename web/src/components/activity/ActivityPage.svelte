@@ -7,10 +7,10 @@
   import EmptyState from '../shared/EmptyState.svelte';
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
   import ErrorState from '../shared/ErrorState.svelte';
-  import { nodeState, loadingState, errorState } from '../../lib/stores.js';
+  import { nodeState, loadingState, errorState, ledgerState } from '../../lib/stores.svelte.js';
   import { getActivityLog, isMockMode } from '../../lib/api.js';
   import { ACTIVITY_LABELS } from '../../lib/constants.js';
-  import { formatDate } from '../../lib/utils.js';
+  import { formatDate, formatTime } from '../../lib/utils.js';
 
   let loaded = $state(false);
   let filterType = $state('');
@@ -38,6 +38,32 @@
 
   let isLive = $derived(!isMockMode());
 
+  // ── Derived activity for live mode ────────────────────────
+  // Merge the leaf-reported outbound transfers with any derived
+  // balance-change entries from balance_receipt events.
+  let liveActivity = $derived.by(() => {
+    const rows = [];
+
+    // Outbound transfers recorded by the ledger-event poller
+    for (const entry of ledgerState.activity) {
+      rows.push({
+        id: entry.id,
+        type: 'transfer',
+        label: 'Transfer',
+        from: entry.from,
+        to: entry.to,
+        amount: entry.amount,
+        timestamp: entry.timestamp,
+        reported: true,
+      });
+    }
+
+    // Sort by timestamp descending (newest first)
+    rows.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+    return rows;
+  });
+
   const typeBadgeVariant = {
     transfer: 'info',
     issue: 'ok',
@@ -47,6 +73,7 @@
     topo_create: 'info',
     topo_move: 'warn',
     topo_detach: 'danger',
+    balance_update: 'ok',
   };
 
   const columns = [
@@ -76,18 +103,60 @@
 
 <div class="activity-page">
   <Card title="Activity Log">
-    {#if isLive && nodeState.activity.length === 0 && loaded}
-      <!-- Live mode: activity log not available -->
-      <div class="live-unavailable">
-        <Badge variant="info" label="Live mode" />
-        <p class="unavailable-desc">
-          Activity logging is not available in the web client yet. This node does not expose an activity API to the browser.
-        </p>
-        <p class="unavailable-cli muted text-sm">
-          Activity data is managed by the node process. Check the node CLI for operation history.
+    {#if isLive}
+      <div class="live-notice">
+        <p class="text-sm muted">
+          Only payments sent from this browser are listed here. Incoming value updates your balance but is not shown as a separate activity row.
         </p>
       </div>
+
+      {#if liveActivity.length === 0}
+        <EmptyState
+          title="No activity yet"
+          message="Your outbound payments will appear here once they are confirmed."
+        />
+      {:else}
+        <div class="activity-table">
+          {#each liveActivity as entry (entry.id)}
+            <div class="activity-row">
+              <div class="activity-cell activity-cell--type">
+                <Badge variant={typeBadgeVariant[entry.type] || 'muted'} label={entry.label} />
+              </div>
+              <div class="activity-cell activity-cell--from">
+                {#if entry.from}
+                  <span class="mono-text text-sm">{entry.from}</span>
+                {:else}
+                  <span class="text-xs muted">system</span>
+                {/if}
+              </div>
+              <div class="activity-cell activity-cell--to">
+                <span class="mono-text text-sm">{entry.to ?? '\u2014'}</span>
+              </div>
+              <div class="activity-cell activity-cell--amount">
+                {#if entry.amount != null}
+                  <span class="mono-text text-sm" style="font-weight:600;color:{entry.amount > 0 ? 'var(--ok)' : entry.amount < 0 ? 'var(--danger)' : 'var(--muted)'}">
+                    {entry.amount > 0 ? '+' : ''}{entry.amount.toLocaleString()}
+                  </span>
+                {:else}
+                  <span class="text-xs muted">\u2014</span>
+                {/if}
+              </div>
+              <div class="activity-cell activity-cell--time">
+                <span class="text-sm">{formatDate(entry.timestamp)}</span>
+              </div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+
+      <div class="activity-footnote">
+        <Badge variant="muted" label="Reported by your leaf" />
+        <span class="text-xs muted">
+          Activity data comes from the leaf process and is not independently attested.
+        </span>
+      </div>
     {:else}
+      <!-- Mock mode: original filter + table -->
       <div class="toolbar">
         <select bind:value={filterType} onchange={handleFilter} aria-label="Filter by type">
           <option value="">All types</option>
@@ -135,17 +204,71 @@
     font: inherit;
     font-size: var(--text-sm);
   }
-  .live-unavailable {
+
+  /* Live activity */
+  .live-notice {
+    padding-bottom: var(--sp-3);
+    border-bottom: 1px solid var(--border);
+    margin-bottom: var(--sp-3);
+  }
+  .activity-table {
     display: flex;
     flex-direction: column;
+    gap: var(--sp-1);
+  }
+  .activity-row {
+    display: flex;
+    align-items: center;
     gap: var(--sp-3);
-    padding: var(--sp-4) 0;
+    padding: var(--sp-2) 0;
+    border-bottom: 1px solid var(--border);
   }
-  .unavailable-desc {
-    font-size: var(--text-sm);
-    line-height: var(--leading-normal);
+  .activity-row:last-child {
+    border-bottom: none;
   }
-  .unavailable-cli {
-    font-size: var(--text-sm);
+  .activity-cell {
+    display: flex;
+    align-items: center;
+  }
+  .activity-cell--type {
+    flex-shrink: 0;
+    min-width: 80px;
+  }
+  .activity-cell--from {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .activity-cell--to {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .activity-cell--amount {
+    flex-shrink: 0;
+    text-align: right;
+    min-width: 80px;
+    justify-content: flex-end;
+  }
+  .activity-cell--time {
+    flex-shrink: 0;
+    text-align: right;
+    min-width: 100px;
+    justify-content: flex-end;
+    color: var(--muted);
+  }
+  .mono-text {
+    font-family: var(--mono);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .activity-footnote {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding-top: var(--sp-3);
+    border-top: 1px solid var(--border);
+    margin-top: var(--sp-3);
   }
 </style>

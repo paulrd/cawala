@@ -4,7 +4,7 @@
   import EndpointId from '../shared/EndpointId.svelte';
   import Badge from '../shared/Badge.svelte';
   import ConnectionIndicator from '../shared/ConnectionIndicator.svelte';
-  import { clientState, apiCapabilities, showToast } from '../../lib/stores.js';
+  import { clientState, ledgerState, apiCapabilities, showToast } from '../../lib/stores.svelte.js';
   import { isMockMode, isIdentityPersistent, getCapabilities } from '../../lib/api.js';
 
   let caps = $derived(getCapabilities());
@@ -57,6 +57,22 @@
       {/if}
     </div>
   </Card>
+
+  {#if !isMockMode() && ledgerState.pinnedLedger}
+    <Card title="Leaf Ledger Trust">
+      <div class="settings-section">
+        <div class="setting-row">
+          <span class="setting-label">Pinned ledger</span>
+          <code class="text-sm" style="word-break: break-all; font-family: var(--mono);">
+            {ledgerState.pinnedLedger}
+          </code>
+        </div>
+        <p class="muted text-sm" style="margin-top: var(--sp-1);">
+          This is the leaf's ledger public key, pinned on first use (TOFU). Your balance and payment receipts are verified against this key.
+        </p>
+      </div>
+    </Card>
+  {/if}
 
   {#if caps.multiTabWarning}
     <Card title="Multi-Tab" variant="warn">

@@ -4,7 +4,7 @@
   import EndpointId from '../shared/EndpointId.svelte';
   import Badge from '../shared/Badge.svelte';
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
-  import { clientState, showToast } from '../../lib/stores.js';
+  import { clientState, showToast } from '../../lib/stores.svelte.js';
   import {
     parseInvite,
     requestJoin,

@@ -1,7 +1,7 @@
 <script>
   import { truncateMiddle } from '../../lib/utils.js';
   import { copyToClipboard } from '../../lib/utils.js';
-  import { showToast } from '../../lib/stores.js';
+  import { showToast } from '../../lib/stores.svelte.js';
 
   /**
    * EndpointId — truncated iroh endpoint ID with copy button.

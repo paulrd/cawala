@@ -1,7 +1,7 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
-  import { initRouter, currentRoute } from './lib/router.js';
-  import { clientState, apiCapabilities } from './lib/stores.js';
+  import { initRouter, currentRoute } from './lib/router.svelte.js';
+  import { clientState, apiCapabilities } from './lib/stores.svelte.js';
   import { initApi, spawnClient, destroyClient, isMockMode, getCapabilities } from './lib/api.js';
   import { CLIENT_STATUS, CONNECTION } from './lib/constants.js';
   import Shell from './components/layout/Shell.svelte';

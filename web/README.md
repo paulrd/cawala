@@ -59,12 +59,41 @@ cargo run -p cawala-node
 
 ### Live mode limits
 
-The join handshake, Rust invite parsing, stable identity, ping, and the local
-topology snapshot are live. **Not available in the web client:** approving or
-rejecting joins, pending-join listing, account balances, and the activity log
-(the control protocol exposes no request/reply for them). Those pages say so
-and point at the node CLI. The browser is a user leaf — it is never a node
-admin and never holds a ledger key.
+The join handshake, Rust invite parsing, stable identity, ping, the local
+topology snapshot, and same-leaf value messaging (send a payment; read a
+cryptographically verified balance and outbound activity) are live. **Not
+available in the web client:** approving or rejecting joins, pending-join
+listing, any other admin action, issuing/burning value, and cross-leaf/multi-hop
+payments. Funding is an operator act run from the node CLI, never the browser.
+Only *outbound* activity is enumerable in v1 (the receipt history lists the
+transfers touching this account; funding is not represented as activity). The
+browser is a user leaf — it is never a node admin and never holds a ledger key
+(it signs orders with its own operator key).
+
+## Sending value (live)
+
+Users of the same leaf can pay each other. The browser signs a `PaymentOrder`
+with its operator key; the leaf verifies and appends the transfer and replies
+with a signed balance receipt that the browser checks against the leaf's ledger
+key (trust-on-first-use pinned).
+
+1. Join the leaf and have the operator approve you (see above). Approval opens
+   your ledger account.
+2. The operator funds you — an explicit CLI act, run from the repo root against
+   the live node's data dir:
+   `cargo run -p cawala-node -- --data-dir <node-data> ledger fund --to <your-endpoint-id> --amount 100`
+   Each run issues value again; there is no browser-side issue path.
+3. In the app, open **My Account → Send payment**, enter the recipient's
+   endpoint id and an amount, and send. The recipient must also be a user of the
+   same leaf (same-leaf `Direct` only in v1).
+4. The verified **balance** and **activity** update once the leaf's receipt
+   verifies. Only outbound activity is enumerable in v1 (the receipt history
+   lists your transfers); cross-leaf/multi-hop payments are not implemented.
+
+Approval and funding run as separate `cawala-node` processes while the node is
+running. That is safe: the node's ledger service re-reads and replays the log
+before every mutation and authoritative read, so external appends are picked up
+without a restart.
 
 ## Test (manual round-trip checklist)
 
@@ -115,6 +144,17 @@ reject path). Network-dependent on the N0 relay/pkarr:
 cd web
 node scripts/smoke-join.mjs
 # expected: "[smoke-join] ALL CHECKS PASSED"
+```
+
+End-to-end same-leaf payment (two browser clients join -> CLI approve -> CLI
+`ledger fund` -> A sends 25 -> A sees balance 75, B sees 25). Network-dependent
+on the N0 relay/pkarr; prints `SKIP:` and exits 0 only if that path is genuinely
+unreachable (set `SMOKE_PAYMENT_REQUIRE_NETWORK=1` to make that a hard failure):
+
+```sh
+cd web
+node scripts/smoke-payment.mjs
+# expected: "[smoke-payment] ALL CHECKS PASSED"
 ```
 
 ### Production build / preview

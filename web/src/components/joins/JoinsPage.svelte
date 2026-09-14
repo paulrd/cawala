@@ -6,7 +6,7 @@
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
   import ErrorState from '../shared/ErrorState.svelte';
   import Badge from '../shared/Badge.svelte';
-  import { nodeState, loadingState, errorState, showToast } from '../../lib/stores.js';
+  import { nodeState, loadingState, errorState, showToast } from '../../lib/stores.svelte.js';
   import { getJoinRequests, approveJoin, rejectJoin, isMockMode, AdminUnavailableError } from '../../lib/api.js';
   import { formatDate } from '../../lib/utils.js';
 

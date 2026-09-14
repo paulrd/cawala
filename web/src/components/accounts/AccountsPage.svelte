@@ -6,8 +6,10 @@
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
   import ErrorState from '../shared/ErrorState.svelte';
   import Badge from '../shared/Badge.svelte';
-  import { nodeState, loadingState, errorState } from '../../lib/stores.js';
+  import { nodeState, loadingState, errorState, ledgerState } from '../../lib/stores.svelte.js';
   import { getAccounts, isMockMode } from '../../lib/api.js';
+  import { navigate } from '../../lib/router.svelte.js';
+  import { ROUTES } from '../../lib/constants.js';
 
   let loaded = $state(false);
 
@@ -29,6 +31,11 @@
 
   let isLive = $derived(!isMockMode());
 
+  // ── Live mode: show the verified balance as the headline ──
+  let liveAccountReady = $derived(isLive && ledgerState.balance != null);
+  let liveAccountLoading = $derived(isLive && ledgerState.balance == null);
+
+  // ── Mock mode: accounting equation ────────────────────────
   const columns = [
     { key: 'label', label: 'Account' },
     { key: 'type', label: 'Type',
@@ -58,46 +65,84 @@
 </script>
 
 <div class="accounts-page">
-  {#if isLive && nodeState.accounts.length === 0 && loaded}
-    <!-- Live mode: accounts not available -->
-    <Card title="Accounts">
-      <div class="live-unavailable">
-        <Badge variant="info" label="Live mode" />
-        <p class="unavailable-desc">
-          Account balances are not available in the web client yet. This node does not expose a ledger API to the browser.
-        </p>
-        <p class="unavailable-cli muted text-sm">
-          Account data is managed by the node process. Check the node CLI for balance information.
-        </p>
-      </div>
-    </Card>
-  {:else if loadingState.accounts && !loaded}
-    <LoadingSkeleton rows={3} />
-  {:else if errorState.accounts}
-    <ErrorState message="Failed to load accounts" onRetry={loadData} />
-  {:else}
-    <Card title="Accounting Equation">
-      <div class="equation">
-        <div class="eq-item">
-          <span class="eq-label muted">Assets</span>
-          <Balance amount={totalAssets} size="lg" />
+  {#if isLive}
+    <!-- ── Live mode: "My account" semantics ──────────── -->
+    {#if liveAccountReady}
+      <Card title="My Account">
+        <div class="my-account">
+          <div class="account-balance">
+            <Balance amount={ledgerState.balance} size="lg" showSign={false} />
+          </div>
+          <p class="account-note text-sm muted">
+            This is your verified balance from the leaf process. It is updated when a balance receipt arrives.
+          </p>
+          <div class="account-meta">
+            <Badge variant="ok" label="Verified" />
+            {#if ledgerState.height != null}
+              <span class="text-sm muted">Height {ledgerState.height}</span>
+            {/if}
+          </div>
         </div>
-        <span class="eq-op muted">&minus;</span>
-        <div class="eq-item">
-          <span class="eq-label muted">Liabilities</span>
-          <Balance amount={totalLiability} size="lg" />
-        </div>
-        <span class="eq-op muted">=</span>
-        <div class="eq-item">
-          <span class="eq-label muted">Equity</span>
-          <Balance amount={equity} size="lg" />
-        </div>
-      </div>
-    </Card>
+      </Card>
 
-    <Card title="All Accounts">
-      <DataTable columns={columns} rows={nodeState.accounts} />
-    </Card>
+      <div class="live-guidance">
+        <p class="text-sm muted">
+          The node accounting equation (assets &minus; liabilities = equity) applies to node operators, not leaf users. Your account balance is managed by your parent node.
+        </p>
+        <button
+          type="button"
+          class="link-btn"
+          onclick={() => navigate(ROUTES.MY_ACCOUNT)}
+        >
+          Go to My Account to send payments
+        </button>
+      </div>
+    {:else if liveAccountLoading}
+      <Card title="My Account">
+        <LoadingSkeleton rows={2} />
+        <p class="text-sm muted" style="margin-top: var(--sp-3);">
+          Balance not yet verified. Waiting for a receipt from your leaf.
+        </p>
+      </Card>
+    {:else}
+      <Card title="Accounts">
+        <EmptyState
+          title="No account data yet"
+          message="Your verified balance will appear here once a receipt arrives from your leaf process."
+        />
+      </Card>
+    {/if}
+
+  {:else}
+    <!-- ── Mock mode: original accounting-equation UI ──── -->
+    {#if loadingState.accounts && !loaded}
+      <LoadingSkeleton rows={3} />
+    {:else if errorState.accounts}
+      <ErrorState message="Failed to load accounts" onRetry={loadData} />
+    {:else}
+      <Card title="Accounting Equation">
+        <div class="equation">
+          <div class="eq-item">
+            <span class="eq-label muted">Assets</span>
+            <Balance amount={totalAssets} size="lg" />
+          </div>
+          <span class="eq-op muted">&minus;</span>
+          <div class="eq-item">
+            <span class="eq-label muted">Liabilities</span>
+            <Balance amount={totalLiability} size="lg" />
+          </div>
+          <span class="eq-op muted">=</span>
+          <div class="eq-item">
+            <span class="eq-label muted">Equity</span>
+            <Balance amount={equity} size="lg" />
+          </div>
+        </div>
+      </Card>
+
+      <Card title="All Accounts">
+        <DataTable columns={columns} rows={nodeState.accounts} />
+      </Card>
+    {/if}
   {/if}
 </div>
 
@@ -107,6 +152,47 @@
     flex-direction: column;
     gap: var(--sp-5);
   }
+
+  /* Live mode */
+  .my-account {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+  }
+  .account-balance {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-2);
+  }
+  .account-note {
+    line-height: var(--leading-normal);
+  }
+  .account-meta {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+  }
+  .live-guidance {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+  }
+  .link-btn {
+    background: none;
+    border: none;
+    color: var(--accent);
+    font: inherit;
+    font-size: var(--text-sm);
+    cursor: pointer;
+    padding: 0;
+    text-decoration: underline;
+    text-align: left;
+  }
+  .link-btn:hover {
+    color: var(--accent-hover);
+  }
+
+  /* Mock mode */
   .equation {
     display: flex;
     align-items: center;
@@ -126,18 +212,5 @@
     font-size: var(--text-2xl);
     font-weight: 300;
     line-height: 1;
-  }
-  .live-unavailable {
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-3);
-    padding: var(--sp-4) 0;
-  }
-  .unavailable-desc {
-    font-size: var(--text-sm);
-    line-height: var(--leading-normal);
-  }
-  .unavailable-cli {
-    font-size: var(--text-sm);
   }
 </style>

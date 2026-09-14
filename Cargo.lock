@@ -306,8 +306,10 @@ name = "cawala-client"
 version = "0.1.0"
 dependencies = [
  "cawala-control",
+ "cawala-ledger",
  "cawala-msg",
  "cawala-proto",
+ "cawala-topology",
  "console_error_panic_hook",
  "getrandom 0.3.4",
  "iroh",
@@ -353,6 +355,7 @@ dependencies = [
 name = "cawala-msg"
 version = "0.1.0"
 dependencies = [
+ "cawala-ledger",
  "cawala-proto",
  "postcard",
  "serde",

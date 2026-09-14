@@ -8,9 +8,12 @@ use cawala_control::{
     JoinRequest, MoveChild, NodeId, OperatorPubKey, OperatorSecretKey, SetAddress, SignedControl,
 };
 use cawala_ledger::{AccountRef, LedgerPubKey};
+use cawala_msg::MSG_LEDGER_V1;
+use cawala_node::control::spawn_control_node_live;
+use cawala_node::msg::{NeighborSource, dispatch_ledger_envelope};
 use cawala_node::{
-    ControlNode, MsgConfig, RoutableSnapshot, build_envelope, identity, ledger_keys, ledger_store,
-    record, send_envelope, spawn_control_node, spawn_control_only, spawn_with_secret_key,
+    ControlNode, LedgerService, MsgConfig, RoutableSnapshot, build_envelope, identity, ledger_keys,
+    ledger_store, record, send_envelope, spawn_control_only, spawn_with_secret_key,
 };
 use cawala_topology::OctAddr;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -236,6 +239,27 @@ enum LedgerCommand {
     Verify,
     /// Create the ledger key and an empty log/meta (idempotent).
     Init,
+    /// Open a child's ledger account (idempotent).
+    OpenAccount {
+        /// The child's `EndpointId`.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        node: String,
+        /// `user` (the default) or `node`.
+        #[arg(long, value_name = "KIND")]
+        kind: Option<String>,
+    },
+    /// Issue value into a user's account (an explicit operator act).
+    ///
+    /// Each run issues again: the ledger has no per-issue replay guard, so this
+    /// is deliberately operator-only and never reachable from a browser order.
+    Fund {
+        /// The user's `EndpointId`.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        to: String,
+        /// Amount to issue.
+        #[arg(long, value_name = "AMOUNT")]
+        amount: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -325,17 +349,27 @@ async fn run(data_dir: PathBuf) -> Result<()> {
     )?));
 
     if let Some(address) = store.record().address.clone() {
-        let snapshot = RoutableSnapshot::from_record(store.record())?;
+        let config = MsgConfig::default();
+        // Live routing view: re-reads node.json per message so a `control
+        // approve` performed in another process is observed without a restart.
+        let source =
+            NeighborSource::live(&data_dir, &node_id, std::collections::HashMap::new())?;
+        let ledger = Arc::new(Mutex::new(LedgerService::open(&data_dir, &node_id)?));
 
         // Must stay alive for the accept loop; dropped at process exit.
-        let (_router, mut received) =
-            spawn_control_node(secret_key, snapshot, MsgConfig::default(), control).await?;
+        let (router, mut received) =
+            spawn_control_node_live(secret_key, source.clone(), config.clone(), control).await?;
+        let endpoint = router.endpoint().clone();
         info!(endpoint_id = %node_id, %address, "node endpoint bound with messaging + control");
         println!("EndpointId: {node_id}");
         println!("Address: {address}");
         println!("Serving cawala/ping/0, cawala/msg/0, and cawala/control/0");
 
-        // Log envelopes delivered locally at this node.
+        // Drain locally delivered envelopes. `Delivered` means "queued": ledger
+        // payloads are dispatched (and applied) here, off the transport path.
+        let dispatch_dir = data_dir.clone();
+        let dispatch_node = node_id.clone();
+        let dispatch_ledger = Arc::clone(&ledger);
         tokio::spawn(async move {
             while let Some(env) = received.recv().await {
                 info!(
@@ -345,6 +379,18 @@ async fn run(data_dir: PathBuf) -> Result<()> {
                     msg_id = %env.msg_id.to_hex(),
                     "received message"
                 );
+                if env.msg_type == MSG_LEDGER_V1 {
+                    dispatch_ledger_envelope(
+                        &endpoint,
+                        &source,
+                        &config,
+                        &dispatch_ledger,
+                        &dispatch_dir,
+                        &dispatch_node,
+                        env,
+                    )
+                    .await;
+                }
             }
         });
 
@@ -424,6 +470,34 @@ fn ledger(data_dir: &std::path::Path, command: LedgerCommand) -> Result<()> {
                 return Err(err);
             }
         },
+        LedgerCommand::OpenAccount { node, kind } => {
+            let mut service = LedgerService::open(data_dir, &node_id)?;
+            let kind = match kind.as_deref() {
+                None | Some("user") => ChildKind::User,
+                Some("node") => ChildKind::Node,
+                Some(other) => {
+                    anyhow::bail!("invalid kind '{other}' (expected 'node' or 'user')")
+                }
+            };
+            let child = NodeId::from(node.clone());
+            if service.ensure_account_open(&child, kind)? {
+                println!("opened account for {node}");
+            } else {
+                println!("account for {node} is already open");
+            }
+        }
+        LedgerCommand::Fund { to, amount } => {
+            let mut service = LedgerService::open(data_dir, &node_id)?;
+            let operator = OperatorSecretKey::from_bytes(secret_key.to_bytes());
+            let nonce = getrandom::u64().map_err(|err| anyhow::anyhow!("getrandom: {err}"))?;
+            let now = now_unix_seconds();
+            let to_id = NodeId::from(to.clone());
+            let (seq, hash) = service.fund(&to_id, amount, &operator, nonce, now)?;
+            println!("issued {amount} to {to}");
+            println!("entry_seq: {seq}");
+            println!("entry_hash: {hash}");
+            println!("balance: {}", service.balance_of(&to_id));
+        }
     }
     Ok(())
 }
@@ -759,6 +833,14 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
         ControlCommand::Approve { node, slot } => {
             let mut engine = ControlNode::open(data_dir, &node_id, operator.clone())?;
             let approval = engine.approve_pending(&node, slot, now_unix_seconds())?;
+            // User children hold a ledger account at this leaf; open it before
+            // the applicant is told it joined, so a browser user has somewhere
+            // to receive value. A node child has its own ledger, so it gets no
+            // account here.
+            if approval.kind == ChildKind::User {
+                let mut service = LedgerService::open(data_dir, &node_id)?;
+                service.ensure_account_open(&NodeId::from(node.clone()), ChildKind::User)?;
+            }
             let signed = SignedControl::authorize(
                 me.clone(),
                 &operator,

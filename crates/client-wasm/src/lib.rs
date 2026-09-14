@@ -26,8 +26,8 @@ use cawala_control::{
     OperatorSecretKey, SignedControl,
 };
 use cawala_msg::{
-    Ack, AckStatus, Envelope, MsgError, MsgId, OctAddr, PeerRef, RejectReason, Seen, SeenConfig,
-    SeenSet,
+    Ack, AckStatus, BalanceQueryV1, Envelope, LedgerPayloadV1, MSG_LEDGER_V1, MsgError, MsgId,
+    OctAddr, OrderV1, PeerRef, RejectReason, Seen, SeenConfig, SeenSet,
 };
 use iroh::{EndpointAddr, EndpointId};
 use iroh::{
@@ -43,15 +43,18 @@ use wasm_bindgen::{JsError, prelude::wasm_bindgen};
 
 mod control;
 pub mod dto;
+pub mod ledger_state;
 pub mod state;
 
 use crate::control::{
     ControlHandler, JOIN_TTL_SECONDS, SharedControl, exchange_control, invite_endpoint_addr,
 };
 use crate::dto::{
-    ControlEventDto, JoinOutcome, JoinStatus, SnapshotDto, parse_operator_hex, reject_code_str,
+    ControlEventDto, JoinOutcome, JoinStatus, LedgerEventDto, LedgerStatusDto, PaymentOutcome,
+    SnapshotDto, parse_operator_hex, reject_code_str,
 };
-use crate::state::LocalStateV1;
+use crate::ledger_state::LedgerStateV1;
+use crate::state::{LocalStateV1, ParentLink};
 
 /// WASM entry point, called once when the module is instantiated.
 #[wasm_bindgen(start)]
@@ -162,39 +165,120 @@ fn rejected(msg_id: MsgId, reason: RejectReason) -> Ack {
     }
 }
 
+/// Where a browser leaf's current asserted address comes from.
+///
+/// [`ClientNode::spawn_with_address`] supplies a fixed address, but a control
+/// client is assigned one only after `JoinApproved`. Because
+/// [`RouterBuilder::spawn`](iroh::protocol::RouterBuilder::spawn) fixes the
+/// advertised ALPNs at spawn time, the handler is registered up front and reads
+/// the live address from [`SharedControl`] instead.
+enum AddressSource {
+    /// A fixed address supplied by `spawn_with_address`.
+    Fixed(OctAddr),
+    /// The live address in the control client's [`LocalStateV1`].
+    Shared(Arc<SharedControl>),
+}
+
+impl std::fmt::Debug for AddressSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddressSource::Fixed(addr) => f.debug_tuple("Fixed").field(addr).finish(),
+            AddressSource::Shared(_) => f.write_str("Shared(..)"),
+        }
+    }
+}
+
+/// Which origins a handler accepts for delivery.
+enum ParentRule {
+    /// No origin restriction (the fixed-address client knows no parent).
+    Unrestricted,
+    /// Only envelopes whose `src.node` equals the recorded parent. `None` means
+    /// an address exists but no parent does, so every sender is refused.
+    Required(Option<String>),
+}
+
 /// Server side of the `cawala/msg/0` protocol for a browser leaf.
 ///
 /// Mirrors the native `cawala-node` `MsgHandler`'s receive-origin behavior:
 /// validate, de-duplicate, and deliver envelopes addressed to this leaf. It
 /// never forwards for other peers, so anything not addressed here is answered
 /// with [`RejectReason::NoRoute`].
-#[derive(Debug)]
 pub struct MsgHandler {
-    self_addr: OctAddr,
+    source: AddressSource,
     self_node: String,
     seen: Mutex<SeenSet>,
     sink: mpsc::Sender<Envelope>,
 }
 
+impl std::fmt::Debug for MsgHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MsgHandler")
+            .field("source", &self.source)
+            .field("self_node", &self.self_node)
+            .finish_non_exhaustive()
+    }
+}
+
 impl MsgHandler {
-    /// Build a handler for the leaf at `self_addr`/`self_node`, delivering
-    /// accepted envelopes to `sink`.
+    /// Build a handler for the leaf at the fixed `self_addr`/`self_node`,
+    /// delivering accepted envelopes to `sink`.
     pub fn new(self_addr: OctAddr, self_node: String, sink: mpsc::Sender<Envelope>) -> Self {
         MsgHandler {
-            self_addr,
+            source: AddressSource::Fixed(self_addr),
             self_node,
             seen: Mutex::new(SeenSet::new(SeenConfig::default())),
             sink,
         }
     }
 
+    /// Build a handler whose asserted address and accepted parent are read live
+    /// from `shared`, for a control client that learns its address only after
+    /// `JoinApproved`.
+    pub(crate) fn for_shared(
+        shared: Arc<SharedControl>,
+        self_node: String,
+        sink: mpsc::Sender<Envelope>,
+    ) -> Self {
+        MsgHandler {
+            source: AddressSource::Shared(shared),
+            self_node,
+            seen: Mutex::new(SeenSet::new(SeenConfig::default())),
+            sink,
+        }
+    }
+
+    /// This leaf's current asserted address, if any.
+    fn current_address(&self) -> Option<OctAddr> {
+        match &self.source {
+            AddressSource::Fixed(addr) => Some(addr.clone()),
+            AddressSource::Shared(shared) => shared.lock_state().record.address.clone(),
+        }
+    }
+
+    /// The origin restriction for this handler.
+    fn parent_rule(&self) -> ParentRule {
+        match &self.source {
+            AddressSource::Fixed(_) => ParentRule::Unrestricted,
+            AddressSource::Shared(shared) => {
+                let parent = shared
+                    .lock_state()
+                    .record
+                    .parent
+                    .as_ref()
+                    .map(|link| link.node_id.as_str().to_string());
+                ParentRule::Required(parent)
+            }
+        }
+    }
+
     /// Validate, de-duplicate, and locally deliver one received envelope.
     ///
     /// The rules match the native handler, minus forwarding: structural
-    /// validation, hop-chain shape, loop/replay defense, and a check that the
-    /// last recorded hop equals the authenticated QUIC peer, then delivery to
-    /// the sink if the envelope is addressed to us. A wasm leaf keeps no
-    /// neighbor list, so that last-hop check is the only adjacency test.
+    /// validation, hop-chain shape, loop/replay defense, a check that the last
+    /// recorded hop equals the authenticated QUIC peer, and (for a control
+    /// leaf) that the origin is the parent it joined, then delivery to the sink
+    /// if the envelope is addressed to us. A wasm leaf keeps no neighbor list,
+    /// so that last-hop check is the only adjacency test.
     pub async fn handle(&self, remote: iroh::EndpointId, env: Envelope) -> Ack {
         let msg_id = env.msg_id;
         let origin = env.src.node.clone();
@@ -212,28 +296,48 @@ impl MsgHandler {
             return rejected(msg_id, reason);
         }
 
-        // 2. Routing shape: the recorded path must be a plausible walk.
+        // 2. We must have been assigned an address (a control client learns one
+        //    only after `JoinApproved`).
+        let Some(self_addr) = self.current_address() else {
+            return rejected(msg_id, RejectReason::NoAddress);
+        };
+
+        // 3. Leaf delivery. Browsers never forward, so anything not addressed
+        //    to us has no route from here.
+        if env.dst != self_addr {
+            return rejected(msg_id, RejectReason::NoRoute);
+        }
+
+        // 4. Routing shape: the recorded path must be a plausible walk.
         if cawala_msg::validate_hop_chain(&env.src.addr, &env.dst, &env.hop_chain).is_err() {
             return rejected(msg_id, RejectReason::BadHopChain);
         }
 
-        // 3. We must not already appear in the path we are being handed.
+        // 5. We must not already appear in the path we are being handed.
         if env
             .hop_chain
             .iter()
-            .any(|hop| hop.addr == self.self_addr || hop.node == self.self_node)
+            .any(|hop| hop.addr == self_addr || hop.node == self.self_node)
         {
             return rejected(msg_id, RejectReason::BadHopChain);
         }
 
-        // 4. The last hop must be the peer we are actually talking to.
+        // 6. The last hop must be the peer we are actually talking to.
         let remote_node = remote.to_string();
         match env.hop_chain.last() {
             Some(last) if last.node == remote_node => {}
             _ => return rejected(msg_id, RejectReason::NotNeighbor),
         }
 
-        // 5. Replay: remember (origin, msg_id) and never deliver a duplicate.
+        // 7. A control leaf only accepts envelopes originated by the parent it
+        //    joined; the routing leaf is the sole legitimate sender.
+        match self.parent_rule() {
+            ParentRule::Unrestricted => {}
+            ParentRule::Required(Some(parent)) if env.src.node == parent => {}
+            ParentRule::Required(_) => return rejected(msg_id, RejectReason::NotNeighbor),
+        }
+
+        // 8. Replay: remember (origin, msg_id) and never deliver a duplicate.
         //    The guard is scoped so it is never held across an `.await`.
         let seen = {
             let mut seen = self
@@ -249,11 +353,6 @@ impl MsgHandler {
             };
         }
 
-        // 6. Leaf delivery. Browsers never forward, so anything not addressed
-        //    to us has no route from here.
-        if env.dst != self.self_addr {
-            return rejected(msg_id, RejectReason::NoRoute);
-        }
         match self.sink.try_send(env) {
             Ok(()) => Ack {
                 msg_id,
@@ -377,6 +476,7 @@ pub struct ClientNode {
     address: Option<String>,
     rx: Option<tokio::sync::Mutex<mpsc::Receiver<Envelope>>>,
     control: Arc<SharedControl>,
+    ledger: Mutex<LedgerStateV1>,
 }
 
 #[wasm_bindgen]
@@ -402,6 +502,7 @@ impl ClientNode {
             address: None,
             rx: None,
             control,
+            ledger: Mutex::new(LedgerStateV1::new()),
         })
     }
 
@@ -431,6 +532,7 @@ impl ClientNode {
             address: Some(self_addr),
             rx: Some(tokio::sync::Mutex::new(rx)),
             control,
+            ledger: Mutex::new(LedgerStateV1::new()),
         })
     }
 
@@ -453,23 +555,34 @@ impl ClientNode {
         let operator = OperatorSecretKey::from_bytes(secret.to_bytes());
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret)
-            .alpns(vec![proto::ALPN.to_vec(), CONTROL_ALPN.to_vec()])
+            .alpns(vec![
+                proto::ALPN.to_vec(),
+                CONTROL_ALPN.to_vec(),
+                cawala_msg::ALPN.to_vec(),
+            ])
             .bind()
             .await
             .map_err(to_js_err)?;
-        let control = Arc::new(SharedControl::new(
-            endpoint.id().to_string(),
-            Some(operator),
-        ));
+        let self_node = endpoint.id().to_string();
+        let control = Arc::new(SharedControl::new(self_node.clone(), Some(operator)));
+        // Bounded, so a slow consumer applies backpressure via `Busy` acks
+        // rather than growing without limit. The handler reads the assigned
+        // address live from `control`, which is empty until `JoinApproved`.
+        let (sink, rx) = mpsc::channel(32);
         let router = Router::builder(endpoint)
             .accept(proto::ALPN, PingHandler)
             .accept(CONTROL_ALPN, ControlHandler::new(Arc::clone(&control)))
+            .accept(
+                cawala_msg::ALPN,
+                MsgHandler::for_shared(Arc::clone(&control), self_node, sink),
+            )
             .spawn();
         Ok(ClientNode {
             router,
             address: None,
-            rx: None,
+            rx: Some(tokio::sync::Mutex::new(rx)),
             control,
+            ledger: Mutex::new(LedgerStateV1::new()),
         })
     }
 
@@ -647,8 +760,21 @@ impl ClientNode {
     }
 
     /// This client's messaging address, or `None` for a ping-only client.
+    ///
+    /// For a control client the assigned address lives in the shared local
+    /// state (set by `JoinApproved`), so it is read live rather than duplicated
+    /// here; [`ClientNode::spawn_with_address`] clients keep the fixed address
+    /// they were constructed with.
     pub fn address(&self) -> Option<String> {
-        self.address.clone()
+        if let Some(address) = &self.address {
+            return Some(address.clone());
+        }
+        self.control
+            .lock_state()
+            .record
+            .address
+            .as_ref()
+            .map(|address| address.to_string())
     }
 
     /// Send one framed [`Envelope`] to a direct neighbor (the leaf node) and
@@ -668,9 +794,10 @@ impl ClientNode {
         payload: Vec<u8>,
     ) -> Result<String, JsError> {
         let self_addr: OctAddr = self
-            .address
-            .as_deref()
-            .ok_or_else(|| JsError::new("client has no messaging address; use spawn_with_address"))?
+            .address()
+            .ok_or_else(|| {
+                JsError::new("client has no messaging address; use spawn_with_address or join")
+            })?
             .parse()
             .map_err(to_js_err)?;
         let dst: OctAddr = dst.parse().map_err(to_js_err)?;
@@ -694,7 +821,18 @@ impl ClientNode {
             payload,
         );
 
-        let ack = n0_future::time::timeout(n0_future::time::Duration::from_secs(10), async {
+        let ack = self.exchange_ack(next_hop, &env).await?;
+
+        Ok(ack.status_str().to_string())
+    }
+
+    /// Dial `next_hop` on `cawala/msg/0`, frame `env`, and read the [`Ack`],
+    /// bounded by a 10-second timeout.
+    ///
+    /// Uses [`n0_future::time::timeout`] (never a `tokio` runtime) because this
+    /// runs on wasm.
+    async fn exchange_ack(&self, next_hop: EndpointId, env: &Envelope) -> Result<Ack, JsError> {
+        n0_future::time::timeout(n0_future::time::Duration::from_secs(10), async {
             let connection = self
                 .router
                 .endpoint()
@@ -702,7 +840,7 @@ impl ClientNode {
                 .await
                 .map_err(to_js_err)?;
             let (mut send, mut recv) = connection.open_bi().await.map_err(to_js_err)?;
-            proto::write_framed(&mut send, &env)
+            proto::write_framed(&mut send, env)
                 .await
                 .map_err(to_js_err)?;
             send.finish().map_err(to_js_err)?;
@@ -717,9 +855,7 @@ impl ClientNode {
             Ok::<Ack, JsError>(ack)
         })
         .await
-        .map_err(|_| JsError::new("send_envelope timed out waiting for ack"))??;
-
-        Ok(ack.status_str().to_string())
+        .map_err(|_| JsError::new("send timed out waiting for ack"))?
     }
 
     /// Non-blocking receive of the next envelope delivered to this leaf.
@@ -735,6 +871,254 @@ impl ClientNode {
             Ok(env) => Ok(Some(ReceivedEnvelope::from(env))),
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => Ok(None),
         }
+    }
+
+    /// Send a same-leaf `Direct` payment order to `to` (a node id string) and
+    /// return its hash plus the routing leaf's ack.
+    ///
+    /// The client must be joined (an assigned address and parent). `amount` is
+    /// in the single Cawala nominal unit, must be a whole number, and must fit
+    /// an exact JavaScript integer (`<= 2^53-1`). The order is operator-signed
+    /// and persisted as pending **before** it is dialed, so a racing
+    /// `"order_result"` event can always be matched; the terminal status
+    /// arrives through [`ClientNode::try_recv_ledger_event`].
+    pub async fn send_payment(&self, to: String, amount: f64) -> Result<PaymentOutcome, JsError> {
+        let operator = self
+            .control
+            .operator
+            .clone()
+            .ok_or_else(|| JsError::new("client has no control identity; use spawn_control"))?;
+        let (self_addr, parent) = self.joined_context()?;
+        let self_node = self.control.node_id().to_string();
+
+        let recipient: EndpointId = to.parse().map_err(to_js_err)?;
+        if recipient.to_string() == self_node {
+            return Err(JsError::new("cannot send a payment to yourself"));
+        }
+        let amount = ledger_state::validate_amount(amount).map_err(to_js_err)?;
+
+        let now = now_unix_seconds();
+        let mut nonce_bytes = [0u8; 8];
+        getrandom::fill(&mut nonce_bytes).map_err(to_js_err)?;
+        let order = ledger_state::build_payment_order(
+            cawala_ledger::NodeId::from(self_node.clone()),
+            cawala_ledger::NodeId::from(recipient.to_string()),
+            amount,
+            u64::from_le_bytes(nonce_bytes),
+            now.saturating_add(ledger_state::ORDER_TTL_SECS),
+        );
+        let order_hash = order.hash();
+        let auth = order.authorize(&operator).map_err(to_js_err)?;
+
+        // Persist before dialing so a result racing the ack can still match.
+        self.ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_pending(order.clone(), auth.clone(), now);
+
+        let payload = LedgerPayloadV1::Order(OrderV1 { order, auth });
+        let ack = self.send_ledger_payload(self_addr, &parent, payload).await?;
+        Ok(PaymentOutcome::new(
+            order_hash.to_hex(),
+            ack.status_str().to_string(),
+        ))
+    }
+
+    /// Request a signed balance receipt from the routing leaf and return the
+    /// leaf's ack bucket.
+    ///
+    /// The verified receipt arrives asynchronously through
+    /// [`ClientNode::try_recv_ledger_event`] as a `"balance_receipt"` event.
+    pub async fn request_balance(&self) -> Result<String, JsError> {
+        let (self_addr, parent) = self.joined_context()?;
+        let mut query_bytes = [0u8; 8];
+        getrandom::fill(&mut query_bytes).map_err(to_js_err)?;
+        let payload = LedgerPayloadV1::BalanceQuery(BalanceQueryV1 {
+            query_id: u64::from_le_bytes(query_bytes),
+        });
+        let ack = self.send_ledger_payload(self_addr, &parent, payload).await?;
+        Ok(ack.status_str().to_string())
+    }
+
+    /// Non-blocking drain of the next ledger event.
+    ///
+    /// Envelopes that are not `MSG_LEDGER_V1` are skipped; a malformed,
+    /// unexpected, or unverifiable ledger message yields a `kind = "invalid"`
+    /// event and never mutates the balance or pending set. Returns `None` when
+    /// the queue is empty.
+    pub fn try_recv_ledger_event(&self) -> Option<LedgerEventDto> {
+        let Some(rx) = &self.rx else {
+            return None;
+        };
+        let mut rx = rx.try_lock().ok()?;
+        loop {
+            let env = match rx.try_recv() {
+                Ok(env) => env,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return None,
+            };
+            if env.msg_type != MSG_LEDGER_V1 {
+                tracing::info!(msg_type = env.msg_type, "skipping non-ledger envelope");
+                continue;
+            }
+            let payload = match LedgerPayloadV1::from_bytes(&env.payload) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    tracing::warn!(%err, "malformed ledger payload");
+                    return Some(LedgerEventDto::invalid("malformed_payload"));
+                }
+            };
+            return Some(match payload {
+                LedgerPayloadV1::OrderResult(result) => self.apply_order_result_event(&result),
+                LedgerPayloadV1::BalanceReceipt(receipt) => {
+                    self.apply_balance_receipt_event(&receipt)
+                }
+                _ => {
+                    tracing::warn!("unexpected inbound ledger payload");
+                    LedgerEventDto::invalid("unexpected_payload")
+                }
+            });
+        }
+    }
+
+    /// Apply one inbound `OrderResult` to the persisted ledger state.
+    fn apply_order_result_event(&self, result: &cawala_msg::OrderResultV1) -> LedgerEventDto {
+        let Some((self_node, parent)) = self.ledger_binding() else {
+            return LedgerEventDto::invalid("not_joined");
+        };
+        let now = now_unix_seconds();
+        let mut ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match ledger_state::apply_order_result(&mut ledger, result, &self_node, &parent, now) {
+            Ok(app) => LedgerEventDto::order_result(&app),
+            Err(reason) => LedgerEventDto::invalid(&reason),
+        }
+    }
+
+    /// Apply one inbound `BalanceReceipt` to the persisted ledger state.
+    fn apply_balance_receipt_event(
+        &self,
+        receipt: &cawala_msg::BalanceReceiptV1,
+    ) -> LedgerEventDto {
+        let Some((self_node, parent)) = self.ledger_binding() else {
+            return LedgerEventDto::invalid("not_joined");
+        };
+        let mut ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match ledger_state::apply_balance_receipt(&mut ledger, receipt, &self_node, &parent) {
+            Ok(balance) => LedgerEventDto::balance_receipt(&balance),
+            Err(reason) => LedgerEventDto::invalid(&reason),
+        }
+    }
+
+    /// The `(self_node, parent)` pair used to bind an inbound receipt.
+    fn ledger_binding(&self) -> Option<(String, cawala_ledger::NodeId)> {
+        let self_node = self.control.node_id().to_string();
+        let parent = {
+            let state = self.control.lock_state();
+            state
+                .record
+                .parent
+                .as_ref()
+                .map(|link| cawala_ledger::NodeId::from(link.node_id.as_str().to_string()))?
+        };
+        Some((self_node, parent))
+    }
+
+    /// A snapshot of the persisted balance/height, pinned ledger key, and
+    /// pending/activity counts.
+    pub fn ledger_status(&self) -> LedgerStatusDto {
+        let (address, parent) = {
+            let state = self.control.lock_state();
+            (
+                state.record.address.as_ref().map(|a| a.to_string()),
+                state
+                    .record
+                    .parent
+                    .as_ref()
+                    .map(|p| p.node_id.as_str().to_string()),
+            )
+        };
+        let ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        LedgerStatusDto::from_state(address, parent, &ledger)
+    }
+
+    /// Export the ledger state as postcard bytes.
+    ///
+    /// The blob contains the pinned ledger key, verified balance, activity, and
+    /// pending orders; it contains **no secret key material**, so it is safe to
+    /// persist in browser storage.
+    pub fn export_ledger_state(&self) -> Vec<u8> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .to_bytes()
+    }
+
+    /// Replace the ledger state from bytes previously produced by
+    /// [`ClientNode::export_ledger_state`].
+    pub fn import_ledger_state(&self, bytes: &[u8]) -> Result<(), JsError> {
+        let state = LedgerStateV1::from_bytes(bytes).map_err(to_js_err)?;
+        *self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
+        Ok(())
+    }
+
+    /// Require a joined client and return its assigned address and parent link.
+    fn joined_context(&self) -> Result<(OctAddr, ParentLink), JsError> {
+        let state = self.control.lock_state();
+        let addr = state
+            .record
+            .address
+            .clone()
+            .ok_or_else(|| JsError::new("not joined: no assigned address"))?;
+        let parent = state
+            .record
+            .parent
+            .clone()
+            .ok_or_else(|| JsError::new("not joined: no parent"))?;
+        Ok((addr, parent))
+    }
+
+    /// Frame `payload` as a `MSG_LEDGER_V1` envelope addressed to the routing
+    /// leaf (the parent) and exchange it for an [`Ack`].
+    async fn send_ledger_payload(
+        &self,
+        self_addr: OctAddr,
+        parent: &ParentLink,
+        payload: LedgerPayloadV1,
+    ) -> Result<Ack, JsError> {
+        let dst = self_addr
+            .parent()
+            .ok_or_else(|| JsError::new("assigned address has no parent"))?;
+        let next_hop: EndpointId = parent.node_id.as_str().parse().map_err(to_js_err)?;
+        let bytes = payload.to_bytes().map_err(to_js_err)?;
+
+        let mut id_bytes = [0u8; MsgId::LEN];
+        getrandom::fill(&mut id_bytes).map_err(to_js_err)?;
+        let mut nonce_bytes = [0u8; 8];
+        getrandom::fill(&mut nonce_bytes).map_err(to_js_err)?;
+        let src = PeerRef {
+            addr: self_addr,
+            node: self.control.node_id().to_string(),
+        };
+        let env = Envelope::new(
+            src,
+            dst,
+            MsgId::from_bytes(id_bytes),
+            MSG_LEDGER_V1,
+            u64::from_le_bytes(nonce_bytes),
+            bytes,
+        );
+        self.exchange_ack(next_hop, &env).await
     }
 
     /// Send one framed `Ping` with the given UTF-8 payload to `endpoint_id`

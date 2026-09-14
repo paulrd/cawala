@@ -267,11 +267,14 @@ async function waitForStatus(node, predicate, description, timeoutMs) {
  * Classify a join failure. A failure to *establish* the control connection is
  * purely environmental (N0 relay/pkarr); a failure after the connection is a
  * real handshake bug. iroh surfaces connect failures as JsError strings that
- * mention connect/timeout/dns/relay.
+ * mention connect/timeout/dns/relay. An unreachable pkarr/DNS lookup surfaces
+ * as "No addressing information available" (the wasm `fetch` to
+ * `https://dns.iroh.link` failed), so "addressing"/"fetch failed" are treated
+ * as the network-unreachable bucket too.
  */
 function isNetworkConnectError(err) {
   const text = String(err?.message ?? err);
-  return /connect|connection|timeout|timed out|dns|relay|lookup|pkarr|unreachable|host/i.test(
+  return /connect|connection|timeout|timed out|dns|relay|lookup|pkarr|unreachable|host|addressing|fetch failed/i.test(
     text,
   );
 }

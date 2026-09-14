@@ -7,10 +7,17 @@
 //! than `Debug` renderings.
 
 use cawala_control::{ChildKind, Invite, NodeId, OperatorPubKey, RejectCode};
+use cawala_ledger::Hash;
 use wasm_bindgen::{JsError, prelude::wasm_bindgen};
 
+use crate::ledger_state::{LedgerStateV1, OrderResultApplication, VerifiedBalanceV1};
 use crate::state::LocalStateV1;
 use crate::to_js_err;
+
+/// Lowercase hex rendering of a ledger [`Hash`] (64 characters).
+pub(crate) fn hash_hex(hash: Hash) -> String {
+    hash.to_hex()
+}
 
 /// Stable JS string for a [`ChildKind`].
 pub(crate) fn child_kind_str(kind: ChildKind) -> &'static str {
@@ -328,6 +335,241 @@ impl ControlEventDto {
     }
 }
 
+/// The immediate outcome of sending a payment order.
+///
+/// The terminal status arrives asynchronously as a
+/// [`LedgerEventDto`] of kind `"order_result"`.
+#[wasm_bindgen]
+pub struct PaymentOutcome {
+    order_hash_hex: String,
+    ack: String,
+}
+
+impl PaymentOutcome {
+    /// Build an outcome from the order hash and the leaf's ack bucket.
+    pub(crate) fn new(order_hash_hex: String, ack: String) -> Self {
+        PaymentOutcome { order_hash_hex, ack }
+    }
+}
+
+#[wasm_bindgen]
+impl PaymentOutcome {
+    /// The order's domain-separated hash as 64 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn order_hash_hex(&self) -> String {
+        self.order_hash_hex.clone()
+    }
+
+    /// The leaf's ack bucket: `"delivered"`, `"duplicate"`, or `"rejected"`.
+    ///
+    /// This only reports that the leaf accepted the envelope, not that the
+    /// order applied; wait for a `"order_result"` ledger event for that.
+    #[wasm_bindgen(getter)]
+    pub fn ack(&self) -> String {
+        self.ack.clone()
+    }
+}
+
+/// One decoded ledger event drained by
+/// [`crate::ClientNode::try_recv_ledger_event`].
+///
+/// `kind` is `"order_result"`, `"balance_receipt"`, or `"invalid"`. Optional
+/// fields are populated per kind; amounts/heights/timestamps are `f64` so
+/// JavaScript never receives a raw `u64`.
+#[wasm_bindgen]
+pub struct LedgerEventDto {
+    kind: String,
+    order_hash: Option<String>,
+    status: Option<String>,
+    reason: Option<String>,
+    amount: Option<f64>,
+    balance: Option<f64>,
+    height: Option<f64>,
+    counterparty: Option<String>,
+    entry_seq: Option<f64>,
+}
+
+impl LedgerEventDto {
+    /// An order result (applied, duplicate, or rejected).
+    pub(crate) fn order_result(app: &OrderResultApplication) -> Self {
+        LedgerEventDto {
+            kind: "order_result".to_string(),
+            order_hash: Some(hash_hex(app.order_hash)),
+            status: Some(app.status.to_string()),
+            reason: app.reason.map(str::to_string),
+            amount: Some(app.amount as f64),
+            balance: app.balance.as_ref().map(|balance| balance.amount as f64),
+            height: app.balance.as_ref().map(|balance| balance.height as f64),
+            counterparty: Some(app.counterparty.as_str().to_string()),
+            entry_seq: app.entry_seq.map(|seq| seq as f64),
+        }
+    }
+
+    /// A verified balance receipt.
+    pub(crate) fn balance_receipt(balance: &VerifiedBalanceV1) -> Self {
+        LedgerEventDto {
+            kind: "balance_receipt".to_string(),
+            order_hash: None,
+            status: None,
+            reason: None,
+            amount: None,
+            balance: Some(balance.amount as f64),
+            height: Some(balance.height as f64),
+            counterparty: None,
+            entry_seq: None,
+        }
+    }
+
+    /// A malformed, unknown, or unverifiable ledger message. No state changed.
+    pub(crate) fn invalid(reason: &str) -> Self {
+        LedgerEventDto {
+            kind: "invalid".to_string(),
+            order_hash: None,
+            status: None,
+            reason: Some(reason.to_string()),
+            amount: None,
+            balance: None,
+            height: None,
+            counterparty: None,
+            entry_seq: None,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl LedgerEventDto {
+    /// Event kind: `"order_result"`, `"balance_receipt"`, or `"invalid"`.
+    #[wasm_bindgen(getter)]
+    pub fn kind(&self) -> String {
+        self.kind.clone()
+    }
+
+    /// The order's hash (hex), for `"order_result"` events.
+    #[wasm_bindgen(getter)]
+    pub fn order_hash(&self) -> Option<String> {
+        self.order_hash.clone()
+    }
+
+    /// `"applied"`, `"duplicate"`, or `"rejected"`, for order results.
+    #[wasm_bindgen(getter)]
+    pub fn status(&self) -> Option<String> {
+        self.status.clone()
+    }
+
+    /// A stable rejection/error reason, when one applies.
+    #[wasm_bindgen(getter)]
+    pub fn reason(&self) -> Option<String> {
+        self.reason.clone()
+    }
+
+    /// The order amount, for `"order_result"` events.
+    #[wasm_bindgen(getter)]
+    pub fn amount(&self) -> Option<f64> {
+        self.amount
+    }
+
+    /// The verified balance, for receipts (and results carrying one).
+    #[wasm_bindgen(getter)]
+    pub fn balance(&self) -> Option<f64> {
+        self.balance
+    }
+
+    /// The ledger height the balance was attested at, when known.
+    #[wasm_bindgen(getter)]
+    pub fn height(&self) -> Option<f64> {
+        self.height
+    }
+
+    /// The payee node id, for order results.
+    #[wasm_bindgen(getter)]
+    pub fn counterparty(&self) -> Option<String> {
+        self.counterparty.clone()
+    }
+
+    /// The applied entry's ledger `seq`, when there is one.
+    #[wasm_bindgen(getter)]
+    pub fn entry_seq(&self) -> Option<f64> {
+        self.entry_seq
+    }
+}
+
+/// A snapshot of this client's ledger/balance state, for the UI.
+#[wasm_bindgen]
+pub struct LedgerStatusDto {
+    address: Option<String>,
+    parent: Option<String>,
+    balance: Option<f64>,
+    height: Option<f64>,
+    pinned_ledger: Option<String>,
+    pending: u32,
+    activity: u32,
+}
+
+impl LedgerStatusDto {
+    /// Build a status view from the topology links and the persisted ledger
+    /// state.
+    pub(crate) fn from_state(
+        address: Option<String>,
+        parent: Option<String>,
+        state: &LedgerStateV1,
+    ) -> Self {
+        LedgerStatusDto {
+            address,
+            parent,
+            balance: state.balance.as_ref().map(|balance| balance.amount as f64),
+            height: state.balance.as_ref().map(|balance| balance.height as f64),
+            pinned_ledger: state.pinned_ledger.map(|key| key.to_string()),
+            pending: state.pending.len() as u32,
+            activity: state.activity.len() as u32,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl LedgerStatusDto {
+    /// This client's assigned address, if joined.
+    #[wasm_bindgen(getter)]
+    pub fn address(&self) -> Option<String> {
+        self.address.clone()
+    }
+
+    /// This client's parent node id, if joined.
+    #[wasm_bindgen(getter)]
+    pub fn parent(&self) -> Option<String> {
+        self.parent.clone()
+    }
+
+    /// The last verified balance, if any.
+    #[wasm_bindgen(getter)]
+    pub fn balance(&self) -> Option<f64> {
+        self.balance
+    }
+
+    /// The height the balance was attested at, if any.
+    #[wasm_bindgen(getter)]
+    pub fn height(&self) -> Option<f64> {
+        self.height
+    }
+
+    /// The pinned ledger key as 64 lowercase hex characters, if any.
+    #[wasm_bindgen(getter)]
+    pub fn pinned_ledger(&self) -> Option<String> {
+        self.pinned_ledger.clone()
+    }
+
+    /// Number of in-flight orders.
+    #[wasm_bindgen(getter)]
+    pub fn pending(&self) -> u32 {
+        self.pending
+    }
+
+    /// Number of recorded activity entries.
+    #[wasm_bindgen(getter)]
+    pub fn activity(&self) -> u32 {
+        self.activity
+    }
+}
+
 /// This client's parent link, as returned in [`SnapshotDto`].
 #[wasm_bindgen]
 #[derive(Clone)]
@@ -632,5 +874,75 @@ mod tests {
         assert_eq!(parse_operator_hex(&key.to_string()).unwrap(), key);
         assert!(parse_operator_hex("00").is_err());
         assert!(parse_operator_hex(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn hash_hex_is_lowercase_64_chars() {
+        let hex = hash_hex(Hash::from_bytes([0xab; 32]));
+        assert_eq!(hex.len(), 64);
+        assert_eq!(hex, "ab".repeat(32));
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn order_result_event_maps_u64_to_f64_and_reason_string() {
+        let app = OrderResultApplication {
+            status: "applied",
+            reason: None,
+            order_hash: Hash::from_bytes([0x11; 32]),
+            amount: 42,
+            counterparty: cawala_ledger::NodeId::from("bob"),
+            entry_seq: Some(7),
+            balance: Some(VerifiedBalanceV1 {
+                amount: 100,
+                height: 9,
+                state_root: Hash::ZERO,
+            }),
+        };
+        let event = LedgerEventDto::order_result(&app);
+        assert_eq!(event.kind, "order_result");
+        assert_eq!(event.order_hash.as_deref(), Some(&"11".repeat(32) as &str));
+        assert_eq!(event.status.as_deref(), Some("applied"));
+        assert_eq!(event.amount, Some(42.0));
+        assert_eq!(event.balance, Some(100.0));
+        assert_eq!(event.height, Some(9.0));
+        assert_eq!(event.counterparty.as_deref(), Some("bob"));
+        assert_eq!(event.entry_seq, Some(7.0));
+        assert!(event.reason.is_none());
+    }
+
+    #[test]
+    fn invalid_event_carries_stable_reason_and_no_values() {
+        let event = LedgerEventDto::invalid("unknown_order");
+        assert_eq!(event.kind, "invalid");
+        assert_eq!(event.reason.as_deref(), Some("unknown_order"));
+        assert!(event.order_hash.is_none());
+        assert!(event.balance.is_none());
+        assert!(event.height.is_none());
+    }
+
+    #[test]
+    fn ledger_status_dto_reports_counts_and_pin() {
+        let mut state = LedgerStateV1::new();
+        state.pinned_ledger = Some(
+            cawala_ledger::LedgerSecretKey::from_bytes([3u8; 32]).public(),
+        );
+        state.balance = Some(VerifiedBalanceV1 {
+            amount: 55,
+            height: 4,
+            state_root: Hash::ZERO,
+        });
+        let status = LedgerStatusDto::from_state(
+            Some("0.4".to_string()),
+            Some("parent".to_string()),
+            &state,
+        );
+        assert_eq!(status.address.as_deref(), Some("0.4"));
+        assert_eq!(status.parent.as_deref(), Some("parent"));
+        assert_eq!(status.balance, Some(55.0));
+        assert_eq!(status.height, Some(4.0));
+        assert_eq!(status.pinned_ledger.as_deref().map(str::len), Some(64));
+        assert_eq!(status.pending, 0);
+        assert_eq!(status.activity, 0);
     }
 }

@@ -225,7 +225,7 @@
         network-reachable findings (decode amplification, unbounded node-id
         retention, retry poisoning) were fixed and re-verified.
    5. *M4 - Control & web client* (PHASE 1 DONE 2026-09-10; USER-LIVE
-      WIRING DONE 2026-09-13; in progress):
+      WIRING + BROWSER VALUE MESSAGING V1 DONE 2026-09-13; in progress):
       senior-child control flow, indirect multi-node control, Svelte PWA,
       join flow (parent approves -> leaf issues address). Onboarding is
       invite-based so nodes stay undiscoverable; the location *suggestion*
@@ -276,21 +276,55 @@
       - Hardening (same increment): `ControlNode::seniority()` now excludes
         `ChildKind::User`, so a browser user can never become the senior child
         and mutate its parent's topology; hermetic regression test added.
+      - Same-leaf browser value messaging (v1, DONE 2026-09-13): a joined
+        browser can now send a same-leaf `Direct` payment and read a
+        cryptographically verified balance. `crates/msg::ledger_payload` defines
+        the frozen `LedgerPayloadV1` wire variants (`Order`/`OrderResult`/
+        `BalanceQuery`/`BalanceReceipt`) carried in `MSG_LEDGER_V1` envelopes;
+        `crates/node/src/ledger_service.rs` is the leaf half (open/fund/
+        apply/balance-receipt over the persisted `FileLog`, with a `payment_id`
+        replay guard rebuilt by replay so duplicates survive restarts). The
+        browser signs a `PaymentOrder` with its operator key, the leaf verifies
+        and appends a `Direct` transfer, and replies with an `OrderResult`
+        carrying a signed balance receipt the browser verifies against the leaf
+        ledger key it pins trust-on-first-use (`client-wasm`'s `LedgerStateV1`);
+        a retried order is reported `Duplicate` and moves nothing. Outbound
+        activity is enumerable from the receipt history; `ledger fund` is the
+        explicit, operator-only issue path. `control approve` and `ledger fund`
+        run as separate CLI processes against the live node: the service
+        re-reads and replays the log before every mutation and authoritative
+        read, so those external appends are observed without a restart
+        (concurrent appenders remain unsynchronized; see the `LedgerService`
+        resync note). The Svelte rune stores were also split into `.svelte.js`
+        modules (`router.svelte.js`, `stores.svelte.js`) to fix the runes
+        compile error.
+      - Verification for the browser-value increment: the hermetic
+        `crates/node/tests/ledger_orders.rs` drives the real `cawala/msg/0`
+        transport against a leaf with two user children (signed order ->
+        `Applied` + verified balance receipt -> balance query -> duplicate with
+        no ledger movement -> reopen from disk -> removed record rejects the
+        sender), and the network-dependent `web/scripts/smoke-payment.mjs`
+        drives two wasm clients through join, CLI approve, CLI fund, a 25 payment
+        and both verified balances over N0.
       - Verification for the increment: 17 native client state/DTO tests; wasm
         build + `wasm32-unknown-unknown` check; `clippy --workspace --all-targets
         -D warnings`; `cargo test --workspace`; `npm run build`; and an
         end-to-end `web/scripts/smoke-join.mjs` (browser join -> CLI approve ->
         joined at `0.<slot>`, plus the reject path), network-dependent on N0.
-      - Deferred: tree-routed indirect multi-node control; network issue/burn;
-        remote admin from the browser (pending-join listing + approve/reject
-        control requests would need a `CONTROL_FORMAT_VERSION` bump and a node
-        operator-key custody decision); account/activity query over control;
-        browser serving `cawala/msg/0` as a joined node. `MoveChild` remains
-        limited to re-slotting under the same node; no control replay nonce
-        (authority is re-evaluated live per request). The location suggestion
-        service is out of scope for now: a separate, independently hostable,
-        non-authoritative companion (lat/lon or map click -> suggested octal
-        address); the leaf still validates and issues the final address.
+      - Deferred: cross-subtree/multi-hop value movement (a browser order is
+        same-leaf `Direct` only; paying a user under another leaf, cascade
+        settlement, and tree-routed indirect multi-node control are all
+        unimplemented); browser issue/burn (value creation/destruction stays an
+        explicit operator-only act - `ledger fund` - and is deliberately not
+        reachable from a browser order); and remote admin from the browser
+        (pending-join listing + approve/reject would need a
+        `CONTROL_FORMAT_VERSION` bump and a node operator-key custody
+        decision). `MoveChild` remains limited to re-slotting under the same
+        node; no control replay nonce (authority is re-evaluated live per
+        request). The location suggestion service is out of scope for now: a
+        separate, independently hostable, non-authoritative companion (lat/lon
+        or map click -> suggested octal address); the leaf still validates and
+        issues the final address.
   6. *M5 - Hardening*: exit rights, foster-parent recovery, compromise-path
      docs, audit tooling, governance/regulatory surface (Hawala exposure is
      real - community question, not code).

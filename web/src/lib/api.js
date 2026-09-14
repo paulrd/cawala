@@ -29,7 +29,10 @@ import {
   JOIN_STATE,
   JOIN_OUTCOME,
   CONTROL_EVENT,
+  LEDGER_EVENT,
+  ORDER_STATUS,
 } from './constants.js';
+import { ledgerState } from './stores.svelte.js';
 
 // ── Internal state ────────────────────────────────────────────
 
@@ -40,7 +43,12 @@ let _clientNode = null;
 // Identity/state storage keys.
 const IDENTITY_KEY = 'cawala.identity.v1';
 const STATE_KEY = 'cawala.state.v1';
+// Distinct key for the secret-free ledger blob (balance/activity/pending).
+const LEDGER_KEY = 'cawala.ledger.v1';
 const SEED_BYTES = 32;
+
+// Keep the JS activity list bounded like Rust `MAX_ACTIVITY_ENTRIES`.
+const MAX_ACTIVITY_ENTRIES = 200;
 
 let _identityPersistent = false;
 let _memorySeed = null; // in-session fallback when localStorage is unusable
@@ -48,6 +56,11 @@ let _memorySeed = null; // in-session fallback when localStorage is unusable
 // Control-event poller + last drained event.
 let _controlPoller = null;
 let _lastControlEvent = null;
+
+// JS-side in-flight payment map keyed by order hash hex, for UI status.
+const _pendingSends = new Map();
+// Throttle duplicate balance requests fired from init + spawnClient.
+let _lastBalanceRequestAt = 0;
 
 // Best-effort multi-tab identity leadership.
 let _lockRelease = null;
@@ -207,6 +220,40 @@ function _persistState() {
 }
 
 /**
+ * Load the persisted secret-free ledger state blob, if any.
+ * @returns {Uint8Array|null}
+ */
+function _loadLedgerState() {
+  let b64 = null;
+  try {
+    b64 = window.localStorage.getItem(LEDGER_KEY);
+  } catch (err) {
+    _warnOnce('ledger-read', '[api] localStorage unavailable for ledger state read', err);
+    return null;
+  }
+  if (!b64) return null;
+  try {
+    return _base64ToBytes(b64);
+  } catch (err) {
+    _warnOnce('ledger-decode', '[api] persisted ledger state is malformed; ignoring it', err);
+    return null;
+  }
+}
+
+/**
+ * Persist `node.export_ledger_state()` to localStorage. Best-effort; never throws.
+ */
+function _persistLedgerState() {
+  if (!_clientNode) return;
+  try {
+    const bytes = _clientNode.export_ledger_state();
+    window.localStorage.setItem(LEDGER_KEY, _bytesToBase64(bytes));
+  } catch (err) {
+    _warnOnce('ledger-write', '[api] could not persist ledger state (private mode/quota)', err);
+  }
+}
+
+/**
  * Spawn the real control client, restore state, and start the event poller.
  * @returns {Promise<import('../wasm/cawala_client.js').ClientNode>}
  */
@@ -223,9 +270,23 @@ async function _spawnRealNode() {
     }
   }
 
+  const ledgerBytes = _loadLedgerState();
+  if (ledgerBytes) {
+    try {
+      node.import_ledger_state(ledgerBytes);
+    } catch (err) {
+      console.warn('[api] import_ledger_state failed; starting from a fresh ledger state', err);
+    }
+  }
+
   _clientNode = node;
   _persistState();
+  _persistLedgerState();
+  // Reflect any restored verified balance in the reactive store immediately.
+  _syncLedgerStoreFromStatus();
   _startControlPoller();
+  // (Re)verify the persisted balance as soon as an address is known.
+  _requestBalanceIfJoined();
   return node;
 }
 
@@ -310,7 +371,10 @@ function _releaseIdentityLock() {
  */
 function _startControlPoller() {
   if (_controlPoller != null) return;
-  _controlPoller = setInterval(_drainControlEvents, 2000);
+  _controlPoller = setInterval(() => {
+    _drainControlEvents();
+    _drainLedgerEvents();
+  }, 2000);
 }
 
 /**
@@ -330,6 +394,7 @@ function _stopControlPoller() {
 function _drainControlEvents() {
   if (_useMock || !_clientNode) return;
   let drained = false;
+  let accepted = false;
   try {
     for (;;) {
       const ev = _clientNode.try_recv_control_event();
@@ -342,6 +407,7 @@ function _drainControlEvents() {
         dateJoined: ev.date_joined ?? null,
         reason: ev.reason ?? null,
       };
+      if (_lastControlEvent.kind === CONTROL_EVENT.ACCEPTED) accepted = true;
       ev.free?.();
       drained = true;
     }
@@ -350,6 +416,8 @@ function _drainControlEvents() {
     return;
   }
   if (drained) _persistState();
+  // A fresh approval means an address now exists: verify its balance.
+  if (accepted) _requestBalanceIfJoined();
 }
 
 /**
@@ -357,6 +425,209 @@ function _drainControlEvents() {
  */
 export function getLastControlEvent() {
   return _lastControlEvent ? { ..._lastControlEvent } : null;
+}
+
+// ── Ledger-event poller ───────────────────────────────────────
+
+/**
+ * Drain all queued ledger events into `ledgerState`, copying each DTO to a
+ * plain object and freeing it.
+ *
+ * After draining, the authoritative balance/height/pinned-ledger/pending
+ * counts are resynced from `ledger_status()` and the ledger blob is persisted
+ * whenever anything was drained. An `invalid` event never mutates the verified
+ * balance; it only sets `ledgerState.error`.
+ */
+function _drainLedgerEvents() {
+  if (_useMock || !_clientNode) return;
+  let drained = false;
+  try {
+    for (;;) {
+      const ev = _clientNode.try_recv_ledger_event();
+      if (!ev) break;
+      let plain;
+      try {
+        plain = {
+          kind: ev.kind,
+          orderHash: ev.order_hash ?? null,
+          status: ev.status ?? null,
+          reason: ev.reason ?? null,
+          amount: ev.amount ?? null,
+          balance: ev.balance ?? null,
+          height: ev.height ?? null,
+          counterparty: ev.counterparty ?? null,
+          entrySeq: ev.entry_seq ?? null,
+        };
+      } finally {
+        ev.free?.();
+      }
+      _applyLedgerEvent(plain);
+      drained = true;
+    }
+  } catch (err) {
+    _warnOnce('ledger-drain', '[api] ledger event drain failed', err);
+    return;
+  }
+  _syncLedgerStoreFromStatus();
+  if (drained) _persistLedgerState();
+}
+
+/**
+ * Fold one plain ledger-event object into `ledgerState`, resolving a matching
+ * in-flight send by order hash.
+ * @param {object} plain
+ */
+function _applyLedgerEvent(plain) {
+  if (!plain || typeof plain.kind !== 'string') return;
+
+  if (plain.kind === LEDGER_EVENT.ORDER_RESULT) {
+    const orderHash = plain.orderHash;
+    if (orderHash) {
+      const pending = _pendingSends.get(orderHash);
+      if (pending) {
+        pending.status = plain.status ?? pending.status;
+        pending.reason = plain.reason ?? pending.reason;
+        pending.resolvedAt = Date.now();
+      }
+    }
+    // Record a UI transfer entry for a terminal order. The DTO exposes the
+    // order hash (not the ledger entry hash), so that is the stable id.
+    if (plain.status === ORDER_STATUS.APPLIED || plain.status === ORDER_STATUS.DUPLICATE) {
+      _recordActivity({
+        id: orderHash ?? `seq-${plain.entrySeq ?? Date.now()}`,
+        type: ACTIVITY_TYPES.TRANSFER,
+        from: getAddress(),
+        to: plain.counterparty ?? null,
+        amount: plain.amount ?? null,
+        signedBy: _parentNodeId(),
+        timestamp: new Date().toISOString(),
+      });
+    }
+    if (typeof plain.balance === 'number') {
+      ledgerState.balance = plain.balance;
+      ledgerState.verifiedAt = Date.now();
+    }
+    if (typeof plain.height === 'number') {
+      ledgerState.height = plain.height;
+    }
+    ledgerState.error = null;
+    return;
+  }
+
+  if (plain.kind === LEDGER_EVENT.BALANCE_RECEIPT) {
+    if (typeof plain.balance === 'number') {
+      ledgerState.balance = plain.balance;
+      ledgerState.verifiedAt = Date.now();
+    }
+    if (typeof plain.height === 'number') {
+      ledgerState.height = plain.height;
+    }
+    ledgerState.error = null;
+    return;
+  }
+
+  if (plain.kind === LEDGER_EVENT.INVALID) {
+    // Never mutate the verified balance on an invalid event.
+    ledgerState.error = plain.reason ?? 'ledger_event_invalid';
+  }
+}
+
+/**
+ * Append a UI-shaped activity entry, de-duplicating by id and capping the list.
+ * @param {{ id: string, type: string, from: string|null, to: string|null, amount: number|null, signedBy: string|null, timestamp: string }} entry
+ */
+function _recordActivity(entry) {
+  if (!entry || !entry.id) return;
+  if (ledgerState.activity.some((existing) => existing.id === entry.id)) return;
+  const next = [...ledgerState.activity, entry];
+  if (next.length > MAX_ACTIVITY_ENTRIES) {
+    next.splice(0, next.length - MAX_ACTIVITY_ENTRIES);
+  }
+  ledgerState.activity = next;
+}
+
+/**
+ * Resync the balance/height/pin/pending fields of `ledgerState` from the
+ * authoritative wasm `ledger_status()` snapshot.
+ */
+function _syncLedgerStoreFromStatus() {
+  if (_useMock || !_clientNode) return;
+  let status;
+  try {
+    status = _readLedgerStatus(_clientNode);
+  } catch (err) {
+    _warnOnce('ledger-status', '[api] ledger status read failed', err);
+    return;
+  }
+  ledgerState.balance = status.balance;
+  ledgerState.height = status.height;
+  ledgerState.pinnedLedger = status.pinnedLedger;
+  ledgerState.pending = status.pending;
+  if (status.balance != null && ledgerState.verifiedAt == null) {
+    // A balance restored from persisted state is still verified; stamp it.
+    ledgerState.verifiedAt = Date.now();
+  }
+}
+
+/**
+ * Copy a wasm `LedgerStatusDto` to a plain object and free it.
+ * @param {object} node
+ * @returns {{ address: string|null, parent: string|null, balance: number|null, height: number|null, pinnedLedger: string|null, pending: number, activity: number }}
+ */
+function _readLedgerStatus(node) {
+  const dto = node.ledger_status();
+  try {
+    return {
+      address: dto.address ?? null,
+      parent: dto.parent ?? null,
+      balance: dto.balance ?? null,
+      height: dto.height ?? null,
+      pinnedLedger: dto.pinned_ledger ?? null,
+      pending: dto.pending,
+      activity: dto.activity,
+    };
+  } finally {
+    dto.free?.();
+  }
+}
+
+/**
+ * This client's parent node id, if joined (used as the activity `signedBy`).
+ * @returns {string|null}
+ */
+function _parentNodeId() {
+  if (!_clientNode) return null;
+  let snapshot;
+  let parent;
+  try {
+    snapshot = _clientNode.local_snapshot();
+    parent = snapshot.parent;
+    return parent?.node_id ?? null;
+  } catch {
+    return null;
+  } finally {
+    parent?.free?.();
+    snapshot?.free?.();
+  }
+}
+
+/**
+ * Fire a best-effort `requestBalance()` when an address is assigned, throttled
+ * so init + spawnClient do not issue duplicate requests.
+ */
+function _requestBalanceIfJoined() {
+  if (_useMock || !_clientNode) return;
+  let address = null;
+  try {
+    address = _readJoinStatus(_clientNode).address ?? null;
+  } catch {
+    /* ignore */
+  }
+  if (!address) return;
+  const now = Date.now();
+  if (now - _lastBalanceRequestAt < 1000) return;
+  _lastBalanceRequestAt = now;
+  void requestBalance();
 }
 
 // ── Client lifecycle ──────────────────────────────────────────
@@ -376,9 +647,11 @@ export async function spawnClient() {
   }
   const node = _requireNode();
   const status = _readJoinStatus(node);
+  const address = status.address ?? null;
+  if (address) _requestBalanceIfJoined();
   return {
     endpointId: node.endpoint_id(),
-    address: status.address ?? null,
+    address,
   };
 }
 
@@ -412,12 +685,18 @@ export function destroyClient() {
       /* best effort */
     }
     try {
+      _persistLedgerState();
+    } catch {
+      /* best effort */
+    }
+    try {
       _clientNode.free?.();
     } catch {
       /* ignore */
     }
     _clientNode = null;
   }
+  _pendingSends.clear();
   _releaseIdentityLock();
 }
 
@@ -519,6 +798,153 @@ export function tryRecvEnvelope() {
     _warnOnce('envelope-recv', '[api] try_recv_envelope unavailable on this client', err);
     return null;
   }
+}
+
+// ── Ledger / value transfer ───────────────────────────────────
+
+/**
+ * Send a same-leaf payment to `toEndpointId`.
+ *
+ * The amount is validated client-side, then `node.send_payment` signs and dials
+ * the order. The returned `ack` only reports the routing leaf accepted the
+ * envelope; the terminal `applied`/`duplicate`/`rejected` status arrives
+ * asynchronously through the ledger-event poller and is reflected in
+ * `ledgerState` (and resolvable by hash through the internal pending map).
+ *
+ * @param {string} toEndpointId Recipient node id.
+ * @param {number} amount Whole, positive Cawala units.
+ * @returns {Promise<{ orderHash: string, ack: string }>}
+ */
+export async function sendPayment(toEndpointId, amount) {
+  if (_useMock) {
+    await mockDelay(500);
+    const numeric = Number(amount);
+    const orderHash = _randomHex32();
+    _recordActivity({
+      id: orderHash,
+      type: ACTIVITY_TYPES.TRANSFER,
+      from: getAddress(),
+      to: typeof toEndpointId === 'string' ? toEndpointId : null,
+      amount: Number.isFinite(numeric) ? numeric : null,
+      signedBy: getEndpointId(),
+      timestamp: new Date().toISOString(),
+    });
+    return { orderHash, ack: ENVELOPE_ACK.DELIVERED };
+  }
+
+  if (typeof toEndpointId !== 'string' || !toEndpointId.trim()) {
+    throw new Error('Enter the recipient node id.');
+  }
+  const numeric = Number(amount);
+  if (!Number.isFinite(numeric)) {
+    throw new Error('Enter a valid amount.');
+  }
+  if (!Number.isInteger(numeric)) {
+    throw new Error('Amount must be a whole number.');
+  }
+  if (numeric <= 0) {
+    throw new Error('Amount must be greater than zero.');
+  }
+  if (numeric > Number.MAX_SAFE_INTEGER) {
+    throw new Error('Amount is too large (maximum is 9,007,199,254,740,991).');
+  }
+
+  const node = _requireNode();
+  let outcome;
+  try {
+    outcome = await node.send_payment(toEndpointId.trim(), numeric);
+  } catch (err) {
+    throw new Error(`Payment failed: ${_errorMessage(err)}`);
+  }
+
+  let orderHash;
+  let ack;
+  try {
+    orderHash = outcome.order_hash_hex;
+    ack = outcome.ack;
+  } finally {
+    outcome.free?.();
+  }
+
+  _pendingSends.set(orderHash, {
+    orderHash,
+    to: toEndpointId.trim(),
+    amount: numeric,
+    ack,
+    status: 'pending',
+    reason: null,
+    sentAt: Date.now(),
+    resolvedAt: null,
+  });
+  _persistLedgerState();
+  // Pick up a terminal result that raced the ack, and resync pending counts.
+  _drainLedgerEvents();
+  return { orderHash, ack };
+}
+
+/**
+ * Ask the routing leaf for a signed balance receipt.
+ *
+ * The verified balance arrives asynchronously as a `balance_receipt` ledger
+ * event. This is a safe no-op when not initialized; a wasm error (e.g. not
+ * joined) is surfaced on `ledgerState.error` rather than thrown.
+ *
+ * @returns {Promise<string|null>} The leaf's ack bucket, or null when unavailable.
+ */
+export async function requestBalance() {
+  if (_useMock) {
+    await mockDelay(150);
+    return ENVELOPE_ACK.DELIVERED;
+  }
+  if (!_clientNode) return null;
+  try {
+    return await _clientNode.request_balance();
+  } catch (err) {
+    const message = _errorMessage(err);
+    _warnOnce('balance-request', '[api] request_balance failed', err);
+    ledgerState.error = message;
+    return null;
+  }
+}
+
+/**
+ * A plain snapshot of the verified ledger state.
+ *
+ * Prefers the live wasm `ledger_status()` DTO (freeing it) and falls back to
+ * the reactive `ledgerState` store. `activity` is the number of recorded
+ * entries; the entries themselves live in `ledgerState.activity`.
+ *
+ * @returns {{ address: string|null, parent: string|null, balance: number|null, height: number|null, pinnedLedger: string|null, pending: number, activity: number }}
+ */
+export function getLedgerStatus() {
+  if (!_useMock && _clientNode) {
+    return _readLedgerStatus(_clientNode);
+  }
+  return {
+    address: getAddress(),
+    parent: null,
+    balance: ledgerState.balance,
+    height: ledgerState.height,
+    pinnedLedger: ledgerState.pinnedLedger,
+    pending: ledgerState.pending,
+    activity: ledgerState.activity.length,
+  };
+}
+
+/**
+ * Snapshot of the JS-tracked payments for UI status, keyed by order hash. Each
+ * entry starts as `status: 'pending'` and is updated to `applied`/`duplicate`/
+ * `rejected` when the matching `order_result` event is drained. The
+ * authoritative in-flight count is `ledgerState.pending`.
+ *
+ * Note: this map is per-session (not persisted), so sends from a previous page
+ * load are not listed even though their orders may still be pending in the
+ * wasm ledger state.
+ *
+ * @returns {Array<{ orderHash: string, to: string, amount: number, ack: string, status: string, reason: string|null, sentAt: number, resolvedAt: number|null }>}
+ */
+export function getPendingPayments() {
+  return Array.from(_pendingSends.values(), (payment) => ({ ...payment }));
 }
 
 // ── Control messages ──────────────────────────────────────────
@@ -881,7 +1307,18 @@ export async function getAccounts() {
     await mockDelay(200);
     return [...MOCK_DATA.accounts];
   }
-  return [];
+  // Only expose a real account once a cryptographically verified balance
+  // exists; never fabricate a zero balance before the first receipt.
+  const address = getAddress();
+  if (!address || ledgerState.balance == null) return [];
+  return [
+    {
+      address,
+      type: 'asset',
+      label: 'My account',
+      balance: ledgerState.balance,
+    },
+  ];
 }
 
 /**
@@ -922,7 +1359,20 @@ export async function getActivityLog(filters) {
     }
     return entries;
   }
-  return [];
+  // Live: UI-shaped entries accumulated by the ledger-event poller.
+  let entries = [...ledgerState.activity];
+  if (filters?.type) {
+    entries = entries.filter((e) => e.type === filters.type);
+  }
+  if (filters?.address) {
+    const addr = filters.address.toLowerCase();
+    entries = entries.filter(
+      (e) =>
+        (e.from && e.from.toLowerCase().includes(addr)) ||
+        (e.to && e.to.toLowerCase().includes(addr)),
+    );
+  }
+  return entries;
 }
 
 /**
@@ -1051,6 +1501,34 @@ function _base64ToBytes(b64) {
     out[i] = binary.charCodeAt(i);
   }
   return out;
+}
+
+/**
+ * A user-facing message from a wasm/JsError or any thrown value.
+ * @param {unknown} err
+ * @returns {string}
+ */
+function _errorMessage(err) {
+  if (err == null) return 'unknown error';
+  if (typeof err === 'string') return err;
+  if (typeof err.message === 'string' && err.message) return err.message;
+  return String(err);
+}
+
+/**
+ * 32 random bytes as 64 lowercase hex chars (mock order-hash stand-in).
+ * @returns {string}
+ */
+function _randomHex32() {
+  const bytes = new Uint8Array(32);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  return _bytesToHex(bytes);
 }
 
 // ── Mock data ─────────────────────────────────────────────────

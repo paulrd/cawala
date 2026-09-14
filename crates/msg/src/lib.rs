@@ -34,12 +34,17 @@
 //! large allocation before authentication.
 
 pub mod envelope;
+pub mod ledger_payload;
 pub mod replay;
 pub mod route;
 
 pub use envelope::{
     Ack, AckStatus, Envelope, Hop, MSG_CONTROL_V1, MSG_LEDGER_V1, MessageType, MsgError, MsgId,
     PROTOCOL_VERSION, PeerRef, RejectReason,
+};
+pub use ledger_payload::{
+    BalanceQueryV1, BalanceReceiptV1, LEDGER_PAYLOAD_VERSION, LedgerPayloadError, LedgerPayloadV1,
+    MAX_RECEIPT_HISTORY, OrderRejectV1, OrderResultV1, OrderStatusV1, OrderV1, ValueNoticeV1,
 };
 pub use proto::OctAddr;
 pub use replay::{Seen, SeenConfig, SeenSet};
