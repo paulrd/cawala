@@ -32,7 +32,8 @@ import {
   LEDGER_EVENT,
   ORDER_STATUS,
 } from './constants.js';
-import { ledgerState } from './stores.svelte.js';
+import { clientState, ledgerState } from './stores.svelte.js';
+import * as idb from './identityBundle.js';
 
 // ── Internal state ────────────────────────────────────────────
 
@@ -41,11 +42,25 @@ let _wasmModule = null;
 let _clientNode = null;
 
 // Identity/state storage keys.
+// The identity seed stays global (one browser install == one identity). The
+// state/ledger blobs are identity-scoped: `${STATE_KEY}:<nodeId>`. The
+// un-suffixed keys are the legacy (pre-portability) locations and are read once
+// as a backward-compat fallback on load.
 const IDENTITY_KEY = 'cawala.identity.v1';
 const STATE_KEY = 'cawala.state.v1';
 // Distinct key for the secret-free ledger blob (balance/activity/pending).
 const LEDGER_KEY = 'cawala.ledger.v1';
 const SEED_BYTES = 32;
+
+/**
+ * Identity-scoped storage key: `cawala.state.v1:<nodeId>`.
+ * @param {string} base
+ * @param {string} nodeId
+ * @returns {string}
+ */
+function _scopedKey(base, nodeId) {
+  return `${base}:${nodeId}`;
+}
 
 // Keep the JS activity list bounded like Rust `MAX_ACTIVITY_ENTRIES`.
 const MAX_ACTIVITY_ENTRIES = 200;
@@ -61,6 +76,10 @@ let _lastControlEvent = null;
 const _pendingSends = new Map();
 // Throttle duplicate balance requests fired from init + spawnClient.
 let _lastBalanceRequestAt = 0;
+// Throttle the poller-driven balance pull so node-side (CLI) funding surfaces.
+let _lastAutoBalanceRefreshAt = 0;
+// visibilitychange handler ref, so the poller can add/remove it idempotently.
+let _visibilityHandler = null;
 
 // Best-effort multi-tab identity leadership.
 let _lockRelease = null;
@@ -186,24 +205,64 @@ function _loadOrCreateIdentity(wasm) {
 }
 
 /**
- * Load the persisted postcard state blob, if any.
+ * Read a base64 blob from an identity-scoped key, falling back once to the
+ * legacy un-namespaced key for installs predating identity portability.
+ * @param {string} base
+ * @param {string} nodeId
+ * @param {string} warnKey
  * @returns {Uint8Array|null}
  */
-function _loadState() {
+function _loadScopedBlob(base, nodeId, warnKey) {
   let b64 = null;
   try {
-    b64 = window.localStorage.getItem(STATE_KEY);
+    b64 = window.localStorage.getItem(_scopedKey(base, nodeId));
+    if (b64 == null) {
+      // One-time backward compat: pre-portability installs stored the blob
+      // under the un-suffixed key.
+      b64 = window.localStorage.getItem(base);
+    }
   } catch (err) {
-    _warnOnce('state-read', '[api] localStorage unavailable for state read', err);
+    _warnOnce(warnKey, `[api] localStorage unavailable for ${base} read`, err);
     return null;
   }
   if (!b64) return null;
   try {
     return _base64ToBytes(b64);
   } catch (err) {
-    _warnOnce('state-decode', '[api] persisted state is malformed; ignoring it', err);
+    _warnOnce(`${warnKey}-decode`, `[api] persisted ${base} is malformed; ignoring it`, err);
     return null;
   }
+}
+
+/**
+ * Persist a base64 blob under its identity-scoped key. Best-effort; never throws.
+ * @param {string} base
+ * @param {Uint8Array} bytes
+ * @param {string} warnKey
+ */
+function _persistScopedBlob(base, bytes, warnKey) {
+  if (!_clientNode) return;
+  let nodeId;
+  try {
+    nodeId = _clientNode.endpoint_id();
+  } catch (err) {
+    _warnOnce(`${warnKey}-id`, `[api] could not read endpoint id for ${base}`, err);
+    return;
+  }
+  try {
+    window.localStorage.setItem(_scopedKey(base, nodeId), _bytesToBase64(bytes));
+  } catch (err) {
+    _warnOnce(warnKey, `[api] could not persist ${base} (private mode/quota)`, err);
+  }
+}
+
+/**
+ * Load the persisted postcard state blob, if any.
+ * @param {string} nodeId
+ * @returns {Uint8Array|null}
+ */
+function _loadState(nodeId) {
+  return _loadScopedBlob(STATE_KEY, nodeId, 'state-read');
 }
 
 /**
@@ -213,7 +272,7 @@ function _persistState() {
   if (!_clientNode) return;
   try {
     const bytes = _clientNode.export_state();
-    window.localStorage.setItem(STATE_KEY, _bytesToBase64(bytes));
+    _persistScopedBlob(STATE_KEY, bytes, 'state-write');
   } catch (err) {
     _warnOnce('state-write', '[api] could not persist client state (private mode/quota)', err);
   }
@@ -221,23 +280,11 @@ function _persistState() {
 
 /**
  * Load the persisted secret-free ledger state blob, if any.
+ * @param {string} nodeId
  * @returns {Uint8Array|null}
  */
-function _loadLedgerState() {
-  let b64 = null;
-  try {
-    b64 = window.localStorage.getItem(LEDGER_KEY);
-  } catch (err) {
-    _warnOnce('ledger-read', '[api] localStorage unavailable for ledger state read', err);
-    return null;
-  }
-  if (!b64) return null;
-  try {
-    return _base64ToBytes(b64);
-  } catch (err) {
-    _warnOnce('ledger-decode', '[api] persisted ledger state is malformed; ignoring it', err);
-    return null;
-  }
+function _loadLedgerState(nodeId) {
+  return _loadScopedBlob(LEDGER_KEY, nodeId, 'ledger-read');
 }
 
 /**
@@ -247,7 +294,7 @@ function _persistLedgerState() {
   if (!_clientNode) return;
   try {
     const bytes = _clientNode.export_ledger_state();
-    window.localStorage.setItem(LEDGER_KEY, _bytesToBase64(bytes));
+    _persistScopedBlob(LEDGER_KEY, bytes, 'ledger-write');
   } catch (err) {
     _warnOnce('ledger-write', '[api] could not persist ledger state (private mode/quota)', err);
   }
@@ -260,8 +307,9 @@ function _persistLedgerState() {
 async function _spawnRealNode() {
   const seed = _loadOrCreateIdentity(_wasmModule);
   const node = await _wasmModule.ClientNode.spawn_control(seed);
+  const nodeId = node.endpoint_id();
 
-  const stateBytes = _loadState();
+  const stateBytes = _loadState(nodeId);
   if (stateBytes) {
     try {
       node.import_state(stateBytes);
@@ -270,7 +318,7 @@ async function _spawnRealNode() {
     }
   }
 
-  const ledgerBytes = _loadLedgerState();
+  const ledgerBytes = _loadLedgerState(nodeId);
   if (ledgerBytes) {
     try {
       node.import_ledger_state(ledgerBytes);
@@ -285,6 +333,8 @@ async function _spawnRealNode() {
   // Reflect any restored verified balance in the reactive store immediately.
   _syncLedgerStoreFromStatus();
   _startControlPoller();
+  // Surface a restored/approved join address app-wide before verifying it.
+  _syncJoinStateIntoStore();
   // (Re)verify the persisted balance as soon as an address is known.
   _requestBalanceIfJoined();
   return node;
@@ -367,14 +417,60 @@ function _releaseIdentityLock() {
 // ── Control-event poller ──────────────────────────────────────
 
 /**
+ * Mirror the live join address into `clientState` so an approval accepted
+ * outside the join page propagates app-wide within one poller tick. No-op in
+ * mock mode; never throws.
+ */
+function _syncJoinStateIntoStore() {
+  if (_useMock || !_clientNode) return;
+  let status;
+  try {
+    status = _readJoinStatus(_clientNode);
+  } catch (err) {
+    _warnOnce('join-state-sync', '[api] join status read failed', err);
+    return;
+  }
+  const address = status.address ?? null;
+  if (address !== clientState.address) {
+    clientState.address = address;
+  }
+}
+
+/**
+ * Re-query the balance when the tab becomes visible again. Still subject to
+ * the 1 s throttle in `_requestBalanceIfJoined`.
+ */
+function _onVisibilityChange() {
+  if (typeof document === 'undefined' || document.visibilityState === 'hidden') return;
+  if (_useMock || !_clientNode || clientState.address == null) return;
+  _requestBalanceIfJoined();
+}
+
+/**
  * Start the 2 s control-event drain loop (idempotent).
  */
 function _startControlPoller() {
   if (_controlPoller != null) return;
   _controlPoller = setInterval(() => {
+    _syncJoinStateIntoStore();
     _drainControlEvents();
     _drainLedgerEvents();
+    // Periodic pull so a node-side (CLI) funding is picked up without a reload.
+    if (
+      clientState.address != null &&
+      !(typeof document !== 'undefined' && document.visibilityState === 'hidden')
+    ) {
+      const now = Date.now();
+      if (now - _lastAutoBalanceRefreshAt >= 20000) {
+        _lastAutoBalanceRefreshAt = now;
+        _requestBalanceIfJoined();
+      }
+    }
   }, 2000);
+  if (typeof document !== 'undefined' && _visibilityHandler == null) {
+    _visibilityHandler = _onVisibilityChange;
+    document.addEventListener('visibilitychange', _visibilityHandler);
+  }
 }
 
 /**
@@ -384,6 +480,10 @@ function _stopControlPoller() {
   if (_controlPoller != null) {
     clearInterval(_controlPoller);
     _controlPoller = null;
+  }
+  if (typeof document !== 'undefined' && _visibilityHandler != null) {
+    document.removeEventListener('visibilitychange', _visibilityHandler);
+    _visibilityHandler = null;
   }
 }
 
@@ -700,6 +800,217 @@ export function destroyClient() {
   }
   _pendingSends.clear();
   _releaseIdentityLock();
+}
+
+// ── Portable identity ─────────────────────────────────────────
+
+/**
+ * Tear down the live client without persisting its state. Used before swapping
+ * or wiping an identity so stale state/events can never be written under the
+ * new identity's keys.
+ */
+function _teardownClient() {
+  _stopControlPoller();
+  if (_clientNode) {
+    try {
+      _clientNode.free?.();
+    } catch {
+      /* ignore */
+    }
+    _clientNode = null;
+  }
+  _releaseIdentityLock();
+  _memorySeed = null;
+}
+
+/**
+ * Read the current identity seed as hex, preferring localStorage and falling
+ * back to the in-session seed.
+ * @returns {string|null}
+ */
+function _readStoredSeedHex() {
+  let storedHex = null;
+  try {
+    storedHex = window.localStorage.getItem(IDENTITY_KEY);
+  } catch (err) {
+    _warnOnce('identity-export-read', '[api] localStorage unavailable for identity export', err);
+  }
+  if (typeof storedHex === 'string' && /^[0-9a-fA-F]{64}$/.test(storedHex)) {
+    return storedHex.toLowerCase();
+  }
+  if (_memorySeed) return _bytesToHex(_memorySeed);
+  return null;
+}
+
+/**
+ * Write (or, for a null blob, remove) an identity-scoped base64 blob.
+ * @param {string} base
+ * @param {string} nodeId
+ * @param {string|null} b64
+ */
+function _writeScopedB64(base, nodeId, b64) {
+  try {
+    if (typeof b64 === 'string') {
+      window.localStorage.setItem(_scopedKey(base, nodeId), b64);
+    } else {
+      window.localStorage.removeItem(_scopedKey(base, nodeId));
+    }
+  } catch (err) {
+    _warnOnce(`${base}-import-write`, `[api] could not write ${base} for the imported identity`, err);
+  }
+}
+
+/**
+ * Remove an identity-scoped blob. Best-effort.
+ * @param {string} base
+ * @param {string} nodeId
+ */
+function _removeScopedBlob(base, nodeId) {
+  try {
+    window.localStorage.removeItem(_scopedKey(base, nodeId));
+  } catch (err) {
+    _warnOnce(`${base}-remove`, `[api] could not remove ${base} for the identity`, err);
+  }
+}
+
+/**
+ * Remove the legacy (pre-portability) un-namespaced state/ledger blobs.
+ */
+function _removeLegacyBlobs() {
+  try {
+    window.localStorage.removeItem(STATE_KEY);
+    window.localStorage.removeItem(LEDGER_KEY);
+  } catch (err) {
+    _warnOnce('legacy-remove', '[api] could not remove legacy state/ledger keys', err);
+  }
+}
+
+/**
+ * Encrypt and serialize the current identity (seed + opaque state/ledger blobs)
+ * into a passphrase-protected, portable bundle string.
+ *
+ * Requires a live client and a stored seed. Does not mutate any state.
+ *
+ * @param {string} passphrase
+ * @returns {Promise<string>} Serialized identity bundle.
+ */
+export async function exportIdentityBundle(passphrase) {
+  const node = _requireNode();
+  const seedHex = _readStoredSeedHex();
+  if (!seedHex) {
+    throw new Error('No identity to export. This device has no stored account key.');
+  }
+  const nodeId = node.endpoint_id();
+
+  let stateB64 = null;
+  let ledgerB64 = null;
+  try {
+    const stateBytes = node.export_state();
+    stateB64 = stateBytes ? _bytesToBase64(stateBytes) : null;
+  } catch (err) {
+    _warnOnce('export-state', '[api] export_state failed; exporting the identity without client state', err);
+  }
+  try {
+    const ledgerBytes = node.export_ledger_state();
+    ledgerB64 = ledgerBytes ? _bytesToBase64(ledgerBytes) : null;
+  } catch (err) {
+    _warnOnce('export-ledger', '[api] export_ledger_state failed; exporting the identity without ledger state', err);
+  }
+
+  const bundle = await idb.encryptIdentityBundle({
+    seedHex,
+    stateB64,
+    ledgerB64,
+    nodeId,
+    passphrase,
+  });
+  return idb.serializeIdentityBundle(bundle);
+}
+
+/**
+ * Inspect a serialized bundle's cleartext metadata without decrypting it.
+ *
+ * @param {string} text
+ * @returns {{ version: number, nodeId: string }}
+ */
+export function inspectIdentityBundle(text) {
+  const bundle = idb.parseIdentityBundle(text);
+  const meta = idb.inspectIdentityBundle(bundle);
+  return { version: meta.version, nodeId: meta.nodeId };
+}
+
+/**
+ * Decrypt and install an identity bundle, replacing any current identity.
+ *
+ * Tears the live client down, writes the recovered seed to `cawala.identity.v1`
+ * and the recovered state/ledger blobs under the bundle's `nodeId` keys. Does
+ * NOT reload; the caller reloads so `initApi()` restores the new identity.
+ *
+ * JS cannot derive the endpoint id from an Ed25519 seed without the wasm
+ * client, so the cleartext `nodeId` is trusted here. It is bound into the
+ * AES-GCM AAD, so a tampered value fails decryption before we get this far.
+ *
+ * @param {string} text
+ * @param {string} passphrase
+ * @returns {Promise<{ nodeId: string }>}
+ */
+export async function importIdentityBundle(text, passphrase) {
+  const bundle = idb.parseIdentityBundle(text);
+  const meta = idb.inspectIdentityBundle(bundle);
+  const decrypted = await idb.decryptIdentityBundle(bundle, passphrase);
+
+  if (typeof decrypted.seedHex !== 'string' || !/^[0-9a-fA-F]{64}$/.test(decrypted.seedHex)) {
+    throw new Error('Malformed identity bundle');
+  }
+  const seedHex = decrypted.seedHex.toLowerCase();
+  const nodeId = meta.nodeId;
+
+  // Tear down before writing so nothing from the old identity can leak through.
+  _teardownClient();
+
+  try {
+    window.localStorage.setItem(IDENTITY_KEY, seedHex);
+  } catch (err) {
+    _warnOnce('identity-import-write', '[api] could not persist the imported identity', err);
+  }
+
+  // Never mix blobs across identities: overwrite when present, remove when not.
+  _writeScopedB64(STATE_KEY, nodeId, decrypted.stateB64);
+  _writeScopedB64(LEDGER_KEY, nodeId, decrypted.ledgerB64);
+  _removeLegacyBlobs();
+
+  return { nodeId };
+}
+
+/**
+ * Wipe this device's identity: tear the live client down and remove the seed,
+ * the current identity's state/ledger blobs, and the legacy blobs. Does NOT
+ * reload; the caller reloads to start fresh.
+ *
+ * @returns {Promise<void>}
+ */
+export async function wipeIdentity() {
+  let nodeId = null;
+  if (_clientNode) {
+    try {
+      nodeId = _clientNode.endpoint_id();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  _teardownClient();
+
+  try {
+    window.localStorage.removeItem(IDENTITY_KEY);
+  } catch (err) {
+    _warnOnce('identity-wipe', '[api] could not remove the stored identity', err);
+  }
+  if (nodeId) {
+    _removeScopedBlob(STATE_KEY, nodeId);
+    _removeScopedBlob(LEDGER_KEY, nodeId);
+  }
+  _removeLegacyBlobs();
 }
 
 // ── Identity & connection ─────────────────────────────────────

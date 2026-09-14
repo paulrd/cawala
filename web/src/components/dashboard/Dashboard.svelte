@@ -8,8 +8,8 @@
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
   import EmptyState from '../shared/EmptyState.svelte';
   import ErrorState from '../shared/ErrorState.svelte';
-  import { clientState, ledgerState, nodeState, loadingState, errorState, apiCapabilities } from '../../lib/stores.svelte.js';
-  import { getChildren, getAccounts, getJoinRequests, isMockMode } from '../../lib/api.js';
+  import { clientState, ledgerState, nodeState, loadingState, errorState, apiCapabilities, showToast } from '../../lib/stores.svelte.js';
+  import { getChildren, getAccounts, getJoinRequests, isMockMode, requestBalance } from '../../lib/api.js';
   import { ROUTES } from '../../lib/constants.js';
   import { navigate } from '../../lib/router.svelte.js';
   import { formatDate, timeAgo } from '../../lib/utils.js';
@@ -63,8 +63,23 @@
 
   let isLive = $derived(!isMockMode());
 
+  // Show join CTA when live and not yet joined (no address assigned).
+  let showJoinCta = $derived(isLive && clientState.address == null);
+
   // Live mode: balance availability
   let balanceReady = $derived(isLive && ledgerState.balance != null);
+  let balanceFresh = $derived(
+    ledgerState.verifiedAt != null && (Date.now() - ledgerState.verifiedAt) < 30000
+  );
+  let balanceStale = $derived(
+    ledgerState.verifiedAt != null && (Date.now() - ledgerState.verifiedAt) >= 30000
+  );
+  let balanceUnverified = $derived(ledgerState.balance == null);
+
+  async function handleBalanceRequest() {
+    await requestBalance();
+    showToast('Balance refresh requested', 'info', 2000);
+  }
 
   const childColumns = [
     { key: 'address', label: 'Address', mono: true, sortable: true },
@@ -101,6 +116,23 @@
 
     {#if isLive}
       <!-- ── Live mode: user-leaf dashboard ──────────── -->
+
+      {#if showJoinCta}
+        <div class="join-cta">
+          <div class="join-cta-body">
+            <h3 class="join-cta-title">Join the network</h3>
+            <p class="join-cta-text">You are not connected to a node yet. Paste an invite from a node operator to join.</p>
+            <button
+              type="button"
+              class="btn btn--primary"
+              onclick={() => navigate(ROUTES.JOIN_FLOW)}
+            >
+              Go to Join
+            </button>
+          </div>
+        </div>
+      {/if}
+
       <div class="summary-grid">
         <Card title="My Balance">
           <div class="summary-value">
@@ -113,7 +145,11 @@
           <div class="summary-meta">
             {#if balanceReady}
               <div class="meta-row">
-                <Badge variant="ok" label="Verified" />
+                {#if balanceFresh}
+                  <Badge variant="ok" label="Verified" />
+                {:else if balanceStale}
+                  <Badge variant="warn" label="Stale — re-verifying" />
+                {/if}
                 {#if ledgerState.height != null}
                   <span class="text-sm muted">Height {ledgerState.height}</span>
                 {/if}
@@ -121,8 +157,22 @@
               {#if ledgerState.verifiedAt}
                 <span class="text-xs muted">Last verified: {timeAgo(new Date(ledgerState.verifiedAt))}</span>
               {/if}
+              <button
+                type="button"
+                class="btn btn--ghost btn--sm"
+                onclick={handleBalanceRequest}
+              >
+                Refresh balance
+              </button>
             {:else}
               <span class="text-sm muted">Balance not yet verified. Waiting for a receipt from your leaf.</span>
+              <button
+                type="button"
+                class="btn btn--ghost btn--sm"
+                onclick={handleBalanceRequest}
+              >
+                Request balance
+              </button>
             {/if}
           </div>
         </Card>
@@ -368,6 +418,28 @@
     font-size: var(--text-sm);
     color: var(--muted);
   }
+  .join-cta {
+    padding: var(--sp-6) var(--sp-5);
+    background: var(--bg-raised);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-lg);
+  }
+  .join-cta-body {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--sp-3);
+  }
+  .join-cta-title {
+    font-size: var(--text-base);
+    font-weight: 600;
+    color: var(--fg);
+  }
+  .join-cta-text {
+    font-size: var(--text-sm);
+    color: var(--muted);
+    max-width: 480px;
+  }
 
   /* Shared button styles */
   .btn {
@@ -394,6 +466,10 @@
   }
   .btn--ghost:hover {
     background: var(--bg-hover);
+  }
+  .btn--sm {
+    font-size: var(--text-xs);
+    padding: var(--sp-1) var(--sp-3);
   }
 
   @media (max-width: 767px) {

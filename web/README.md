@@ -95,6 +95,31 @@ running. That is safe: the node's ledger service re-reads and replays the log
 before every mutation and authoritative read, so external appends are picked up
 without a restart.
 
+## Identity portability (move to another device)
+
+A browser user's identity is a 32-byte Ed25519 seed stored in this origin's
+`localStorage`. It is both the iroh endpoint id and the account's operator key,
+so the same seed restores the same address and balance.
+
+**Settings → Identity** provides:
+
+- **Export identity** — encrypts the seed plus the join/ledger state into one
+  passphrase-protected file (`cawala-identity-<id>.json`). The passphrase is
+  never stored and cannot be recovered; anyone with the file *and* passphrase can
+  spend from the account.
+- **Import identity** — paste or load a bundle on another device, preview the
+  incoming endpoint id, confirm, and reload. This replaces the identity on that
+  device.
+- **Remove identity** — deletes this device's local identity (export first).
+
+Cross-device note: using the same identity on two devices at the same time is
+**not prevented**. Run one device at a time; concurrent use can produce confusing
+connection behavior because the relay keeps the most recent connection for an
+endpoint id. Recovery from a lost seed is not available in v1.
+
+Within a single browser, opening a second tab keeps the identity lock held by
+the first tab, so the second tab runs in mock mode by design.
+
 ## Test (manual round-trip checklist)
 
 1. Open the app at the Vite URL (e.g. http://localhost:5173). It should log

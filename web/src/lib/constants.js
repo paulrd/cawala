@@ -134,6 +134,7 @@ export const ROUTES = {
 /** Navigation items for sidebar / mobile nav. */
 export const NAV_ITEMS = [
   { route: ROUTES.DASHBOARD, label: 'Dashboard', icon: 'grid' },
+  { route: ROUTES.JOIN_FLOW, label: 'Join', icon: 'log-in' },
   { route: ROUTES.MY_NODE, label: 'My Node', icon: 'server' },
   { route: ROUTES.ACCOUNTS, label: 'Accounts', icon: 'wallet' },
   { route: ROUTES.ACTIVITY, label: 'Activity', icon: 'list' },
