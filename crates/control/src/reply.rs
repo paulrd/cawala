@@ -12,14 +12,19 @@
 
 use serde::{Deserialize, Serialize};
 
-use cawala_ledger::NodeId;
+use cawala_ledger::{NodeId, OperatorPubKey};
 use cawala_topology::{ChildKind, OctAddr};
 
 /// ALPN negotiated on every direct control connection.
 pub const CONTROL_ALPN: &[u8] = b"cawala/control/0";
 
 /// Wire format version for [`ControlReply`].
-pub const CONTROL_REPLY_VERSION: u8 = 1;
+///
+/// Bumped to 2 when the admin reply variants ([`ControlReply::AdminSnapshot`],
+/// [`ControlReply::AdminApproved`], [`ControlReply::AdminRejected`]) were
+/// appended. There is no on-wire reader pinned to this constant yet; it exists
+/// so a future reader can reject a mismatched frame up front.
+pub const CONTROL_REPLY_VERSION: u8 = 2;
 
 /// The node's answer to one direct control request.
 ///
@@ -34,6 +39,17 @@ pub enum ControlReply {
     Rejected(RejectCode),
     /// Reply to [`ControlRequest::Query`](crate::ControlRequest::Query).
     Snapshot(NodeSnapshot),
+    /// Reply to
+    /// [`ControlRequest::AdminQuery`](crate::ControlRequest::AdminQuery): the
+    /// node snapshot plus the joins awaiting admin approval.
+    AdminSnapshot(AdminSnapshot),
+    /// Reply to
+    /// [`ControlRequest::AdminApproveJoin`](crate::ControlRequest::AdminApproveJoin):
+    /// the approved child was assigned `slot`.
+    AdminApproved(AdminApproved),
+    /// Reply to
+    /// [`ControlRequest::AdminRejectJoin`](crate::ControlRequest::AdminRejectJoin).
+    AdminRejected(AdminRejected),
 }
 
 /// Why a control request was refused.
@@ -61,6 +77,10 @@ pub enum RejectCode {
     NotAttached,
     /// A cross-region move was requested in a context that forbids it.
     CrossRegion,
+    /// The request's `expiry` has passed (`now > expiry`).
+    Expired,
+    /// The request's `nonce` was already seen for this origin.
+    Replay,
     /// An internal error occurred; the request was not applied.
     Internal,
 }
@@ -109,6 +129,69 @@ pub struct ChildSnapshot {
     pub date_joined: u64,
 }
 
+/// The admin view of a node: its control state plus pending joins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminSnapshot {
+    /// The node's ordinary control snapshot.
+    pub node: NodeSnapshot,
+    /// Joins queued for admin approval.
+    pub pending: Vec<AdminPendingJoin>,
+}
+
+/// One join awaiting admin approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminPendingJoin {
+    /// The applicant node id.
+    pub child: NodeId,
+    /// Whether the applicant is a node or a leaf user.
+    pub kind: ChildKind,
+    /// The applicant's operator key.
+    pub operator: OperatorPubKey,
+    /// The slot the applicant asked for, or `None` if it left the choice to the
+    /// parent.
+    pub desired_slot: Option<u8>,
+    /// Unix seconds after which the pending request is stale.
+    pub expiry: u64,
+}
+
+/// An admin-approved join, with the assigned slot and delivery outcome.
+///
+/// The slot is echoed unconditionally (the node always assigns one, even when
+/// the request left `desired_slot` as `None`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminApproved {
+    /// The approved child.
+    pub child: NodeId,
+    /// The slot the child was assigned (`0..=7`).
+    pub slot: u8,
+    /// The child's derived octal address.
+    pub address: OctAddr,
+    /// Whether the approval reached the applicant.
+    pub delivery: DeliveryStatus,
+}
+
+/// An admin-rejected join, with the delivery outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminRejected {
+    /// The rejected child.
+    pub child: NodeId,
+    /// Whether the rejection reached the applicant.
+    pub delivery: DeliveryStatus,
+}
+
+/// Whether the node delivered an admin decision back to the applicant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeliveryStatus {
+    /// The applicant acknowledged the decision.
+    Delivered,
+    /// The applicant could not be reached.
+    Unreachable,
+    /// The applicant refused the decision; see [`RejectCode`].
+    Rejected(RejectCode),
+    /// Delivery timed out.
+    TimedOut,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,9 +213,44 @@ mod tests {
             ControlReply::Rejected(RejectCode::BadRequest),
             ControlReply::Rejected(RejectCode::NotAttached),
             ControlReply::Rejected(RejectCode::CrossRegion),
+            ControlReply::Rejected(RejectCode::Expired),
+            ControlReply::Rejected(RejectCode::Replay),
             ControlReply::Rejected(RejectCode::Internal),
             ControlReply::Snapshot(snapshot()),
+            ControlReply::AdminSnapshot(admin_snapshot()),
+            ControlReply::AdminApproved(AdminApproved {
+                child: node("applicant"),
+                slot: 3,
+                address: "0.3".parse().unwrap(),
+                delivery: DeliveryStatus::Delivered,
+            }),
+            ControlReply::AdminRejected(AdminRejected {
+                child: node("applicant"),
+                delivery: DeliveryStatus::Rejected(RejectCode::Unauthorized),
+            }),
         ]
+    }
+
+    fn admin_snapshot() -> AdminSnapshot {
+        AdminSnapshot {
+            node: snapshot(),
+            pending: vec![
+                AdminPendingJoin {
+                    child: node("applicant"),
+                    kind: ChildKind::Node,
+                    operator: cawala_ledger::OperatorSecretKey::from_bytes([9u8; 32]).public(),
+                    desired_slot: Some(2),
+                    expiry: 1_000,
+                },
+                AdminPendingJoin {
+                    child: node("user-c"),
+                    kind: ChildKind::User,
+                    operator: cawala_ledger::OperatorSecretKey::from_bytes([8u8; 32]).public(),
+                    desired_slot: None,
+                    expiry: 2_000,
+                },
+            ],
+        }
     }
 
     fn snapshot() -> NodeSnapshot {

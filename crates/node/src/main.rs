@@ -4,8 +4,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use cawala_control::{
-    ChildKind, ControlReply, ControlRequest, CreateChild, DetachChild, Invite, JoinRejection,
-    JoinRequest, MoveChild, NodeId, OperatorPubKey, OperatorSecretKey, SetAddress, SignedControl,
+    CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest, CreateChild, DetachChild,
+    Invite, JoinRejection, JoinRequest, MoveChild, NodeId, OperatorPubKey, OperatorSecretKey,
+    SetAddress, SignedControl,
 };
 use cawala_ledger::{AccountRef, Amount, LedgerPubKey};
 use cawala_msg::{MSG_LEDGER_V1, MSG_SETTLE_V1};
@@ -14,9 +15,9 @@ use cawala_node::msg::{
     NeighborSource, dispatch_ledger_envelope, dispatch_settle_envelope, sweep_settlements,
 };
 use cawala_node::{
-    ControlNode, LedgerService, MsgConfig, RoutableSnapshot, SettlementManager, build_envelope,
-    identity, ledger_keys, ledger_service, ledger_store, record, send_envelope, spawn_control_only,
-    spawn_with_secret_key,
+    ControlNode, LedgerService, MsgConfig, RoutableSnapshot, SettlementManager, admin_cli,
+    build_envelope, identity, ledger_keys, ledger_service, ledger_store, record, send_envelope,
+    spawn_control_only, spawn_with_secret_key,
 };
 use cawala_topology::OctAddr;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -205,6 +206,39 @@ enum ControlCommand {
         #[arg(long, value_name = "ENDPOINT_ID")]
         node: String,
     },
+    /// Manage this node's admin grants (operator-signed delegations).
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
+}
+
+/// `control admin` subcommands, backed by [`admin_cli`].
+///
+/// These are **local** operator commands: they edit `<data-dir>/admins.json`
+/// directly (no network). Grant/revoke sign with this node's operator key.
+#[derive(Subcommand)]
+enum AdminCommand {
+    /// Grant an operator key administrative authority over this node.
+    Grant {
+        /// The admin's operator public key, hex (64 chars).
+        #[arg(long, value_name = "OPERATOR_HEX")]
+        key: String,
+        /// Unix-seconds expiry; omitted defaults to 7 days from now.
+        #[arg(long, value_name = "EPOCH_SECONDS")]
+        expiry: Option<u64>,
+        /// Human-readable label (at most 64 bytes).
+        #[arg(long, value_name = "LABEL")]
+        label: Option<String>,
+    },
+    /// Revoke an operator key's administrative authority.
+    Revoke {
+        /// The admin's operator public key, hex (64 chars).
+        #[arg(long, value_name = "OPERATOR_HEX")]
+        key: String,
+    },
+    /// List this node's admin grants.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -380,8 +414,7 @@ async fn run(data_dir: PathBuf) -> Result<()> {
         let config = MsgConfig::default();
         // Live routing view: re-reads node.json per message so a `control
         // approve` performed in another process is observed without a restart.
-        let source =
-            NeighborSource::live(&data_dir, &node_id, std::collections::HashMap::new())?;
+        let source = NeighborSource::live(&data_dir, &node_id, std::collections::HashMap::new())?;
         let ledger = Arc::new(Mutex::new(LedgerService::open(&data_dir, &node_id)?));
         let manager = Arc::new(Mutex::new(SettlementManager::new()));
 
@@ -595,7 +628,11 @@ fn ledger(data_dir: &std::path::Path, command: LedgerCommand) -> Result<()> {
             println!("balance: {}", service.balance_of(&to_id));
             println!(
                 "parent_balance: {}",
-                service.ledger().balances().parent_balance().unwrap_or(Amount::ZERO)
+                service
+                    .ledger()
+                    .balances()
+                    .parent_balance()
+                    .unwrap_or(Amount::ZERO)
             );
         }
     }
@@ -771,6 +808,11 @@ fn now_unix_seconds() -> u64 {
         .unwrap_or(0)
 }
 
+/// A fresh control-request nonce from the OS randomness source.
+fn fresh_nonce() -> u64 {
+    getrandom::u64().unwrap_or_else(|_| now_unix_seconds())
+}
+
 /// Send one `cawala/msg/0` envelope.
 async fn msg_command(data_dir: &std::path::Path, command: MsgCommand) -> Result<()> {
     match command {
@@ -897,8 +939,13 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
             };
             let mut engine = ControlNode::open(data_dir, &node_id, operator.clone())?;
             engine.begin_outbound_join(request.clone(), parent_id.clone(), pinned_operator)?;
-            let signed =
-                SignedControl::authorize(me.clone(), &operator, ControlRequest::Join(request))?;
+            let signed = SignedControl::authorize(
+                me.clone(),
+                &operator,
+                fresh_nonce(),
+                now.saturating_add(CONTROL_REQUEST_TTL_SECS),
+                ControlRequest::Join(request),
+            )?;
             let reply = match target {
                 Some(target) => send_control_addr(&secret_key, target, &signed).await?,
                 None => send_control(&secret_key, &parent_id.to_string(), &signed).await?,
@@ -974,11 +1021,13 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
                 service.ensure_account_open(&NodeId::from(node.clone()), ChildKind::User)?;
             }
             let parent_ledger = service.ledger_key_public();
-            let approval =
-                engine.approve_pending(&node, slot, now_unix_seconds(), parent_ledger)?;
+            let now = now_unix_seconds();
+            let approval = engine.approve_pending(&node, slot, now, parent_ledger)?;
             let signed = SignedControl::authorize(
                 me.clone(),
                 &operator,
+                fresh_nonce(),
+                now.saturating_add(CONTROL_REQUEST_TTL_SECS),
                 ControlRequest::JoinApproved(approval),
             )?;
             let reply = send_control(&secret_key, &node, &signed).await?;
@@ -1000,6 +1049,8 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
             let signed = SignedControl::authorize(
                 me.clone(),
                 &operator,
+                fresh_nonce(),
+                now_unix_seconds().saturating_add(CONTROL_REQUEST_TTL_SECS),
                 ControlRequest::JoinRejected(rejection),
             )?;
             let reply = send_control(&secret_key, &node, &signed).await?;
@@ -1050,6 +1101,50 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
         ControlCommand::Query { node } => {
             send_control_command(&secret_key, &node, me, &operator, ControlRequest::Query).await?;
         }
+        ControlCommand::Admin { command } => {
+            admin_command(data_dir, &node_id, &operator, command)?;
+        }
+    }
+    Ok(())
+}
+
+/// Local `control admin grant|revoke|list`, delegating to [`admin_cli`].
+fn admin_command(
+    data_dir: &std::path::Path,
+    node_id: &str,
+    operator: &OperatorSecretKey,
+    command: AdminCommand,
+) -> Result<()> {
+    match command {
+        AdminCommand::Grant { key, expiry, label } => {
+            let admin = parse_operator_pubkey(&key)?;
+            let now = now_unix_seconds();
+            let outcome = admin_cli::grant(data_dir, node_id, operator, admin, expiry, label, now)
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
+            println!(
+                "granted admin={} scope=admin expires={}",
+                outcome.admin, outcome.expiry
+            );
+            println!("node {node_id}: add this admin key in Settings -> Node administration.");
+        }
+        AdminCommand::Revoke { key } => {
+            let admin = parse_operator_pubkey(&key)?;
+            admin_cli::revoke(data_dir, node_id, operator, &admin)
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
+            println!("revoked admin={admin}");
+        }
+        AdminCommand::List => {
+            let entries = admin_cli::list(data_dir, node_id, operator)
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
+            if entries.is_empty() {
+                println!("no admins");
+            } else {
+                let now = now_unix_seconds();
+                for entry in &entries {
+                    println!("{}", entry.render(now));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1062,7 +1157,13 @@ async fn send_control_command(
     operator: &OperatorSecretKey,
     request: ControlRequest,
 ) -> Result<()> {
-    let signed = SignedControl::authorize(origin, operator, request)?;
+    let signed = SignedControl::authorize(
+        origin,
+        operator,
+        fresh_nonce(),
+        now_unix_seconds().saturating_add(CONTROL_REQUEST_TTL_SECS),
+        request,
+    )?;
     let reply = send_control(secret_key, target, &signed).await?;
     print_reply(&reply);
     Ok(())
@@ -1123,6 +1224,37 @@ fn print_reply(reply: &ControlReply) {
         ControlReply::Pending => println!("pending"),
         ControlReply::Rejected(code) => println!("rejected: {code:?}"),
         ControlReply::Snapshot(snapshot) => print_snapshot(snapshot),
+        ControlReply::AdminSnapshot(snapshot) => print_admin_snapshot(snapshot),
+        ControlReply::AdminApproved(approved) => println!(
+            "admin-approved: child={} slot={} address={} delivery={:?}",
+            approved.child, approved.slot, approved.address, approved.delivery
+        ),
+        ControlReply::AdminRejected(rejected) => {
+            println!(
+                "admin-rejected: child={} delivery={:?}",
+                rejected.child, rejected.delivery
+            )
+        }
+    }
+}
+
+fn print_admin_snapshot(snapshot: &cawala_control::AdminSnapshot) {
+    print_snapshot(&snapshot.node);
+    if snapshot.pending.is_empty() {
+        println!("pending: (none)");
+    } else {
+        for pending in &snapshot.pending {
+            println!(
+                "pending: {} kind={} operator={} slot={} expiry={}",
+                pending.child,
+                kind_name(pending.kind),
+                pending.operator,
+                pending
+                    .desired_slot
+                    .map_or_else(|| "auto".to_string(), |slot| slot.to_string()),
+                pending.expiry,
+            );
+        }
     }
 }
 

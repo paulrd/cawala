@@ -6,7 +6,10 @@
 //! strings, and the `ChildKind`/`RejectCode` enums become stable strings rather
 //! than `Debug` renderings.
 
-use cawala_control::{ChildKind, Invite, NodeId, OperatorPubKey, RejectCode};
+use cawala_control::{
+    AdminApproved, AdminPendingJoin, AdminRejected, AdminSnapshot, ChildKind, DeliveryStatus,
+    Invite, NodeId, NodeSnapshot, OperatorPubKey, RejectCode,
+};
 use cawala_ledger::Hash;
 use cawala_msg::OctAddr;
 use wasm_bindgen::{JsError, prelude::wasm_bindgen};
@@ -45,7 +48,22 @@ pub(crate) fn reject_code_str(code: RejectCode) -> &'static str {
         RejectCode::BadRequest => "bad_request",
         RejectCode::NotAttached => "not_attached",
         RejectCode::CrossRegion => "cross_region",
+        RejectCode::Expired => "expired",
+        RejectCode::Replay => "replay",
         RejectCode::Internal => "internal",
+    }
+}
+
+/// Stable JS string for a [`DeliveryStatus`].
+///
+/// A `Rejected` outcome embeds its stable reject code, e.g.
+/// `"rejected:unauthorized"`.
+pub(crate) fn delivery_status_str(status: &DeliveryStatus) -> String {
+    match status {
+        DeliveryStatus::Delivered => "delivered".to_string(),
+        DeliveryStatus::Unreachable => "unreachable".to_string(),
+        DeliveryStatus::TimedOut => "timed_out".to_string(),
+        DeliveryStatus::Rejected(code) => format!("rejected:{}", reject_code_str(*code)),
     }
 }
 
@@ -351,7 +369,10 @@ pub struct PaymentOutcome {
 impl PaymentOutcome {
     /// Build an outcome from the order hash and the leaf's ack bucket.
     pub(crate) fn new(order_hash_hex: String, ack: String) -> Self {
-        PaymentOutcome { order_hash_hex, ack }
+        PaymentOutcome {
+            order_hash_hex,
+            ack,
+        }
     }
 }
 
@@ -675,6 +696,7 @@ impl ChildDto {
 
 /// A snapshot of this client's local topology, for the PWA.
 #[wasm_bindgen]
+#[derive(Clone)]
 pub struct SnapshotDto {
     node_id: String,
     address: Option<String>,
@@ -715,6 +737,31 @@ impl SnapshotDto {
             children,
         }
     }
+
+    /// Build a snapshot from a remote node's [`NodeSnapshot`] (an admin query
+    /// reply), where addresses are already materialized rather than derived.
+    pub(crate) fn from_node_snapshot(snapshot: &NodeSnapshot) -> Self {
+        SnapshotDto {
+            node_id: snapshot.node_id.as_str().to_string(),
+            address: snapshot.address.as_ref().map(|address| address.to_string()),
+            parent: snapshot.parent.as_ref().map(|parent| ParentDto {
+                node_id: parent.node_id.as_str().to_string(),
+                slot: parent.slot,
+                address: parent.address.to_string(),
+            }),
+            children: snapshot
+                .children
+                .iter()
+                .map(|child| ChildDto {
+                    child_id: child.child_id.as_str().to_string(),
+                    kind: child_kind_str(child.kind).to_string(),
+                    slot: child.slot,
+                    address: child.address.as_ref().map(|address| address.to_string()),
+                    date_joined: child.date_joined as f64,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[wasm_bindgen]
@@ -741,6 +788,160 @@ impl SnapshotDto {
     #[wasm_bindgen(getter)]
     pub fn children(&self) -> Vec<ChildDto> {
         self.children.clone()
+    }
+}
+
+/// One join awaiting admin approval, as returned by
+/// [`crate::ClientNode::admin_query`].
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct AdminPendingJoinDto {
+    child_id: String,
+    kind: String,
+    operator: String,
+    desired_slot: Option<u8>,
+    expiry: f64,
+}
+
+impl AdminPendingJoinDto {
+    /// Convert one wire pending-join row.
+    pub(crate) fn from_pending(pending: &AdminPendingJoin) -> Self {
+        AdminPendingJoinDto {
+            child_id: pending.child.as_str().to_string(),
+            kind: child_kind_str(pending.kind).to_string(),
+            operator: pending.operator.to_string(),
+            desired_slot: pending.desired_slot,
+            expiry: pending.expiry as f64,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl AdminPendingJoinDto {
+    /// The applicant's node id.
+    #[wasm_bindgen(getter)]
+    pub fn child_id(&self) -> String {
+        self.child_id.clone()
+    }
+
+    /// `"node"` or `"user"`.
+    #[wasm_bindgen(getter)]
+    pub fn kind(&self) -> String {
+        self.kind.clone()
+    }
+
+    /// The applicant's operator public key as 64 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn operator(&self) -> String {
+        self.operator.clone()
+    }
+
+    /// The requested slot (`0..=7`), or `None` when the parent picks.
+    #[wasm_bindgen(getter)]
+    pub fn desired_slot(&self) -> Option<u8> {
+        self.desired_slot
+    }
+
+    /// Unix-seconds expiry (as an `f64`; never a raw `u64`).
+    #[wasm_bindgen(getter)]
+    pub fn expiry(&self) -> f64 {
+        self.expiry
+    }
+}
+
+/// An admin view of a node: its topology snapshot plus pending joins.
+#[wasm_bindgen]
+pub struct AdminSnapshotDto {
+    node: SnapshotDto,
+    pending: Vec<AdminPendingJoinDto>,
+}
+
+impl AdminSnapshotDto {
+    /// Convert an `AdminSnapshot` reply.
+    pub(crate) fn from_snapshot(snapshot: &AdminSnapshot) -> Self {
+        AdminSnapshotDto {
+            node: SnapshotDto::from_node_snapshot(&snapshot.node),
+            pending: snapshot
+                .pending
+                .iter()
+                .map(AdminPendingJoinDto::from_pending)
+                .collect(),
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl AdminSnapshotDto {
+    /// The node's topology snapshot.
+    #[wasm_bindgen(getter)]
+    pub fn node(&self) -> SnapshotDto {
+        self.node.clone()
+    }
+
+    /// The joins awaiting admin approval.
+    #[wasm_bindgen(getter)]
+    pub fn pending(&self) -> Vec<AdminPendingJoinDto> {
+        self.pending.clone()
+    }
+}
+
+/// The result of an admin approve/reject/redeliver action.
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct AdminActionDto {
+    child: String,
+    slot: Option<u8>,
+    address: Option<String>,
+    delivery: String,
+}
+
+impl AdminActionDto {
+    /// Convert an `AdminApproved` reply.
+    pub(crate) fn from_approved(approved: &AdminApproved) -> Self {
+        AdminActionDto {
+            child: approved.child.as_str().to_string(),
+            slot: Some(approved.slot),
+            address: Some(approved.address.to_string()),
+            delivery: delivery_status_str(&approved.delivery),
+        }
+    }
+
+    /// Convert an `AdminRejected` reply.
+    pub(crate) fn from_rejected(rejected: &AdminRejected) -> Self {
+        AdminActionDto {
+            child: rejected.child.as_str().to_string(),
+            slot: None,
+            address: None,
+            delivery: delivery_status_str(&rejected.delivery),
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl AdminActionDto {
+    /// The affected child node id.
+    #[wasm_bindgen(getter)]
+    pub fn child(&self) -> String {
+        self.child.clone()
+    }
+
+    /// The assigned slot, for an approval.
+    #[wasm_bindgen(getter)]
+    pub fn slot(&self) -> Option<u8> {
+        self.slot
+    }
+
+    /// The child's derived address, for an approval.
+    #[wasm_bindgen(getter)]
+    pub fn address(&self) -> Option<String> {
+        self.address.clone()
+    }
+
+    /// The applicant's view of delivery: `"delivered"`, `"unreachable"`,
+    /// `"timed_out"`, or `"rejected:<code>"`.
+    #[wasm_bindgen(getter)]
+    pub fn delivery(&self) -> String {
+        self.delivery.clone()
     }
 }
 
@@ -939,9 +1140,104 @@ mod tests {
             "slot_out_of_range"
         );
         assert_eq!(reject_code_str(RejectCode::NotAttached), "not_attached");
+        assert_eq!(reject_code_str(RejectCode::Expired), "expired");
+        assert_eq!(reject_code_str(RejectCode::Replay), "replay");
         assert_eq!(reject_code_str(RejectCode::Internal), "internal");
         assert_eq!(child_kind_str(ChildKind::Node), "node");
         assert_eq!(child_kind_str(ChildKind::User), "user");
+    }
+
+    #[test]
+    fn delivery_status_strings_are_stable() {
+        assert_eq!(delivery_status_str(&DeliveryStatus::Delivered), "delivered");
+        assert_eq!(
+            delivery_status_str(&DeliveryStatus::Unreachable),
+            "unreachable"
+        );
+        assert_eq!(delivery_status_str(&DeliveryStatus::TimedOut), "timed_out");
+        assert_eq!(
+            delivery_status_str(&DeliveryStatus::Rejected(RejectCode::Expired)),
+            "rejected:expired"
+        );
+        assert_eq!(
+            delivery_status_str(&DeliveryStatus::Rejected(RejectCode::Replay)),
+            "rejected:replay"
+        );
+    }
+
+    #[test]
+    fn admin_snapshot_dto_maps_node_and_pending() {
+        let snapshot = AdminSnapshot {
+            node: NodeSnapshot {
+                node_id: node("parent"),
+                address: Some("0.3".parse().unwrap()),
+                parent: Some(cawala_control::ParentSnapshot {
+                    node_id: node("grandparent"),
+                    slot: 3,
+                    address: "0".parse().unwrap(),
+                }),
+                children: vec![cawala_control::ChildSnapshot {
+                    child_id: node("kid"),
+                    kind: ChildKind::Node,
+                    slot: 1,
+                    address: Some("0.3.1".parse().unwrap()),
+                    date_joined: 42,
+                }],
+            },
+            pending: vec![AdminPendingJoin {
+                child: node("applicant"),
+                kind: ChildKind::User,
+                operator: operator(5).public(),
+                desired_slot: Some(2),
+                expiry: 1_700_000_000,
+            }],
+        };
+
+        let dto = AdminSnapshotDto::from_snapshot(&snapshot);
+        assert_eq!(dto.node.node_id, "parent");
+        assert_eq!(dto.node.address.as_deref(), Some("0.3"));
+        let parent = dto.node.parent.as_ref().unwrap();
+        assert_eq!(parent.node_id, "grandparent");
+        assert_eq!(parent.slot, 3);
+        assert_eq!(parent.address, "0");
+        assert_eq!(dto.node.children.len(), 1);
+        assert_eq!(dto.node.children[0].child_id, "kid");
+        assert_eq!(dto.node.children[0].kind, "node");
+        assert_eq!(dto.node.children[0].address.as_deref(), Some("0.3.1"));
+
+        assert_eq!(dto.pending.len(), 1);
+        let pending = &dto.pending[0];
+        assert_eq!(pending.child_id, "applicant");
+        assert_eq!(pending.kind, "user");
+        assert_eq!(pending.operator, operator(5).public().to_string());
+        assert_eq!(pending.operator.len(), 64);
+        assert_eq!(pending.desired_slot, Some(2));
+        assert_eq!(pending.expiry, 1_700_000_000.0);
+    }
+
+    #[test]
+    fn admin_action_dto_maps_approved_and_rejected() {
+        let approved = AdminApproved {
+            child: node("applicant"),
+            slot: 2,
+            address: "0.2".parse().unwrap(),
+            delivery: DeliveryStatus::Delivered,
+        };
+        let dto = AdminActionDto::from_approved(&approved);
+        assert_eq!(dto.child, "applicant");
+        assert_eq!(dto.slot, Some(2));
+        assert_eq!(dto.address.as_deref(), Some("0.2"));
+        assert_eq!(dto.delivery, "delivered");
+
+        let rejected = AdminRejected {
+            child: node("applicant"),
+            delivery: DeliveryStatus::Rejected(RejectCode::Unauthorized),
+        };
+        let dto = AdminActionDto::from_rejected(&rejected);
+        assert_eq!(dto.child, "applicant");
+        assert_eq!(dto.slot, None);
+        assert_eq!(dto.address, None);
+        assert_eq!(dto.delivery, "rejected:unauthorized");
     }
 
     #[test]
@@ -1060,9 +1356,7 @@ mod tests {
     #[test]
     fn ledger_status_dto_reports_counts_and_pin() {
         let mut state = LedgerStateV1::new();
-        state.pinned_ledger = Some(
-            cawala_ledger::LedgerSecretKey::from_bytes([3u8; 32]).public(),
-        );
+        state.pinned_ledger = Some(cawala_ledger::LedgerSecretKey::from_bytes([3u8; 32]).public());
         state.balance = Some(VerifiedBalanceV1 {
             amount: 55,
             height: 4,

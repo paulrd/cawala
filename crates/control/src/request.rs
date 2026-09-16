@@ -26,7 +26,8 @@ pub const MAX_NODE_ID_LEN: usize = 128;
 /// authoritative; it only needs to be long enough for a coordinate string.
 pub const MAX_LOCATION_HINT_LEN: usize = 256;
 
-/// Maximum accepted length, in bytes, of [`JoinRejection::reason`].
+/// Maximum accepted length, in bytes, of [`JoinRejection::reason`] and
+/// [`AdminJoinReject::reason`].
 pub const MAX_REASON_LEN: usize = 256;
 
 /// An applicant's request to join the network under a parent node.
@@ -224,6 +225,109 @@ pub struct SetAddress {
     pub address: Option<OctAddr>,
 }
 
+/// An admin's approval of a join that a node queued for approval.
+///
+/// The enclosing [`SignedControl`](crate::SignedControl) must be signed by the
+/// node's registered operator key; the node additionally requires that key to
+/// hold an active [`AdminGrant`](crate::AdminGrant) before applying this.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminJoinApprove {
+    /// The pending child to approve.
+    pub child: NodeId,
+    /// Explicit slot (`0..=7`), or `None` to let the node pick.
+    pub slot: Option<u8>,
+}
+
+impl AdminJoinApprove {
+    /// Check the child-id length bound and, when present, the slot range.
+    ///
+    /// `child` must be at most [`MAX_NODE_ID_LEN`] bytes and `slot`, when
+    /// present, must be in `0..=7`; whether the child is actually pending is
+    /// the node's concern.
+    pub fn validate(&self) -> Result<(), ControlError> {
+        let child_len = self.child.as_str().len();
+        if child_len > MAX_NODE_ID_LEN {
+            return Err(ControlError::FieldTooLong {
+                field: "child",
+                len: child_len,
+                max: MAX_NODE_ID_LEN,
+            });
+        }
+        if let Some(slot) = self.slot
+            && slot > MAX_SLOT
+        {
+            return Err(ControlError::SlotOutOfRange(slot));
+        }
+        Ok(())
+    }
+}
+
+/// An admin's refusal of a join that a node queued for approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminJoinReject {
+    /// The pending child to reject.
+    pub child: NodeId,
+    /// Optional human-readable reason.
+    pub reason: Option<String>,
+}
+
+impl AdminJoinReject {
+    /// Check the child-id and reason length bounds.
+    ///
+    /// `child` must be at most [`MAX_NODE_ID_LEN`] bytes and `reason`, when
+    /// present, at most [`MAX_REASON_LEN`] bytes.
+    pub fn validate(&self) -> Result<(), ControlError> {
+        let child_len = self.child.as_str().len();
+        if child_len > MAX_NODE_ID_LEN {
+            return Err(ControlError::FieldTooLong {
+                field: "child",
+                len: child_len,
+                max: MAX_NODE_ID_LEN,
+            });
+        }
+        if let Some(reason) = &self.reason
+            && reason.len() > MAX_REASON_LEN
+        {
+            return Err(ControlError::FieldTooLong {
+                field: "reason",
+                len: reason.len(),
+                max: MAX_REASON_LEN,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// An admin's request to re-send the stored decision for one child.
+///
+/// A node keeps the operator-signed `JoinApproved`/`JoinRejected` it most
+/// recently issued per child; this asks it to deliver that decision again
+/// (e.g. after the applicant missed it). The stored frame is re-sent as-is; the
+/// applicant matches it by the echoed `JoinRequest.nonce`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminRedeliverJoin {
+    /// The child whose last decision should be re-sent.
+    pub child: NodeId,
+}
+
+impl AdminRedeliverJoin {
+    /// Check the child-id length bound.
+    ///
+    /// `child` must be at most [`MAX_NODE_ID_LEN`] bytes; whether a decision is
+    /// actually stored is the node's concern.
+    pub fn validate(&self) -> Result<(), ControlError> {
+        let child_len = self.child.as_str().len();
+        if child_len > MAX_NODE_ID_LEN {
+            return Err(ControlError::FieldTooLong {
+                field: "child",
+                len: child_len,
+                max: MAX_NODE_ID_LEN,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// The v1 control-request payload.
 ///
 /// Variant order is frozen: postcard encodes the discriminant positionally.
@@ -245,6 +349,14 @@ pub enum ControlRequest {
     SetAddress(SetAddress),
     /// Read-only: the target replies with its state and balances.
     Query,
+    /// Read-only admin view: pending joins and admin state.
+    AdminQuery,
+    /// Approve a pending join as the node's admin.
+    AdminApproveJoin(AdminJoinApprove),
+    /// Reject a pending join as the node's admin.
+    AdminRejectJoin(AdminJoinReject),
+    /// Re-send the stored decision for a child as the node's admin.
+    AdminRedeliverJoin(AdminRedeliverJoin),
 }
 
 impl ControlRequest {
@@ -259,8 +371,32 @@ impl ControlRequest {
             ControlRequest::MoveChild(_) => "move-child",
             ControlRequest::SetAddress(_) => "set-address",
             ControlRequest::Query => "query",
+            ControlRequest::AdminQuery => "admin-query",
+            ControlRequest::AdminApproveJoin(_) => "admin-approve-join",
+            ControlRequest::AdminRejectJoin(_) => "admin-reject-join",
+            ControlRequest::AdminRedeliverJoin(_) => "admin-redeliver-join",
         }
     }
+
+    /// Whether this is one of the admin-only variants.
+    pub fn is_admin(&self) -> bool {
+        matches!(
+            self,
+            ControlRequest::AdminQuery
+                | ControlRequest::AdminApproveJoin(_)
+                | ControlRequest::AdminRejectJoin(_)
+                | ControlRequest::AdminRedeliverJoin(_)
+        )
+    }
+}
+
+/// Whether `request` is one of the admin-only variants.
+///
+/// Admin requests are authenticated like any other control request, but are
+/// authorised only when the signing operator holds an active
+/// [`AdminGrant`](crate::AdminGrant) scoped to the `origin` node.
+pub fn is_admin_request(request: &ControlRequest) -> bool {
+    request.is_admin()
 }
 
 #[cfg(test)]
@@ -332,6 +468,18 @@ mod tests {
                 address: Some("0.3".parse().unwrap()),
             }),
             ControlRequest::Query,
+            ControlRequest::AdminQuery,
+            ControlRequest::AdminApproveJoin(AdminJoinApprove {
+                child: node("applicant"),
+                slot: Some(3),
+            }),
+            ControlRequest::AdminRejectJoin(AdminJoinReject {
+                child: node("applicant"),
+                reason: Some("denied".to_string()),
+            }),
+            ControlRequest::AdminRedeliverJoin(AdminRedeliverJoin {
+                child: node("applicant"),
+            }),
         ]
     }
 
@@ -349,7 +497,129 @@ mod tests {
                 "move-child",
                 "set-address",
                 "query",
+                "admin-query",
+                "admin-approve-join",
+                "admin-reject-join",
+                "admin-redeliver-join",
             ]
+        );
+    }
+
+    #[test]
+    fn is_admin_only_matches_admin_variants() {
+        for request in sample_requests() {
+            let expected = matches!(
+                request,
+                ControlRequest::AdminQuery
+                    | ControlRequest::AdminApproveJoin(_)
+                    | ControlRequest::AdminRejectJoin(_)
+                    | ControlRequest::AdminRedeliverJoin(_)
+            );
+            assert_eq!(request.is_admin(), expected, "{request:?}");
+            assert_eq!(is_admin_request(&request), expected, "{request:?}");
+        }
+    }
+
+    #[test]
+    fn admin_approve_join_validate_enforces_bounds() {
+        let valid = AdminJoinApprove {
+            child: node("applicant"),
+            slot: Some(MAX_SLOT),
+        };
+        assert_eq!(valid.validate(), Ok(()));
+
+        // `None` is always acceptable.
+        let auto = AdminJoinApprove {
+            child: node("applicant"),
+            slot: None,
+        };
+        assert_eq!(auto.validate(), Ok(()));
+
+        let bad_slot = AdminJoinApprove {
+            child: node("applicant"),
+            slot: Some(MAX_SLOT + 1),
+        };
+        assert_eq!(
+            bad_slot.validate(),
+            Err(ControlError::SlotOutOfRange(MAX_SLOT + 1))
+        );
+
+        let long_child = AdminJoinApprove {
+            child: node(&"n".repeat(MAX_NODE_ID_LEN + 1)),
+            slot: None,
+        };
+        assert_eq!(
+            long_child.validate(),
+            Err(ControlError::FieldTooLong {
+                field: "child",
+                len: MAX_NODE_ID_LEN + 1,
+                max: MAX_NODE_ID_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn admin_reject_join_validate_enforces_bounds() {
+        let valid = AdminJoinReject {
+            child: node("applicant"),
+            reason: Some("x".repeat(MAX_REASON_LEN)),
+        };
+        assert_eq!(valid.validate(), Ok(()));
+
+        // `None` reason is acceptable.
+        let bare = AdminJoinReject {
+            child: node("applicant"),
+            reason: None,
+        };
+        assert_eq!(bare.validate(), Ok(()));
+
+        let long_reason = AdminJoinReject {
+            child: node("applicant"),
+            reason: Some("x".repeat(MAX_REASON_LEN + 1)),
+        };
+        assert_eq!(
+            long_reason.validate(),
+            Err(ControlError::FieldTooLong {
+                field: "reason",
+                len: MAX_REASON_LEN + 1,
+                max: MAX_REASON_LEN,
+            })
+        );
+
+        let long_child = AdminJoinReject {
+            child: node(&"n".repeat(MAX_NODE_ID_LEN + 1)),
+            reason: None,
+        };
+        assert_eq!(
+            long_child.validate(),
+            Err(ControlError::FieldTooLong {
+                field: "child",
+                len: MAX_NODE_ID_LEN + 1,
+                max: MAX_NODE_ID_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn admin_redeliver_join_validate_enforces_bounds() {
+        assert_eq!(
+            AdminRedeliverJoin {
+                child: node("applicant")
+            }
+            .validate(),
+            Ok(())
+        );
+
+        let long_child = AdminRedeliverJoin {
+            child: node(&"n".repeat(MAX_NODE_ID_LEN + 1)),
+        };
+        assert_eq!(
+            long_child.validate(),
+            Err(ControlError::FieldTooLong {
+                field: "child",
+                len: MAX_NODE_ID_LEN + 1,
+                max: MAX_NODE_ID_LEN,
+            })
         );
     }
 

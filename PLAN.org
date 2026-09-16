@@ -358,6 +358,87 @@
   6. *M5 - Hardening*: exit rights, foster-parent recovery, compromise-path
      docs, audit tooling, governance/regulatory surface (Hawala exposure is
      real - community question, not code).
+     - Browser identity portability (increment 1, DONE `58f725e`): the browser
+       user's 32-byte seed is both the iroh endpoint id and the operator key, so
+       moving the seed moves the account. Settings exports a passphrase-encrypted
+       `IdentityBundleV1` (PBKDF2-SHA-256 600k -> AES-256-GCM, nodeId bound as
+       AAD) carrying the seed plus the secret-free join/ledger state, and imports
+       it on another device; the state blob must travel with the seed because
+       re-joining an existing NodeId is rejected (`DuplicatePeer`). Storage is
+       identity-scoped, with a one-time fallback to the legacy un-namespaced
+       keys. Client-side only; no protocol change. `web/test` covers round-trip,
+       wrong-passphrase, tamper/AAD, and a no-seed-in-plaintext guard.
+     - Decision: encrypt the exported file only (no at-rest localStorage
+       encryption in v1); concurrent use of one identity across devices is NOT
+       enforced (relays last-connect-wins with no app-visible signal) and is
+       documented rather than implied. Deferred: a human-transcribable recovery
+       phrase (same seed, different encoding) and the account-key vs
+       per-device-key split (`PeerRef.node` is an EndpointId everywhere;
+       post-v1).
+     - Owed: lost-seed recovery is custodial by nature - the account is keyed by
+       the NodeId, so a parent/quorum would authorize a re-key. Needs a control
+       request variant + `CONTROL_FORMAT_VERSION` bump, a control replay
+       nonce/expiry (none exists today; only joins echo one), and a
+       `PeerRegistry` update/remove primitive (today only a rebuild workaround
+       exists). Old-key-signed rotation is safe but does not cover loss; decide
+       who holds recovery authority, the delay, and the audit trail. Optional
+       hardening: derive the endpoint id from the seed in `client-wasm` so import
+       can verify the cleartext nodeId.
+     - Browser admin control (increment 1, DONE): a **delegated admin key**
+       `K_admin`. The browser sends `AdminQuery` / `AdminApproveJoin` /
+       `AdminRejectJoin` to a node it has been granted; the **node** re-signs and
+       delivers the applicant-facing `JoinApproved` / `JoinRejected` with its own
+       operator key (required - the applicant pins the invite operator and
+       nonce/parent/child, so a browser-signed approval is rejected;
+       `node/src/control.rs` `handle_join_approved`, `client-wasm/src/state.rs`
+       `on_join_approved`). `CONTROL_FORMAT_VERSION` 3: `SignedControl` gains
+       `nonce` + `expiry` (signed preimage); `ControlRequest`/`ControlReply` gain
+       admin variants (append-only, postcard order frozen); an operator-signed
+       `AdminGrant {node, admin, scope, granted_at, expiry, label}`. Authority is
+       a node-local `admins.json` (NOT `PeerRegistry`, which cannot hold a second
+       operator per NodeId); a delegated controller may only reach the three
+       admin requests (never topology/issue/self `Query`). Replay: per-node
+       `msg::SeenSet` keyed `(origin, controller)`; request TTL 120 s client /
+       300 s server cap. CLI `control admin grant|revoke|list`.
+     - Admin decisions: grant TTL 7 d default / 30 d hard max (no "never");
+       user account open stays lazy (materialized by `ledger fund`/first issue -
+       the browser path deliberately does not couple `LedgerService` into the
+       control handler); approval delivery retries (`AdminRedeliverJoin` + a
+       bounded in-memory child->approval map) so an unreachable applicant is not
+       left attached-but-uninformed; admin keys are device-local and are cleared
+       on identity wipe. Audit: `<data-dir>/control_audit.jsonl` (grant/revoke/
+       request/delivery).
+     - Built: control v3 (`SignedControl` `nonce`/`expiry`, the four admin
+       requests, admin replies + `DeliveryStatus`, `Expired`/`Replay` reject
+       codes), node engine (fail-closed `admins.json`, `authorize_admin`,
+       per-node `SeenSet` replay guard, outbound delivery + reply patching +
+       `AdminRedeliverJoin` retry, `control_audit.jsonl`), CLI
+       `control admin grant|revoke|list`, `client-wasm` (`set_admin_key` +
+       `admin_query/approve/reject/redeliver`), and web (`adminKeys.js`,
+       live `JoinsPage`, Settings "Node administration" card). Verified:
+       `cargo test -p cawala-node` incl. the hermetic
+       `crates/node/tests/control_admin.rs` matrix (8 tests: delegated
+       allow/deny + surface isolation, peer isolation, expiry window, replay,
+       revoke, MemoryLookup `Delivered` and no-lookup `Unreachable`), control +
+       client crate tests, the wasm32 check, `web npm test` (24) and
+       `npx vite build`, and a live N0 `web/scripts/smoke-admin.mjs`
+       (grant -> query -> approve delivered -> applicant joined -> revoke ->
+       unauthorized).
+     - Routed control (deferred, composes with the above): `MSG_CONTROL_V1`
+       (already reserved, `crates/msg/src/envelope.rs`) carries control over
+       envelopes, hop-by-hop up the tree via `next_step`/`route` (ascend
+       supported). Authority is the **structural per-hop (H1)** model: each
+       intermediary re-signs with its own senior-child authority and the
+       destination authorizes its immediate child; the human's end-to-end intent
+       travels for audit but is advisory. `AdminGrant` is the portable
+       delegation primitive to carry; routing adds a `Routed` wrapper and swaps
+       transport without changing the admin DTO surface. Rejected alternatives:
+       holding the node operator seed in the browser; collapsing user/leaf
+       identity.
+     - Companion gap to fix while in here: `JoinRejected` is only
+       signature-checked (not pinned-operator-checked) on both applicants, so
+       anyone who knows the parent id can cancel an in-flight join
+       (pre-existing, not introduced by admin control).
 
 * Top Risks
   1. Iroh WASM maturity -> M0 spike before any other work.

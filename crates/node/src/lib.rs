@@ -15,6 +15,9 @@ use tracing::info;
 
 pub use proto::{ALPN, PingPong};
 
+pub mod admin_cli;
+pub mod admin_store;
+pub mod audit;
 pub mod control;
 pub mod control_store;
 pub mod identity;
@@ -26,9 +29,12 @@ pub mod msg;
 pub mod record;
 pub mod settlement;
 
+pub use admin_cli::{AdminCliError, AdminListEntry, GrantOutcome};
+pub use admin_store::{ADMIN_STORE_VERSION, ADMINS_FILE, AdminStore, AdminStoreError};
+pub use audit::CONTROL_AUDIT_FILE;
 pub use control::{
-    ControlHandler, ControlNode, spawn_control_node, spawn_control_node_on, spawn_control_only,
-    spawn_control_only_on,
+    Authority, ControlHandler, ControlNode, OutboundControl, OutboundKind, spawn_control_node,
+    spawn_control_node_on, spawn_control_only, spawn_control_only_on,
 };
 pub use control_store::{ControlStore, OUTBOUND_JOIN_FILE, OutboundJoin, PENDING_JOINS_FILE};
 pub use ledger_keys::{LEDGER_KEY_FILE, load_or_create_ledger_key, persist_ledger_key};

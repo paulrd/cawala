@@ -16,7 +16,8 @@
 //! is deliberately **not** consulted for authorization — signatures are the
 //! authority.
 
-use std::path::PathBuf;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,16 +25,21 @@ use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use cawala_control::{
-    CONTROL_ALPN, CONTROL_FORMAT_VERSION, ChildKind, ChildSnapshot, ControlError, ControlReply,
-    ControlRequest, CreateChild, DetachChild, Invite, JoinApproval, JoinRejection, JoinRequest,
-    MAX_CONTROL_FRAME, MoveChild, NodeId, NodeSnapshot, OperatorPubKey, OperatorSecretKey,
-    ParentSnapshot, RejectCode, SetAddress, SignedControl, senior_child, verify_control,
+    ADMIN_GRANT_VERSION, AdminApproved, AdminJoinApprove, AdminJoinReject, AdminPendingJoin,
+    AdminRedeliverJoin, AdminRejected, AdminScope, AdminSnapshot, CONTROL_ALPN,
+    CONTROL_FORMAT_VERSION, CONTROL_REQUEST_MAX_TTL_SECS, CONTROL_REQUEST_TTL_SECS, ChildKind,
+    ChildSnapshot, ControlError, ControlReply, ControlRequest, CreateChild, DeliveryStatus,
+    DetachChild, Invite, JoinApproval, JoinRejection, JoinRequest, MAX_CONTROL_FRAME, MoveChild,
+    NodeId, NodeSnapshot, OperatorPubKey, OperatorSecretKey, ParentSnapshot, RejectCode,
+    SetAddress, SignedAdminGrant, SignedControl, is_admin_request, senior_child, verify_control,
 };
 use cawala_ledger::{LedgerPubKey, PeerKeys, PeerRegistry, PeerRole};
+use cawala_msg::{MsgId, Seen, SeenConfig, SeenSet};
 
+use crate::admin_store::AdminStore;
 use crate::control_store::ControlStore;
 use crate::ledger_peers;
 use crate::msg::{MSG_ALPN, MsgConfig, MsgHandler, NeighborSource, RoutableSnapshot};
@@ -51,6 +57,72 @@ const SINK_CAPACITY: usize = 256;
 /// with [`RejectCode::Capacity`]; an already-queued applicant stays idempotent.
 const MAX_PENDING_JOINS: usize = 64;
 
+/// Per-attempt deadline when delivering a queued `JoinApproved`/`JoinRejected`
+/// to its applicant.
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Replay-guard bounds for the per-node control engine.
+///
+/// Control requests are terminal, so there is no `unobserve` rollback; the
+/// window only needs to outlive a retry burst.
+const CONTROL_SEEN_CONFIG: SeenConfig = SeenConfig {
+    max_per_origin: 256,
+    max_origins: 128,
+};
+
+/// Maximum number of most-recent per-child decisions retained for redelivery.
+const MAX_STORED_DECISIONS: usize = 64;
+
+/// Placeholder delivery status in a reply produced by the engine; the
+/// [`ControlHandler`] patches it after dialing the applicant.
+const PENDING_DELIVERY: DeliveryStatus = DeliveryStatus::Unreachable;
+
+/// Who an authenticated control request is acting as.
+///
+/// Returned by [`ControlNode::authorize`] (topology surface) and
+/// [`ControlNode::authorize_admin`] (admin surface) so a handler can tell which
+/// rule admitted the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Authority {
+    /// This node's own operator key (self-admin).
+    SelfOperator,
+    /// An operator holding an active [`AdminScope`] scoped to this node.
+    Delegated(AdminScope),
+    /// A directly-controlled peer (senior child) verified against the registry.
+    Peer,
+}
+
+/// What a queued outbound frame answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundKind {
+    /// An operator-signed `JoinApproved`.
+    Approved,
+    /// An operator-signed `JoinRejected`.
+    Rejected,
+}
+
+impl OutboundKind {
+    /// Stable label for logs and audit lines.
+    fn label(self) -> &'static str {
+        match self {
+            OutboundKind::Approved => "join-approved",
+            OutboundKind::Rejected => "join-rejected",
+        }
+    }
+}
+
+/// A frame the engine wants delivered to an applicant after the current
+/// request is answered.
+#[derive(Debug, Clone)]
+pub struct OutboundControl {
+    /// The applicant to dial.
+    pub target: NodeId,
+    /// The operator-signed frame to send.
+    pub signed: SignedControl,
+    /// What the frame is.
+    pub kind: OutboundKind,
+}
+
 /// The local control engine: persisted links plus the judge of who may mutate
 /// them.
 ///
@@ -65,6 +137,14 @@ pub struct ControlNode {
     record: RecordStore,
     peers: PeerRegistry,
     pending: ControlStore,
+    admins: AdminStore,
+    /// Frames to deliver after the current request is answered. Drained by the
+    /// `ControlHandler` while it still holds the engine lock.
+    outbound: VecDeque<OutboundControl>,
+    /// Most-recent operator-signed decision per child, for redelivery.
+    decisions: VecDeque<SignedControl>,
+    /// Per-node replay guard keyed `origin:controller`, id = request nonce.
+    seen: SeenSet,
 }
 
 impl ControlNode {
@@ -76,6 +156,7 @@ impl ControlNode {
         record: RecordStore,
         peers: PeerRegistry,
         pending: ControlStore,
+        admins: AdminStore,
     ) -> Self {
         ControlNode {
             data_dir: data_dir.into(),
@@ -84,11 +165,18 @@ impl ControlNode {
             record,
             peers,
             pending,
+            admins,
+            outbound: VecDeque::new(),
+            decisions: VecDeque::new(),
+            seen: SeenSet::new(CONTROL_SEEN_CONFIG),
         }
     }
 
-    /// Open (or create) the node's record, peers, and pending-join state from
-    /// `data_dir`.
+    /// Open (or create) the node's record, peers, pending-join, and admin-grant
+    /// state from `data_dir`.
+    ///
+    /// `admins.json` is validated against this node's operator key: a corrupt
+    /// or mis-scoped document fails the open (fail closed).
     pub fn open(
         data_dir: impl Into<PathBuf>,
         node_id: &str,
@@ -101,6 +189,8 @@ impl ControlNode {
             .map_err(|err| ControlError::Codec(err.to_string()))?;
         let pending =
             ControlStore::open(&data_dir).map_err(|err| ControlError::Codec(err.to_string()))?;
+        let admins = AdminStore::load(&data_dir, node_id, &operator.public())
+            .map_err(|err| ControlError::Codec(err.to_string()))?;
         Ok(ControlNode {
             data_dir,
             node_id: node_id.to_string(),
@@ -108,12 +198,21 @@ impl ControlNode {
             record,
             peers,
             pending,
+            admins,
+            outbound: VecDeque::new(),
+            decisions: VecDeque::new(),
+            seen: SeenSet::new(CONTROL_SEEN_CONFIG),
         })
     }
 
     /// This node's id.
     pub fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// This node's data directory.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     /// This node's record.
@@ -131,9 +230,19 @@ impl ControlNode {
         &self.pending
     }
 
+    /// This node's admin-grant store.
+    pub fn admins(&self) -> &AdminStore {
+        &self.admins
+    }
+
     /// This node's operator public key.
     pub fn operator_public(&self) -> OperatorPubKey {
         self.operator.public()
+    }
+
+    /// Drain the frames queued for delivery by the last `receive*` call.
+    pub fn take_outbound(&mut self) -> Vec<OutboundControl> {
+        self.outbound.drain(..).collect()
     }
 
     /// The senior child rule: `origin` may control this node iff it is this
@@ -166,7 +275,15 @@ impl ControlNode {
     }
 
     /// Authenticate and authorize a topology-changing request.
-    fn authorize(&self, signed: &SignedControl) -> Result<(), RejectCode> {
+    ///
+    /// This is the **strict** surface: self-origin must be signed by this
+    /// node's own operator key, and any other origin must be the senior child
+    /// and verify against the peer registry. A *delegated admin* (an operator
+    /// with an [`AdminScope`] but not this node's operator key, and not a
+    /// senior child) therefore never passes here, so it can never reach
+    /// `CreateChild`/`DetachChild`/`MoveChild`/`SetAddress`/`Query`. Use
+    /// [`ControlNode::authorize_admin`] for the admin surface.
+    fn authorize(&self, signed: &SignedControl, _now: u64) -> Result<Authority, RejectCode> {
         if !self.authorized(&signed.origin) {
             return Err(RejectCode::Unauthorized);
         }
@@ -175,10 +292,38 @@ impl ControlNode {
             if signed.controller != self.operator.public() || signed.verify_signature().is_err() {
                 return Err(RejectCode::Unauthorized);
             }
-        } else {
-            verify_control(signed, &self.peers).map_err(|err| map_control_error(&err))?;
+            return Ok(Authority::SelfOperator);
         }
-        Ok(())
+        verify_control(signed, &self.peers).map_err(|err| map_control_error(&err))?;
+        Ok(Authority::Peer)
+    }
+
+    /// Authenticate and authorize an **admin** request.
+    ///
+    /// Requirements, all mandatory:
+    /// - `signed.origin` is this node (`self.node_id`), so a peer or senior
+    ///   child can never drive the admin surface;
+    /// - the request is one of the `is_admin_request` variants;
+    /// - the controller is either this node's own operator key (self-admin) or
+    ///   an operator holding an active [`AdminScope`] granted by this node.
+    ///
+    /// The grant store is refreshed from disk before this is consulted (see
+    /// [`ControlNode::receive_at`]); a grant is only active while
+    /// `now <= expiry`.
+    fn authorize_admin(&self, signed: &SignedControl, now: u64) -> Result<Authority, RejectCode> {
+        if signed.origin.as_str() != self.node_id {
+            return Err(RejectCode::Unauthorized);
+        }
+        if !is_admin_request(&signed.request) {
+            return Err(RejectCode::Unauthorized);
+        }
+        if signed.controller == self.operator.public() {
+            return Ok(Authority::SelfOperator);
+        }
+        match self.admins.active_scope(&signed.controller, now) {
+            Some(scope) => Ok(Authority::Delegated(scope)),
+            None => Err(RejectCode::Unauthorized),
+        }
     }
 
     /// Handle one incoming request and produce its reply.
@@ -195,6 +340,14 @@ impl ControlNode {
     }
 
     /// [`ControlNode::receive`] with a caller-supplied clock (unix seconds).
+    ///
+    /// The checks run strictly in this order:
+    /// 1. wire version is [`CONTROL_FORMAT_VERSION`];
+    /// 2. the operator signature verifies under `signed.controller`;
+    /// 3. `now <= expiry <= now + CONTROL_REQUEST_MAX_TTL_SECS`;
+    /// 4. admin grants are reloaded from disk (fail closed to empty);
+    /// 5. the `(origin, controller, nonce)` replay guard;
+    /// 6. dispatch.
     pub async fn receive_at(
         &mut self,
         _remote: EndpointId,
@@ -204,18 +357,59 @@ impl ControlNode {
         if signed.version != CONTROL_FORMAT_VERSION {
             return ControlReply::Rejected(RejectCode::BadVersion);
         }
-        match &signed.request {
+        if signed.verify_signature().is_err() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        if now > signed.expiry {
+            return ControlReply::Rejected(RejectCode::Expired);
+        }
+        if signed.expiry > now.saturating_add(CONTROL_REQUEST_MAX_TTL_SECS) {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        // Full reload so a grant/revoke performed by a separate operator CLI
+        // process is observed without a restart. On any load failure, serve no
+        // delegated authority (fail closed).
+        if let Err(err) = self
+            .admins
+            .reload(&self.data_dir, &self.node_id, &self.operator.public())
+        {
+            warn!(%err, "admin grant reload failed; serving no delegated authority");
+            self.admins = AdminStore::empty();
+        }
+        // Replay guard: per (origin, controller), keyed by the request nonce.
+        // Control requests are terminal, so a marked nonce is never unobserved.
+        let seen_origin = format!("{}:{}", signed.origin, signed.controller);
+        if self.seen.observe(&seen_origin, nonce_msg_id(signed.nonce)) == Seen::Duplicate {
+            let reply = ControlReply::Rejected(RejectCode::Replay);
+            self.audit_request(&signed, &reply, now);
+            return reply;
+        }
+        let reply = match &signed.request {
             ControlRequest::Join(join) => self.handle_join(&signed, join, now),
             ControlRequest::JoinApproved(approval) => self.handle_join_approved(&signed, approval),
             ControlRequest::JoinRejected(rejection) => {
                 self.handle_join_rejected(&signed, rejection)
             }
-            ControlRequest::CreateChild(create) => self.handle_create_child(&signed, create),
-            ControlRequest::DetachChild(detach) => self.handle_detach_child(&signed, detach),
-            ControlRequest::MoveChild(move_child) => self.handle_move_child(&signed, move_child),
-            ControlRequest::SetAddress(set) => self.handle_set_address(&signed, set),
-            ControlRequest::Query => self.handle_query(&signed),
-        }
+            ControlRequest::CreateChild(create) => self.handle_create_child(&signed, create, now),
+            ControlRequest::DetachChild(detach) => self.handle_detach_child(&signed, detach, now),
+            ControlRequest::MoveChild(move_child) => {
+                self.handle_move_child(&signed, move_child, now)
+            }
+            ControlRequest::SetAddress(set) => self.handle_set_address(&signed, set, now),
+            ControlRequest::Query => self.handle_query(&signed, now),
+            ControlRequest::AdminQuery => self.handle_admin_query(&signed, now),
+            ControlRequest::AdminApproveJoin(approve) => {
+                self.handle_admin_approve_join(&signed, approve, now)
+            }
+            ControlRequest::AdminRejectJoin(reject) => {
+                self.handle_admin_reject_join(&signed, reject, now)
+            }
+            ControlRequest::AdminRedeliverJoin(redeliver) => {
+                self.handle_admin_redeliver_join(&signed, redeliver, now)
+            }
+        };
+        self.audit_request(&signed, &reply, now);
+        reply
     }
 
     /// Applicant side: queue the outbound join so a later `JoinApproved` /
@@ -615,8 +809,9 @@ impl ControlNode {
         &mut self,
         signed: &SignedControl,
         create: &CreateChild,
+        now: u64,
     ) -> ControlReply {
-        if let Err(code) = self.authorize(signed) {
+        if let Err(code) = self.authorize(signed, now) {
             return ControlReply::Rejected(code);
         }
         let backup = self.record.clone();
@@ -654,8 +849,9 @@ impl ControlNode {
         &mut self,
         signed: &SignedControl,
         detach: &DetachChild,
+        now: u64,
     ) -> ControlReply {
-        if let Err(code) = self.authorize(signed) {
+        if let Err(code) = self.authorize(signed, now) {
             return ControlReply::Rejected(code);
         }
         if let Err(err) = self.record.detach_child(detach.child.as_str()) {
@@ -673,8 +869,9 @@ impl ControlNode {
         &mut self,
         signed: &SignedControl,
         move_child: &MoveChild,
+        now: u64,
     ) -> ControlReply {
-        if let Err(code) = self.authorize(signed) {
+        if let Err(code) = self.authorize(signed, now) {
             return ControlReply::Rejected(code);
         }
         // v1 supports only re-slotting a direct child under this node.
@@ -710,8 +907,13 @@ impl ControlNode {
         ControlReply::Accepted
     }
 
-    fn handle_set_address(&mut self, signed: &SignedControl, set: &SetAddress) -> ControlReply {
-        if let Err(code) = self.authorize(signed) {
+    fn handle_set_address(
+        &mut self,
+        signed: &SignedControl,
+        set: &SetAddress,
+        now: u64,
+    ) -> ControlReply {
+        if let Err(code) = self.authorize(signed, now) {
             return ControlReply::Rejected(code);
         }
         let result = match &set.address {
@@ -727,11 +929,330 @@ impl ControlNode {
         ControlReply::Accepted
     }
 
-    fn handle_query(&mut self, signed: &SignedControl) -> ControlReply {
-        if let Err(code) = self.authorize(signed) {
+    fn handle_query(&mut self, signed: &SignedControl, now: u64) -> ControlReply {
+        if let Err(code) = self.authorize(signed, now) {
             return ControlReply::Rejected(code);
         }
         ControlReply::Snapshot(self.snapshot())
+    }
+
+    /// Admin: return this node's control snapshot plus the joins awaiting
+    /// approval.
+    ///
+    /// Pending rows are capped by [`MAX_PENDING_JOINS`]; the untrusted
+    /// `location_hint` on a [`JoinRequest`] is deliberately omitted.
+    fn handle_admin_query(&mut self, signed: &SignedControl, now: u64) -> ControlReply {
+        if let Err(code) = self.authorize_admin(signed, now) {
+            return ControlReply::Rejected(code);
+        }
+        let pending = self
+            .pending
+            .pending()
+            .iter()
+            .take(MAX_PENDING_JOINS)
+            .map(|request| AdminPendingJoin {
+                child: request.node.clone(),
+                kind: request.kind,
+                operator: request.operator,
+                desired_slot: request.desired_slot,
+                expiry: request.expiry,
+            })
+            .collect();
+        ControlReply::AdminSnapshot(AdminSnapshot {
+            node: self.snapshot(),
+            pending,
+        })
+    }
+
+    /// Admin: approve a pending join, assign its slot/address, sign a
+    /// `JoinApproved` with this node's operator key, and queue it for
+    /// delivery.
+    ///
+    /// The parent ledger public key is resolved lazily from
+    /// `<data-dir>/ledger_key`; the node deliberately does not couple a
+    /// [`LedgerService`](crate::LedgerService) into the control path or open
+    /// the child's account here. The account is materialized later by `ledger
+    /// fund`/first issue.
+    fn handle_admin_approve_join(
+        &mut self,
+        signed: &SignedControl,
+        approve: &AdminJoinApprove,
+        now: u64,
+    ) -> ControlReply {
+        if let Err(code) = self.authorize_admin(signed, now) {
+            return ControlReply::Rejected(code);
+        }
+        if approve.validate().is_err() {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        if let Err(code) = self.precheck_approve(&approve.child, approve.slot) {
+            return ControlReply::Rejected(code);
+        }
+        let parent_ledger = match crate::ledger_keys::load_or_create_ledger_key(&self.data_dir) {
+            Ok(key) => key.public(),
+            Err(err) => {
+                warn!(%err, "admin approve: cannot resolve this node's ledger key");
+                return ControlReply::Rejected(RejectCode::Internal);
+            }
+        };
+        let approval =
+            match self.approve_pending(approve.child.as_str(), approve.slot, now, parent_ledger) {
+                Ok(approval) => approval,
+                Err(err) => {
+                    warn!(%err, child = %approve.child, "admin approve failed");
+                    return ControlReply::Rejected(map_approve_error(&err));
+                }
+            };
+        let signed_approval =
+            match self.sign_decision(ControlRequest::JoinApproved(approval.clone()), now) {
+                Ok(signed) => signed,
+                Err(code) => return ControlReply::Rejected(code),
+            };
+        self.store_decision(signed_approval.clone());
+        self.outbound.push_back(OutboundControl {
+            target: approval.child.clone(),
+            signed: signed_approval,
+            kind: OutboundKind::Approved,
+        });
+        ControlReply::AdminApproved(AdminApproved {
+            child: approval.child,
+            slot: approval.slot,
+            address: approval.address,
+            delivery: PENDING_DELIVERY,
+        })
+    }
+
+    /// Admin: reject a pending join and queue the operator-signed rejection for
+    /// delivery.
+    fn handle_admin_reject_join(
+        &mut self,
+        signed: &SignedControl,
+        reject: &AdminJoinReject,
+        now: u64,
+    ) -> ControlReply {
+        if let Err(code) = self.authorize_admin(signed, now) {
+            return ControlReply::Rejected(code);
+        }
+        if reject.validate().is_err() {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        let Some(pending) = self.pending.pending_for(&reject.child) else {
+            return ControlReply::Rejected(RejectCode::NotFound);
+        };
+        let nonce = pending.nonce;
+        if let Err(err) = self.reject_pending(reject.child.as_str()) {
+            warn!(%err, child = %reject.child, "admin reject failed");
+            return ControlReply::Rejected(RejectCode::Internal);
+        }
+        let rejection = JoinRejection {
+            child: reject.child.clone(),
+            reason: reject
+                .reason
+                .clone()
+                .unwrap_or_else(|| "rejected".to_string()),
+            nonce,
+        };
+        let signed_rejection =
+            match self.sign_decision(ControlRequest::JoinRejected(rejection), now) {
+                Ok(signed) => signed,
+                Err(code) => return ControlReply::Rejected(code),
+            };
+        self.store_decision(signed_rejection.clone());
+        self.outbound.push_back(OutboundControl {
+            target: reject.child.clone(),
+            signed: signed_rejection,
+            kind: OutboundKind::Rejected,
+        });
+        ControlReply::AdminRejected(AdminRejected {
+            child: reject.child.clone(),
+            delivery: PENDING_DELIVERY,
+        })
+    }
+
+    /// Admin: re-send the stored decision for `child`, if one is retained.
+    ///
+    /// The stored frame is reused as-is (fresh top-level nonce not needed: the
+    /// applicant matches it by the echoed `JoinRequest.nonce`). If nothing is
+    /// stored, reply [`RejectCode::NotFound`].
+    fn handle_admin_redeliver_join(
+        &mut self,
+        signed: &SignedControl,
+        redeliver: &AdminRedeliverJoin,
+        now: u64,
+    ) -> ControlReply {
+        if let Err(code) = self.authorize_admin(signed, now) {
+            return ControlReply::Rejected(code);
+        }
+        if redeliver.validate().is_err() {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        let Some(stored) = self.stored_decision(&redeliver.child).cloned() else {
+            return ControlReply::Rejected(RejectCode::NotFound);
+        };
+        // Clone the request out so the decision's fields can be read without
+        // holding a borrow of `stored` while it is moved into the outbound
+        // queue.
+        let request = stored.request.clone();
+        match &request {
+            ControlRequest::JoinApproved(approval) => {
+                let child = approval.child.clone();
+                self.outbound.push_back(OutboundControl {
+                    target: child.clone(),
+                    signed: stored,
+                    kind: OutboundKind::Approved,
+                });
+                ControlReply::AdminApproved(AdminApproved {
+                    child,
+                    slot: approval.slot,
+                    address: approval.address.clone(),
+                    delivery: PENDING_DELIVERY,
+                })
+            }
+            ControlRequest::JoinRejected(rejection) => {
+                let child = rejection.child.clone();
+                self.outbound.push_back(OutboundControl {
+                    target: child.clone(),
+                    signed: stored,
+                    kind: OutboundKind::Rejected,
+                });
+                ControlReply::AdminRejected(AdminRejected {
+                    child,
+                    delivery: PENDING_DELIVERY,
+                })
+            }
+            _ => {
+                warn!("stored decision is not a join decision");
+                ControlReply::Rejected(RejectCode::Internal)
+            }
+        }
+    }
+
+    /// Validate an admin approval against current state, returning the precise
+    /// [`RejectCode`] without mutating anything.
+    ///
+    /// Doing this first avoids relying on the string form of the errors
+    /// [`ControlNode::approve_pending`] returns.
+    fn precheck_approve(&self, child: &NodeId, slot: Option<u8>) -> Result<(), RejectCode> {
+        if self.pending.pending_for(child).is_none() {
+            return Err(RejectCode::NotFound);
+        }
+        if self.record.record().address.is_none() {
+            return Err(RejectCode::NotAttached);
+        }
+        match slot {
+            Some(slot) if slot > cawala_topology::MAX_SLOT => Err(RejectCode::SlotOutOfRange),
+            Some(slot) if self.record.record().children.iter().any(|c| c.slot == slot) => {
+                Err(RejectCode::SlotTaken)
+            }
+            None if lowest_free_slot(self.record.record()).is_none() => Err(RejectCode::Capacity),
+            _ => Ok(()),
+        }
+    }
+
+    /// Sign an outbound decision with this node's own operator key, using a
+    /// fresh top-level nonce and a short expiry.
+    fn sign_decision(
+        &self,
+        request: ControlRequest,
+        now: u64,
+    ) -> Result<SignedControl, RejectCode> {
+        SignedControl::authorize(
+            NodeId::from(self.node_id.clone()),
+            &self.operator,
+            fresh_nonce(),
+            now.saturating_add(CONTROL_REQUEST_TTL_SECS),
+            request,
+        )
+        .map_err(|_| RejectCode::Internal)
+    }
+
+    /// Retain an operator-signed decision as the most recent one for its child.
+    fn store_decision(&mut self, signed: SignedControl) {
+        let Some(child) = decision_target(&signed).cloned() else {
+            return;
+        };
+        self.decisions
+            .retain(|stored| decision_target(stored) != Some(&child));
+        self.decisions.push_back(signed);
+        while self.decisions.len() > MAX_STORED_DECISIONS {
+            self.decisions.pop_front();
+        }
+    }
+
+    /// The most recent stored decision for `child`, if any.
+    fn stored_decision(&self, child: &NodeId) -> Option<&SignedControl> {
+        self.decisions
+            .iter()
+            .find(|stored| decision_target(stored) == Some(child))
+    }
+
+    /// Insert or replace an operator-signed admin grant and persist it.
+    ///
+    /// The grant must be scoped to this node and signed by this node's own
+    /// operator key; otherwise it is refused before touching the store.
+    pub fn grant_admin(&mut self, grant: SignedAdminGrant) -> Result<(), ControlError> {
+        if grant.grant.version != ADMIN_GRANT_VERSION {
+            return Err(ControlError::UnsupportedVersion(grant.grant.version));
+        }
+        if grant.grant.node.as_str() != self.node_id {
+            return Err(ControlError::Codec(format!(
+                "admin grant is scoped to node '{}', expected '{}'",
+                grant.grant.node, self.node_id
+            )));
+        }
+        grant
+            .verify(&self.operator.public())
+            .map_err(|err| ControlError::Codec(err.to_string()))?;
+        let admin = grant.grant.admin;
+        let expiry = grant.grant.expiry;
+        self.admins.grant(grant);
+        self.admins
+            .save(&self.data_dir)
+            .map_err(|err| ControlError::Codec(err.to_string()))?;
+        self.audit(serde_json::json!({
+            "event": "grant",
+            "admin": admin.to_string(),
+            "node": self.node_id,
+            "expiry": expiry,
+        }));
+        Ok(())
+    }
+
+    /// Remove the grant for `admin` and persist, returning whether one existed.
+    pub fn revoke_admin(&mut self, admin: &OperatorPubKey) -> Result<bool, ControlError> {
+        let removed = self.admins.revoke(admin);
+        if removed {
+            self.admins
+                .save(&self.data_dir)
+                .map_err(|err| ControlError::Codec(err.to_string()))?;
+        }
+        self.audit(serde_json::json!({
+            "event": "revoke",
+            "admin": admin.to_string(),
+            "node": self.node_id,
+            "removed": removed,
+        }));
+        Ok(removed)
+    }
+
+    /// Append one best-effort JSONL audit record. Never fails a request.
+    fn audit(&self, event: serde_json::Value) {
+        crate::audit::append(&self.data_dir, event);
+    }
+
+    /// Audit an admin request outcome (non-admin requests are not audited).
+    fn audit_request(&self, signed: &SignedControl, reply: &ControlReply, now: u64) {
+        if !is_admin_request(&signed.request) {
+            return;
+        }
+        self.audit(serde_json::json!({
+            "ts": now,
+            "event": "request",
+            "actor": signed.controller.to_string(),
+            "origin": signed.origin.to_string(),
+            "kind": signed.request.kind(),
+            "outcome": reply_outcome(reply),
+        }));
     }
 
     /// Build the direct dial target for an [`Invite`], applying its optional
@@ -814,12 +1335,14 @@ impl ControlNode {
 #[derive(Debug, Clone)]
 pub struct ControlHandler {
     node: Arc<Mutex<ControlNode>>,
+    endpoint: Endpoint,
 }
 
 impl ControlHandler {
-    /// Wrap a shared engine.
-    pub fn new(node: Arc<Mutex<ControlNode>>) -> Self {
-        ControlHandler { node }
+    /// Wrap a shared engine and the node's own endpoint (used to dial the
+    /// applicant when delivering a queued decision).
+    pub fn new(node: Arc<Mutex<ControlNode>>, endpoint: Endpoint) -> Self {
+        ControlHandler { node, endpoint }
     }
 
     /// A clone of the shared engine handle.
@@ -835,10 +1358,42 @@ impl ProtocolHandler for ControlHandler {
         let signed: SignedControl =
             proto::read_framed_with_limit::<SignedControl, _>(&mut recv, MAX_CONTROL_FRAME).await?;
 
-        let reply = {
+        // Process the request and drain any frames it queued, all under the
+        // engine lock. The lock is dropped before any delivery (await) or file
+        // I/O; audit writes here happen while the lock is held but are cheap.
+        let (mut reply, outbound, data_dir) = {
             let mut engine = self.node.lock().await;
-            engine.receive(remote, signed).await
+            let reply = engine.receive(remote, signed).await;
+            let outbound = engine.take_outbound();
+            let data_dir = engine.data_dir().to_path_buf();
+            (reply, outbound, data_dir)
         };
+
+        // Deliver decisions owned by this node and patch the reply with the
+        // applicant's view. Never hold the engine mutex across `send_direct`.
+        let mut last_status = None;
+        for item in outbound {
+            let status = match item.target.as_str().parse::<EndpointId>() {
+                Ok(target) => delivery_status(
+                    ControlNode::send_direct(
+                        &self.endpoint,
+                        target,
+                        &item.signed,
+                        DELIVERY_TIMEOUT,
+                    )
+                    .await,
+                ),
+                Err(err) => {
+                    warn!(child = %item.target, %err, "invalid applicant endpoint id");
+                    DeliveryStatus::Unreachable
+                }
+            };
+            audit_delivery(&data_dir, &item.target, item.kind, &status);
+            last_status = Some(status);
+        }
+        if let Some(status) = last_status {
+            patch_delivery(&mut reply, status);
+        }
         info!(%remote, kind = signed_kind(&reply), "control reply");
 
         proto::write_framed(&mut send, &reply).await?;
@@ -853,9 +1408,10 @@ impl ProtocolHandler for ControlHandler {
 
 /// Register the ping + control handlers on `endpoint` (no messaging).
 pub fn spawn_control_only_on(endpoint: Endpoint, node: Arc<Mutex<ControlNode>>) -> Router {
+    let handler = ControlHandler::new(node, endpoint.clone());
     Router::builder(endpoint)
         .accept(proto::ALPN, crate::PingHandler)
-        .accept(CONTROL_ALPN, ControlHandler::new(node))
+        .accept(CONTROL_ALPN, handler)
         .spawn()
 }
 
@@ -926,10 +1482,11 @@ pub fn spawn_control_node_live_on(
 ) -> (Router, tokio::sync::mpsc::Receiver<cawala_msg::Envelope>) {
     let (sink, receiver) = tokio::sync::mpsc::channel(SINK_CAPACITY);
     let handler = MsgHandler::with_source(endpoint.clone(), source, config, sink);
+    let control = ControlHandler::new(node, endpoint.clone());
     let router = Router::builder(endpoint)
         .accept(proto::ALPN, crate::PingHandler)
         .accept(MSG_ALPN, handler)
-        .accept(CONTROL_ALPN, ControlHandler::new(node))
+        .accept(CONTROL_ALPN, control)
         .spawn();
     (router, receiver)
 }
@@ -947,6 +1504,90 @@ fn now_unix_seconds() -> u64 {
         .unwrap_or(0)
 }
 
+/// A fresh request nonce from the OS randomness source.
+///
+/// `getrandom` failing is effectively impossible on supported platforms; the
+/// clock is a monotonic fallback (a collision is caught by the replay guard,
+/// never silently applied).
+fn fresh_nonce() -> u64 {
+    getrandom::u64().unwrap_or_else(|_| now_unix_seconds())
+}
+
+/// Pack a nonce into the 16-byte replay [`MsgId`] (first 8 bytes big-endian).
+fn nonce_msg_id(nonce: u64) -> MsgId {
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&nonce.to_be_bytes());
+    MsgId::from_bytes(id)
+}
+
+/// The child a stored decision answers, if it is an approval/rejection.
+fn decision_target(signed: &SignedControl) -> Option<&NodeId> {
+    match &signed.request {
+        ControlRequest::JoinApproved(approval) => Some(&approval.child),
+        ControlRequest::JoinRejected(rejection) => Some(&rejection.child),
+        _ => None,
+    }
+}
+
+/// Map an [`ControlNode::approve_pending`] failure to the wire [`RejectCode`].
+///
+/// The precise cases are pre-checked in [`ControlNode::precheck_approve`]; this
+/// is the fallback for persist/ledger failures.
+fn map_approve_error(err: &ControlError) -> RejectCode {
+    if matches!(err, ControlError::SlotOutOfRange(_)) {
+        RejectCode::SlotOutOfRange
+    } else {
+        RejectCode::Internal
+    }
+}
+
+/// Short outcome label for an audited reply.
+fn reply_outcome(reply: &ControlReply) -> String {
+    match reply {
+        ControlReply::Accepted => "accepted".to_string(),
+        ControlReply::Pending => "pending".to_string(),
+        ControlReply::Rejected(code) => format!("rejected:{code:?}"),
+        ControlReply::Snapshot(_) => "snapshot".to_string(),
+        ControlReply::AdminSnapshot(_) => "admin-snapshot".to_string(),
+        ControlReply::AdminApproved(_) => "admin-approved".to_string(),
+        ControlReply::AdminRejected(_) => "admin-rejected".to_string(),
+    }
+}
+
+/// Map a direct-delivery exchange to the applicant's view of it.
+fn delivery_status(result: Result<ControlReply, ControlError>) -> DeliveryStatus {
+    match result {
+        Ok(ControlReply::Rejected(code)) => DeliveryStatus::Rejected(code),
+        Ok(_) => DeliveryStatus::Delivered,
+        Err(ControlError::Codec(message)) if message.contains("timed out") => {
+            DeliveryStatus::TimedOut
+        }
+        Err(_) => DeliveryStatus::Unreachable,
+    }
+}
+
+/// Patch the `delivery` field of an admin reply with the real outcome.
+fn patch_delivery(reply: &mut ControlReply, status: DeliveryStatus) {
+    match reply {
+        ControlReply::AdminApproved(approved) => approved.delivery = status,
+        ControlReply::AdminRejected(rejected) => rejected.delivery = status,
+        _ => {}
+    }
+}
+
+/// Best-effort delivery audit line. Never fails a request.
+fn audit_delivery(data_dir: &Path, child: &NodeId, kind: OutboundKind, status: &DeliveryStatus) {
+    crate::audit::append(
+        data_dir,
+        serde_json::json!({
+            "event": "delivery",
+            "child": child.to_string(),
+            "kind": kind.label(),
+            "outcome": format!("{status:?}"),
+        }),
+    );
+}
+
 /// Stable label for a reply, for logs.
 fn signed_kind(reply: &ControlReply) -> &'static str {
     match reply {
@@ -954,6 +1595,9 @@ fn signed_kind(reply: &ControlReply) -> &'static str {
         ControlReply::Pending => "pending",
         ControlReply::Rejected(_) => "rejected",
         ControlReply::Snapshot(_) => "snapshot",
+        ControlReply::AdminSnapshot(_) => "admin-snapshot",
+        ControlReply::AdminApproved(_) => "admin-approved",
+        ControlReply::AdminRejected(_) => "admin-rejected",
     }
 }
 
@@ -985,7 +1629,9 @@ fn map_control_error(err: &ControlError) -> RejectCode {
         ControlError::MissingLedgerForNode
         | ControlError::UnexpectedLedgerForUser
         | ControlError::SlotOutOfRange(_)
-        | ControlError::FieldTooLong { .. } => RejectCode::BadRequest,
+        | ControlError::FieldTooLong { .. }
+        | ControlError::GrantExpiryNotAfterGrant { .. }
+        | ControlError::GrantTtlTooLong { .. } => RejectCode::BadRequest,
         ControlError::Codec(_) => RejectCode::Internal,
     }
 }
@@ -1004,6 +1650,7 @@ fn map_ledger_error(err: &cawala_ledger::LedgerError) -> RejectCode {
 mod tests {
     use super::*;
     use crate::record::ChildEntry;
+    use cawala_control::{AdminGrant, DEFAULT_ADMIN_TTL_SECS};
     use cawala_ledger::{LedgerPubKey, LedgerSecretKey};
     use iroh::SecretKey;
 
@@ -1027,6 +1674,24 @@ mod tests {
 
     fn ledger(seed: u8) -> LedgerPubKey {
         LedgerSecretKey::from_bytes([seed; 32]).public()
+    }
+
+    /// Sign a control request for a synthetic-clock engine (`now == 0`), with an
+    /// expiry inside `CONTROL_REQUEST_MAX_TTL_SECS`.
+    fn authorize_at(
+        origin: &str,
+        op: &OperatorSecretKey,
+        nonce: u64,
+        request: ControlRequest,
+    ) -> SignedControl {
+        SignedControl::authorize(
+            NodeId::from(origin),
+            op,
+            nonce,
+            CONTROL_REQUEST_MAX_TTL_SECS,
+            request,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1073,6 +1738,7 @@ mod tests {
             record,
             PeerRegistry::new(),
             store,
+            AdminStore::empty(),
         );
         // `receive_at` ignores the remote; any endpoint id will do.
         let remote = EndpointId::from(SecretKey::generate().public());
@@ -1080,12 +1746,13 @@ mod tests {
         // Exactly `MAX_PENDING_JOINS` distinct applicants are queued.
         for i in 0..MAX_PENDING_JOINS {
             let join = applicant_join(i, &applicant_op);
-            let signed = SignedControl::authorize(
-                join.node.clone(),
+            let origin = join.node.clone();
+            let signed = authorize_at(
+                origin.as_str(),
                 &applicant_op,
+                i as u64,
                 ControlRequest::Join(join),
-            )
-            .unwrap();
+            );
             assert_eq!(
                 engine.receive_at(remote, signed, 0).await,
                 ControlReply::Pending,
@@ -1096,26 +1763,30 @@ mod tests {
 
         // One more distinct applicant is refused; the queue does not grow.
         let overflow = applicant_join(MAX_PENDING_JOINS, &applicant_op);
-        let signed = SignedControl::authorize(
-            overflow.node.clone(),
+        let overflow_origin = overflow.node.clone();
+        let signed = authorize_at(
+            overflow_origin.as_str(),
             &applicant_op,
+            MAX_PENDING_JOINS as u64,
             ControlRequest::Join(overflow),
-        )
-        .unwrap();
+        );
         assert_eq!(
             engine.receive_at(remote, signed, 0).await,
             ControlReply::Rejected(RejectCode::Capacity)
         );
         assert_eq!(engine.pending().pending().len(), MAX_PENDING_JOINS);
 
-        // An already-queued applicant is still idempotent even when full.
+        // An already-queued applicant is still idempotent even when full. A
+        // fresh nonce models a genuine retry; the replay guard would reject the
+        // exact same frame.
         let requeue = applicant_join(0, &applicant_op);
-        let signed = SignedControl::authorize(
-            requeue.node.clone(),
+        let requeue_origin = requeue.node.clone();
+        let signed = authorize_at(
+            requeue_origin.as_str(),
             &applicant_op,
+            9_999,
             ControlRequest::Join(requeue),
-        )
-        .unwrap();
+        );
         assert_eq!(
             engine.receive_at(remote, signed, 0).await,
             ControlReply::Pending
@@ -1149,6 +1820,7 @@ mod tests {
             record,
             PeerRegistry::new(),
             store,
+            AdminStore::empty(),
         );
         engine
             .begin_outbound_join(request.clone(), NodeId::from("parent"), pinned)
@@ -1199,12 +1871,12 @@ mod tests {
         let remote = EndpointId::from(SecretKey::generate().public());
 
         // A self-consistent approval signed by some other key is rejected.
-        let forged = SignedControl::authorize(
-            NodeId::from("parent"),
+        let forged = authorize_at(
+            "parent",
             &attacker,
+            1,
             ControlRequest::JoinApproved(approval.clone()),
-        )
-        .unwrap();
+        );
         assert_eq!(
             engine.receive_at(remote, forged, 0).await,
             ControlReply::Rejected(RejectCode::Unauthorized)
@@ -1216,12 +1888,7 @@ mod tests {
         );
 
         // The pinned key's approval is accepted.
-        let good = SignedControl::authorize(
-            NodeId::from("parent"),
-            &pinned,
-            ControlRequest::JoinApproved(approval),
-        )
-        .unwrap();
+        let good = authorize_at("parent", &pinned, 2, ControlRequest::JoinApproved(approval));
         assert_eq!(
             engine.receive_at(remote, good, 0).await,
             ControlReply::Accepted
@@ -1241,12 +1908,12 @@ mod tests {
         let approval = approval_for(&request);
         let remote = EndpointId::from(SecretKey::generate().public());
 
-        let signed = SignedControl::authorize(
-            NodeId::from("parent"),
+        let signed = authorize_at(
+            "parent",
             &parent_op,
+            1,
             ControlRequest::JoinApproved(approval.clone()),
-        )
-        .unwrap();
+        );
         assert_eq!(
             engine.receive_at(remote, signed, 0).await,
             ControlReply::Accepted
@@ -1262,16 +1929,17 @@ mod tests {
         assert_eq!(peers.get(&NodeId::from("parent")), Some(&expected));
 
         // Re-delivering the same approval (e.g. after a lost ack) rewrites the
-        // identical row: no duplicate, no corruption.
+        // identical row: no duplicate, no corruption. A fresh frame models the
+        // retry (the exact same frame would be caught by the replay guard).
         engine
             .begin_outbound_join(request.clone(), NodeId::from("parent"), None)
             .unwrap();
-        let signed = SignedControl::authorize(
-            NodeId::from("parent"),
+        let signed = authorize_at(
+            "parent",
             &parent_op,
+            2,
             ControlRequest::JoinApproved(approval),
-        )
-        .unwrap();
+        );
         assert_eq!(
             engine.receive_at(remote, signed, 0).await,
             ControlReply::Accepted
@@ -1294,12 +1962,12 @@ mod tests {
         let remote = EndpointId::from(SecretKey::generate().public());
 
         // First join completes with the request's nonce and installs the row.
-        let signed = SignedControl::authorize(
-            NodeId::from("parent"),
+        let signed = authorize_at(
+            "parent",
             &parent_op,
+            1,
             ControlRequest::JoinApproved(approval.clone()),
-        )
-        .unwrap();
+        );
         assert_eq!(
             engine.receive_at(remote, signed, 0).await,
             ControlReply::Accepted
@@ -1314,13 +1982,15 @@ mod tests {
             .begin_outbound_join(new_request, NodeId::from("parent"), None)
             .unwrap();
 
-        // Replaying the old approval is refused before any mutation.
-        let replay = SignedControl::authorize(
-            NodeId::from("parent"),
+        // Replaying the old approval is refused before any mutation. The
+        // top-level frame is fresh so the replay guard does not preempt the
+        // inner stale-nonce rule under test.
+        let replay = authorize_at(
+            "parent",
             &parent_op,
+            2,
             ControlRequest::JoinApproved(approval),
-        )
-        .unwrap();
+        );
         assert_eq!(
             engine.receive_at(remote, replay, 0).await,
             ControlReply::Rejected(RejectCode::Unauthorized)
@@ -1359,12 +2029,12 @@ mod tests {
         engine.peers.insert(conflicting.clone()).unwrap();
         ledger_peers::save_peers(dir.path(), &engine.peers).unwrap();
 
-        let signed = SignedControl::authorize(
-            NodeId::from("parent"),
+        let signed = authorize_at(
+            "parent",
             &parent_op,
+            1,
             ControlRequest::JoinApproved(approval),
-        )
-        .unwrap();
+        );
         let remote = EndpointId::from(SecretKey::generate().public());
         assert_eq!(
             engine.receive_at(remote, signed, 0).await,
@@ -1403,12 +2073,12 @@ mod tests {
             .unwrap();
         ledger_peers::save_peers(dir.path(), &engine.peers).unwrap();
 
-        let signed = SignedControl::authorize(
-            NodeId::from("parent"),
+        let signed = authorize_at(
+            "parent",
             &parent_op,
+            1,
             ControlRequest::JoinApproved(approval),
-        )
-        .unwrap();
+        );
         let remote = EndpointId::from(SecretKey::generate().public());
         assert_eq!(
             engine.receive_at(remote, signed, 0).await,
@@ -1428,6 +2098,332 @@ mod tests {
         assert!(
             engine.record().parent.is_some(),
             "the link is installed once the row is updated"
+        );
+    }
+
+    /// An admin-capable engine ("parent") with an asserted address.
+    fn admin_engine(dir: &std::path::Path) -> (ControlNode, OperatorSecretKey) {
+        let operator = OperatorSecretKey::from_bytes([1u8; 32]);
+        let mut record = RecordStore::open(dir, "parent").unwrap();
+        record.set_address("0".parse().unwrap()).unwrap();
+        record.save().unwrap();
+        let store = ControlStore::open(dir).unwrap();
+        let engine = ControlNode::new(
+            dir.to_path_buf(),
+            "parent",
+            operator.clone(),
+            record,
+            PeerRegistry::new(),
+            store,
+            AdminStore::empty(),
+        );
+        (engine, operator)
+    }
+
+    /// Queue one applicant's join on `engine` and return the request.
+    async fn queue_join(engine: &mut ControlNode, i: usize) -> JoinRequest {
+        let applicant_op = OperatorSecretKey::from_bytes([7u8; 32]);
+        let join = applicant_join(i, &applicant_op);
+        let origin = join.node.clone();
+        let signed = authorize_at(
+            origin.as_str(),
+            &applicant_op,
+            i as u64 + 1,
+            ControlRequest::Join(join.clone()),
+        );
+        let remote = EndpointId::from(SecretKey::generate().public());
+        assert_eq!(
+            engine.receive_at(remote, signed, 0).await,
+            ControlReply::Pending
+        );
+        join
+    }
+
+    #[tokio::test]
+    async fn admin_approve_queues_signed_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, operator) = admin_engine(dir.path());
+        let join = queue_join(&mut engine, 0).await;
+        let remote = EndpointId::from(SecretKey::generate().public());
+
+        let approve = authorize_at(
+            "parent",
+            &operator,
+            100,
+            ControlRequest::AdminApproveJoin(AdminJoinApprove {
+                child: join.node.clone(),
+                slot: Some(2),
+            }),
+        );
+        let reply = engine.receive_at(remote, approve, 0).await;
+        let ControlReply::AdminApproved(approved) = reply else {
+            panic!("expected AdminApproved, got {reply:?}");
+        };
+        assert_eq!(approved.child, join.node);
+        assert_eq!(approved.slot, 2);
+        assert_eq!(approved.address, "0.2".parse().unwrap());
+        assert_eq!(
+            approved.delivery,
+            DeliveryStatus::Unreachable,
+            "the engine returns a placeholder; the handler patches it"
+        );
+
+        // The child is attached and the signed decision is queued.
+        assert!(
+            engine
+                .record()
+                .children
+                .iter()
+                .any(|c| c.child_id == join.node.as_str())
+        );
+        let outbound = engine.take_outbound();
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].kind, OutboundKind::Approved);
+        assert_eq!(outbound[0].target, join.node);
+        assert_eq!(outbound[0].signed.controller, operator.public());
+        assert_eq!(outbound[0].signed.verify_signature(), Ok(()));
+        let ControlRequest::JoinApproved(approval) = &outbound[0].signed.request else {
+            panic!("expected a JoinApproved frame");
+        };
+        assert_eq!(approval.child, join.node);
+        assert_eq!(approval.slot, 2);
+        assert!(engine.take_outbound().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_reject_queues_signed_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, operator) = admin_engine(dir.path());
+        let join = queue_join(&mut engine, 0).await;
+        let remote = EndpointId::from(SecretKey::generate().public());
+
+        let reject = authorize_at(
+            "parent",
+            &operator,
+            101,
+            ControlRequest::AdminRejectJoin(AdminJoinReject {
+                child: join.node.clone(),
+                reason: Some("nope".to_string()),
+            }),
+        );
+        let reply = engine.receive_at(remote, reject, 0).await;
+        let ControlReply::AdminRejected(rejected) = reply else {
+            panic!("expected AdminRejected, got {reply:?}");
+        };
+        assert_eq!(rejected.child, join.node);
+        assert_eq!(rejected.delivery, DeliveryStatus::Unreachable);
+
+        // The pending row is gone and the signed rejection is queued.
+        assert!(engine.pending().pending().is_empty());
+        let outbound = engine.take_outbound();
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].kind, OutboundKind::Rejected);
+        let ControlRequest::JoinRejected(rejection) = &outbound[0].signed.request else {
+            panic!("expected a JoinRejected frame");
+        };
+        assert_eq!(rejection.child, join.node);
+        assert_eq!(rejection.reason, "nope");
+        assert_eq!(rejection.nonce, join.nonce);
+        assert_eq!(outbound[0].signed.verify_signature(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn admin_redeliver_requeues_and_unknown_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, operator) = admin_engine(dir.path());
+        let join = queue_join(&mut engine, 0).await;
+        let remote = EndpointId::from(SecretKey::generate().public());
+
+        let approve = authorize_at(
+            "parent",
+            &operator,
+            200,
+            ControlRequest::AdminApproveJoin(AdminJoinApprove {
+                child: join.node.clone(),
+                slot: Some(1),
+            }),
+        );
+        assert!(matches!(
+            engine.receive_at(remote, approve, 0).await,
+            ControlReply::AdminApproved(_)
+        ));
+        let first = engine.take_outbound();
+        assert_eq!(first.len(), 1);
+
+        // Redelivery re-queues the stored frame unchanged.
+        let redeliver = authorize_at(
+            "parent",
+            &operator,
+            201,
+            ControlRequest::AdminRedeliverJoin(AdminRedeliverJoin {
+                child: join.node.clone(),
+            }),
+        );
+        assert!(matches!(
+            engine.receive_at(remote, redeliver, 0).await,
+            ControlReply::AdminApproved(_)
+        ));
+        let second = engine.take_outbound();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].signed, first[0].signed, "the frame is reused");
+
+        // Nothing stored for an unknown child.
+        let unknown = authorize_at(
+            "parent",
+            &operator,
+            202,
+            ControlRequest::AdminRedeliverJoin(AdminRedeliverJoin {
+                child: NodeId::from("ghost"),
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(remote, unknown, 0).await,
+            ControlReply::Rejected(RejectCode::NotFound)
+        );
+        assert!(engine.take_outbound().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_approve_unknown_child_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, operator) = admin_engine(dir.path());
+        let remote = EndpointId::from(SecretKey::generate().public());
+        let approve = authorize_at(
+            "parent",
+            &operator,
+            300,
+            ControlRequest::AdminApproveJoin(AdminJoinApprove {
+                child: NodeId::from("ghost"),
+                slot: None,
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(remote, approve, 0).await,
+            ControlReply::Rejected(RejectCode::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_admin_is_scoped_and_cannot_use_topology_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, operator) = admin_engine(dir.path());
+        let admin_op = OperatorSecretKey::from_bytes([5u8; 32]);
+        let grant = AdminGrant {
+            version: ADMIN_GRANT_VERSION,
+            node: NodeId::from("parent"),
+            admin: admin_op.public(),
+            scope: AdminScope::Admin,
+            granted_at: 10,
+            expiry: 10 + DEFAULT_ADMIN_TTL_SECS,
+            label: None,
+        };
+        engine
+            .grant_admin(SignedAdminGrant::authorize(grant, &operator).unwrap())
+            .unwrap();
+
+        let remote = EndpointId::from(SecretKey::generate().public());
+
+        // A delegated admin may use the admin surface...
+        let admin_query = authorize_at("parent", &admin_op, 400, ControlRequest::AdminQuery);
+        assert!(matches!(
+            engine.receive_at(remote, admin_query, 0).await,
+            ControlReply::AdminSnapshot(_)
+        ));
+
+        // ...but never the topology surface (`Query` etc.).
+        let topology_query = authorize_at("parent", &admin_op, 401, ControlRequest::Query);
+        assert_eq!(
+            engine.receive_at(remote, topology_query, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+
+        // Revoking removes the delegated authority (and the reload is from disk).
+        assert!(engine.revoke_admin(&admin_op.public()).unwrap());
+        let after_revoke = authorize_at("parent", &admin_op, 402, ControlRequest::AdminQuery);
+        assert_eq!(
+            engine.receive_at(remote, after_revoke, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_cannot_use_admin_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _operator) = admin_engine(dir.path());
+        // A directly-controlled peer (e.g. the senior child) would pass
+        // `authorize`, but `authorize_admin` requires the origin to be this
+        // node, so the admin surface is closed to it.
+        let peer_op = OperatorSecretKey::from_bytes([6u8; 32]);
+        let remote = EndpointId::from(SecretKey::generate().public());
+        let query = authorize_at("peer", &peer_op, 500, ControlRequest::AdminQuery);
+        assert_eq!(
+            engine.receive_at(remote, query, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_guard_rejects_duplicate_admin_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, operator) = admin_engine(dir.path());
+        let remote = EndpointId::from(SecretKey::generate().public());
+        let query = authorize_at("parent", &operator, 600, ControlRequest::AdminQuery);
+
+        assert!(matches!(
+            engine.receive_at(remote, query.clone(), 0).await,
+            ControlReply::AdminSnapshot(_)
+        ));
+        assert_eq!(
+            engine.receive_at(remote, query, 0).await,
+            ControlReply::Rejected(RejectCode::Replay)
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_window_is_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, operator) = admin_engine(dir.path());
+        let remote = EndpointId::from(SecretKey::generate().public());
+
+        // Already expired: `now > expiry`.
+        let expired = SignedControl::authorize(
+            NodeId::from("parent"),
+            &operator,
+            1,
+            0,
+            ControlRequest::AdminQuery,
+        )
+        .unwrap();
+        assert_eq!(
+            engine.receive_at(remote, expired, 1).await,
+            ControlReply::Rejected(RejectCode::Expired)
+        );
+
+        // An expiry further out than the cap.
+        let too_long = SignedControl::authorize(
+            NodeId::from("parent"),
+            &operator,
+            2,
+            CONTROL_REQUEST_MAX_TTL_SECS + 1,
+            ControlRequest::AdminQuery,
+        )
+        .unwrap();
+        assert_eq!(
+            engine.receive_at(remote, too_long, 0).await,
+            ControlReply::Rejected(RejectCode::BadRequest)
+        );
+    }
+
+    #[tokio::test]
+    async fn tampered_expiry_is_rejected_as_unauthorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, operator) = admin_engine(dir.path());
+        let remote = EndpointId::from(SecretKey::generate().public());
+        let mut query = authorize_at("parent", &operator, 700, ControlRequest::AdminQuery);
+        query.expiry += 1;
+        assert_eq!(
+            engine.receive_at(remote, query, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
         );
     }
 }

@@ -3,9 +3,14 @@
 //! A [`SignedControl`] binds a [`ControlRequest`] to an origin node and the
 //! operator key that signed it. The signature is over a **domain-separated
 //! hash** of the canonical postcard encoding of `(version, origin, controller,
-//! request)`, mirroring the ledger's `auth` module. Because the hash domain
-//! (`cawala-control/request/v1`) differs from every ledger domain, a control
-//! signature can never be replayed as a ledger authorisation, or vice versa.
+//! nonce, expiry, request)`, mirroring the ledger's `auth` module. Because the
+//! hash domain (`cawala-control/request/v1`) differs from every ledger domain,
+//! a control signature can never be replayed as a ledger authorisation, or vice
+//! versa.
+//!
+//! `nonce` and `expiry` are carried inside the signature so a replayer cannot
+//! swap or refresh them: replay/staleness checks belong to the node, but the
+//! values themselves are bound to the request.
 //!
 //! # Trust boundary
 //!
@@ -27,7 +32,22 @@ use crate::request::ControlRequest;
 /// Bumped to 2 when [`JoinApproval`](crate::JoinApproval) gained
 /// `parent_ledger`: the signed preimage changed, so a v1 verifier must reject a
 /// v2 message rather than misparse it.
-pub const CONTROL_FORMAT_VERSION: u8 = 2;
+///
+/// Bumped to 3 when [`SignedControl`] gained `nonce` and `expiry`: the signed
+/// preimage changed again, so a v2 verifier must likewise reject a v3 message
+/// rather than misparse it.
+pub const CONTROL_FORMAT_VERSION: u8 = 3;
+
+/// Recommended lifetime, in seconds, of a control request (`nonce`/`expiry`).
+///
+/// This crate has no clock: callers stamp `expiry = now + TTL` and the node
+/// enforces `now <= expiry` plus the replay `nonce`.
+pub const CONTROL_REQUEST_TTL_SECS: u64 = 120;
+
+/// Absolute upper bound, in seconds, accepted for a control request's
+/// `expiry - now`. A node rejects anything larger; this is the ceiling
+/// [`CONTROL_REQUEST_TTL_SECS`] must stay under.
+pub const CONTROL_REQUEST_MAX_TTL_SECS: u64 = 300;
 
 /// BLAKE3 derive-key context for the control signing hash.
 pub const CONTROL_CONTEXT: &str = "cawala-control/request/v1";
@@ -35,7 +55,8 @@ pub const CONTROL_CONTEXT: &str = "cawala-control/request/v1";
 /// An operator-signed control request.
 ///
 /// Field order is frozen: the signing preimage is the postcard encoding of
-/// `(version, origin, controller, request)` in declaration order.
+/// `(version, origin, controller, nonce, expiry, request)` in declaration
+/// order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedControl {
     /// Wire format version ([`CONTROL_FORMAT_VERSION`]).
@@ -44,6 +65,12 @@ pub struct SignedControl {
     pub origin: NodeId,
     /// The operator key that produced `signature`.
     pub controller: OperatorPubKey,
+    /// Fresh per-request nonce. The node tracks seen nonces per origin to
+    /// reject replays; it is signed here so a relay cannot alter it.
+    pub nonce: u64,
+    /// Unix seconds; the request is valid while `now <= expiry`. Signed here
+    /// so a relay cannot extend its lifetime.
+    pub expiry: u64,
     /// The request being authorised.
     pub request: ControlRequest,
     /// Operator signature over [`SignedControl::signing_hash`].
@@ -60,6 +87,8 @@ struct SigningPreimage<'a> {
     version: u8,
     origin: &'a NodeId,
     controller: &'a OperatorPubKey,
+    nonce: u64,
+    expiry: u64,
     request: &'a ControlRequest,
 }
 
@@ -67,17 +96,22 @@ impl SignedControl {
     /// Build a signed control message, setting
     /// `version = CONTROL_FORMAT_VERSION`.
     ///
-    /// The caller supplies the operator secret key; this crate never generates
-    /// key material.
+    /// `nonce` must be fresh per request and `expiry` is unix seconds; both are
+    /// covered by the signature. The caller supplies the operator secret key;
+    /// this crate never generates key material.
     pub fn authorize(
         origin: NodeId,
         controller: &OperatorSecretKey,
+        nonce: u64,
+        expiry: u64,
         request: ControlRequest,
     ) -> Result<Self, ControlError> {
         let mut signed = SignedControl {
             version: CONTROL_FORMAT_VERSION,
             origin,
             controller: controller.public(),
+            nonce,
+            expiry,
             request,
             // Placeholder; replaced below. The signing hash does not cover the
             // signature field.
@@ -90,12 +124,14 @@ impl SignedControl {
 
     /// The signed preimage hash: BLAKE3 derive-key([`CONTROL_CONTEXT`]) over
     /// the canonical postcard encoding of
-    /// `(version, origin, controller, request)`.
+    /// `(version, origin, controller, nonce, expiry, request)`.
     pub fn signing_hash(&self) -> Hash {
         let preimage = SigningPreimage {
             version: self.version,
             origin: &self.origin,
             controller: &self.controller,
+            nonce: self.nonce,
+            expiry: self.expiry,
             request: &self.request,
         };
         // The derived serde impls used here never fail to encode; the only
@@ -183,6 +219,22 @@ pub enum ControlError {
     /// Canonical postcard encoding/decoding failed.
     #[error("postcard encode/decode: {0}")]
     Codec(String),
+    /// An admin grant's expiry is not strictly after its `granted_at`.
+    #[error("admin grant expiry {expiry} is not after granted_at {granted_at}")]
+    GrantExpiryNotAfterGrant {
+        /// Unix-seconds time the grant was issued.
+        granted_at: u64,
+        /// Unix-seconds expiry that must be greater than `granted_at`.
+        expiry: u64,
+    },
+    /// An admin grant's lifetime exceeds [`MAX_ADMIN_TTL_SECS`](crate::MAX_ADMIN_TTL_SECS).
+    #[error("admin grant ttl {ttl}s exceeds max {max}s")]
+    GrantTtlTooLong {
+        /// The requested lifetime (`expiry - granted_at`) in seconds.
+        ttl: u64,
+        /// The permitted maximum lifetime in seconds.
+        max: u64,
+    },
 }
 
 #[cfg(test)]
@@ -236,7 +288,7 @@ mod tests {
     }
 
     fn signed_with(op: &OperatorSecretKey) -> SignedControl {
-        SignedControl::authorize(node("origin"), op, sample_request()).unwrap()
+        SignedControl::authorize(node("origin"), op, 7, 1_000, sample_request()).unwrap()
     }
 
     #[test]
@@ -248,6 +300,8 @@ mod tests {
         assert_eq!(signed.version, CONTROL_FORMAT_VERSION);
         assert_eq!(signed.origin, node("origin"));
         assert_eq!(signed.controller, op.public());
+        assert_eq!(signed.nonce, 7);
+        assert_eq!(signed.expiry, 1_000);
         assert_eq!(signed.verify_signature(), Ok(()));
 
         let verified = verify_control(&signed, &registry).unwrap();
@@ -300,6 +354,42 @@ mod tests {
     }
 
     #[test]
+    fn verify_control_rejects_tampered_nonce() {
+        let op = operator(1);
+        let registry = registry_with(&[("origin", &op, &ledger(11))]);
+        let mut signed = signed_with(&op);
+
+        // The nonce is inside the signed preimage: a relay cannot swap it.
+        signed.nonce += 1;
+        assert_eq!(
+            signed.verify_signature(),
+            Err(ControlError::InvalidSignature)
+        );
+        assert_eq!(
+            verify_control(&signed, &registry),
+            Err(ControlError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn verify_control_rejects_tampered_expiry() {
+        let op = operator(1);
+        let registry = registry_with(&[("origin", &op, &ledger(11))]);
+        let mut signed = signed_with(&op);
+
+        // The expiry is inside the signed preimage: a relay cannot extend it.
+        signed.expiry += 1;
+        assert_eq!(
+            signed.verify_signature(),
+            Err(ControlError::InvalidSignature)
+        );
+        assert_eq!(
+            verify_control(&signed, &registry),
+            Err(ControlError::InvalidSignature)
+        );
+    }
+
+    #[test]
     fn verify_control_rejects_bad_version() {
         let op = operator(1);
         let registry = registry_with(&[("origin", &op, &ledger(11))]);
@@ -318,10 +408,10 @@ mod tests {
 
     #[test]
     fn verify_control_rejects_v1_version() {
-        // The format is now 2 (v1 predates `JoinApproval::parent_ledger`). A v1
+        // The format is now 3 (v1 predates `JoinApproval::parent_ledger`). A v1
         // envelope must be rejected up front rather than parsed with the new
         // shape; the check is version-exact, not `>=`.
-        assert_ne!(CONTROL_FORMAT_VERSION, 1, "this test assumes format 2");
+        assert_ne!(CONTROL_FORMAT_VERSION, 1, "this test assumes format 3");
         let op = operator(1);
         let registry = registry_with(&[("origin", &op, &ledger(11))]);
         let mut signed = signed_with(&op);
@@ -337,16 +427,37 @@ mod tests {
     }
 
     #[test]
+    fn verify_control_rejects_v2_version() {
+        // v2 predates `SignedControl::nonce`/`expiry`; a v2 envelope must be
+        // rejected rather than parsed with the v3 shape.
+        assert_ne!(CONTROL_FORMAT_VERSION, 2, "this test assumes format 3");
+        let op = operator(1);
+        let registry = registry_with(&[("origin", &op, &ledger(11))]);
+        let mut signed = signed_with(&op);
+        signed.version = 2;
+        assert_eq!(
+            verify_control(&signed, &registry),
+            Err(ControlError::UnsupportedVersion(2))
+        );
+        assert_eq!(
+            verify_control(&signed, &PeerRegistry::new()),
+            Err(ControlError::UnsupportedVersion(2))
+        );
+    }
+
+    #[test]
     fn signing_hash_is_stable() {
         // Golden vector. This pins the frozen field order and domain-separated
-        // encoding of `(version, origin, controller, request)`: a reordered,
-        // added, or removed field changes this hash, so the pinned value must
-        // only ever change as part of a deliberate protocol version bump. It
-        // changed at version 2 when `JoinApproval` gained `parent_ledger`.
+        // encoding of `(version, origin, controller, nonce, expiry, request)`: a
+        // reordered, added, or removed field changes this hash, so the pinned
+        // value must only ever change as part of a deliberate protocol version
+        // bump. It changed at version 2 when `JoinApproval` gained
+        // `parent_ledger`, and again at version 3 when `SignedControl` gained
+        // `nonce` and `expiry`.
         let signed = signed_with(&operator(7));
         assert_eq!(
             signed.signing_hash().to_hex(),
-            "a65d7f4f6da383ef7aa82682603daea8e2dad3fdb80571e6fe87978773818123"
+            "467b9187602e4441c8da24021d858826a4e915426155987cb3b4e47c06b83978"
         );
     }
 

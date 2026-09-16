@@ -34,6 +34,7 @@ import {
 } from './constants.js';
 import { clientState, ledgerState } from './stores.svelte.js';
 import * as idb from './identityBundle.js';
+import * as adminKeys from './adminKeys.js';
 
 // ── Internal state ────────────────────────────────────────────
 
@@ -324,6 +325,20 @@ async function _spawnRealNode() {
       node.import_ledger_state(ledgerBytes);
     } catch (err) {
       console.warn('[api] import_ledger_state failed; starting from a fresh ledger state', err);
+    }
+  }
+
+  // Restore any persisted delegated admin key (K_admin) into the fresh node so
+  // admin actions survive a reload. The seed is read only via adminSeedBytes.
+  const activeAdmin = adminKeys.activeAdminNode();
+  if (activeAdmin) {
+    const adminSeed = adminKeys.adminSeedBytes(activeAdmin.nodeId);
+    if (adminSeed && adminSeed.length === 32) {
+      try {
+        node.set_admin_key(adminSeed);
+      } catch (err) {
+        console.warn('[api] set_admin_key failed; admin actions will be unavailable', err);
+      }
     }
   }
 
@@ -1011,6 +1026,8 @@ export async function wipeIdentity() {
     _removeScopedBlob(LEDGER_KEY, nodeId);
   }
   _removeLegacyBlobs();
+  // Admin keys are device-local and identity-bound: wipe them too.
+  adminKeys.clearAllAdminEntries();
 }
 
 // ── Identity & connection ─────────────────────────────────────
@@ -1361,6 +1378,88 @@ export class AdminUnavailableError extends Error {
   }
 }
 
+// ── Delegated admin keys ──────────────────────────────────────
+
+/**
+ * Generate a fresh delegated admin key for `nodeId` and install it on the live
+ * client. The returned public key is what the operator grants with
+ * `control admin grant`.
+ *
+ * The seed is persisted device-locally (adminKeys) and is never put into an
+ * exported identity bundle. In mock mode no wasm is touched and a fake public
+ * key is returned (nothing is persisted).
+ *
+ * @param {string} nodeId Target parent node id (64 hex).
+ * @param {{ expirySeconds?: number|null, label?: string|null }} [opts]
+ * @returns {Promise<{ nodeId: string, adminPubHex: string }>}
+ */
+export async function configureAdminNode(nodeId, { expirySeconds = null, label = null } = {}) {
+  if (typeof nodeId !== 'string' || !/^[0-9a-fA-F]{64}$/.test(nodeId)) {
+    throw new Error('nodeId must be exactly 64 hex characters');
+  }
+
+  const now = Date.now();
+  const ttlSeconds = expirySeconds == null ? 7 * 24 * 3600 : Number(expirySeconds);
+  if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
+    throw new Error('expirySeconds must be a positive number');
+  }
+  const expiresAt = now + ttlSeconds * 1000;
+
+  if (_useMock) {
+    await mockDelay(200);
+    const adminPubHex = _randomHex32();
+    return { nodeId: nodeId.toLowerCase(), adminPubHex };
+  }
+
+  const node = _requireNode();
+  const seed = _wasmModule.generate_secret_key();
+  const seedBytes = seed instanceof Uint8Array ? seed : new Uint8Array(seed);
+  if (seedBytes.length !== 32) {
+    throw new Error('Failed to configure admin key: generated seed is not 32 bytes.');
+  }
+  node.set_admin_key(seedBytes);
+  const adminPubHex = node.admin_public_key();
+  if (typeof adminPubHex !== 'string' || !adminPubHex) {
+    throw new Error('Failed to configure admin key: node returned no admin public key.');
+  }
+
+  adminKeys.addAdminEntry({
+    nodeId,
+    adminSeedHex: _bytesToHex(seedBytes),
+    adminPubHex,
+    grantedAt: now,
+    expiresAt,
+    label,
+  });
+
+  return { nodeId: nodeId.toLowerCase(), adminPubHex };
+}
+
+/**
+ * Forget a delegated admin key: clears the live node's key when this is the
+ * active entry, then removes the persisted entry.
+ * @param {string} nodeId
+ */
+export function removeAdminNode(nodeId) {
+  const active = adminKeys.activeAdminNode();
+  if (active && active.nodeId === String(nodeId).toLowerCase()) {
+    try {
+      _clientNode?.clear_admin_key?.();
+    } catch (err) {
+      _warnOnce('admin-clear-key', '[api] clear_admin_key failed', err);
+    }
+  }
+  adminKeys.removeAdminNode(nodeId);
+}
+
+/**
+ * Admin nodes for UI display (seed-free).
+ * @returns {Array<{ nodeId: string, adminPubHex: string, scope: 'admin', grantedAt: number, expiresAt: number, label: string|null, active: boolean }>}
+ */
+export function getAdminNodes() {
+  return adminKeys.listAdminNodes();
+}
+
 /**
  * Request to join a parent node.
  *
@@ -1416,31 +1515,86 @@ export async function requestJoin(parsed, addressHint) {
 }
 
 /**
- * Approve a pending join request. Not available in the web client.
+ * Approve a pending join request.
+ *
+ * Live mode requires an active delegated admin key; without one this throws
+ * `AdminUnavailableError` (as before). The wasm call may reject with a
+ * `JsError` whose message is `admin request rejected: <stable_code>`.
+ *
  * @param {string} childEndpointId
- * @param {number|null} slot
- * @returns {Promise<{ status: string, address: string }>}
+ * @param {number|null} [slot]
+ * @returns {Promise<{ status: string, address: string|null, delivery: string }>}
  */
-export async function approveJoin(childEndpointId, slot) {
+export async function approveJoin(childEndpointId, slot = null) {
   if (_useMock) {
     await mockDelay(400);
     const s = slot ?? 4;
-    return { status: 'approved', address: `0.3.${s}` };
+    return { status: 'approved', address: `0.3.${s}`, delivery: 'delivered' };
   }
-  throw new AdminUnavailableError('approve');
+  const active = adminKeys.activeAdminNode();
+  if (!active) throw new AdminUnavailableError('approve');
+
+  const node = _requireNode();
+  const dto = await node.admin_approve_join(active.nodeId, childEndpointId, slot);
+  try {
+    return {
+      status: 'approved',
+      address: dto.address ?? null,
+      delivery: dto.delivery,
+    };
+  } finally {
+    dto.free?.();
+  }
 }
 
 /**
- * Reject a pending join request. Not available in the web client.
+ * Reject a pending join request.
+ *
+ * Live mode requires an active delegated admin key; without one this throws
+ * `AdminUnavailableError` (as before).
+ *
  * @param {string} childEndpointId
- * @returns {Promise<{ status: string }>}
+ * @param {string|null} [reason]
+ * @returns {Promise<{ status: string, delivery: string }>}
  */
-export async function rejectJoin(childEndpointId) {
+export async function rejectJoin(childEndpointId, reason = null) {
   if (_useMock) {
     await mockDelay(300);
-    return { status: 'rejected' };
+    return { status: 'rejected', delivery: 'delivered' };
   }
-  throw new AdminUnavailableError('reject');
+  const active = adminKeys.activeAdminNode();
+  if (!active) throw new AdminUnavailableError('reject');
+
+  const node = _requireNode();
+  const dto = await node.admin_reject_join(active.nodeId, childEndpointId, reason);
+  try {
+    return { status: 'rejected', delivery: dto.delivery };
+  } finally {
+    dto.free?.();
+  }
+}
+
+/**
+ * Re-send a previously stored join decision (approve or reject) to a child.
+ *
+ * @param {string} childEndpointId
+ * @returns {Promise<{ status: string, delivery: string }>}
+ */
+export async function redeliverJoin(childEndpointId) {
+  if (_useMock) {
+    await mockDelay(300);
+    return { status: 'redelivered', delivery: 'delivered' };
+  }
+  const active = adminKeys.activeAdminNode();
+  if (!active) throw new AdminUnavailableError('redeliver');
+
+  const node = _requireNode();
+  const dto = await node.admin_redeliver_join(active.nodeId, childEndpointId);
+  try {
+    return { status: 'redelivered', delivery: dto.delivery };
+  } finally {
+    dto.free?.();
+  }
 }
 
 /**
@@ -1748,8 +1902,11 @@ export async function getAccounts() {
 }
 
 /**
- * Get pending join requests. Pending joins are not exposed by the protocol, so
- * live mode returns an empty list.
+ * Get pending join requests.
+ *
+ * Live mode requires an active delegated admin key: it queries the target
+ * node's admin snapshot and maps each pending join. Without an active admin
+ * key it returns an empty list (as before).
  * @returns {Promise<Array>}
  */
 export async function getJoinRequests() {
@@ -1757,7 +1914,37 @@ export async function getJoinRequests() {
     await mockDelay(200);
     return [...MOCK_DATA.joinRequests];
   }
-  return [];
+
+  const active = adminKeys.activeAdminNode();
+  if (!active) return [];
+
+  let snapshot;
+  try {
+    snapshot = await _requireNode().admin_query(active.nodeId);
+  } catch (err) {
+    _warnOnce('admin-query', '[api] admin_query failed', err);
+    return [];
+  }
+
+  // Cache the pending list once: the getter may hand back fresh wasm handles
+  // on each access, so we must free the exact objects we mapped.
+  const rows = snapshot.pending ?? [];
+  try {
+    return rows.map((row) => ({
+      endpointId: row.child_id,
+      requestedAddress: null,
+      slot: row.desired_slot ?? null,
+      kind: row.kind ?? null,
+      operator: row.operator ?? null,
+      expiry: row.expiry ?? null,
+      timestamp: null,
+      status: 'pending',
+      nodeId: active.nodeId,
+    }));
+  } finally {
+    for (const row of rows) row.free?.();
+    snapshot.free?.();
+  }
 }
 
 /**
@@ -1847,7 +2034,7 @@ function _readJoinStatus(node) {
 export function getCapabilities() {
   return {
     mock: _useMock,
-    canAdmin: false,
+    canAdmin: !_useMock && !!adminKeys.activeAdminNode(),
     canQueryPeers: false,
     identityPersistent: _identityPersistent,
     multiTabLeader: _multiTabLeader,

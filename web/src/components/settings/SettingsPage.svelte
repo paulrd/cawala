@@ -14,7 +14,11 @@
     inspectIdentityBundle,
     importIdentityBundle,
     wipeIdentity,
+    getAdminNodes,
+    configureAdminNode,
+    removeAdminNode,
   } from '../../lib/api.js';
+  import { copyToClipboard } from '../../lib/utils.js';
 
   let caps = $derived(getCapabilities());
   let mock = $derived(isMockMode());
@@ -122,6 +126,101 @@
       showToast(err?.message || 'Wipe failed.', 'danger');
       wipeBusy = false;
     }
+  }
+
+  // ── Admin node state ──────────────────────────────────────
+  let adminNodes = $state([]);
+  let adminBusy = $state(false);
+  let configureNodeId = $state('');
+  let configureLabel = $state('');
+  let configureDays = $state(7);
+  let configureResult = $state(null); // { nodeId, adminPubHex } | null
+  let removeConfirmOpen = $state(false);
+  let removeTarget = $state(null); // nodeId string
+
+  async function loadAdminNodes() {
+    if (mock) return;
+    try {
+      adminNodes = getAdminNodes();
+    } catch {
+      adminNodes = [];
+    }
+  }
+
+  $effect(() => {
+    if (!mock) loadAdminNodes();
+  });
+
+  function validateNodeId(id) {
+    return /^[0-9a-fA-F]{64}$/.test(id);
+  }
+
+  let configureReady = $derived(
+    validateNodeId(configureNodeId) &&
+    configureDays > 0 &&
+    !adminBusy,
+  );
+
+  async function handleConfigure() {
+    if (!configureReady) return;
+    adminBusy = true;
+    try {
+      const expirySeconds = Math.round(configureDays * 24 * 60 * 60);
+      const result = await configureAdminNode(configureNodeId, {
+        expirySeconds,
+        label: configureLabel.trim() || null,
+      });
+      configureResult = result;
+      showToast('Admin key generated. Copy the public key and ask the operator to grant it.', 'ok');
+      await loadAdminNodes();
+    } catch (err) {
+      showToast(err?.message || 'Failed to generate admin key.', 'danger');
+    } finally {
+      adminBusy = false;
+    }
+  }
+
+  function handleCopyPubKey() {
+    if (configureResult) {
+      copyToClipboard(configureResult.adminPubHex).then((ok) => {
+        showToast(ok ? 'Public key copied.' : 'Copy failed.', ok ? 'ok' : 'warn');
+      });
+    }
+  }
+
+  function handleCopyCommand() {
+    if (!configureResult) return;
+    const cmd = `cawala-node control admin grant --key ${configureResult.adminPubHex} --label ${configureLabel.trim() || 'browser-admin'}`;
+    copyToClipboard(cmd).then((ok) => {
+      showToast(ok ? 'Command copied.' : 'Copy failed.', ok ? 'ok' : 'warn');
+    });
+  }
+
+  function handleRemoveAdmin(nodeId) {
+    removeTarget = nodeId;
+    removeConfirmOpen = true;
+  }
+
+  function doRemoveAdmin() {
+    if (!removeTarget) return;
+    try {
+      removeAdminNode(removeTarget);
+      showToast('Admin node removed.', 'ok');
+      loadAdminNodes();
+    } catch (err) {
+      showToast(err?.message || 'Failed to remove admin node.', 'danger');
+    }
+    removeConfirmOpen = false;
+    removeTarget = null;
+  }
+
+  function formatTs(ms) {
+    if (!ms) return '--';
+    return new Date(ms).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  }
+
+  function isExpired(expiresAt) {
+    return typeof expiresAt === 'number' && expiresAt < Date.now();
   }
 </script>
 
@@ -359,6 +458,139 @@
     </div>
   </Card>
 
+  <!-- ── Node Administration ──────────────────────────────────── -->
+  <Card title="Node Administration">
+    <div class="settings-section">
+      {#if mock}
+        <div class="muted text-sm">
+          Node administration is not available in mock mode.
+        </div>
+      {:else}
+        <p class="muted text-sm">
+          Generate a delegated admin key to approve or reject join requests from this browser.
+          The operator must grant this key on the target node before it can be used.
+        </p>
+
+        <!-- Configure form -->
+        <div class="admin-block">
+          <h4 class="admin-heading">Generate admin key</h4>
+          <div class="field">
+            <label class="field-label" for="admin-node-id">Node ID (64 hex characters)</label>
+            <input
+              id="admin-node-id"
+              type="text"
+              class="field-input field-input--mono"
+              placeholder="e.g. z6Mk..."
+              bind:value={configureNodeId}
+              disabled={adminBusy}
+            />
+            {#if configureNodeId && !validateNodeId(configureNodeId)}
+              <span class="field-hint field-hint--danger">Must be exactly 64 hex characters.</span>
+            {/if}
+          </div>
+          <div class="field">
+            <label class="field-label" for="admin-label">Label (optional)</label>
+            <input
+              id="admin-label"
+              type="text"
+              class="field-input"
+              placeholder="e.g. office-laptop"
+              bind:value={configureLabel}
+              disabled={adminBusy}
+            />
+          </div>
+          <div class="field">
+            <label class="field-label" for="admin-days">Expiry (days)</label>
+            <input
+              id="admin-days"
+              type="number"
+              class="field-input"
+              min="1"
+              bind:value={configureDays}
+              disabled={adminBusy}
+            />
+          </div>
+          <button
+            type="button"
+            class="btn btn--primary"
+            disabled={!configureReady}
+            onclick={handleConfigure}
+          >
+            {#if adminBusy}Generating...{:else}Generate key{/if}
+          </button>
+        </div>
+
+        {#if configureResult}
+          <div class="admin-result">
+            <h4 class="admin-heading">Key generated</h4>
+            <p class="muted text-sm">
+              Give the public key below to the node operator. They must run the grant
+              command on the node before this browser can manage joins.
+            </p>
+            <div class="admin-pubkey-row">
+              <code class="admin-pubkey">{configureResult.adminPubHex}</code>
+              <button type="button" class="btn btn--ghost btn--sm" onclick={handleCopyPubKey}>
+                Copy
+              </button>
+            </div>
+            <div class="admin-command-row">
+              <span class="field-label">Operator command</span>
+              <code class="admin-command">
+                cawala-node control admin grant --key {configureResult.adminPubHex} --label {configureLabel.trim() || 'browser-admin'}
+              </code>
+              <button type="button" class="btn btn--ghost btn--sm" onclick={handleCopyCommand}>
+                Copy
+              </button>
+            </div>
+            <div class="warn-box">
+              <span class="warn-icon">!</span>
+              <span>
+                The admin private key is stored in this browser. Anyone with browser access can approve
+                or reject join requests for the configured node until the key expires or is revoked.
+              </span>
+            </div>
+          </div>
+        {/if}
+
+        <!-- Configured admin nodes -->
+        {#if adminNodes.length > 0}
+          <div class="admin-nodes">
+            <h4 class="admin-heading">Configured admin nodes</h4>
+            {#each adminNodes as node}
+              <div class="admin-node-row" class:admin-node--expired={isExpired(node.expiresAt)}>
+                <div class="admin-node-info">
+                  <div class="admin-node-id">
+                    <code class="text-sm mono">{node.nodeId}</code>
+                    {#if node.active}
+                      <Badge variant="ok" label="Active" />
+                    {:else if isExpired(node.expiresAt)}
+                      <Badge variant="danger" label="Expired" />
+                    {:else}
+                      <Badge variant="muted" label="Inactive" />
+                    {/if}
+                    {#if node.label}
+                      <Badge variant="info" label={node.label} />
+                    {/if}
+                  </div>
+                  <span class="text-xs muted">
+                    Granted: {formatTs(node.grantedAt)} | Expires: {formatTs(node.expiresAt)}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  class="btn btn--danger-outline btn--sm"
+                  onclick={() => handleRemoveAdmin(node.nodeId)}
+                >
+                  Remove
+                </button>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      {/if}
+    </div>
+  </Card>
+
   <!-- Import confirm dialog -->
   <ConfirmDialog
     open={importConfirmOpen}
@@ -379,6 +611,17 @@
     variant="danger"
     onConfirm={doWipe}
     onCancel={() => { wipeConfirmOpen = false; }}
+  />
+
+  <!-- Remove admin confirm dialog -->
+  <ConfirmDialog
+    open={removeConfirmOpen}
+    title="Remove admin node?"
+    message="This will remove the admin key for this node from this browser. You will not be able to manage join requests for this node unless you reconfigure."
+    confirmLabel="Remove"
+    variant="danger"
+    onConfirm={doRemoveAdmin}
+    onCancel={() => { removeConfirmOpen = false; removeTarget = null; }}
   />
 
   <Card title="Location Service">
@@ -586,6 +829,120 @@
     gap: var(--sp-3);
   }
   .preview-row code {
+    word-break: break-all;
+  }
+
+  /* ── Admin card ───────────────────────────────── */
+  .admin-block {
+    padding: var(--sp-4);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+  }
+  .admin-heading {
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--fg);
+    margin: 0;
+  }
+  .field-hint {
+    font-size: var(--text-xs);
+    color: var(--muted);
+    margin-top: calc(-1 * var(--sp-1));
+  }
+  .field-hint--danger {
+    color: var(--danger);
+  }
+  .field-input--mono {
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+  }
+  .admin-result {
+    padding: var(--sp-4);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+    background: var(--bg);
+  }
+  .admin-pubkey-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: var(--sp-3);
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+  }
+  .admin-pubkey {
+    flex: 1;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    word-break: break-all;
+    color: var(--accent);
+  }
+  .admin-command-row {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+  }
+  .admin-command {
+    padding: var(--sp-3);
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    word-break: break-all;
+    color: var(--fg);
+  }
+  .btn--sm {
+    padding: var(--sp-1) var(--sp-2);
+    font-size: var(--text-xs);
+  }
+  .btn--ghost {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--border);
+  }
+  .btn--ghost:hover {
+    background: var(--bg-hover);
+    color: var(--fg);
+  }
+  .admin-nodes {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+  }
+  .admin-node-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: var(--sp-3) var(--sp-4);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg);
+    gap: var(--sp-3);
+  }
+  .admin-node--expired {
+    opacity: 0.6;
+  }
+  .admin-node-info {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+    min-width: 0;
+  }
+  .admin-node-id {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    flex-wrap: wrap;
+  }
+  .admin-node-id code {
     word-break: break-all;
   }
 </style>

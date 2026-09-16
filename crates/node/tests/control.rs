@@ -7,13 +7,15 @@
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cawala_control::{
-    ChildKind, ControlReply, ControlRequest, CreateChild, Invite, JoinRequest, NodeId,
-    OperatorPubKey, OperatorSecretKey, RejectCode, SetAddress, SignedControl,
+    CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest, CreateChild, Invite,
+    JoinRequest, NodeId, OperatorPubKey, OperatorSecretKey, RejectCode, SetAddress, SignedControl,
 };
 use cawala_ledger::{LedgerPubKey, LedgerSecretKey, PeerKeys, PeerRegistry, PeerRole};
+use cawala_node::AdminStore;
 use cawala_node::control::{ControlNode, spawn_control_only_on};
 use cawala_node::control_store::ControlStore;
 use cawala_node::ledger_peers::load_peers;
@@ -26,6 +28,42 @@ use tokio::sync::Mutex;
 /// Per-exchange deadline for loopback tests.
 fn timeout() -> Duration {
     Duration::from_secs(3)
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A process-unique request nonce, so a retry exercise that re-signs the same
+/// logical request is not caught by the engine's replay guard.
+fn fresh_nonce() -> u64 {
+    static NONCE: AtomicU64 = AtomicU64::new(1);
+    NONCE.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Sign a control request at a caller-supplied clock (`now`).
+fn authorize_at(
+    origin: NodeId,
+    op: &OperatorSecretKey,
+    request: ControlRequest,
+    now: u64,
+) -> SignedControl {
+    SignedControl::authorize(
+        origin,
+        op,
+        fresh_nonce(),
+        now + CONTROL_REQUEST_TTL_SECS,
+        request,
+    )
+    .expect("sign control request")
+}
+
+/// Sign a control request at the current wall clock.
+fn authorize(origin: NodeId, op: &OperatorSecretKey, request: ControlRequest) -> SignedControl {
+    authorize_at(origin, op, request, now_unix_seconds())
 }
 
 /// Bind a hermetic endpoint on IPv4 loopback with relays disabled.
@@ -139,6 +177,7 @@ async fn spawn_node(spec: NodeSpec<'_>) -> TestNode {
         record,
         registry,
         store,
+        AdminStore::empty(),
     );
     let shared = Arc::new(Mutex::new(engine));
     let router = spawn_control_only_on(endpoint.clone(), shared.clone());
@@ -229,12 +268,11 @@ async fn join_request_then_approve_assigns_address() {
         .begin_outbound_join(join.clone(), node(&parent_id), None)
         .expect("record outbound join");
 
-    let signed_join = SignedControl::authorize(
+    let signed_join = authorize(
         node(&applicant_id),
         &applicant_op,
         ControlRequest::Join(join),
-    )
-    .unwrap();
+    );
     let reply = send(&applicant.endpoint, &parent.addr, &signed_join).await;
     assert_eq!(reply, ControlReply::Pending);
     assert_eq!(parent.engine().await.pending().pending().len(), 1);
@@ -248,12 +286,11 @@ async fn join_request_then_approve_assigns_address() {
     assert_eq!(approval.address.to_string(), "0.0");
     assert_eq!(approval.parent_ledger, ledger(55).public());
 
-    let signed_approval = SignedControl::authorize(
+    let signed_approval = authorize(
         node(&parent_id),
         &parent_op,
-        ControlRequest::JoinApproved(approval),
-    )
-    .unwrap();
+        ControlRequest::JoinApproved(approval.clone()),
+    );
     let reply = send(&parent.endpoint, &applicant.addr, &signed_approval).await;
     assert_eq!(reply, ControlReply::Accepted);
 
@@ -291,8 +328,14 @@ async fn join_request_then_approve_assigns_address() {
     }
 
     // Redelivering the approval after the outbound join is cleared is a no-op
-    // and must not corrupt the persisted parent row.
-    let reply = send(&parent.endpoint, &applicant.addr, &signed_approval).await;
+    // and must not corrupt the persisted parent row. The retry re-signs the
+    // same approval with a fresh frame so it is not caught by the replay guard.
+    let redelivery = authorize(
+        node(&parent_id),
+        &parent_op,
+        ControlRequest::JoinApproved(approval),
+    );
+    let reply = send(&parent.endpoint, &applicant.addr, &redelivery).await;
     assert_eq!(reply, ControlReply::Rejected(RejectCode::NotAttached));
     let peers = load_peers(applicant_dir.path()).expect("applicant peers");
     assert_eq!(
@@ -375,12 +418,11 @@ async fn join_with_ip_hint_reaches_parent_without_lookup() {
         .begin_outbound_join(join.clone(), node(&parent_id), Some(parent_op.public()))
         .expect("record outbound join");
 
-    let signed = SignedControl::authorize(
+    let signed = authorize(
         node(&applicant_id),
         &applicant_op,
         ControlRequest::Join(join),
-    )
-    .unwrap();
+    );
     let reply = send(&applicant.endpoint, &target, &signed).await;
     assert_eq!(reply, ControlReply::Pending);
     assert_eq!(parent.engine().await.pending().pending().len(), 1);
@@ -430,19 +472,26 @@ async fn join_idempotent() {
         Some(3),
         u64::MAX,
     );
-    let signed = SignedControl::authorize(
+    let signed = authorize(
         node(&applicant_id),
         &applicant_op,
-        ControlRequest::Join(join),
-    )
-    .unwrap();
+        ControlRequest::Join(join.clone()),
+    );
 
     assert_eq!(
         send(&applicant.endpoint, &parent.addr, &signed).await,
         ControlReply::Pending
     );
+    // A retry re-signs the same logical request with a fresh nonce; the
+    // applicant id is what makes the queue idempotent. The exact same frame
+    // would be rejected by the replay guard.
+    let retry = authorize(
+        node(&applicant_id),
+        &applicant_op,
+        ControlRequest::Join(join),
+    );
     assert_eq!(
-        send(&applicant.endpoint, &parent.addr, &signed).await,
+        send(&applicant.endpoint, &parent.addr, &retry).await,
         ControlReply::Pending
     );
     assert_eq!(parent.engine().await.pending().pending().len(), 1);
@@ -497,12 +546,11 @@ async fn non_senior_child_control_rejected() {
     let sender = bind(&sender_key).await;
 
     // The junior child (later date_joined) tries to clear the parent's address.
-    let signed = SignedControl::authorize(
+    let signed = authorize(
         node(&junior_id),
         &junior_op,
         ControlRequest::SetAddress(SetAddress { address: None }),
-    )
-    .unwrap();
+    );
     let reply = send(&sender, &parent.addr, &signed).await;
     assert_eq!(reply, ControlReply::Rejected(RejectCode::Unauthorized));
 
@@ -574,12 +622,11 @@ async fn user_child_is_never_senior_for_control() {
     let sender = bind(&SecretKey::generate()).await;
 
     // The earliest-joining user child is not authorized to clear the address.
-    let user_clear = SignedControl::authorize(
+    let user_clear = authorize(
         node(&user_id),
         &user_op,
         ControlRequest::SetAddress(SetAddress { address: None }),
-    )
-    .unwrap();
+    );
     assert_eq!(
         send(&sender, &parent.addr, &user_clear).await,
         ControlReply::Rejected(RejectCode::Unauthorized)
@@ -590,12 +637,11 @@ async fn user_child_is_never_senior_for_control() {
     }
 
     // The node child (later date_joined) is still authorized.
-    let node_clear = SignedControl::authorize(
+    let node_clear = authorize(
         node(&node_child_id),
         &node_child_op,
         ControlRequest::SetAddress(SetAddress { address: None }),
-    )
-    .unwrap();
+    );
     assert_eq!(
         send(&sender, &parent.addr, &node_clear).await,
         ControlReply::Accepted
@@ -654,12 +700,11 @@ async fn senior_child_can_control_parent() {
     let sender = bind(&SecretKey::generate()).await;
 
     // Clear, then re-assert, the parent's address.
-    let clear = SignedControl::authorize(
+    let clear = authorize(
         node(&senior_id),
         &senior_op,
         ControlRequest::SetAddress(SetAddress { address: None }),
-    )
-    .unwrap();
+    );
     assert_eq!(
         send(&sender, &parent.addr, &clear).await,
         ControlReply::Accepted
@@ -669,14 +714,13 @@ async fn senior_child_can_control_parent() {
         assert_eq!(engine.record().address, None);
     }
 
-    let set = SignedControl::authorize(
+    let set = authorize(
         node(&senior_id),
         &senior_op,
         ControlRequest::SetAddress(SetAddress {
             address: Some("0".parse().unwrap()),
         }),
-    )
-    .unwrap();
+    );
     assert_eq!(
         send(&sender, &parent.addr, &set).await,
         ControlReply::Accepted
@@ -692,7 +736,7 @@ async fn senior_child_can_control_parent() {
     let grandchild_op = operator(&grandchild_key);
     let grandchild_op_pub: OperatorPubKey = grandchild_op.public();
     let grandchild_ledger = ledger(21);
-    let create = SignedControl::authorize(
+    let create = authorize(
         node(&senior_id),
         &senior_op,
         ControlRequest::CreateChild(CreateChild {
@@ -703,8 +747,7 @@ async fn senior_child_can_control_parent() {
             slot: Some(5),
             date_joined: 30,
         }),
-    )
-    .unwrap();
+    );
     assert_eq!(
         send(&sender, &parent.addr, &create).await,
         ControlReply::Accepted
@@ -758,11 +801,12 @@ async fn query_returns_snapshot() {
     .await;
 
     // Self-admin query: the node's own operator is authorized.
-    let signed = SignedControl::authorize(node(&node_id), &node_op, ControlRequest::Query).unwrap();
+    let now = now_unix_seconds();
+    let signed = authorize_at(node(&node_id), &node_op, ControlRequest::Query, now);
     let reply = test_node
         .engine()
         .await
-        .receive_at(EndpointId::from(node_key.public()), signed, 0)
+        .receive_at(EndpointId::from(node_key.public()), signed, now)
         .await;
 
     let ControlReply::Snapshot(snapshot) = reply else {
@@ -840,12 +884,11 @@ async fn join_capacity_overflow_rejected() {
         None,
         u64::MAX,
     );
-    let signed = SignedControl::authorize(
+    let signed = authorize(
         node(&applicant_id),
         &applicant_op,
         ControlRequest::Join(join),
-    )
-    .unwrap();
+    );
     assert_eq!(
         send(&applicant.endpoint, &parent.addr, &signed).await,
         ControlReply::Rejected(RejectCode::Capacity)

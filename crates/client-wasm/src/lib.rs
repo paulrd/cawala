@@ -22,19 +22,18 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use cawala_control::{
-    CONTROL_ALPN, ChildKind, ControlReply, ControlRequest, Invite, JoinRequest, NodeId,
-    OperatorSecretKey, SignedControl,
+    AdminJoinApprove, AdminJoinReject, AdminRedeliverJoin, CONTROL_ALPN, CONTROL_REQUEST_TTL_SECS,
+    ChildKind, ControlReply, ControlRequest, Invite, JoinRequest, NodeId, OperatorSecretKey,
+    RejectCode, SignedControl,
 };
 use cawala_msg::{
     Ack, AckStatus, BalanceQueryV1, Envelope, LedgerPayloadV1, LedgerPayloadV2, MSG_LEDGER_V1,
     MsgError, MsgId, OctAddr, OrderV2, PeerRef, RejectReason, Seen, SeenConfig, SeenSet,
     VersionedLedgerPayload, decode_versioned,
 };
+use iroh::endpoint::Connection;
+use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{EndpointAddr, EndpointId};
-use iroh::{
-    endpoint::Connection,
-    protocol::{AcceptError, ProtocolHandler, Router},
-};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tracing::info;
@@ -48,11 +47,12 @@ pub mod ledger_state;
 pub mod state;
 
 use crate::control::{
-    ControlHandler, JOIN_TTL_SECONDS, SharedControl, exchange_control, invite_endpoint_addr,
+    ControlHandler, JOIN_TTL_SECONDS, SharedControl, exchange_admin, exchange_control,
+    invite_endpoint_addr,
 };
 use crate::dto::{
-    ControlEventDto, JoinOutcome, JoinStatus, LedgerEventDto, LedgerStatusDto, PaymentOutcome,
-    SnapshotDto, parse_operator_hex, reject_code_str,
+    AdminActionDto, AdminSnapshotDto, ControlEventDto, JoinOutcome, JoinStatus, LedgerEventDto,
+    LedgerStatusDto, PaymentOutcome, SnapshotDto, parse_operator_hex, reject_code_str,
 };
 use crate::ledger_state::LedgerStateV1;
 use crate::state::{LocalStateV1, ParentLink};
@@ -90,7 +90,7 @@ pub fn generate_secret_key() -> Result<Vec<u8>, JsError> {
 
 /// Current time as unix seconds, via [`web_time::SystemTime`] so it works on
 /// `wasm32-unknown-unknown` as well as natively.
-fn now_unix_seconds() -> u64 {
+pub(crate) fn now_unix_seconds() -> u64 {
     web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -707,8 +707,16 @@ impl ClientNode {
             now,
         );
 
-        let signed = SignedControl::authorize(me, &operator, ControlRequest::Join(request))
-            .map_err(to_js_err)?;
+        let mut signed_nonce = [0u8; 8];
+        getrandom::fill(&mut signed_nonce).map_err(to_js_err)?;
+        let signed = SignedControl::authorize(
+            me,
+            &operator,
+            u64::from_le_bytes(signed_nonce),
+            now.saturating_add(CONTROL_REQUEST_TTL_SECS),
+            ControlRequest::Join(request),
+        )
+        .map_err(to_js_err)?;
         let reply = exchange_control(self.router.endpoint(), target, &signed).await?;
 
         match reply {
@@ -723,12 +731,125 @@ impl ClientNode {
             ControlReply::Snapshot(_) => {
                 Err(JsError::new("unexpected snapshot reply to a join request"))
             }
+            _ => Err(JsError::new("unexpected reply to a join request")),
         }
     }
 
     /// A local summary of the join handshake state.
     pub fn join_status(&self) -> JoinStatus {
         JoinStatus::from_state(&self.control.lock_state())
+    }
+
+    /// Install a delegated admin key (K_admin) used by the `admin_*` methods.
+    ///
+    /// `secret_key` must be exactly 32 bytes (an Ed25519 seed). The key is held
+    /// in memory only: it is **never** persisted on the Rust side and never
+    /// enters [`ClientNode::export_state`]/[`ClientNode::export_ledger_state`].
+    /// The PWA owns its storage.
+    pub fn set_admin_key(&self, secret_key: &[u8]) -> Result<(), JsError> {
+        let seed: [u8; 32] = secret_key
+            .try_into()
+            .map_err(|_| JsError::new("admin key must be exactly 32 bytes"))?;
+        self.control
+            .set_admin(Some(OperatorSecretKey::from_bytes(seed)));
+        Ok(())
+    }
+
+    /// Forget the delegated admin key, if any.
+    pub fn clear_admin_key(&self) {
+        self.control.set_admin(None);
+    }
+
+    /// The configured admin public key as 64 lowercase hex characters, or
+    /// `None` when no admin key is set.
+    pub fn admin_public_key(&self) -> Option<String> {
+        self.control.admin_key().map(|key| key.public().to_string())
+    }
+
+    /// Query `node`'s admin snapshot (its topology plus pending joins).
+    ///
+    /// `node` is the target's endpoint id. Requires a configured admin key and
+    /// dials the node directly over `cawala/control/0`.
+    pub async fn admin_query(&self, node: String) -> Result<AdminSnapshotDto, JsError> {
+        let (target, admin) = self.admin_context(&node)?;
+        let reply = exchange_admin(
+            self.router.endpoint(),
+            target,
+            &admin,
+            ControlRequest::AdminQuery,
+        )
+        .await?;
+        match reply {
+            ControlReply::AdminSnapshot(snapshot) => Ok(AdminSnapshotDto::from_snapshot(&snapshot)),
+            ControlReply::Rejected(code) => Err(admin_rejected(code)),
+            _ => Err(unexpected_admin_reply("an admin query")),
+        }
+    }
+
+    /// Approve `child`'s pending join at `node`, optionally assigning `slot`.
+    pub async fn admin_approve_join(
+        &self,
+        node: String,
+        child: String,
+        slot: Option<u8>,
+    ) -> Result<AdminActionDto, JsError> {
+        let (target, admin) = self.admin_context(&node)?;
+        let child = parse_child(&child)?;
+        let request = ControlRequest::AdminApproveJoin(AdminJoinApprove { child, slot });
+        let reply = exchange_admin(self.router.endpoint(), target, &admin, request).await?;
+        match reply {
+            ControlReply::AdminApproved(approved) => Ok(AdminActionDto::from_approved(&approved)),
+            ControlReply::AdminRejected(rejected) => Ok(AdminActionDto::from_rejected(&rejected)),
+            ControlReply::Rejected(code) => Err(admin_rejected(code)),
+            _ => Err(unexpected_admin_reply("an admin approval")),
+        }
+    }
+
+    /// Reject `child`'s pending join at `node`, optionally carrying `reason`.
+    pub async fn admin_reject_join(
+        &self,
+        node: String,
+        child: String,
+        reason: Option<String>,
+    ) -> Result<AdminActionDto, JsError> {
+        let (target, admin) = self.admin_context(&node)?;
+        let child = parse_child(&child)?;
+        let request = ControlRequest::AdminRejectJoin(AdminJoinReject { child, reason });
+        let reply = exchange_admin(self.router.endpoint(), target, &admin, request).await?;
+        match reply {
+            ControlReply::AdminApproved(approved) => Ok(AdminActionDto::from_approved(&approved)),
+            ControlReply::AdminRejected(rejected) => Ok(AdminActionDto::from_rejected(&rejected)),
+            ControlReply::Rejected(code) => Err(admin_rejected(code)),
+            _ => Err(unexpected_admin_reply("an admin rejection")),
+        }
+    }
+
+    /// Re-send `child`'s most recent stored decision from `node`.
+    pub async fn admin_redeliver_join(
+        &self,
+        node: String,
+        child: String,
+    ) -> Result<AdminActionDto, JsError> {
+        let (target, admin) = self.admin_context(&node)?;
+        let child = parse_child(&child)?;
+        let request = ControlRequest::AdminRedeliverJoin(AdminRedeliverJoin { child });
+        let reply = exchange_admin(self.router.endpoint(), target, &admin, request).await?;
+        match reply {
+            ControlReply::AdminApproved(approved) => Ok(AdminActionDto::from_approved(&approved)),
+            ControlReply::AdminRejected(rejected) => Ok(AdminActionDto::from_rejected(&rejected)),
+            ControlReply::Rejected(code) => Err(admin_rejected(code)),
+            _ => Err(unexpected_admin_reply("an admin redelivery")),
+        }
+    }
+
+    /// Require a configured admin key and parse the target node id.
+    fn admin_context(&self, node: &str) -> Result<(EndpointId, OperatorSecretKey), JsError> {
+        let admin = self
+            .control
+            .admin_key()
+            .ok_or_else(|| JsError::new("no admin key configured; call set_admin_key first"))?;
+        let target: EndpointId = node.parse().map_err(to_js_err)?;
+        Ok((target, admin))
     }
 
     /// A snapshot of this client's local topology (address, parent, children).
@@ -936,7 +1057,9 @@ impl ClientNode {
             auth,
             payee_addr,
         });
-        let ack = self.send_ledger_payload_v2(self_addr, &parent, payload).await?;
+        let ack = self
+            .send_ledger_payload_v2(self_addr, &parent, payload)
+            .await?;
         Ok(PaymentOutcome::new(
             order_hash.to_hex(),
             ack.status_str().to_string(),
@@ -958,10 +1081,7 @@ impl ClientNode {
         let address = self
             .user_address()
             .ok_or_else(|| JsError::new("not joined: no assigned address"))?;
-        Ok(dto::receive_uri_for(
-            self.control.node_id(),
-            &address,
-        ))
+        Ok(dto::receive_uri_for(self.control.node_id(), &address))
     }
 
     /// Request a signed balance receipt from the routing leaf and return the
@@ -976,7 +1096,9 @@ impl ClientNode {
         let payload = LedgerPayloadV1::BalanceQuery(BalanceQueryV1 {
             query_id: u64::from_le_bytes(query_bytes),
         });
-        let ack = self.send_ledger_payload(self_addr, &parent, payload).await?;
+        let ack = self
+            .send_ledger_payload(self_addr, &parent, payload)
+            .await?;
         Ok(ack.status_str().to_string())
     }
 
@@ -1043,10 +1165,7 @@ impl ClientNode {
 
     /// Apply one inbound v2 settlement `OrderResultV2` to the persisted ledger
     /// state.
-    fn apply_settlement_result_event(
-        &self,
-        result: &cawala_msg::OrderResultV2,
-    ) -> LedgerEventDto {
+    fn apply_settlement_result_event(&self, result: &cawala_msg::OrderResultV2) -> LedgerEventDto {
         let Some((self_node, parent)) = self.ledger_binding() else {
             return LedgerEventDto::invalid("not_joined");
         };
@@ -1274,6 +1393,29 @@ impl ClientNode {
         tracing::info!(%endpoint_id, ?addr, "connecting via local relay fallback");
         endpoint.connect(addr, proto::ALPN).await.map_err(to_js_err)
     }
+}
+
+/// Validate a child node id string and return its canonical [`NodeId`] form.
+///
+/// The wire accepts opaque strings, but a browser should only ever name a real
+/// endpoint; parsing as an [`EndpointId`] rejects anything else and normalizes
+/// hex/base32 spellings.
+fn parse_child(raw: &str) -> Result<NodeId, JsError> {
+    let endpoint: EndpointId = raw.parse().map_err(to_js_err)?;
+    Ok(NodeId::from(endpoint.to_string()))
+}
+
+/// Map an admin reply rejection to a JS error carrying the stable code string.
+fn admin_rejected(code: RejectCode) -> JsError {
+    JsError::new(&format!(
+        "admin request rejected: {}",
+        reject_code_str(code)
+    ))
+}
+
+/// Build the error for a structurally unexpected reply to an admin action.
+fn unexpected_admin_reply(what: &str) -> JsError {
+    JsError::new(&format!("unexpected reply to {what}"))
 }
 
 pub(crate) fn to_js_err(err: impl std::fmt::Display) -> JsError {

@@ -11,8 +11,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use cawala_control::{
-    CONTROL_ALPN, CONTROL_FORMAT_VERSION, ControlReply, ControlRequest, Invite, JoinApproval,
-    JoinRejection, MAX_CONTROL_FRAME, OperatorSecretKey, SignedControl,
+    CONTROL_ALPN, CONTROL_FORMAT_VERSION, CONTROL_REQUEST_TTL_SECS, ControlReply, ControlRequest,
+    Invite, JoinApproval, JoinRejection, MAX_CONTROL_FRAME, NodeId, OperatorSecretKey, RejectCode,
+    SignedControl,
 };
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
@@ -21,7 +22,7 @@ use tracing::info;
 
 use crate::dto::ControlEventDto;
 use crate::state::{LocalStateV1, Transition};
-use crate::to_js_err;
+use crate::{now_unix_seconds, to_js_err};
 
 /// Per-request direct-control deadline, mirroring the native client.
 const CONTROL_TIMEOUT_SECS: u64 = 15;
@@ -37,6 +38,11 @@ pub(crate) const JOIN_TTL_SECONDS: u64 = 3600;
 pub(crate) struct SharedControl {
     node_id: String,
     pub(crate) operator: Option<OperatorSecretKey>,
+    /// A delegated administrator key (K_admin), supplied by JS at runtime.
+    ///
+    /// This is **never** persisted on the Rust side and never enters
+    /// [`LocalStateV1`] or the exported state blobs; the PWA owns its storage.
+    admin: Mutex<Option<OperatorSecretKey>>,
     state: Mutex<LocalStateV1>,
     events: Mutex<VecDeque<ControlEventDto>>,
 }
@@ -48,6 +54,7 @@ impl SharedControl {
         SharedControl {
             node_id,
             operator,
+            admin: Mutex::new(None),
             state: Mutex::new(LocalStateV1::new()),
             events: Mutex::new(VecDeque::new()),
         }
@@ -56,6 +63,23 @@ impl SharedControl {
     /// This endpoint's node id.
     pub(crate) fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// Install (or clear) the delegated admin key.
+    pub(crate) fn set_admin(&self, admin: Option<OperatorSecretKey>) {
+        let mut slot = self
+            .admin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = admin;
+    }
+
+    /// The delegated admin key, if one is configured (cloned for signing).
+    pub(crate) fn admin_key(&self) -> Option<OperatorSecretKey> {
+        self.admin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Lock the local state, recovering from a poisoned lock.
@@ -104,13 +128,18 @@ impl ControlHandler {
     /// Dispatch exactly one signed request, synchronously.
     fn handle(&self, signed: &SignedControl) -> ControlReply {
         if signed.version != CONTROL_FORMAT_VERSION {
-            return ControlReply::Rejected(cawala_control::RejectCode::BadVersion);
+            return ControlReply::Rejected(RejectCode::BadVersion);
+        }
+        // Companion to the v3 wire change: never act on an already-expired
+        // frame, even if its signature is otherwise valid.
+        if signed.expiry < now_unix_seconds() {
+            return ControlReply::Rejected(RejectCode::Expired);
         }
         match &signed.request {
             ControlRequest::JoinApproved(approval) => self.handle_join_approved(signed, approval),
             ControlRequest::JoinRejected(rejection) => self.handle_join_rejected(signed, rejection),
             ControlRequest::Query => self.handle_query(signed),
-            _ => ControlReply::Rejected(cawala_control::RejectCode::Unauthorized),
+            _ => ControlReply::Rejected(RejectCode::Unauthorized),
         }
     }
 
@@ -121,7 +150,7 @@ impl ControlHandler {
         approval: &JoinApproval,
     ) -> ControlReply {
         if signed.verify_signature().is_err() {
-            return ControlReply::Rejected(cawala_control::RejectCode::Unauthorized);
+            return ControlReply::Rejected(RejectCode::Unauthorized);
         }
         let transition = self.shared.lock_state().on_join_approved(
             self.shared.node_id(),
@@ -143,10 +172,10 @@ impl ControlHandler {
         rejection: &JoinRejection,
     ) -> ControlReply {
         if signed.verify_signature().is_err() {
-            return ControlReply::Rejected(cawala_control::RejectCode::Unauthorized);
+            return ControlReply::Rejected(RejectCode::Unauthorized);
         }
         if rejection.validate().is_err() {
-            return ControlReply::Rejected(cawala_control::RejectCode::BadRequest);
+            return ControlReply::Rejected(RejectCode::BadRequest);
         }
         let transition = self
             .shared
@@ -175,7 +204,7 @@ impl ControlHandler {
                 .to_node_snapshot(self.shared.node_id());
             ControlReply::Snapshot(snapshot)
         } else {
-            ControlReply::Rejected(cawala_control::RejectCode::Unauthorized)
+            ControlReply::Rejected(RejectCode::Unauthorized)
         }
     }
 }
@@ -266,6 +295,44 @@ pub(crate) async fn exchange_control(
     .map_err(|_| wasm_bindgen::JsError::new("control request timed out"))?
 }
 
+/// Build an operator-signed admin request addressed to `target`.
+///
+/// `origin` is the target node id (the running node's engine requires
+/// `signed.origin == self.node_id`), `controller` is the delegated admin key, the
+/// nonce is fresh, and the expiry is `now + CONTROL_REQUEST_TTL_SECS` so a
+/// browser clock cannot mint an over-long-lived frame.
+pub(crate) fn sign_admin_request(
+    target: EndpointId,
+    admin: &OperatorSecretKey,
+    request: ControlRequest,
+) -> Result<SignedControl, wasm_bindgen::JsError> {
+    let mut nonce_bytes = [0u8; 8];
+    getrandom::fill(&mut nonce_bytes).map_err(to_js_err)?;
+    SignedControl::authorize(
+        NodeId::from(target.to_string()),
+        admin,
+        u64::from_le_bytes(nonce_bytes),
+        now_unix_seconds().saturating_add(CONTROL_REQUEST_TTL_SECS),
+        request,
+    )
+    .map_err(to_js_err)
+}
+
+/// Sign an admin request with `admin` and directly exchange it with `target` on
+/// [`CONTROL_ALPN`].
+///
+/// Dialing uses an id-only [`EndpointAddr`], exactly like the join path, so the
+/// N0 address-lookup service resolves the node.
+pub(crate) async fn exchange_admin(
+    endpoint: &iroh::Endpoint,
+    target: EndpointId,
+    admin: &OperatorSecretKey,
+    request: ControlRequest,
+) -> Result<ControlReply, wasm_bindgen::JsError> {
+    let signed = sign_admin_request(target, admin, request)?;
+    exchange_control(endpoint, EndpointAddr::from(target), &signed).await
+}
+
 /// Stable label for a reply, for logs.
 fn reply_kind(reply: &ControlReply) -> &'static str {
     match reply {
@@ -273,5 +340,8 @@ fn reply_kind(reply: &ControlReply) -> &'static str {
         ControlReply::Pending => "pending",
         ControlReply::Rejected(_) => "rejected",
         ControlReply::Snapshot(_) => "snapshot",
+        ControlReply::AdminSnapshot(_) => "admin-snapshot",
+        ControlReply::AdminApproved(_) => "admin-approved",
+        ControlReply::AdminRejected(_) => "admin-rejected",
     }
 }

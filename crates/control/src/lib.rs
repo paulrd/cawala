@@ -39,24 +39,32 @@
 /// [`cawala_msg`]: https://docs.rs/cawala-msg
 pub const MAX_CONTROL_FRAME: u32 = 64 * 1024;
 
+pub mod admin;
 pub mod invite;
 pub mod reply;
 pub mod request;
 pub mod senior;
 pub mod sign;
 
+pub use admin::{
+    ADMIN_GRANT_CONTEXT, ADMIN_GRANT_VERSION, AdminGrant, AdminScope, DEFAULT_ADMIN_TTL_SECS,
+    MAX_ADMIN_TTL_SECS, SignedAdminGrant,
+};
 pub use cawala_ledger::{NodeId, OperatorPubKey, OperatorSecretKey, Signature};
 pub use cawala_topology::{ChildKind, OctAddr};
 pub use invite::{INVITE_SCHEME, Invite, InviteError};
 pub use reply::{
-    CONTROL_ALPN, CONTROL_REPLY_VERSION, ChildSnapshot, ControlReply, NodeSnapshot, ParentSnapshot,
-    RejectCode,
+    AdminApproved, AdminPendingJoin, AdminRejected, AdminSnapshot, CONTROL_ALPN,
+    CONTROL_REPLY_VERSION, ChildSnapshot, ControlReply, DeliveryStatus, NodeSnapshot,
+    ParentSnapshot, RejectCode,
 };
 pub use request::{
-    ControlRequest, CreateChild, DetachChild, JoinApproval, JoinRejection, JoinRequest,
-    MAX_LOCATION_HINT_LEN, MAX_NODE_ID_LEN, MAX_REASON_LEN, MoveChild, SetAddress,
+    AdminJoinApprove, AdminJoinReject, AdminRedeliverJoin, ControlRequest, CreateChild,
+    DetachChild, JoinApproval, JoinRejection, JoinRequest, MAX_LOCATION_HINT_LEN, MAX_NODE_ID_LEN,
+    MAX_REASON_LEN, MoveChild, SetAddress, is_admin_request,
 };
 pub use senior::senior_child;
 pub use sign::{
-    CONTROL_CONTEXT, CONTROL_FORMAT_VERSION, ControlError, SignedControl, verify_control,
+    CONTROL_CONTEXT, CONTROL_FORMAT_VERSION, CONTROL_REQUEST_MAX_TTL_SECS,
+    CONTROL_REQUEST_TTL_SECS, ControlError, SignedControl, verify_control,
 };
