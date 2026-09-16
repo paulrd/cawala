@@ -400,6 +400,14 @@
         resolves `Indeterminate` plus an audit record. This buys accountability
         and detection, not prevention; a signed topology/registry distribution
         (the only true prevention) is out of scope.
+      - Reload activity reconstruction (DONE): the persisted browser ledger state
+        (`LEDGER_STATE_VERSION` 4) records cross-leaf settlement outcomes with
+        amount/counterparty/entry-seq and exposes them plus the value-notice
+        activity via `ledger_activity()` / `settlement_records()`; the web layer
+        rebuilds the UI activity list from both on load and after each sync,
+        deduped with live events, and the Activity page renders settlement status
+        truthfully (applied/duplicate proven; partial/indeterminate/unverified
+        warn; rejected danger). Local blob bump only - not a wire break.
       - Still owed: no global supply anchor by design; manual prefund liquidity (an
         underfunded LCA parent yields a `Partial`: payer debited, payee not
         credited); control format 3 / settlement payload 2 / browser ledger

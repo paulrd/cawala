@@ -1310,6 +1310,39 @@ impl ClientNode {
         LedgerStatusDto::from_state(address, parent, &ledger)
     }
 
+    /// The persisted activity log, oldest first, for UI reconstruction after a
+    /// reload.
+    ///
+    /// Entries come from verified value notices (balance receipts and their
+    /// history) and are bounded by
+    /// [`ledger_state::MAX_ACTIVITY_ENTRIES`](crate::ledger_state::MAX_ACTIVITY_ENTRIES).
+    pub fn ledger_activity(&self) -> Vec<dto::ActivityEntryDto> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .activity
+            .iter()
+            .map(dto::ActivityEntryDto::from_entry)
+            .collect()
+    }
+
+    /// The persisted terminal settlement outcomes, oldest first, for UI
+    /// reconstruction after a reload.
+    ///
+    /// Records are bounded by
+    /// [`ledger_state::MAX_SETTLEMENT_RECORDS`](crate::ledger_state::MAX_SETTLEMENT_RECORDS)
+    /// and carry the order's amount, payee, and verified terminal `seq` when the
+    /// resolving result provided them.
+    pub fn settlement_records(&self) -> Vec<dto::SettlementRecordDto> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .settlements
+            .iter()
+            .map(dto::SettlementRecordDto::from_record)
+            .collect()
+    }
+
     /// Export the ledger state as postcard bytes.
     ///
     /// The blob contains the pinned ledger key, verified balance, activity, and

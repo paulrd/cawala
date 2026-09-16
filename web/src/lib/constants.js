@@ -175,6 +175,13 @@ export const NAV_ITEMS = [
 /** Activity entry types. */
 export const ACTIVITY_TYPES = {
   TRANSFER: 'transfer',
+  /**
+   * A terminal settlement outcome reconstructed from persisted state
+   * (`ClientNode.settlement_records()`). Carries a `status` from
+   * `ORDER_STATUS`; unlike a `TRANSFER` it may not have moved value
+   * (`partial`/`rejected`/`indeterminate`/`unverified`).
+   */
+  SETTLEMENT: 'settlement',
   ISSUE: 'issue',
   BURN: 'burn',
   JOIN_APPROVED: 'join_approved',
@@ -187,6 +194,7 @@ export const ACTIVITY_TYPES = {
 /** Map activity types to human-readable labels. */
 export const ACTIVITY_LABELS = {
   [ACTIVITY_TYPES.TRANSFER]: 'Transfer',
+  [ACTIVITY_TYPES.SETTLEMENT]: 'Settlement',
   [ACTIVITY_TYPES.ISSUE]: 'Issue',
   [ACTIVITY_TYPES.BURN]: 'Burn',
   [ACTIVITY_TYPES.JOIN_APPROVED]: 'Join Approved',

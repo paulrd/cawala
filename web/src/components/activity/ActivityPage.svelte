@@ -9,7 +9,7 @@
   import ErrorState from '../shared/ErrorState.svelte';
   import { nodeState, loadingState, errorState, ledgerState } from '../../lib/stores.svelte.js';
   import { getActivityLog, isMockMode } from '../../lib/api.js';
-  import { ACTIVITY_LABELS } from '../../lib/constants.js';
+  import { ACTIVITY_TYPES, ACTIVITY_LABELS, ORDER_STATUS_LABELS, ORDER_STATUS_DESCRIPTIONS } from '../../lib/constants.js';
   import { formatDate, formatTime } from '../../lib/utils.js';
 
   let loaded = $state(false);
@@ -44,17 +44,21 @@
   let liveActivity = $derived.by(() => {
     const rows = [];
 
-    // Outbound transfers recorded by the ledger-event poller
     for (const entry of ledgerState.activity) {
+      const isSettlement = entry.type === ACTIVITY_TYPES.SETTLEMENT;
       rows.push({
         id: entry.id,
-        type: 'transfer',
-        label: 'Transfer',
+        type: entry.type,
+        label: ACTIVITY_LABELS[entry.type] || entry.type,
         from: entry.from,
         to: entry.to,
         amount: entry.amount,
         timestamp: entry.timestamp,
         reported: true,
+        // Settlement-specific fields
+        status: isSettlement ? entry.status : null,
+        reason: isSettlement ? entry.reason : null,
+        orderHash: isSettlement ? entry.orderHash : null,
       });
     }
 
@@ -66,6 +70,7 @@
 
   const typeBadgeVariant = {
     transfer: 'info',
+    settlement: 'info',
     issue: 'ok',
     burn: 'danger',
     join_approved: 'ok',
@@ -74,6 +79,15 @@
     topo_move: 'warn',
     topo_detach: 'danger',
     balance_update: 'ok',
+  };
+
+  const settlementStatusVariant = {
+    applied: 'ok',
+    duplicate: 'ok',
+    partial: 'warn',
+    indeterminate: 'warn',
+    unverified: 'warn',
+    rejected: 'danger',
   };
 
   const columns = [
@@ -121,6 +135,14 @@
             <div class="activity-row">
               <div class="activity-cell activity-cell--type">
                 <Badge variant={typeBadgeVariant[entry.type] || 'muted'} label={entry.label} />
+                {#if entry.status}
+                  <span title={ORDER_STATUS_DESCRIPTIONS[entry.status] || ''}>
+                    <Badge
+                      variant={settlementStatusVariant[entry.status] || 'muted'}
+                      label={ORDER_STATUS_LABELS[entry.status] || entry.status}
+                    />
+                  </span>
+                {/if}
               </div>
               <div class="activity-cell activity-cell--from">
                 {#if entry.from}
@@ -233,6 +255,7 @@
   .activity-cell--type {
     flex-shrink: 0;
     min-width: 80px;
+    gap: var(--sp-2);
   }
   .activity-cell--from {
     flex: 1;

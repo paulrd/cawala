@@ -50,10 +50,13 @@ use serde::{Deserialize, Serialize};
 /// checked by [`LedgerStateV1::from_bytes`]. v2 adds the bounded `settlements`
 /// list (v2 settlement outcomes). v3 adds the bounded `pinned_leaf_keys`
 /// mini-registry and the per-order payee/leaf binding the browser needs to
-/// verify a terminal inclusion proof. A version bump discards previously
-/// persisted state on import: the TOFU ledger pin, verified balance, activity,
-/// and pending orders are not migrated across versions.
-pub const LEDGER_STATE_VERSION: u8 = 3;
+/// verify a terminal inclusion proof. v4 enriches each
+/// [`SettlementRecordV1`] with `amount`/`counterparty`/`entry_seq` so a reload
+/// can reconstruct a useful settlement entry (and the activity/settlement lists
+/// become visible to JS). A version bump discards previously persisted state on
+/// import by design: the TOFU ledger pin, verified balance, activity, and
+/// pending orders are not migrated across versions.
+pub const LEDGER_STATE_VERSION: u8 = 4;
 
 /// Maximum number of in-flight orders retained; older ones are evicted.
 pub const MAX_PENDING_ORDERS: usize = 32;
@@ -171,12 +174,51 @@ pub enum SettlementStateV1 {
 }
 
 /// A remembered settlement outcome, keyed by the order hash.
+///
+/// The extra fields are copied from the pending order/result at resolution time
+/// so a reload can reconstruct a useful settlement entry without re-deriving it
+/// (the payer's own hop entry is not carried in the result). They are `Option`
+/// because some outcome paths genuinely lack the value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettlementRecordV1 {
     /// The order's domain-separated hash.
     pub order_hash: Hash,
     /// The terminal settlement state.
     pub state: SettlementStateV1,
+    /// The order amount, when known.
+    pub amount: Option<u64>,
+    /// The payee node, when known.
+    pub counterparty: Option<NodeId>,
+    /// The terminal ledger `seq`, when the outcome carries a verified one.
+    pub entry_seq: Option<u64>,
+}
+
+/// Stable JS string for a persisted [`SettlementStateV1`].
+///
+/// Mirrors the `status` strings used by [`crate::dto::LedgerEventDto`].
+pub fn settlement_state_str(state: &SettlementStateV1) -> &'static str {
+    match state {
+        SettlementStateV1::Applied => "applied",
+        SettlementStateV1::Duplicate => "duplicate",
+        SettlementStateV1::Partial { .. } => "partial",
+        SettlementStateV1::Rejected { .. } => "rejected",
+        SettlementStateV1::Indeterminate { .. } => "indeterminate",
+        SettlementStateV1::Unverified { .. } => "unverified",
+    }
+}
+
+/// The stable reason carried by a persisted [`SettlementStateV1`], if any.
+///
+/// `Partial` stores only the failing hop (not a reason string), so it has none.
+pub fn settlement_state_reason(state: &SettlementStateV1) -> Option<&str> {
+    match state {
+        SettlementStateV1::Applied | SettlementStateV1::Duplicate | SettlementStateV1::Partial { .. } => {
+            None
+        }
+        SettlementStateV1::Rejected { reason }
+        | SettlementStateV1::Indeterminate { reason }
+        | SettlementStateV1::Unverified { reason } => Some(reason.as_str()),
+    }
 }
 
 /// The versioned, postcard-serializable ledger state blob.
@@ -483,16 +525,35 @@ impl LedgerStateV1 {
     /// Record a terminal settlement outcome, replacing any existing record for
     /// the same order and evicting the oldest beyond
     /// [`MAX_SETTLEMENT_RECORDS`].
-    pub fn record_settlement(&mut self, order_hash: Hash, state: SettlementStateV1) {
+    ///
+    /// `amount`/`counterparty`/`entry_seq` are copied from the resolved order
+    /// and result so the record survives a reload usefully.
+    pub fn record_settlement(
+        &mut self,
+        order_hash: Hash,
+        state: SettlementStateV1,
+        amount: Option<u64>,
+        counterparty: Option<NodeId>,
+        entry_seq: Option<u64>,
+    ) {
         if let Some(existing) = self
             .settlements
             .iter_mut()
             .find(|record| record.order_hash == order_hash)
         {
             existing.state = state;
+            existing.amount = amount;
+            existing.counterparty = counterparty;
+            existing.entry_seq = entry_seq;
             return;
         }
-        self.settlements.push(SettlementRecordV1 { order_hash, state });
+        self.settlements.push(SettlementRecordV1 {
+            order_hash,
+            state,
+            amount,
+            counterparty,
+            entry_seq,
+        });
         while self.settlements.len() > MAX_SETTLEMENT_RECORDS {
             self.settlements.remove(0);
         }
@@ -917,7 +978,17 @@ fn apply_settlement_result_inner(
     if let Some(balance) = &verified_balance {
         state.balance = Some(balance.clone());
     }
-    state.record_settlement(order_hash, settlement_state);
+    // Capture the resolving order's amount/counterparty (always known while the
+    // pending record exists) and the verified terminal `seq` (only for an
+    // applied/duplicate success) so the persisted record is useful after a
+    // reload.
+    state.record_settlement(
+        order_hash,
+        settlement_state,
+        Some(pending.order.amount.get()),
+        Some(pending.order.to.clone()),
+        entry_seq,
+    );
 
     Ok(SettlementApplication {
         status: status_str,
@@ -948,11 +1019,14 @@ fn apply_settlement_result_inner(
 /// explicitly not a completed payment); the verified receipt remains the signed
 /// ground truth.
 ///
-/// # Known limitation
+/// # Reload
 ///
-/// Settled outcomes are recorded in [`LedgerStateV1::settlements`], but a
-/// reload does not reconstruct them into the activity log (the payer's own hop
-/// entry is not carried in the result).
+/// Settled outcomes are recorded in [`LedgerStateV1::settlements`] with the
+/// order's amount, payee, and verified terminal `seq`; both the activity log
+/// and these records are surfaced to JS ([`crate::ClientNode::ledger_activity`]
+/// / [`crate::ClientNode::settlement_records`]) so a reload can reconstruct the
+/// UI. The payer's own hop entry is still not carried in the result, so a
+/// settlement record is a summary rather than a full activity entry.
 pub fn apply_settlement_result(
     state: &mut LedgerStateV1,
     result: &OrderResultV3,
@@ -1338,11 +1412,30 @@ mod tests {
         state.record_activity(activity_from_notice(&notice(1, 0xaa)));
         state.pin_leaf_key(node("leaf-a"), key.public());
         push_pending(&mut state, &key, pending_order(1));
+        state.record_settlement(
+            Hash::from_bytes([0x44; 32]),
+            SettlementStateV1::Unverified {
+                reason: "missing proof".to_string(),
+            },
+            Some(5),
+            Some(node("n2")),
+            None,
+        );
 
         let bytes = state.to_bytes();
         let back = LedgerStateV1::from_bytes(&bytes).unwrap();
         assert_eq!(back, state);
         assert_eq!(back.pinned_leaf_keys.len(), 1);
+        assert_eq!(back.settlements.len(), 1);
+        assert_eq!(back.settlements[0].amount, Some(5));
+        assert_eq!(back.settlements[0].counterparty, Some(node("n2")));
+        assert_eq!(back.settlements[0].entry_seq, None);
+        assert_eq!(
+            back.settlements[0].state,
+            SettlementStateV1::Unverified {
+                reason: "missing proof".to_string()
+            }
+        );
     }
 
     #[test]
@@ -1376,10 +1469,20 @@ mod tests {
     #[test]
     fn import_rejects_garbage_wrong_version_and_trailing_bytes() {
         assert!(LedgerStateV1::from_bytes(b"not postcard").is_err());
+
+        // A future/unknown version is rejected...
         let mut wrong = LedgerStateV1::new();
         wrong.version = LEDGER_STATE_VERSION + 1;
-        let bytes = wrong.to_bytes();
-        assert!(LedgerStateV1::from_bytes(&bytes).is_err());
+        assert!(LedgerStateV1::from_bytes(&wrong.to_bytes()).is_err());
+
+        // ...and so is the previous (v3) blob version; a version bump discards
+        // older blobs by design.
+        let mut v3 = LedgerStateV1::new();
+        v3.version = 3;
+        assert!(LedgerStateV1::from_bytes(&v3.to_bytes()).is_err());
+        let mut v2 = LedgerStateV1::new();
+        v2.version = 2;
+        assert!(LedgerStateV1::from_bytes(&v2.to_bytes()).is_err());
 
         let mut good = LedgerStateV1::new().to_bytes();
         good.push(0x00);
@@ -1806,6 +1909,11 @@ mod tests {
         assert!(app.reason.is_none());
         assert!(state.pending.is_empty());
         assert_eq!(state.settlements[0].state, SettlementStateV1::Applied);
+        // The persisted record captures the order amount/payee and the verified
+        // terminal seq for reload reconstruction.
+        assert_eq!(state.settlements[0].amount, Some(5));
+        assert_eq!(state.settlements[0].counterparty, Some(node("n2")));
+        assert_eq!(state.settlements[0].entry_seq, Some(7));
         assert_eq!(
             state.pinned_leaf_key(&node("leaf-a")),
             Some(leaf_key),

@@ -15,7 +15,8 @@ use cawala_msg::OctAddr;
 use wasm_bindgen::{JsError, prelude::wasm_bindgen};
 
 use crate::ledger_state::{
-    LedgerStateV1, OrderResultApplication, SettlementApplication, VerifiedBalanceV1,
+    ActivityEntryV1, LedgerStateV1, OrderResultApplication, SettlementApplication, SettlementRecordV1,
+    VerifiedBalanceV1, hop_role_str, settlement_state_reason, settlement_state_str,
 };
 use crate::state::LocalStateV1;
 use crate::to_js_err;
@@ -625,6 +626,159 @@ impl LedgerStatusDto {
     }
 }
 
+/// One remembered value-movement activity entry, exposed to JS so a reload can
+/// rebuild the activity feed. `entry_seq`/`issued_at` are `f64` so JavaScript
+/// never receives a raw `u64`; hashes are lowercase hex.
+#[wasm_bindgen]
+pub struct ActivityEntryDto {
+    entry_seq: f64,
+    entry_hash: String,
+    payment_id: String,
+    from: String,
+    to: String,
+    amount: f64,
+    role: String,
+    issued_at: f64,
+}
+
+impl ActivityEntryDto {
+    /// Convert one persisted activity entry.
+    pub(crate) fn from_entry(entry: &ActivityEntryV1) -> Self {
+        ActivityEntryDto {
+            entry_seq: entry.entry_seq as f64,
+            entry_hash: hash_hex(entry.entry_hash),
+            payment_id: hash_hex(entry.payment_id),
+            from: entry.from.as_str().to_string(),
+            to: entry.to.as_str().to_string(),
+            amount: entry.amount as f64,
+            role: hop_role_str(entry.role).to_string(),
+            issued_at: entry.issued_at as f64,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl ActivityEntryDto {
+    /// The ledger `seq` of the entry that moved value.
+    #[wasm_bindgen(getter)]
+    pub fn entry_seq(&self) -> f64 {
+        self.entry_seq
+    }
+
+    /// The entry's hash as 64 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn entry_hash(&self) -> String {
+        self.entry_hash.clone()
+    }
+
+    /// The cascade `payment_id` as 64 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn payment_id(&self) -> String {
+        self.payment_id.clone()
+    }
+
+    /// The payer node.
+    #[wasm_bindgen(getter)]
+    pub fn from(&self) -> String {
+        self.from.clone()
+    }
+
+    /// The payee node.
+    #[wasm_bindgen(getter)]
+    pub fn to(&self) -> String {
+        self.to.clone()
+    }
+
+    /// The amount moved.
+    #[wasm_bindgen(getter)]
+    pub fn amount(&self) -> f64 {
+        self.amount
+    }
+
+    /// The hop's role: `"ascend"`, `"lca"`, `"descend"`, or `"direct"`.
+    #[wasm_bindgen(getter)]
+    pub fn role(&self) -> String {
+        self.role.clone()
+    }
+
+    /// Unix-seconds issuance time (as an `f64`; never a raw `u64`).
+    #[wasm_bindgen(getter)]
+    pub fn issued_at(&self) -> f64 {
+        self.issued_at
+    }
+}
+
+/// One remembered settlement outcome, exposed to JS so a reload can rebuild the
+/// settlement history. `status` is the same stable string set as
+/// [`LedgerEventDto`]'s `status`; optional fields are populated when the
+/// resolving result carried them.
+#[wasm_bindgen]
+pub struct SettlementRecordDto {
+    order_hash: String,
+    status: String,
+    reason: Option<String>,
+    amount: Option<f64>,
+    counterparty: Option<String>,
+    entry_seq: Option<f64>,
+}
+
+impl SettlementRecordDto {
+    /// Convert one persisted settlement record.
+    pub(crate) fn from_record(record: &SettlementRecordV1) -> Self {
+        SettlementRecordDto {
+            order_hash: hash_hex(record.order_hash),
+            status: settlement_state_str(&record.state).to_string(),
+            reason: settlement_state_reason(&record.state).map(str::to_string),
+            amount: record.amount.map(|amount| amount as f64),
+            counterparty: record
+                .counterparty
+                .as_ref()
+                .map(|id| id.as_str().to_string()),
+            entry_seq: record.entry_seq.map(|seq| seq as f64),
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl SettlementRecordDto {
+    /// The order's hash as 64 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn order_hash(&self) -> String {
+        self.order_hash.clone()
+    }
+
+    /// One of `"applied"`, `"duplicate"`, `"partial"`, `"rejected"`,
+    /// `"indeterminate"`, or `"unverified"`.
+    #[wasm_bindgen(getter)]
+    pub fn status(&self) -> String {
+        self.status.clone()
+    }
+
+    /// A stable reason, when the outcome carries one.
+    #[wasm_bindgen(getter)]
+    pub fn reason(&self) -> Option<String> {
+        self.reason.clone()
+    }
+
+    /// The order amount, when known.
+    #[wasm_bindgen(getter)]
+    pub fn amount(&self) -> Option<f64> {
+        self.amount
+    }
+
+    /// The payee node, when known.
+    #[wasm_bindgen(getter)]
+    pub fn counterparty(&self) -> Option<String> {
+        self.counterparty.clone()
+    }
+
+    /// The verified terminal ledger `seq`, when the outcome carries one.
+    #[wasm_bindgen(getter)]
+    pub fn entry_seq(&self) -> Option<f64> {
+        self.entry_seq
+    }
+}
+
 /// This client's parent link, as returned in [`SnapshotDto`].
 #[wasm_bindgen]
 #[derive(Clone)]
@@ -1146,6 +1300,7 @@ mod tests {
     use super::*;
     use cawala_control::{ChildKind, Invite, NodeId, OctAddr, OperatorSecretKey};
 
+    use crate::ledger_state::{ActivityEntryV1, SettlementRecordV1, SettlementStateV1};
     use crate::state::{ChildLink, LocalStateV1, ParentLink};
 
     fn operator(seed: u8) -> OperatorSecretKey {
@@ -1498,5 +1653,97 @@ mod tests {
         assert_eq!(status.pinned_ledger.as_deref().map(str::len), Some(64));
         assert_eq!(status.pending, 0);
         assert_eq!(status.activity, 0);
+    }
+
+    #[test]
+    fn activity_entry_dto_maps_all_fields() {
+        let entry = ActivityEntryV1 {
+            entry_seq: 7,
+            entry_hash: Hash::from_bytes([0x11; 32]),
+            payment_id: Hash::from_bytes([0x22; 32]),
+            from: node("n1"),
+            to: node("n2"),
+            amount: 42,
+            role: cawala_ledger::HopRole::Descend,
+            issued_at: 1_700_000_000,
+        };
+        let dto = ActivityEntryDto::from_entry(&entry);
+        assert_eq!(dto.entry_seq, 7.0);
+        assert_eq!(dto.entry_hash, "11".repeat(32));
+        assert_eq!(dto.payment_id, "22".repeat(32));
+        assert_eq!(dto.from, "n1");
+        assert_eq!(dto.to, "n2");
+        assert_eq!(dto.amount, 42.0);
+        assert_eq!(dto.role, "descend");
+        assert_eq!(dto.issued_at, 1_700_000_000.0);
+    }
+
+    #[test]
+    fn settlement_record_dto_maps_statuses_and_optional_fields() {
+        // A verified `Applied` carries amount/payee/seq.
+        let applied = SettlementRecordV1 {
+            order_hash: Hash::from_bytes([0x33; 32]),
+            state: SettlementStateV1::Applied,
+            amount: Some(100),
+            counterparty: Some(node("n2")),
+            entry_seq: Some(9),
+        };
+        let dto = SettlementRecordDto::from_record(&applied);
+        assert_eq!(dto.order_hash, "33".repeat(32));
+        assert_eq!(dto.status, "applied");
+        assert_eq!(dto.reason, None);
+        assert_eq!(dto.amount, Some(100.0));
+        assert_eq!(dto.counterparty.as_deref(), Some("n2"));
+        assert_eq!(dto.entry_seq, Some(9.0));
+
+        // An `Unverified` outcome keeps its stable status and reason, and has no
+        // verified seq.
+        let unverified = SettlementRecordV1 {
+            order_hash: Hash::from_bytes([0x44; 32]),
+            state: SettlementStateV1::Unverified {
+                reason: "missing proof".to_string(),
+            },
+            amount: Some(5),
+            counterparty: None,
+            entry_seq: None,
+        };
+        let dto = SettlementRecordDto::from_record(&unverified);
+        assert_eq!(dto.status, "unverified");
+        assert_eq!(dto.reason.as_deref(), Some("missing proof"));
+        assert_eq!(dto.amount, Some(5.0));
+        assert_eq!(dto.counterparty, None);
+        assert_eq!(dto.entry_seq, None);
+
+        // `Rejected`/`Partial`/`Indeterminate` map to their stable strings too.
+        for (state, expected) in [
+            (
+                SettlementStateV1::Rejected {
+                    reason: "insufficient_balance".to_string(),
+                },
+                "rejected",
+            ),
+            (
+                SettlementStateV1::Partial {
+                    failed_at: node("leaf-b"),
+                },
+                "partial",
+            ),
+            (
+                SettlementStateV1::Indeterminate {
+                    reason: "internal".to_string(),
+                },
+                "indeterminate",
+            ),
+            (SettlementStateV1::Duplicate, "duplicate"),
+        ] {
+            let record = SettlementRecordV1 {
+                order_hash: Hash::ZERO,
+                state,
+                amount: None,
+                counterparty: None,
+                entry_seq: None,
+            };
+            assert_eq!(SettlementRecordDto::from_record(&record).status, expected);
+        }
     }
 }

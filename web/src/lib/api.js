@@ -328,6 +328,10 @@ async function _spawnRealNode() {
     }
   }
 
+  // Rebuild the UI activity list from the restored state (persisted value
+  // notices + terminal settlement records) so past activity survives a reload.
+  _rebuildActivityFromState(node);
+
   // Restore any persisted delegated admin key (K_admin) into the fresh node so
   // admin actions survive a reload. The seed is read only via adminSeedBytes.
   const activeAdmin = adminKeys.activeAdminNode();
@@ -585,6 +589,8 @@ function _drainLedgerEvents() {
     return;
   }
   _syncLedgerStoreFromStatus();
+  // Reflect any newly persisted movements/settlements in the UI activity list.
+  _rebuildActivityFromState();
   if (drained) _persistLedgerState();
 }
 
@@ -623,6 +629,9 @@ function _applyLedgerEvent(plain) {
         amount: plain.amount ?? null,
         signedBy: _parentNodeId(),
         timestamp: new Date().toISOString(),
+        // Carry the ledger seq so `_rebuildActivityFromState` can collapse this
+        // live movement with the same movement restored from persisted state.
+        ...(plain.entrySeq != null ? { entrySeq: plain.entrySeq } : {}),
       });
     }
     if (typeof plain.balance === 'number') {
@@ -678,6 +687,138 @@ function _recordActivity(entry) {
 }
 
 /**
+ * Normalized dedup key for an activity entry.
+ *
+ * A value movement is keyed by its ledger `entrySeq` (`v:<seq>`) so the same
+ * movement recorded live and restored from persisted state collapses; a
+ * settlement is keyed by its order hash (`s:<hash>`). Anything else keeps its
+ * own `id`.
+ *
+ * @param {object} entry
+ * @returns {string}
+ */
+function _activityKey(entry) {
+  if (!entry || typeof entry !== 'object') return String(entry);
+  if (entry.entrySeq != null) return `v:${entry.entrySeq}`;
+  if (entry.orderHash != null) return `s:${entry.orderHash}`;
+  return entry.id != null ? String(entry.id) : `unknown:${Math.random()}`;
+}
+
+/**
+ * Rebuild `ledgerState.activity` from persisted ledger state so a reload keeps
+ * its history (value notices) and every terminal settlement outcome.
+ *
+ * Merges three sources, deduped by `_activityKey` and capped at
+ * `MAX_ACTIVITY_ENTRIES`, oldest-first by timestamp:
+ *   1. persisted value-notice activity (`ClientNode.ledger_activity()`);
+ *   2. persisted settlement records (`ClientNode.settlement_records()`);
+ *   3. live entries already in `ledgerState.activity` (from `_recordActivity`).
+ *
+ * Persisted data wins on an overlapping key. Settlement records carry no
+ * timestamp, so we reuse the timestamp of a matching live entry (by order hash)
+ * when one exists and otherwise stamp them all with the reconstruction time —
+ * keeping the wasm list's oldest-first order via a stable sort.
+ *
+ * Idempotent and cheap (bounded by the two capped wasm lists). If the wasm
+ * getters are missing or throw, the existing list is kept and a warning is
+ * logged once.
+ *
+ * @param {object} [node] Live client node to read from.
+ */
+function _rebuildActivityFromState(node = _clientNode) {
+  if (_useMock || !node) return;
+  if (
+    typeof node.ledger_activity !== 'function' ||
+    typeof node.settlement_records !== 'function'
+  ) {
+    _warnOnce(
+      'activity-rebuild-unavailable',
+      '[api] ledger_activity/settlement_records unavailable; keeping the current activity list',
+    );
+    return;
+  }
+
+  let next;
+  try {
+    const existing = Array.isArray(ledgerState.activity) ? ledgerState.activity : [];
+    // Seed with live entries first; persisted sources overwrite on key overlap.
+    const byKey = new Map();
+    const stampByOrderHash = new Map();
+    for (const entry of existing) {
+      if (!entry) continue;
+      byKey.set(_activityKey(entry), entry);
+      const orderHash = entry.orderHash ?? entry.id;
+      if (typeof orderHash === 'string' && !stampByOrderHash.has(orderHash)) {
+        stampByOrderHash.set(orderHash, entry.timestamp);
+      }
+    }
+    const signedBy = _parentNodeIdFrom(node);
+    const fallbackStamp = new Date().toISOString();
+
+    // 1. Persisted value notices.
+    const activityDtos = node.ledger_activity() ?? [];
+    try {
+      for (const dto of activityDtos) {
+        const entrySeq = dto.entry_seq;
+        const entryHash = dto.entry_hash ?? null;
+        const issuedAt = Number(dto.issued_at);
+        const timestamp = Number.isFinite(issuedAt)
+          ? new Date(issuedAt * 1000).toISOString()
+          : fallbackStamp;
+        byKey.set(`v:${entrySeq}`, {
+          id: entryHash ?? `v:${entrySeq}`,
+          type: ACTIVITY_TYPES.TRANSFER,
+          from: dto.from ?? null,
+          to: dto.to ?? null,
+          amount: typeof dto.amount === 'number' ? dto.amount : null,
+          signedBy,
+          timestamp,
+          entrySeq,
+          entryHash,
+        });
+      }
+    } finally {
+      for (const dto of activityDtos) dto.free?.();
+    }
+
+    // 2. Persisted settlement records (summary of every terminal outcome).
+    const settlementDtos = node.settlement_records() ?? [];
+    try {
+      for (const record of settlementDtos) {
+        const orderHash = record.order_hash ?? null;
+        const timestamp =
+          (orderHash && stampByOrderHash.get(orderHash)) || fallbackStamp;
+        byKey.set(`s:${orderHash}`, {
+          id: `s:${orderHash}`,
+          type: ACTIVITY_TYPES.SETTLEMENT,
+          from: null,
+          to: record.counterparty ?? null,
+          amount: typeof record.amount === 'number' ? record.amount : null,
+          status: record.status ?? null,
+          reason: record.reason ?? null,
+          orderHash,
+          timestamp,
+          entrySeq: record.entry_seq ?? null,
+        });
+      }
+    } finally {
+      for (const record of settlementDtos) record.free?.();
+    }
+
+    next = [...byKey.values()].sort((a, b) =>
+      String(a.timestamp).localeCompare(String(b.timestamp)),
+    );
+    if (next.length > MAX_ACTIVITY_ENTRIES) {
+      next = next.slice(next.length - MAX_ACTIVITY_ENTRIES);
+    }
+  } catch (err) {
+    _warnOnce('activity-rebuild', '[api] activity rebuild failed; keeping the current list', err);
+    return;
+  }
+  ledgerState.activity = next;
+}
+
+/**
  * Resync the balance/height/pin/pending fields of `ledgerState` from the
  * authoritative wasm `ledger_status()` snapshot.
  */
@@ -723,15 +864,17 @@ function _readLedgerStatus(node) {
 }
 
 /**
- * This client's parent node id, if joined (used as the activity `signedBy`).
+ * A node's parent node id, if joined (used as the activity `signedBy`).
+ * Tolerates a missing/unjoined node and never throws.
+ * @param {object|null} node
  * @returns {string|null}
  */
-function _parentNodeId() {
-  if (!_clientNode) return null;
+function _parentNodeIdFrom(node) {
+  if (!node) return null;
   let snapshot;
   let parent;
   try {
-    snapshot = _clientNode.local_snapshot();
+    snapshot = node.local_snapshot();
     parent = snapshot.parent;
     return parent?.node_id ?? null;
   } catch {
@@ -740,6 +883,14 @@ function _parentNodeId() {
     parent?.free?.();
     snapshot?.free?.();
   }
+}
+
+/**
+ * This client's parent node id, if joined (used as the activity `signedBy`).
+ * @returns {string|null}
+ */
+function _parentNodeId() {
+  return _parentNodeIdFrom(_clientNode);
 }
 
 /**
