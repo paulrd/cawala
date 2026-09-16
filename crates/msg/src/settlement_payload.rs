@@ -15,26 +15,39 @@
 //! # Versioning
 //!
 //! Variants do not carry a version field. The version lives at the codec layer:
-//! [`SettlePayloadV1::to_bytes`] prefixes [`SETTLE_PAYLOAD_VERSION`] to the
-//! postcard body, and [`SettlePayloadV1::from_bytes`] rejects any other version.
+//! [`SettlePayloadV2::to_bytes`] prefixes [`SETTLE_PAYLOAD_VERSION`] to the
+//! postcard body, and [`SettlePayloadV2::from_bytes`] rejects any other version.
+//! The v1 result shape carried a bare `terminal_entry`; v2 replaces it with a
+//! full [`EntryProofV1`], so the whole payload is re-versioned and a v1 frame is
+//! refused with [`SettlePayloadError::UnsupportedVersion`].
 //!
 //! # Bounds
 //!
 //! [`SettleForwardV1::hops`] is a wire-controlled `Vec`; decoding does **not**
 //! truncate it (silently dropping hops would be a correctness bug). Callers use
 //! [`SettleForwardV1::hops_within_bound`] / [`MAX_SETTLE_HOPS`] to reject an
-//! over-long forward at the use site.
+//! over-long forward at the use site. Likewise, an [`EntryProofV1`]'s audit
+//! path is only bounded by [`EntryProofV1::validate`], which callers must run
+//! after decoding.
 
 use serde::{Deserialize, Serialize};
 
-use cawala_ledger::{AuthRef, Hash, NodeId, PaymentOrder, PeerKeys, SignedEntry};
+use cawala_ledger::{
+    AuthRef, EntryInclusionProof, Hash, NodeId, PaymentOrder, PeerKeys, PeerRole, SignedCommitment,
+    SignedEntry,
+};
 use proto::OctAddr;
 
+use crate::envelope::MsgError;
 use crate::ledger_payload::OrderRejectV1;
 
 /// Wire version of the settlement payload, prefixed to every
-/// [`SettlePayloadV1::to_bytes`] encoding.
-pub const SETTLE_PAYLOAD_VERSION: u8 = 1;
+/// [`SettlePayloadV2::to_bytes`] encoding.
+///
+/// Bumped 1 -> 2: the `Forward` body is byte-identical, but the result shape
+/// changed from a bare `terminal_entry` to an [`EntryProofV1`]. A v1 frame is
+/// rejected with [`SettlePayloadError::UnsupportedVersion`].
+pub const SETTLE_PAYLOAD_VERSION: u8 = 2;
 
 /// Maximum number of carried settlement hops a caller should accept. This is a
 /// use-site bound (the v1 route is depth-1: `Ascend`/`Lca`/`Descend`); decoding
@@ -50,15 +63,15 @@ pub const MAX_SETTLE_HOPS: usize = 3;
 // the wire layout is frozen, so keep the declared shape.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SettlePayloadV1 {
+pub enum SettlePayloadV2 {
     /// Origin -> next hop: the order, the payer's authorisation and keys, the
     /// payer/payee addresses, and the evidence hops gathered so far.
     Forward(SettleForwardV1),
     /// Terminal -> origin: the outcome of the cascade.
-    Result(SettleResultV1),
+    Result(SettleResultV2),
 }
 
-impl SettlePayloadV1 {
+impl SettlePayloadV2 {
     /// Encode with the [`SETTLE_PAYLOAD_VERSION`] prefix followed by the
     /// postcard body.
     pub fn to_bytes(&self) -> Result<Vec<u8>, SettlePayloadError> {
@@ -71,9 +84,12 @@ impl SettlePayloadV1 {
 
     /// Decode a version-prefixed payload.
     ///
-    /// Rejects an empty buffer, an unsupported version, a truncated or invalid
-    /// body, and any trailing bytes after the body. Never panics on arbitrary
-    /// input.
+    /// Rejects an empty buffer, an unsupported version (including v1), a
+    /// truncated or invalid body, and any trailing bytes after the body. Never
+    /// panics on arbitrary input.
+    ///
+    /// Decoding does not validate an [`EntryProofV1`]; callers must invoke
+    /// [`EntryProofV1::validate`] before trusting a `Result` payload.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SettlePayloadError> {
         let (version, body) = bytes
             .split_first()
@@ -137,36 +153,108 @@ pub struct SettleHopV1 {
 ///
 /// Field order is frozen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SettleResultV1 {
+pub struct SettleResultV2 {
     /// The cascade's shared `payment_id`.
     pub payment_id: Hash,
     /// Whether the cascade applied or was rejected.
-    pub outcome: SettleOutcomeV1,
+    pub outcome: SettleOutcomeV2,
 }
 
 /// Terminal status of a settlement cascade.
 ///
 /// Variant order is frozen.
-// `Applied` carries a full signed entry; the wire layout is frozen, so keep the
-// declared shape rather than boxing.
+// `Applied` carries a full signed entry plus proof; the wire layout is frozen,
+// so keep the declared shape rather than boxing.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SettleOutcomeV1 {
-    /// The terminal hop applied.
+pub enum SettleOutcomeV2 {
+    /// The terminal hop applied, carrying verifiable inclusion evidence.
     Applied {
         /// The terminal hop's ledger `seq`.
         terminal_seq: u64,
         /// The terminal hop's entry hash.
         terminal_hash: Hash,
-        /// The terminal leaf's signed `Descend` entry, carried so the origin can
-        /// retain signed ground truth (the result itself is advisory).
-        terminal_entry: SignedEntry,
+        /// The terminal leaf's signed entry, signer row, commitment, and
+        /// inclusion proof.
+        proof: EntryProofV1,
     },
     /// The cascade was refused; see [`SettleRejectV1`].
     Rejected {
         /// The refusal reason.
         reason: SettleRejectV1,
     },
+}
+
+/// Evidence that the applied terminal hop is committed by a leaf's log.
+///
+/// Shared by the node-to-node result path ([`SettleOutcomeV2::Applied`]) and the
+/// leaf-to-browser result path
+/// ([`crate::ledger_payload::OrderResultV3::proof`]).
+///
+/// Field order is frozen.
+///
+/// # Validation
+///
+/// Decoding does **not** bound [`inclusion`](Self::inclusion)'s audit path
+/// (postcard has no `Vec` limit) and does not check the proof against
+/// [`commitment`](Self::commitment). Callers **must** invoke
+/// [`EntryProofV1::validate`] before verifying [`inclusion`](Self::inclusion)
+/// with [`cawala_ledger::verify_entry_inclusion`], mirroring how callers bound
+/// `BalanceAttestation::proof` at the use site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryProofV1 {
+    /// The applied terminal hop (`Direct` or `Descend`).
+    pub entry: SignedEntry,
+    /// The terminal leaf's self row: role [`PeerRole::Node`], with a ledger key.
+    pub signer: PeerKeys,
+    /// The asserted signer address; must equal the payee leaf address.
+    pub leaf_addr: OctAddr,
+    /// The commitment the inclusion proof is against; its `entry_count` must
+    /// equal [`inclusion.tree_size`](EntryInclusionProof::tree_size).
+    pub commitment: SignedCommitment,
+    /// The RFC 6962 inclusion proof for [`entry`](Self::entry).
+    pub inclusion: EntryInclusionProof,
+}
+
+impl EntryProofV1 {
+    /// Structurally validate the proof envelope before cryptographic
+    /// verification.
+    ///
+    /// Enforces, in order:
+    ///
+    /// - `inclusion.proof.len() <=` [`cawala_ledger::MAX_ENTRY_PROOF`];
+    /// - `inclusion.index < inclusion.tree_size`;
+    /// - `inclusion.tree_size == commitment.entry_count`;
+    /// - `entry.entry.seq < inclusion.tree_size`;
+    /// - `signer.role ==` [`PeerRole::Node`] and a ledger key is present.
+    ///
+    /// Purely structural: it does not verify signatures, the commitment, or the
+    /// Merkle path. [`cawala_ledger::verify_entry_inclusion`] checks the latter
+    /// against `commitment.entry_root`.
+    pub fn validate(&self) -> Result<(), MsgError> {
+        if self.inclusion.proof.len() > cawala_ledger::MAX_ENTRY_PROOF {
+            return Err(MsgError::InvalidEntryProof("audit path too long"));
+        }
+        if self.inclusion.index >= self.inclusion.tree_size {
+            return Err(MsgError::InvalidEntryProof("index is not below tree_size"));
+        }
+        if u64::from(self.inclusion.tree_size) != self.commitment.commitment.entry_count {
+            return Err(MsgError::InvalidEntryProof(
+                "tree_size does not match commitment entry_count",
+            ));
+        }
+        if self.entry.entry.seq >= u64::from(self.inclusion.tree_size) {
+            return Err(MsgError::InvalidEntryProof(
+                "entry seq is not below tree_size",
+            ));
+        }
+        if self.signer.role != PeerRole::Node || self.signer.ledger.is_none() {
+            return Err(MsgError::InvalidEntryProof(
+                "signer is not a ledger-bearing node",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Why a settlement cascade was rejected.
@@ -208,7 +296,8 @@ fn codec_error(err: postcard::Error) -> SettlePayloadError {
 mod tests {
     use super::*;
     use cawala_ledger::{
-        Amount, Entry, EntryBody, LedgerSecretKey, OperatorSecretKey, PeerRole, SignedEntry,
+        Amount, Commitment, Entry, EntryBody, EntryInclusionProof, LedgerSecretKey,
+        OperatorSecretKey, PeerRole, SignedCommitment, SignedEntry,
     };
 
     fn node(id: &str) -> NodeId {
@@ -290,28 +379,66 @@ mod tests {
         }
     }
 
-    fn result(outcome: SettleOutcomeV1) -> SettleResultV1 {
-        SettleResultV1 {
+    fn sample_commitment() -> SignedCommitment {
+        let key = ledger(0x11);
+        SignedCommitment {
+            commitment: Commitment {
+                ledger_id: key.public(),
+                ledger_pubkey: key.public(),
+                height: 1,
+                entry_count: 1,
+                entry_root: Hash::from_bytes([0x66; 32]),
+                state_root: Hash::from_bytes([0x77; 32]),
+                prev_commitment_hash: Hash::from_bytes([0x88; 32]),
+                issued_at: 1234,
+            },
+            signature: key.sign(b"commitment"),
+        }
+    }
+
+    /// A structurally valid [`EntryProofV1`] for [`signed_entry`] (seq 0,
+    /// `tree_size` 1, `entry_count` 1).
+    fn sample_entry_proof() -> EntryProofV1 {
+        EntryProofV1 {
+            entry: signed_entry(),
+            signer: PeerKeys {
+                node_id: node("leaf"),
+                operator: operator(0x33).public(),
+                ledger: Some(ledger(0x11).public()),
+                role: PeerRole::Node,
+            },
+            leaf_addr: addr("0.1.3"),
+            commitment: sample_commitment(),
+            inclusion: EntryInclusionProof {
+                index: 0,
+                tree_size: 1,
+                proof: vec![],
+            },
+        }
+    }
+
+    fn result(outcome: SettleOutcomeV2) -> SettleResultV2 {
+        SettleResultV2 {
             payment_id: Hash::from_bytes([0x22; 32]),
             outcome,
         }
     }
 
-    fn round_trip(payload: &SettlePayloadV1) {
+    fn round_trip(payload: &SettlePayloadV2) {
         let bytes = payload.to_bytes().unwrap();
         assert_eq!(bytes[0], SETTLE_PAYLOAD_VERSION);
-        let back = SettlePayloadV1::from_bytes(&bytes).unwrap();
+        let back = SettlePayloadV2::from_bytes(&bytes).unwrap();
         assert_eq!(&back, payload);
     }
 
     #[test]
     fn round_trip_every_variant() {
-        round_trip(&SettlePayloadV1::Forward(full_forward(0)));
-        round_trip(&SettlePayloadV1::Forward(full_forward(3)));
-        round_trip(&SettlePayloadV1::Result(result(SettleOutcomeV1::Applied {
+        round_trip(&SettlePayloadV2::Forward(full_forward(0)));
+        round_trip(&SettlePayloadV2::Forward(full_forward(3)));
+        round_trip(&SettlePayloadV2::Result(result(SettleOutcomeV2::Applied {
             terminal_seq: 9,
             terminal_hash: Hash::from_bytes([0x55; 32]),
-            terminal_entry: signed_entry(),
+            proof: sample_entry_proof(),
         })));
         for reason in [
             SettleRejectV1::PayerRejected,
@@ -322,8 +449,8 @@ mod tests {
             SettleRejectV1::RouteTooDeep,
             SettleRejectV1::Malformed,
         ] {
-            round_trip(&SettlePayloadV1::Result(result(
-                SettleOutcomeV1::Rejected { reason },
+            round_trip(&SettlePayloadV2::Result(result(
+                SettleOutcomeV2::Rejected { reason },
             )));
         }
     }
@@ -331,12 +458,12 @@ mod tests {
     #[test]
     fn enum_discriminant_order_is_frozen() {
         let cases = [
-            (SettlePayloadV1::Forward(full_forward(0)), 0u8),
+            (SettlePayloadV2::Forward(full_forward(0)), 0u8),
             (
-                SettlePayloadV1::Result(result(SettleOutcomeV1::Applied {
+                SettlePayloadV2::Result(result(SettleOutcomeV2::Applied {
                     terminal_seq: 1,
                     terminal_hash: Hash::from_bytes([1u8; 32]),
-                    terminal_entry: signed_entry(),
+                    proof: sample_entry_proof(),
                 })),
                 1,
             ),
@@ -351,15 +478,15 @@ mod tests {
 
         // Outcome discriminants are frozen too.
         let applied =
-            postcard::to_allocvec(&SettleOutcomeV1::Applied {
+            postcard::to_allocvec(&SettleOutcomeV2::Applied {
                 terminal_seq: 0,
                 terminal_hash: Hash::ZERO,
-                terminal_entry: signed_entry(),
+                proof: sample_entry_proof(),
             })
             .unwrap();
         assert_eq!(applied[0], 0);
         let rejected =
-            postcard::to_allocvec(&SettleOutcomeV1::Rejected {
+            postcard::to_allocvec(&SettleOutcomeV2::Rejected {
                 reason: SettleRejectV1::Malformed,
             })
             .unwrap();
@@ -386,22 +513,28 @@ mod tests {
     #[test]
     fn malformed_and_truncated_bytes_are_errors() {
         // Empty buffer.
-        assert!(SettlePayloadV1::from_bytes(&[]).is_err());
+        assert!(SettlePayloadV2::from_bytes(&[]).is_err());
 
         // Version byte only, no body.
-        assert!(SettlePayloadV1::from_bytes(&[SETTLE_PAYLOAD_VERSION]).is_err());
+        assert!(SettlePayloadV2::from_bytes(&[SETTLE_PAYLOAD_VERSION]).is_err());
 
-        // Wrong version.
+        // A v1 frame is rejected cleanly.
         assert_eq!(
-            SettlePayloadV1::from_bytes(&[SETTLE_PAYLOAD_VERSION + 1]),
-            Err(SettlePayloadError::UnsupportedVersion(2))
+            SettlePayloadV2::from_bytes(&[1]),
+            Err(SettlePayloadError::UnsupportedVersion(1))
+        );
+
+        // A future version is rejected cleanly.
+        assert_eq!(
+            SettlePayloadV2::from_bytes(&[SETTLE_PAYLOAD_VERSION + 1]),
+            Err(SettlePayloadError::UnsupportedVersion(3))
         );
 
         // Every strict prefix of a valid payload fails to decode; no panic.
-        let valid = SettlePayloadV1::Forward(full_forward(3)).to_bytes().unwrap();
+        let valid = SettlePayloadV2::Forward(full_forward(3)).to_bytes().unwrap();
         for cut in 0..valid.len() {
             assert!(
-                SettlePayloadV1::from_bytes(&valid[..cut]).is_err(),
+                SettlePayloadV2::from_bytes(&valid[..cut]).is_err(),
                 "prefix of length {cut} unexpectedly decoded"
             );
         }
@@ -409,12 +542,61 @@ mod tests {
         // Trailing garbage after an otherwise valid body is rejected.
         let mut trailing = valid.clone();
         trailing.push(0x00);
-        assert!(SettlePayloadV1::from_bytes(&trailing).is_err());
+        assert!(SettlePayloadV2::from_bytes(&trailing).is_err());
 
         // Arbitrary bytes never panic.
         for byte in 0u8..=255 {
-            let _ = SettlePayloadV1::from_bytes(&[byte, byte, byte, byte]);
+            let _ = SettlePayloadV2::from_bytes(&[byte, byte, byte, byte]);
         }
+    }
+
+    #[test]
+    fn entry_proof_validate_enforces_bounds_and_shape() {
+        let proof = sample_entry_proof();
+        assert!(proof.validate().is_ok());
+
+        // Over-long audit path.
+        let mut long = proof.clone();
+        long.inclusion.proof = vec![Hash::ZERO; cawala_ledger::MAX_ENTRY_PROOF + 1];
+        assert!(long.validate().is_err());
+
+        // `index >= tree_size`.
+        let mut bad_index = proof.clone();
+        bad_index.inclusion.index = 1;
+        assert!(bad_index.validate().is_err());
+
+        // `tree_size != commitment.entry_count`.
+        let mut bad_size = proof.clone();
+        bad_size.inclusion.tree_size = 2;
+        assert!(bad_size.validate().is_err());
+
+        // `entry.seq >= tree_size`.
+        let seq_key = ledger(0x77);
+        let seq_entry = Entry {
+            ledger_id: seq_key.public(),
+            seq: 1,
+            height: 1,
+            prev_hash: Hash::ZERO,
+            issued_at: 1234,
+            body: EntryBody::Issue {
+                child: node("child"),
+                amount: Amount::new(7),
+            },
+            postings: vec![],
+            auth: None,
+        };
+        let mut bad_seq = proof.clone();
+        bad_seq.entry = SignedEntry::sign(seq_entry, &seq_key).unwrap();
+        assert!(bad_seq.validate().is_err());
+
+        // Signer must be a ledger-bearing node.
+        let mut bad_role = proof.clone();
+        bad_role.signer.role = PeerRole::User;
+        assert!(bad_role.validate().is_err());
+
+        let mut no_ledger = proof.clone();
+        no_ledger.signer.ledger = None;
+        assert!(no_ledger.validate().is_err());
     }
 
     #[test]

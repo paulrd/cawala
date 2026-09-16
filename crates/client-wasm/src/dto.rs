@@ -10,7 +10,7 @@ use cawala_control::{
     AdminApproved, AdminPendingJoin, AdminRejected, AdminSnapshot, ChildKind, DeliveryStatus,
     Invite, NodeId, NodeSnapshot, OperatorPubKey, RejectCode,
 };
-use cawala_ledger::Hash;
+use cawala_ledger::{Hash, LedgerPubKey};
 use cawala_msg::OctAddr;
 use wasm_bindgen::{JsError, prelude::wasm_bindgen};
 
@@ -399,7 +399,10 @@ impl PaymentOutcome {
 ///
 /// `kind` is `"order_result"`, `"balance_receipt"`, or `"invalid"`. Optional
 /// fields are populated per kind; amounts/heights/timestamps are `f64` so
-/// JavaScript never receives a raw `u64`.
+/// JavaScript never receives a raw `u64`. A settlement `status` is one of
+/// `"applied"`, `"duplicate"`, `"partial"`, `"rejected"`, `"indeterminate"`,
+/// or `"unverified"` (the last meaning a proof-less or unverifiable terminal
+/// `Applied`/`Duplicate`, which must never be shown as success).
 #[wasm_bindgen]
 pub struct LedgerEventDto {
     kind: String,
@@ -431,13 +434,14 @@ impl LedgerEventDto {
         }
     }
 
-    /// A v2 settlement order result; `partial` carries the failing hop.
+    /// A v2/v3 settlement order result; `partial` carries the failing hop and
+    /// `unverified` carries the proof-failure reason.
     pub(crate) fn settlement(app: &SettlementApplication) -> Self {
         LedgerEventDto {
             kind: "order_result".to_string(),
             order_hash: Some(hash_hex(app.order_hash)),
             status: Some(app.status.to_string()),
-            reason: app.reason.map(str::to_string),
+            reason: app.reason.clone(),
             amount: Some(app.amount as f64),
             balance: app.balance.as_ref().map(|balance| balance.amount as f64),
             height: app.balance.as_ref().map(|balance| balance.height as f64),
@@ -494,7 +498,8 @@ impl LedgerEventDto {
         self.order_hash.clone()
     }
 
-    /// `"applied"`, `"duplicate"`, or `"rejected"`, for order results.
+    /// `"applied"`, `"duplicate"`, `"partial"`, `"rejected"`,
+    /// `"indeterminate"`, or `"unverified"`, for order results.
     #[wasm_bindgen(getter)]
     pub fn status(&self) -> Option<String> {
         self.status.clone()
@@ -955,6 +960,16 @@ pub(crate) fn parse_operator_hex(raw: &str) -> Result<OperatorPubKey, String> {
     OperatorPubKey::from_bytes(&bytes).map_err(|err| err.to_string())
 }
 
+/// Parse a 64-hex ledger public key.
+///
+/// Returns a plain [`String`] error (not [`JsError`]) so the error paths are
+/// testable on native targets; the wasm boundary wraps it with [`to_js_err`].
+pub(crate) fn parse_ledger_hex(raw: &str) -> Result<LedgerPubKey, String> {
+    let bytes = decode_hex_32(raw)
+        .ok_or_else(|| "ledger key must be exactly 64 hex characters".to_string())?;
+    LedgerPubKey::from_bytes(&bytes).map_err(|err| err.to_string())
+}
+
 /// Decode 64 hex digits into 32 bytes.
 fn decode_hex_32(raw: &str) -> Option<[u8; 32]> {
     let raw = raw.as_bytes();
@@ -985,11 +1000,14 @@ pub const RECEIVE_SCHEME: &str = "cawala";
 /// Host of a payment receive URI.
 pub const RECEIVE_HOST: &str = "pay";
 
-/// A parsed payment receive URI: the payee's node id and user address.
+/// A parsed payment receive URI: the payee's node id, user address, and the
+/// optional out-of-band leaf pin (`ln`/`lk`).
 #[wasm_bindgen]
 pub struct ReceiveUriInfo {
     node_id: String,
     address: String,
+    leaf_node: Option<String>,
+    leaf_ledger: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -1005,6 +1023,19 @@ impl ReceiveUriInfo {
     pub fn address(&self) -> String {
         self.address.clone()
     }
+
+    /// The payee leaf's node id (the `ln` parameter), when the URI carried one.
+    #[wasm_bindgen(getter)]
+    pub fn leaf_node(&self) -> Option<String> {
+        self.leaf_node.clone()
+    }
+
+    /// The payee leaf's ledger public key as 64 lowercase hex characters (the
+    /// `lk` parameter), when the URI carried one.
+    #[wasm_bindgen(getter)]
+    pub fn leaf_ledger(&self) -> Option<String> {
+        self.leaf_ledger.clone()
+    }
 }
 
 /// Build a `cawala://pay?to=<EndpointId>&addr=<OctAddr>` receive URI.
@@ -1016,21 +1047,48 @@ pub(crate) fn receive_uri_for(node_id: &str, address: &str) -> String {
     format!("{RECEIVE_SCHEME}://{RECEIVE_HOST}?to={node_id}&addr={address}")
 }
 
+/// Build a receive URI carrying the payee leaf's out-of-band pin:
+/// `cawala://pay?to=..&addr=..&ln=<leaf node id>&lk=<leaf ledger key hex>`.
+///
+/// `ln` is the payee leaf's node id (the payee's parent) and `lk` is the ledger
+/// key the payer must verify the terminal inclusion proof under.
+pub(crate) fn receive_uri_with_leaf(
+    node_id: &str,
+    address: &str,
+    leaf_node: &str,
+    leaf_ledger: &str,
+) -> String {
+    format!(
+        "{RECEIVE_SCHEME}://{RECEIVE_HOST}?to={node_id}&addr={address}&ln={leaf_node}&lk={leaf_ledger}"
+    )
+}
+
+/// The parsed components of a pay receive URI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedReceiveUri {
+    pub node_id: String,
+    pub address: OctAddr,
+    pub leaf_node: Option<String>,
+    pub leaf_ledger: Option<LedgerPubKey>,
+}
+
 /// Parse and validate a `cawala://pay?...` receive URI.
 ///
-/// Enforces the scheme/host, exactly the `to` and `addr` parameters (no
-/// duplicates or extras), a parseable `EndpointId`, and a parseable `OctAddr`.
+/// Enforces the scheme/host, the required `to`/`addr` parameters, the optional
+/// `ln`/`lk` leaf-pin pair, no duplicates, and no extras.
 #[wasm_bindgen]
 pub fn parse_receive_uri(uri: &str) -> Result<ReceiveUriInfo, JsError> {
-    let (node_id, address) = parse_receive_uri_inner(uri).map_err(to_js_err)?;
+    let parsed = parse_receive_uri_inner(uri).map_err(to_js_err)?;
     Ok(ReceiveUriInfo {
-        node_id,
-        address: address.to_string(),
+        node_id: parsed.node_id,
+        address: parsed.address.to_string(),
+        leaf_node: parsed.leaf_node,
+        leaf_ledger: parsed.leaf_ledger.map(|key| key.to_string()),
     })
 }
 
 /// Pure parse+validate used by [`parse_receive_uri`] and unit tests.
-pub(crate) fn parse_receive_uri_inner(uri: &str) -> Result<(String, OctAddr), String> {
+pub(crate) fn parse_receive_uri_inner(uri: &str) -> Result<ParsedReceiveUri, String> {
     let prefix = format!("{RECEIVE_SCHEME}://{RECEIVE_HOST}?");
     let query = uri
         .strip_prefix(&prefix)
@@ -1038,6 +1096,8 @@ pub(crate) fn parse_receive_uri_inner(uri: &str) -> Result<(String, OctAddr), St
 
     let mut node: Option<String> = None;
     let mut addr: Option<OctAddr> = None;
+    let mut leaf_node: Option<String> = None;
+    let mut leaf_ledger: Option<LedgerPubKey> = None;
     for pair in query.split('&') {
         let (key, value) = pair
             .split_once('=')
@@ -1050,7 +1110,18 @@ pub(crate) fn parse_receive_uri_inner(uri: &str) -> Result<(String, OctAddr), St
                     .map_err(|_| "invalid payee address".to_string())?;
                 addr = Some(parsed);
             }
-            "to" | "addr" => return Err("duplicate pay URI parameter".to_string()),
+            "ln" if leaf_node.is_none() => {
+                value
+                    .parse::<iroh::EndpointId>()
+                    .map_err(|_| "invalid leaf node id".to_string())?;
+                leaf_node = Some(value.to_string());
+            }
+            "lk" if leaf_ledger.is_none() => {
+                leaf_ledger = Some(parse_ledger_hex(value)?);
+            }
+            "to" | "addr" | "ln" | "lk" => {
+                return Err("duplicate pay URI parameter".to_string());
+            }
             _ => return Err("unexpected pay URI parameter".to_string()),
         }
     }
@@ -1059,7 +1130,15 @@ pub(crate) fn parse_receive_uri_inner(uri: &str) -> Result<(String, OctAddr), St
     let addr = addr.ok_or_else(|| "missing 'addr' parameter".to_string())?;
     node.parse::<iroh::EndpointId>()
         .map_err(|_| "invalid payee node id".to_string())?;
-    Ok((node, addr))
+    if leaf_node.is_some() != leaf_ledger.is_some() {
+        return Err("incomplete leaf pin: 'ln' and 'lk' must appear together".to_string());
+    }
+    Ok(ParsedReceiveUri {
+        node_id: node,
+        address: addr,
+        leaf_node,
+        leaf_ledger,
+    })
 }
 
 #[cfg(test)]
@@ -1107,14 +1186,16 @@ mod tests {
     }
 
     #[test]
-    fn receive_uri_round_trips_and_rejects_malformed() {
+    fn receive_uri_round_trips_without_leaf_pin_and_rejects_malformed() {
         let endpoint = iroh::SecretKey::generate().public().to_string();
         let uri = receive_uri_for(&endpoint, "0.1.3");
         assert_eq!(uri, format!("cawala://pay?to={endpoint}&addr=0.1.3"));
 
-        let (node, addr) = parse_receive_uri_inner(&uri).unwrap();
-        assert_eq!(node, endpoint);
-        assert_eq!(addr, "0.1.3".parse::<OctAddr>().unwrap());
+        let parsed = parse_receive_uri_inner(&uri).unwrap();
+        assert_eq!(parsed.node_id, endpoint);
+        assert_eq!(parsed.address, "0.1.3".parse::<OctAddr>().unwrap());
+        assert!(parsed.leaf_node.is_none());
+        assert!(parsed.leaf_ledger.is_none());
 
         for bad in [
             "not a uri",
@@ -1126,9 +1207,52 @@ mod tests {
             "cawala://pay?to=x&addr=0.1.8",
             "cawala://pay?to=x&addr=0.1.3&extra=1",
             "cawala://pay?to=x&to=y&addr=0.1.3",
+            // Partial, malformed, or duplicate leaf pins.
+            "cawala://pay?to=x&addr=0.1.3&ln=not-a-node",
+            "cawala://pay?to=x&addr=0.1.3&lk=zz",
+            "cawala://pay?to=x&addr=0.1.3&ln=not-a-node&lk=zz",
+            "cawala://pay?to=x&addr=0.1.3&lk=zz",
         ] {
             assert!(parse_receive_uri_inner(bad).is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn receive_uri_round_trips_with_leaf_pin() {
+        let endpoint = iroh::SecretKey::generate().public().to_string();
+        let leaf = iroh::SecretKey::generate().public().to_string();
+        let ledger = cawala_ledger::LedgerSecretKey::from_bytes([7u8; 32]).public();
+        let hex = ledger.to_string();
+        assert_eq!(hex.len(), 64);
+
+        let uri = receive_uri_with_leaf(&endpoint, "0.1.3", &leaf, &hex);
+        assert_eq!(
+            uri,
+            format!("cawala://pay?to={endpoint}&addr=0.1.3&ln={leaf}&lk={hex}")
+        );
+
+        let parsed = parse_receive_uri_inner(&uri).unwrap();
+        assert_eq!(parsed.node_id, endpoint);
+        assert_eq!(parsed.address, "0.1.3".parse::<OctAddr>().unwrap());
+        assert_eq!(parsed.leaf_node.as_deref(), Some(leaf.as_str()));
+        assert_eq!(parsed.leaf_ledger, Some(ledger));
+
+        // A node id that parses as an endpoint but an `ln`/`lk` mismatch pair is
+        // still rejected when only one is present.
+        let only_ln = format!("cawala://pay?to={endpoint}&addr=0.1.3&ln={leaf}");
+        assert!(parse_receive_uri_inner(&only_ln).is_err());
+        let only_lk = format!("cawala://pay?to={endpoint}&addr=0.1.3&lk={hex}");
+        assert!(parse_receive_uri_inner(&only_lk).is_err());
+        let dup = format!("cawala://pay?to={endpoint}&addr=0.1.3&ln={leaf}&lk={hex}&lk={hex}");
+        assert!(parse_receive_uri_inner(&dup).is_err());
+    }
+
+    #[test]
+    fn parse_ledger_hex_round_trips() {
+        let key = cawala_ledger::LedgerSecretKey::from_bytes([5u8; 32]).public();
+        assert_eq!(parse_ledger_hex(&key.to_string()).unwrap(), key);
+        assert!(parse_ledger_hex("00").is_err());
+        assert!(parse_ledger_hex(&"z".repeat(64)).is_err());
     }
 
     #[test]

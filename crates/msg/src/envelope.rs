@@ -264,6 +264,8 @@ pub enum MsgError {
     BadTtl { ttl: u8 },
     #[error("hop chain: {0}")]
     HopChain(#[from] HopChainError),
+    #[error("invalid entry proof: {0}")]
+    InvalidEntryProof(&'static str),
     #[error("postcard encode/decode: {0}")]
     Codec(String),
 }

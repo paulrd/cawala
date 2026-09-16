@@ -38,6 +38,7 @@ use cawala_ledger::{
 use proto::OctAddr;
 
 use crate::MsgId;
+use crate::settlement_payload::EntryProofV1;
 
 /// Wire version of the ledger payload, prefixed to every
 /// [`LedgerPayloadV1::to_bytes`] encoding.
@@ -51,6 +52,14 @@ pub const LEDGER_PAYLOAD_VERSION: u8 = 1;
 /// byte and cleanly rejects it with
 /// [`LedgerPayloadError::UnsupportedVersion`].
 pub const LEDGER_PAYLOAD_V2_VERSION: u8 = 2;
+
+/// Wire version of the v3 ledger payload, prefixed to every
+/// [`LedgerPayloadV3::to_bytes`] encoding.
+///
+/// A separate constant (and prefix byte) keeps the frozen v1/v2 bytes
+/// untouched: an old client reads a v3 frame's first byte and cleanly rejects it
+/// with [`LedgerPayloadError::UnsupportedVersion`].
+pub const LEDGER_PAYLOAD_V3_VERSION: u8 = 3;
 
 /// Maximum receipt history length a caller should accept, in `ValueNoticeV1`
 /// entries. This is a use-site bound; decoding never truncates.
@@ -288,6 +297,49 @@ impl LedgerPayloadV2 {
     }
 }
 
+/// A versioned **v3** ledger payload.
+///
+/// Variant order is frozen. v3 exists because the v2 result
+/// ([`OrderResultV2`]) carries only advisory status; v3 adds an optional
+/// [`EntryProofV1`] so a browser can independently verify the applied terminal
+/// hop. The browser still sends orders as [`LedgerPayloadV2::Order`] /
+/// [`OrderV2`]; v3 is currently result-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LedgerPayloadV3 {
+    /// Leaf -> browser: the outcome of an [`OrderV2`], with a proof of the
+    /// applied terminal hop.
+    OrderResult(OrderResultV3),
+}
+
+impl LedgerPayloadV3 {
+    /// Encode with the [`LEDGER_PAYLOAD_V3_VERSION`] prefix followed by the
+    /// postcard body.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, LedgerPayloadError> {
+        let body = postcard::to_allocvec(self).map_err(codec_error)?;
+        let mut out = Vec::with_capacity(body.len() + 1);
+        out.push(LEDGER_PAYLOAD_V3_VERSION);
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Decode a version-prefixed v3 payload.
+    ///
+    /// Rejects an empty buffer, a non-v3 version, a truncated or invalid body,
+    /// and any trailing bytes after the body. Never panics on arbitrary input.
+    ///
+    /// Decoding does not validate an [`EntryProofV1`]; callers must invoke
+    /// [`EntryProofV1::validate`] before trusting the proof.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, LedgerPayloadError> {
+        let (version, body) = bytes
+            .split_first()
+            .ok_or_else(|| LedgerPayloadError::Codec("empty ledger payload".to_string()))?;
+        if *version != LEDGER_PAYLOAD_V3_VERSION {
+            return Err(LedgerPayloadError::UnsupportedVersion(*version));
+        }
+        decode_body(body)
+    }
+}
+
 /// Browser -> leaf: an operator-signed order plus the payee's address.
 ///
 /// Field order is frozen.
@@ -316,6 +368,28 @@ pub struct OrderResultV2 {
     pub status: SettlementStatusV2,
     /// A fresh balance receipt for the payer, when the leaf offers one.
     pub balance: Option<BalanceReceiptV1>,
+}
+
+/// Leaf -> browser: the outcome of an [`OrderV2`], with verifiable proof.
+///
+/// Field order is frozen. `balance` is the payer's own signed receipt, when the
+/// leaf offers one; `proof` is the applied terminal hop's inclusion evidence,
+/// which clients require for `Applied`/`Duplicate` outcomes.
+///
+/// Decoding does not validate `proof`; callers must invoke
+/// [`EntryProofV1::validate`] before trusting it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderResultV3 {
+    /// The [`MsgId`] of the triggering order envelope.
+    pub reply_to: MsgId,
+    /// The order's domain-separated hash.
+    pub order_hash: Hash,
+    /// The settlement outcome (same semantics as [`SettlementStatusV2`]).
+    pub status: SettlementStatusV2,
+    /// A fresh balance receipt for the payer, when the leaf offers one.
+    pub balance: Option<BalanceReceiptV1>,
+    /// The applied terminal hop's inclusion proof, when there is one.
+    pub proof: Option<EntryProofV1>,
 }
 
 /// The terminal state of an [`OrderV2`] and its settlement.
@@ -370,9 +444,11 @@ pub enum VersionedLedgerPayload {
     V1(LedgerPayloadV1),
     /// A [`LEDGER_PAYLOAD_V2_VERSION`] payload.
     V2(LedgerPayloadV2),
+    /// A [`LEDGER_PAYLOAD_V3_VERSION`] payload.
+    V3(LedgerPayloadV3),
 }
 
-/// Decode a version-prefixed ledger payload of either known version.
+/// Decode a version-prefixed ledger payload of any known version.
 ///
 /// An unknown version (including a future one) is rejected with
 /// [`LedgerPayloadError::UnsupportedVersion`], so an old client never
@@ -384,6 +460,7 @@ pub fn decode_versioned(bytes: &[u8]) -> Result<VersionedLedgerPayload, LedgerPa
     match *version {
         LEDGER_PAYLOAD_VERSION => Ok(VersionedLedgerPayload::V1(decode_body(body)?)),
         LEDGER_PAYLOAD_V2_VERSION => Ok(VersionedLedgerPayload::V2(decode_body(body)?)),
+        LEDGER_PAYLOAD_V3_VERSION => Ok(VersionedLedgerPayload::V3(decode_body(body)?)),
         other => Err(LedgerPayloadError::UnsupportedVersion(other)),
     }
 }
@@ -404,7 +481,8 @@ fn decode_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, LedgerP
 mod tests {
     use super::*;
     use cawala_ledger::{
-        Commitment, EdgeAccount, LedgerSecretKey, OperatorSecretKey, SignedCommitment,
+        Commitment, EdgeAccount, Entry, EntryBody, EntryInclusionProof, LedgerSecretKey,
+        OperatorSecretKey, PeerKeys, PeerRole, SignedCommitment, SignedEntry,
     };
 
     fn node(id: &str) -> NodeId {
@@ -462,6 +540,58 @@ mod tests {
             order_hash: Hash::from_bytes([0x22; 32]),
             status,
             balance: None,
+        }
+    }
+
+    fn sample_signed_entry() -> SignedEntry {
+        let key = ledger(0x11);
+        let entry = Entry {
+            ledger_id: key.public(),
+            seq: 0,
+            height: 0,
+            prev_hash: Hash::ZERO,
+            issued_at: 1234,
+            body: EntryBody::Issue {
+                child: node("child"),
+                amount: Amount::new(7),
+            },
+            postings: vec![],
+            auth: None,
+        };
+        SignedEntry::sign(entry, &key).unwrap()
+    }
+
+    /// A structurally valid [`EntryProofV1`] against [`sample_commitment`]
+    /// (`entry_count`/`tree_size` 3, entry at seq 0).
+    fn sample_entry_proof() -> EntryProofV1 {
+        EntryProofV1 {
+            entry: sample_signed_entry(),
+            signer: PeerKeys {
+                node_id: node("leaf"),
+                operator: operator(0x33).public(),
+                ledger: Some(ledger(0x11).public()),
+                role: PeerRole::Node,
+            },
+            leaf_addr: "0.1.3".parse().expect("valid octal address"),
+            commitment: sample_commitment(),
+            inclusion: EntryInclusionProof {
+                index: 0,
+                tree_size: 3,
+                proof: vec![Hash::from_bytes([0x99; 32])],
+            },
+        }
+    }
+
+    fn sample_order_result_v3(
+        status: SettlementStatusV2,
+        proof: Option<EntryProofV1>,
+    ) -> OrderResultV3 {
+        OrderResultV3 {
+            reply_to: MsgId([0x11; 16]),
+            order_hash: Hash::from_bytes([0x22; 32]),
+            status,
+            balance: None,
+            proof,
         }
     }
 
@@ -695,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_versioned_dispatches_both_versions() {
+    fn decode_versioned_dispatches_all_versions() {
         let v1 = LedgerPayloadV1::Order(sample_order());
         let v1_bytes = v1.to_bytes().unwrap();
         assert_eq!(
@@ -710,15 +840,28 @@ mod tests {
             VersionedLedgerPayload::V2(v2)
         );
 
+        let v3 = LedgerPayloadV3::OrderResult(sample_order_result_v3(
+            SettlementStatusV2::Applied {
+                entry_seq: 0,
+                entry_hash: Hash::from_bytes([0x55; 32]),
+            },
+            Some(sample_entry_proof()),
+        ));
+        let v3_bytes = v3.to_bytes().unwrap();
+        assert_eq!(
+            decode_versioned(&v3_bytes).unwrap(),
+            VersionedLedgerPayload::V3(v3)
+        );
+
         // Unknown / future version and empty buffer are rejected.
         assert_eq!(
-            decode_versioned(&[LEDGER_PAYLOAD_V2_VERSION + 1]),
-            Err(LedgerPayloadError::UnsupportedVersion(3))
+            decode_versioned(&[LEDGER_PAYLOAD_V3_VERSION + 1]),
+            Err(LedgerPayloadError::UnsupportedVersion(4))
         );
         assert!(decode_versioned(&[]).is_err());
 
         // Truncated and trailing bytes are rejected for each version.
-        for valid in [&v1_bytes, &v2_bytes] {
+        for valid in [&v1_bytes, &v2_bytes, &v3_bytes] {
             for cut in 0..valid.len() {
                 assert!(decode_versioned(&valid[..cut]).is_err());
             }
@@ -726,6 +869,97 @@ mod tests {
             trailing.push(0);
             assert!(decode_versioned(&trailing).is_err());
         }
+    }
+
+    #[test]
+    fn v3_order_result_round_trips_with_and_without_proof() {
+        let with_proof = LedgerPayloadV3::OrderResult(sample_order_result_v3(
+            SettlementStatusV2::Applied {
+                entry_seq: 0,
+                entry_hash: Hash::from_bytes([0x55; 32]),
+            },
+            Some(sample_entry_proof()),
+        ));
+        let bytes = with_proof.to_bytes().unwrap();
+        assert_eq!(bytes[0], LEDGER_PAYLOAD_V3_VERSION);
+        assert_eq!(LedgerPayloadV3::from_bytes(&bytes).unwrap(), with_proof);
+        // The proof survives the round trip and still validates.
+        let LedgerPayloadV3::OrderResult(decoded) =
+            LedgerPayloadV3::from_bytes(&bytes).unwrap();
+        assert!(decoded.proof.unwrap().validate().is_ok());
+
+        let without_proof = LedgerPayloadV3::OrderResult(sample_order_result_v3(
+            SettlementStatusV2::Rejected {
+                reason: OrderRejectV1::BadRequest,
+            },
+            None,
+        ));
+        let bytes = without_proof.to_bytes().unwrap();
+        assert_eq!(bytes[0], LEDGER_PAYLOAD_V3_VERSION);
+        assert_eq!(LedgerPayloadV3::from_bytes(&bytes).unwrap(), without_proof);
+
+        // Every strict prefix fails; trailing bytes are rejected.
+        for cut in 0..bytes.len() {
+            assert!(
+                LedgerPayloadV3::from_bytes(&bytes[..cut]).is_err(),
+                "prefix of length {cut} unexpectedly decoded"
+            );
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(LedgerPayloadV3::from_bytes(&trailing).is_err());
+    }
+
+    #[test]
+    fn v3_rejects_other_versions_exactly() {
+        // A v3 reader rejects v1 and v2 frames cleanly.
+        let v1 = LedgerPayloadV1::Order(sample_order()).to_bytes().unwrap();
+        assert_eq!(
+            LedgerPayloadV3::from_bytes(&v1),
+            Err(LedgerPayloadError::UnsupportedVersion(
+                LEDGER_PAYLOAD_VERSION
+            ))
+        );
+        let v2 = LedgerPayloadV2::Order(sample_order_v2()).to_bytes().unwrap();
+        assert_eq!(
+            LedgerPayloadV3::from_bytes(&v2),
+            Err(LedgerPayloadError::UnsupportedVersion(
+                LEDGER_PAYLOAD_V2_VERSION
+            ))
+        );
+
+        // Old readers reject a v3 frame cleanly.
+        let v3 = LedgerPayloadV3::OrderResult(sample_order_result_v3(
+            SettlementStatusV2::Rejected {
+                reason: OrderRejectV1::Internal,
+            },
+            None,
+        ))
+        .to_bytes()
+        .unwrap();
+        assert_eq!(
+            LedgerPayloadV2::from_bytes(&v3),
+            Err(LedgerPayloadError::UnsupportedVersion(
+                LEDGER_PAYLOAD_V3_VERSION
+            ))
+        );
+        assert_eq!(
+            LedgerPayloadV1::from_bytes(&v3),
+            Err(LedgerPayloadError::UnsupportedVersion(
+                LEDGER_PAYLOAD_V3_VERSION
+            ))
+        );
+    }
+
+    #[test]
+    fn v3_discriminant_order_is_frozen() {
+        let result = LedgerPayloadV3::OrderResult(sample_order_result_v3(
+            SettlementStatusV2::Rejected {
+                reason: OrderRejectV1::BadRequest,
+            },
+            None,
+        ));
+        assert_eq!(result.to_bytes().unwrap()[1], 0);
     }
 
     #[test]

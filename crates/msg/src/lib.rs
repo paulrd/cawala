@@ -44,10 +44,10 @@ pub use envelope::{
     MsgError, MsgId, PROTOCOL_VERSION, PeerRef, RejectReason,
 };
 pub use ledger_payload::{
-    BalanceQueryV1, BalanceReceiptV1, LEDGER_PAYLOAD_V2_VERSION, LEDGER_PAYLOAD_VERSION,
-    LedgerPayloadError, LedgerPayloadV1, LedgerPayloadV2, MAX_RECEIPT_HISTORY, OrderRejectV1,
-    OrderResultV1, OrderResultV2, OrderStatusV1, OrderV1, OrderV2, SettlementStatusV2,
-    ValueNoticeV1, VersionedLedgerPayload, decode_versioned,
+    BalanceQueryV1, BalanceReceiptV1, LEDGER_PAYLOAD_V2_VERSION, LEDGER_PAYLOAD_V3_VERSION,
+    LEDGER_PAYLOAD_VERSION, LedgerPayloadError, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
+    MAX_RECEIPT_HISTORY, OrderRejectV1, OrderResultV1, OrderResultV2, OrderResultV3, OrderStatusV1,
+    OrderV1, OrderV2, SettlementStatusV2, ValueNoticeV1, VersionedLedgerPayload, decode_versioned,
 };
 pub use proto::OctAddr;
 pub use replay::{Seen, SeenConfig, SeenSet};
@@ -56,8 +56,8 @@ pub use route::{
     next_step, route, validate_hop_chain,
 };
 pub use settlement_payload::{
-    MAX_SETTLE_HOPS, SETTLE_PAYLOAD_VERSION, SettleForwardV1, SettleHopV1, SettleOutcomeV1,
-    SettlePayloadError, SettlePayloadV1, SettleRejectV1, SettleResultV1,
+    EntryProofV1, MAX_SETTLE_HOPS, SETTLE_PAYLOAD_VERSION, SettleForwardV1, SettleHopV1,
+    SettleOutcomeV2, SettlePayloadError, SettlePayloadV2, SettleRejectV1, SettleResultV2,
 };
 
 /// ALPN negotiated on every cawala/msg/0 connection.

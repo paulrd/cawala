@@ -348,13 +348,28 @@
         (rejecting an entry that names one signer but is signed by another
         registered key); `MirrorMismatch` now carries a
         `MirrorDirection` (unbacked claim vs unmirrored extension).
-      - Still owed: result-path signature verification (settlement results
-        remain advisory - a rogue parent/LCA can misreport but cannot move
-        funds); route-wide carried-prefix verification beyond direct neighbors;
-        commitment-chain assembly + `net`/`verify_cascade` operator harness;
-        no global supply anchor by design; manual prefund liquidity (an
+      - Result-path signature verification (DONE): a settlement result is no
+        longer an unpaid claim. The terminal leaf builds an `EntryProofV1` (its
+        signed terminal entry + a fresh `SignedCommitment` + an RFC-6962
+        `EntryInclusionProof`); the origin cryptographically self-verifies it
+        before accepting `Applied`; the browser verifies it end to end against
+        the payee leaf's ledger key, pinned out-of-band by the receive URI
+        (`ln`/`lk`; TOFU fallback). A missing/invalid proof surfaces as a new
+        `unverified` outcome (never success) and the UI says do-not-resend.
+        Wire: `SETTLE_PAYLOAD_VERSION` 2, `LEDGER_PAYLOAD_V3_VERSION` 3,
+        `LedgerStateV1` v3 (hard break). Accepted residual: the origin binds
+        self-consistency only (it cannot know a sibling leaf's key), so a fully
+        self-consistent forgery is accepted there - the browser's pinned leaf key
+        is the security boundary, and first-use substitution is still possible
+        without a URI pin. Equivocation/withholding and negative-claim
+        falsification stay out of scope (commitment chains / per-hop signed
+        rejections).
+      - Still owed: route-wide carried-prefix verification beyond direct
+        neighbors; commitment-chain assembly + `net`/`verify_cascade` operator
+        harness; no global supply anchor by design; manual prefund liquidity (an
         underfunded LCA parent yields a `Partial`: payer debited, payee not
-        credited); control-format v2 is a hard fleet break.
+        credited); control format 3 / settlement payload 2 / browser ledger
+        payload 3 are hard breaks.
   6. *M5 - Hardening*: exit rights, foster-parent recovery, compromise-path
      docs, audit tooling, governance/regulatory surface (Hawala exposure is
      real - community question, not code).

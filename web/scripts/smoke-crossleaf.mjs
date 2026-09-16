@@ -15,14 +15,18 @@
 //   browsers:  uA joins A, uB joins B (control join -> approve)
 //   operator:  P funds A (150) and B (1000); A prefunds uA (1000); B prefunds
 //              uB (1000)
-//   browser uB: receive_uri() -> uA parses it
-//   browser uA: send_payment(uB, uB_addr, 100) -> applied (A Ascend/P Lca/B
-//              Descend); then a second 100 -> partial at P (the payer leaf's
-//              liability is exhausted)
+//   browser uB: request_balance() -> verified receipt pins its leaf ledger key
+//   browser uB: receive_uri() -> carries `ln=<B>`/`lk=<B ledger key>`; uA parses
+//   browser uA: pin_payee_leaf(ln, lk) -> then send_payment(uB, uB_addr, 100)
+//              -> verified `applied` (A Ascend/P Lca/B Descend terminal proof
+//              verifies under the pinned key); then a second 100 -> partial at P
+//              (the payer leaf's liability is exhausted)
 //
-// Assertions are on the advisory result status plus the browser's verified
-// balance. The cross-subtree result is advisory; the payer's signed receipt is
-// ground truth.
+// The payer's `applied` status is the cryptographically verified terminal
+// result: the inclusion proof must verify under the payee leaf's pinned key.
+// A proof-less or mismatched result surfaces as `unverified`, never success.
+// Assertions are on that verified status, the matching order hash/amount, and
+// the browser's verified balance.
 //
 // ---------------------------------------------------------------------------
 // NETWORK-DEPENDENT. All endpoints bind the iroh `presets::N0` endpoint and use
@@ -358,6 +362,18 @@ async function sendPayment(node, to, toAddress, amount) {
   }
 }
 
+/** Request a signed balance receipt, classifying connect failures. */
+async function requestBalance(node) {
+  try {
+    return await node.request_balance();
+  } catch (err) {
+    if (isNetworkConnectError(err)) {
+      throw new NetworkUnreachable(`request_balance could not reach the leaf: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -516,20 +532,71 @@ async function main() {
     ]);
     log("B ledger prefund uB 1000:", prefundB.stdout.trim());
 
-    // ---- receive URI -----------------------------------------------------
+    // ---- uB pins its routing leaf's ledger key ---------------------------
+    // `receive_uri()` only carries the out-of-band leaf pin (`ln`/`lk`) once
+    // the browser has pinned its routing leaf's ledger key from a verified
+    // balance receipt, so pull one before reading the URI.
+    log("uB: request_balance() to pin the routing leaf's ledger key");
+    const bAck = await requestBalance(clientB);
+    log("uB: balance query ack:", bAck);
+    if (bAck !== "delivered") {
+      throw new Error(`uB: expected balance query ack 'delivered', got '${bAck}'`);
+    }
+    const bReceipt = await waitForLedger(
+      clientB,
+      (status, events) =>
+        status.balance === 1000 &&
+        status.pinnedLedger != null &&
+        events.some((e) => e.kind === "balance_receipt" && e.balance === 1000),
+      "uB to see a verified balance receipt of 1000 and pin its leaf key",
+      LEDGER_STATE_TIMEOUT_MS,
+    );
+    log("uB ledger_status:", JSON.stringify(bReceipt.status));
+
+    // ---- receive URI carries the leaf pin --------------------------------
     const receiveUri = clientB.receive_uri();
     log("uB receive uri:", receiveUri);
+    if (!receiveUri.includes("ln=") || !receiveUri.includes("lk=")) {
+      throw new Error(`uB receive uri is missing the leaf pin (ln/lk): ${receiveUri}`);
+    }
     const parsed = parse_receive_uri(receiveUri);
-    if (parsed.node_id !== ub.browserId || parsed.address !== joinAddresses.uB) {
+    const parsedNodeId = parsed.node_id;
+    const parsedAddress = parsed.address;
+    const parsedLeafNode = parsed.leaf_node ?? null;
+    const parsedLeafLedger = parsed.leaf_ledger ?? null;
+    parsed.free?.();
+    if (parsedNodeId !== ub.browserId || parsedAddress !== joinAddresses.uB) {
       throw new Error(
-        `uB receive uri parsed to ${parsed.node_id}/${parsed.address}, ` +
+        `uB receive uri parsed to ${parsedNodeId}/${parsedAddress}, ` +
           `expected ${ub.browserId}/${joinAddresses.uB}`,
       );
     }
+    if (typeof parsedLeafNode !== "string" || parsedLeafNode.length === 0) {
+      throw new Error(
+        `uB receive uri ln is missing/invalid: ${JSON.stringify(parsedLeafNode)}`,
+      );
+    }
+    if (parsedLeafNode !== b.endpointId) {
+      throw new Error(
+        `uB receive uri ln ${parsedLeafNode} != routing leaf B ${b.endpointId}`,
+      );
+    }
+    if (typeof parsedLeafLedger !== "string" || !/^[0-9a-f]{64}$/.test(parsedLeafLedger)) {
+      throw new Error(
+        `uB receive uri lk is not 64-hex: ${JSON.stringify(parsedLeafLedger)}`,
+      );
+    }
+    log(`uB leaf pin: ln=${parsedLeafNode} lk=${parsedLeafLedger}`);
 
-    // ---- cross-subtree payment 1: applied --------------------------------
-    log(`uA: send_payment(${parsed.node_id}, ${parsed.address}, 100)`);
-    const outcome = await sendPayment(clientA, parsed.node_id, parsed.address, 100);
+    // ---- cross-subtree payment 1: verified applied -----------------------
+    // uA pins the payee leaf's key BEFORE sending, so the terminal inclusion
+    // proof must verify under exactly that key (otherwise the result would be
+    // reported as `unverified`, never `applied`).
+    log(`uA: pin_payee_leaf(${parsedLeafNode}, ${parsedLeafLedger})`);
+    clientA.pin_payee_leaf(parsedLeafNode, parsedLeafLedger);
+
+    log(`uA: send_payment(${parsedNodeId}, ${parsedAddress}, 100)`);
+    const outcome = await sendPayment(clientA, parsedNodeId, parsedAddress, 100);
     log("uA: payment outcome:", JSON.stringify({
       orderHash: outcome.order_hash_hex,
       ack: outcome.ack,
@@ -543,16 +610,47 @@ async function main() {
       (status, events) =>
         status.balance === 900 &&
         events.some((e) => e.kind === "order_result" && e.status === "applied"),
-      "uA to see an applied cross-subtree result with balance 900",
+      "uA to see a verified applied cross-subtree result with balance 900",
       LEDGER_STATE_TIMEOUT_MS,
     );
     log("uA ledger_status:", JSON.stringify(aApplied.status));
+    const appliedEvent = aApplied.events.find(
+      (e) => e.kind === "order_result" && e.status === "applied",
+    );
+    if (!appliedEvent || appliedEvent.status !== "applied") {
+      throw new Error(
+        `uA: expected a cryptographically verified 'applied', got ` +
+          `${JSON.stringify(appliedEvent?.status ?? null)}`,
+      );
+    }
+    if (aApplied.events.some((e) => e.kind === "order_result" && e.status === "unverified")) {
+      throw new Error("uA: settlement was reported 'unverified', expected verified 'applied'");
+    }
+    if (appliedEvent.orderHash !== outcome.order_hash_hex) {
+      throw new Error(
+        `uA: applied order hash ${appliedEvent.orderHash} != sent ${outcome.order_hash_hex}`,
+      );
+    }
+    if (appliedEvent.amount !== 100) {
+      throw new Error(`uA: applied order amount ${appliedEvent.amount} != 100`);
+    }
+    if (appliedEvent.counterparty !== parsedNodeId) {
+      throw new Error(
+        `uA: applied order counterparty ${appliedEvent.counterparty} != payee ${parsedNodeId}`,
+      );
+    }
+    // The verified balance moved by exactly the sent amount (1000 -> 900).
+    if (aApplied.status.balance !== 1000 - 100) {
+      throw new Error(
+        `uA: verified balance ${aApplied.status.balance} != expected ${1000 - 100}`,
+      );
+    }
 
     // ---- cross-subtree payment 2: partial at the LCA ---------------------
     // A's Parent asset covers the Ascend, but P's liability for A is exhausted
     // (150 - 100 = 50), so the LCA hop rejects and the result is `partial`.
-    log(`uA: send_payment(${parsed.node_id}, ${parsed.address}, 100) [expect partial]`);
-    const outcome2 = await sendPayment(clientA, parsed.node_id, parsed.address, 100);
+    log(`uA: send_payment(${parsedNodeId}, ${parsedAddress}, 100) [expect partial]`);
+    const outcome2 = await sendPayment(clientA, parsedNodeId, parsedAddress, 100);
     log("uA: second payment outcome:", JSON.stringify({
       orderHash: outcome2.order_hash_hex,
       ack: outcome2.ack,
@@ -603,4 +701,18 @@ try {
     exitCode = 1;
   }
 }
-process.exit(exitCode);
+
+// `process.exit` can truncate piped stdout/stderr. A final zero-length write on
+// each stream is an ordering barrier: its callback fires only after all earlier
+// writes are flushed, so the `[smoke-crossleaf]` lines (and any error) survive
+// when stdout is redirected. A ref'd fallback timer guarantees exit regardless.
+function flushAndExit(code) {
+  let pending = 2;
+  const done = () => {
+    if (--pending === 0) process.exit(code);
+  };
+  process.stdout.write("", done);
+  process.stderr.write("", done);
+  setTimeout(() => process.exit(code), 1_000);
+}
+flushAndExit(exitCode);

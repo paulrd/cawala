@@ -15,7 +15,7 @@
     parseReceiveUri,
     getReceiveUri,
   } from '../../lib/api.js';
-  import { ORDER_REJECT } from '../../lib/constants.js';
+  import { ORDER_REJECT, ORDER_STATUS, ORDER_STATUS_LABELS, ORDER_STATUS_DESCRIPTIONS } from '../../lib/constants.js';
   import { truncateMiddle, timeAgo, formatTime, copyToClipboard } from '../../lib/utils.js';
 
   let isLive = $derived(!isMockMode());
@@ -113,6 +113,7 @@
         parsedPayee.nodeId,
         parsedPayee.address,
         Number(sendAmount.trim()),
+        parsedPayee,
       );
       sendResult = {
         orderHash,
@@ -450,6 +451,22 @@
             >
               Send another payment
             </button>
+          {:else if sendResult.status === 'unverified'}
+            <div class="result-row result-unverified">
+              <Badge variant="warn" label={ORDER_STATUS_LABELS[ORDER_STATUS.UNVERIFIED]} />
+              <span class="text-sm">{ORDER_STATUS_DESCRIPTIONS[ORDER_STATUS.UNVERIFIED]}</span>
+            </div>
+            <div class="result-detail">
+              <span class="detail-label muted">Order hash</span>
+              <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
+            </div>
+            <button
+              type="button"
+              class="btn btn--ghost btn--sm"
+              onclick={resetSendForm}
+            >
+              Send another payment
+            </button>
           {:else if sendResult.status === 'partial'}
             <div class="result-row result-partial">
               <Badge variant="warn" label="Sent, not confirmed" />
@@ -570,6 +587,15 @@
               <div class="parsed-row">
                 <span class="detail-label muted">Payee address</span>
                 <Address address={parsedPayee.address} size="sm" />
+              </div>
+              <div class="pin-signal">
+                {#if parsedPayee.leafNodeId && parsedPayee.ledgerKeyHex}
+                  <Badge variant="ok" label="Pinned" />
+                  <span class="text-xs muted">Settlement will be verified against the payee leaf key.</span>
+                {:else}
+                  <Badge variant="muted" label="No pin" />
+                  <span class="text-xs muted">Trust-on-first-use — no leaf key in the URI.</span>
+                {/if}
               </div>
             </div>
           {/if}
@@ -856,6 +882,14 @@
   .parsed-row :global(.detail-value) {
     font-family: var(--mono);
     font-size: var(--text-sm);
+  }
+  .pin-signal {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding-top: var(--sp-1);
+    border-top: 1px solid var(--border);
+    margin-top: var(--sp-1);
   }
 
   /* Send result */

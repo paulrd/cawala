@@ -27,9 +27,9 @@ use cawala_control::{
     RejectCode, SignedControl,
 };
 use cawala_msg::{
-    Ack, AckStatus, BalanceQueryV1, Envelope, LedgerPayloadV1, LedgerPayloadV2, MSG_LEDGER_V1,
-    MsgError, MsgId, OctAddr, OrderV2, PeerRef, RejectReason, Seen, SeenConfig, SeenSet,
-    VersionedLedgerPayload, decode_versioned,
+    Ack, AckStatus, BalanceQueryV1, Envelope, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
+    MSG_LEDGER_V1, MsgError, MsgId, OctAddr, OrderV2, PeerRef, RejectReason, Seen, SeenConfig,
+    SeenSet, VersionedLedgerPayload, decode_versioned,
 };
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -293,6 +293,7 @@ impl MsgHandler {
                 MsgError::BadTtl { .. } => RejectReason::TtlExpired,
                 MsgError::HopChain(_) => RejectReason::BadHopChain,
                 MsgError::Codec(_) => RejectReason::Internal,
+                MsgError::InvalidEntryProof(_) => RejectReason::BadPayload,
             };
             return rejected(msg_id, reason);
         }
@@ -1044,11 +1045,24 @@ impl ClientNode {
         let order_hash = order.hash();
         let auth = order.authorize(&operator).map_err(to_js_err)?;
 
+        // The leaf decides same-leaf `Direct` vs a cross-leaf depth-1 `Descend`
+        // settlement; record the payer role now so a later terminal proof can be
+        // verified against it. The out-of-band leaf pin (when the payer pinned
+        // one from the receive URI) is already in the pinned-leaf registry.
+        let payer_leaf = self_addr.parent() == payee_addr.parent();
+
         // Persist before dialing so a result racing the ack can still match.
         self.ledger
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push_pending(order.clone(), auth.clone(), now);
+            .push_pending_with(
+                order.clone(),
+                auth.clone(),
+                now,
+                Some(payee_addr.clone()),
+                payer_leaf,
+                None,
+            );
 
         // v2: the leaf decides same-leaf `Direct` vs a depth-1 settlement from
         // the payee address.
@@ -1077,11 +1091,47 @@ impl ClientNode {
     ///
     /// Share (paste/scan) it so a payer can address a cross-subtree payment to
     /// this user.
+    ///
+    /// When this leaf's routing ledger key has been pinned (from a verified
+    /// balance receipt), the URI also carries the out-of-band leaf pin
+    /// `ln=<parent leaf node id>&lk=<pinned ledger key hex>` so a payer can
+    /// require and verify the terminal inclusion proof under that key before
+    /// treating the payment as applied.
     pub fn receive_uri(&self) -> Result<String, JsError> {
         let address = self
             .user_address()
             .ok_or_else(|| JsError::new("not joined: no assigned address"))?;
-        Ok(dto::receive_uri_for(self.control.node_id(), &address))
+        let parent = self.join_status().parent();
+        let pinned = self.ledger_status().pinned_ledger();
+        match (parent, pinned) {
+            (Some(parent), Some(pinned)) => Ok(dto::receive_uri_with_leaf(
+                self.control.node_id(),
+                &address,
+                &parent,
+                &pinned,
+            )),
+            _ => Ok(dto::receive_uri_for(self.control.node_id(), &address)),
+        }
+    }
+
+    /// Pin the payee leaf's ledger key from a receive URI before sending a
+    /// payment.
+    ///
+    /// `node_id` is the URI's `ln` (the payee's parent leaf node id) and
+    /// `ledger_hex` is the URI's `lk` (that leaf's 64-hex ledger public key).
+    /// Once pinned, a terminal proof for this leaf must verify under exactly
+    /// that key; a mismatch is reported as an `"unverified"` settlement, never
+    /// as success. The pin is stored in the secret-free ledger state, so it
+    /// survives [`ClientNode::export_ledger_state`] round trips.
+    pub fn pin_payee_leaf(&self, node_id: String, ledger_hex: String) -> Result<(), JsError> {
+        let endpoint: EndpointId = node_id.parse().map_err(to_js_err)?;
+        let node = cawala_ledger::NodeId::from(endpoint.to_string());
+        let key = dto::parse_ledger_hex(&ledger_hex).map_err(to_js_err)?;
+        self.ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pin_leaf_key(node, key);
+        Ok(())
     }
 
     /// Request a signed balance receipt from the routing leaf and return the
@@ -1137,7 +1187,10 @@ impl ClientNode {
                     self.apply_balance_receipt_event(&receipt)
                 }
                 VersionedLedgerPayload::V2(LedgerPayloadV2::OrderResult(result)) => {
-                    self.apply_settlement_result_event(&result)
+                    self.apply_settlement_result_v2_event(&result)
+                }
+                VersionedLedgerPayload::V3(LedgerPayloadV3::OrderResult(result)) => {
+                    self.apply_settlement_result_v3_event(&result)
                 }
                 _ => {
                     tracing::warn!("unexpected inbound ledger payload");
@@ -1165,7 +1218,31 @@ impl ClientNode {
 
     /// Apply one inbound v2 settlement `OrderResultV2` to the persisted ledger
     /// state.
-    fn apply_settlement_result_event(&self, result: &cawala_msg::OrderResultV2) -> LedgerEventDto {
+    fn apply_settlement_result_v2_event(
+        &self,
+        result: &cawala_msg::OrderResultV2,
+    ) -> LedgerEventDto {
+        let Some((self_node, parent)) = self.ledger_binding() else {
+            return LedgerEventDto::invalid("not_joined");
+        };
+        let now = now_unix_seconds();
+        let mut ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match ledger_state::apply_settlement_result_v2(&mut ledger, result, &self_node, &parent, now)
+        {
+            Ok(app) => LedgerEventDto::settlement(&app),
+            Err(reason) => LedgerEventDto::invalid(&reason),
+        }
+    }
+
+    /// Apply one inbound v3 settlement `OrderResultV3` (with a terminal
+    /// inclusion proof) to the persisted ledger state.
+    fn apply_settlement_result_v3_event(
+        &self,
+        result: &cawala_msg::OrderResultV3,
+    ) -> LedgerEventDto {
         let Some((self_node, parent)) = self.ledger_binding() else {
             return LedgerEventDto::invalid("not_joined");
         };

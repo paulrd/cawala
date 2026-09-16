@@ -44,6 +44,7 @@ pub mod keys;
 pub mod log;
 pub mod merkle;
 pub mod netting;
+pub mod proof;
 pub mod registry;
 pub mod settlement;
 
@@ -69,6 +70,10 @@ pub use merkle::{
     verify_inclusion, verify_state_inclusion,
 };
 pub use netting::{Finding, MirrorDirection, NetTransfer, NettingReport, net, verify_cascade};
+pub use proof::{
+    EntryInclusionProof, MAX_ENTRY_PROOF, entry_inclusion_proof, verify_applied_entry,
+    verify_entry_inclusion,
+};
 pub use registry::{PeerKeys, PeerRegistry, PeerRole};
 pub use settlement::{
     ExpectedHop, LedgerSet, PlannedHop, SettlementPlan, classify_hop, execute_plan, expected_hops,

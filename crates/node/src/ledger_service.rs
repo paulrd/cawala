@@ -64,11 +64,12 @@ use cawala_ledger::{
     AccountRef, Amount, AuthRef, BalanceAttestation, Entry, EntryBody, Hash, HopRole, IssueRequest,
     Ledger, LedgerError, LedgerPubKey, LedgerSecretKey, NodeId, OperatorPubKey, OperatorSecretKey,
     PaymentOrder, PeerKeys, PeerRegistry, PeerRole, Posting, PrefundRequest, SignedAmount,
-    SignedCommitment, SignedEntry, attest_balance, build_commitment, entry_hash, hop_postings,
-    verify_issue, verify_prefund, verify_transfer,
+    SignedCommitment, SignedEntry, attest_balance, build_commitment, entry_hash,
+    entry_inclusion_proof, hop_postings, verify_issue, verify_prefund, verify_transfer,
 };
 use cawala_msg::{
-    BalanceReceiptV1, MAX_RECEIPT_HISTORY, MsgId, OrderRejectV1, OrderStatusV1, ValueNoticeV1,
+    BalanceReceiptV1, EntryProofV1, MAX_RECEIPT_HISTORY, MsgId, OctAddr, OrderRejectV1,
+    OrderStatusV1, ValueNoticeV1,
 };
 use cawala_topology::ChildKind;
 
@@ -254,6 +255,38 @@ impl LedgerService {
             .ok_or(LedgerError::MissingEntry {
                 index: seq as usize,
             })
+    }
+
+    /// Assemble an [`EntryProofV1`] for the entry at `seq` from this node's own
+    /// live ledger.
+    ///
+    /// The proof binds the node's signed entry at `seq` to a fresh signed
+    /// commitment at the current head, with an RFC 6962 inclusion proof for its
+    /// leaf. `leaf_addr` is this node's asserted address (its position in the
+    /// topology); `signer` is the node's in-memory self row (role
+    /// [`PeerRole::Node`], ledger key present) from
+    /// [`effective_registry`](Self::effective_registry).
+    ///
+    /// Read-only over the in-memory ledger: a caller that has just applied an
+    /// entry (so the ledger is refreshed) can build the proof without another
+    /// disk replay. `seq` is the leaf index because the log is dense.
+    pub fn build_entry_proof(&self, seq: u64, leaf_addr: OctAddr) -> Result<EntryProofV1> {
+        let entry = self.entry_at(seq)?;
+        let signer = self
+            .effective_registry()?
+            .get(&NodeId::from(self.node_id.clone()))
+            .cloned()
+            .context("effective registry is missing this node's self row")?;
+        let inclusion = entry_inclusion_proof(&self.ledger, seq)?;
+        let commitment = build_commitment(&self.ledger, Hash::ZERO, unix_now())?;
+        let commitment = SignedCommitment::sign(commitment, &self.key)?;
+        Ok(EntryProofV1 {
+            entry,
+            signer,
+            leaf_addr,
+            commitment,
+            inclusion,
+        })
     }
 
     /// This node's ledger public key.

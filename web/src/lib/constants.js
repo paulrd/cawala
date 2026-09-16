@@ -84,6 +84,35 @@ export const ORDER_STATUS = {
   PARTIAL: 'partial',
   REJECTED: 'rejected',
   INDETERMINATE: 'indeterminate',
+  /**
+   * A terminal `Applied`/`Duplicate` whose proof was missing or failed to
+   * verify. It is NOT success: never record it as an applied transfer or show
+   * it as confirmed, and do not resend.
+   */
+  UNVERIFIED: 'unverified',
+};
+
+/**
+ * Map order statuses to short human-readable labels (mirrors ACTIVITY_LABELS).
+ * `unverified` is intentionally not a success label: the outcome could not be
+ * cryptographically verified, so do not resend.
+ */
+export const ORDER_STATUS_LABELS = {
+  [ORDER_STATUS.APPLIED]: 'Applied',
+  [ORDER_STATUS.DUPLICATE]: 'Duplicate',
+  [ORDER_STATUS.PARTIAL]: 'Partial',
+  [ORDER_STATUS.REJECTED]: 'Rejected',
+  [ORDER_STATUS.INDETERMINATE]: 'Indeterminate',
+  [ORDER_STATUS.UNVERIFIED]: 'Unverified',
+};
+
+/**
+ * Factual UI copy for terminal order statuses that are easy to misread as
+ * success. Kept short and non-alarming but explicit.
+ */
+export const ORDER_STATUS_DESCRIPTIONS = {
+  [ORDER_STATUS.UNVERIFIED]:
+    'Outcome could not be cryptographically verified; do not resend.',
 };
 
 /**

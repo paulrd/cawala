@@ -598,18 +598,23 @@ function _applyLedgerEvent(plain) {
 
   if (plain.kind === LEDGER_EVENT.ORDER_RESULT) {
     const orderHash = plain.orderHash;
+    const status = plain.status ?? null;
+    const isVerifiedSuccess =
+      status === ORDER_STATUS.APPLIED || status === ORDER_STATUS.DUPLICATE;
+
     if (orderHash) {
       const pending = _pendingSends.get(orderHash);
       if (pending) {
-        pending.status = plain.status ?? pending.status;
+        if (status) pending.status = status;
         pending.reason = plain.reason ?? pending.reason;
         pending.failedAt = plain.failedAt ?? pending.failedAt;
         pending.resolvedAt = Date.now();
       }
     }
-    // Record a UI transfer entry for a terminal order. The DTO exposes the
-    // order hash (not the ledger entry hash), so that is the stable id.
-    if (plain.status === ORDER_STATUS.APPLIED || plain.status === ORDER_STATUS.DUPLICATE) {
+    // Record a UI transfer entry only for a cryptographically verified
+    // terminal order. The DTO exposes the order hash (not the ledger entry
+    // hash), so that is the stable id. `unverified` is never success.
+    if (isVerifiedSuccess) {
       _recordActivity({
         id: orderHash ?? `seq-${plain.entrySeq ?? Date.now()}`,
         type: ACTIVITY_TYPES.TRANSFER,
@@ -627,7 +632,16 @@ function _applyLedgerEvent(plain) {
     if (typeof plain.height === 'number') {
       ledgerState.height = plain.height;
     }
-    ledgerState.error = null;
+    // An unverified settlement is terminal but NOT success: keep a clear
+    // notice and never clear the error as if the transfer had applied.
+    if (status === ORDER_STATUS.UNVERIFIED) {
+      const reason = plain.reason ?? 'settlement proof could not be verified';
+      const where = orderHash ? ` for order ${orderHash}` : '';
+      ledgerState.error =
+        `Settlement unverified${where}: ${reason}. The transfer was not confirmed; do not resend.`;
+    } else {
+      ledgerState.error = null;
+    }
     return;
   }
 
@@ -1133,21 +1147,99 @@ export function tryRecvEnvelope() {
 // ── Ledger / value transfer ───────────────────────────────────
 
 /**
+ * Pin the payee leaf's ledger key (from a receive URI's `ln`/`lk`) before
+ * sending a payment.
+ *
+ * Once pinned, a terminal inclusion proof for that leaf must verify under
+ * exactly this key; a mismatch is reported by the wasm ledger as an
+ * `"unverified"` settlement, never as success. The pin is stored in the
+ * secret-free ledger state, so it survives export/import round trips.
+ *
+ * @param {string} nodeId Payee leaf node id (the URI's `ln`).
+ * @param {string} ledgerHex Payee leaf ledger public key, 64 hex chars (`lk`).
+ * @returns {Promise<void>}
+ */
+export async function pinPayeeLeaf(nodeId, ledgerHex) {
+  if (typeof nodeId !== 'string' || !nodeId.trim()) {
+    throw new Error('A payee leaf node id is required to pin the payee leaf.');
+  }
+  if (typeof ledgerHex !== 'string' || !/^[0-9a-fA-F]{64}$/.test(ledgerHex)) {
+    throw new Error('The payee leaf ledger key must be 64 hex characters.');
+  }
+
+  if (_useMock) {
+    await mockDelay(50);
+    return; // no-op: mock mode has no verifiable settlement
+  }
+
+  const node = _requireNode();
+  if (typeof node.pin_payee_leaf !== 'function') {
+    throw new Error('This client build does not support pinning a payee leaf.');
+  }
+  // Let a wasm rejection propagate: the caller must not send on a failed pin.
+  await node.pin_payee_leaf(nodeId.trim(), ledgerHex.toLowerCase());
+}
+
+/**
+ * Normalize the optional payee-pin argument accepted by `sendPayment`.
+ *
+ * Accepts either a bare 64-hex ledger key or a parsed-payee-shaped object
+ * (`{ leafNodeId, ledgerKeyHex }`, `{ ln, lk }`, or `{ nodeId, ledgerKeyHex }`).
+ * Returns `null` when no pin was supplied.
+ *
+ * @param {string|object|null|undefined} pin
+ * @param {string} fallbackNodeId Payee node id used when the pin is a bare key.
+ * @returns {{ nodeId: string, ledgerHex: string }|null}
+ */
+function _normalizePayeePin(pin, fallbackNodeId) {
+  if (!pin) return null;
+  if (typeof pin === 'string') {
+    return { nodeId: fallbackNodeId, ledgerHex: pin };
+  }
+  if (typeof pin === 'object') {
+    const ledgerHex = pin.ledgerKeyHex ?? pin.lk ?? pin.payeeLedgerHex ?? null;
+    if (!ledgerHex) return null;
+    const nodeId =
+      pin.leafNodeId ?? pin.ln ?? pin.payeeLeafNodeId ?? pin.nodeId ?? fallbackNodeId;
+    return { nodeId, ledgerHex };
+  }
+  return null;
+}
+
+/**
  * Send a payment to a payee (cross-leaf or same-leaf).
  *
  * `to` is the payee's endpoint id (node id) and `toAddress` is their octal
  * address (both normally from a receive URI). `amount` is in whole Cawala
  * units. The order is operator-signed and persisted as pending *before* it is
  * dialed, so a racing `"order_result"` event can always be matched; the
- * terminal status arrives through the ledger-event poller as an
- * `applied`/`duplicate`/`partial`/`rejected` status.
+ * terminal status arrives through the ledger-event poller as one of
+ * `applied`/`duplicate`/`partial`/`rejected`/`indeterminate`/`unverified`.
+ *
+ * The optional `payeePin` is the parsed payee leaf pin (the receive URI's
+ * `ln`/`lk`): a bare 64-hex ledger key or a parsed-payee-shaped object. When
+ * present, the leaf key is pinned *before* the order is sent; if pinning fails
+ * the payment is aborted and the error surfaced.
  *
  * @param {string} to Recipient node id.
  * @param {string} toAddress Recipient octal address (e.g. "0.3.2").
  * @param {number} amount Whole, positive Cawala units.
+ * @param {string|object|null} [payeePin] Parsed payee leaf pin (`lk` hex and/or `ln` id).
  * @returns {Promise<{ orderHash: string, ack: string }>}
  */
-export async function sendPayment(to, toAddress, amount) {
+export async function sendPayment(to, toAddress, amount, payeePin = null) {
+  const pin = _normalizePayeePin(payeePin, typeof to === 'string' ? to.trim() : to);
+
+  if (pin) {
+    try {
+      await pinPayeeLeaf(pin.nodeId, pin.ledgerHex);
+    } catch (err) {
+      throw new Error(
+        `Payment not sent: could not pin the payee leaf (${_errorMessage(err)}).`,
+      );
+    }
+  }
+
   if (_useMock) {
     await mockDelay(500);
     const numeric = Number(amount);
@@ -1271,8 +1363,13 @@ export function getLedgerStatus() {
 /**
  * Parse and validate a `cawala://pay?to=...&addr=...` receive URI.
  *
+ * The URI may also carry the payee leaf's out-of-band pin
+ * (`ln=<leaf node id>&lk=<64-hex ledger key>`); when present it is surfaced as
+ * `leafNodeId`/`ledgerKeyHex` (aliases `ln`/`lk`) so the payer can pin the
+ * leaf before sending and require the terminal proof to verify under that key.
+ *
  * @param {string} uri - Raw receive URI from the user.
- * @returns {Promise<{ nodeId: string, address: string }>}
+ * @returns {Promise<{ nodeId: string, address: string, leafNodeId: string|null, ledgerKeyHex: string|null, ln: string|null, lk: string|null }>}
  * @throws {Error} With a user-facing message if the URI is invalid.
  */
 export async function parseReceiveUri(uri) {
@@ -1298,9 +1395,18 @@ export async function parseReceiveUri(uri) {
   }
 
   try {
+    // wasm-bindgen getters are `leaf_node`/`leaf_ledger`; tolerate `ln`/`lk`
+    // so this keeps working across a concurrent glue regeneration.
+    const leafNodeId = info.leaf_node ?? info.ln ?? null;
+    const ledgerKeyHex = info.leaf_ledger ?? info.lk ?? null;
     return {
       nodeId: info.node_id,
       address: info.address,
+      leafNodeId,
+      ledgerKeyHex,
+      // Literal URI-parameter aliases for callers that mirror the wire names.
+      ln: leafNodeId,
+      lk: ledgerKeyHex,
     };
   } finally {
     info.free?.();
@@ -1308,25 +1414,44 @@ export async function parseReceiveUri(uri) {
 }
 
 /**
- * Mock receive URI parser. Recognises `cawala://pay?to=...&addr=...` URIs.
+ * Mock receive URI parser. Recognises `cawala://pay?to=...&addr=...[&ln=...&lk=...]`.
  */
 function _mockParseReceiveUri(raw) {
+  let url;
   try {
-    const url = new URL(raw);
-    if (url.protocol === 'cawala:' && url.host === 'pay') {
-      const to = url.searchParams.get('to');
-      const addr = url.searchParams.get('addr');
-      if (!to || !addr) {
-        throw new Error('Receive URI is missing required fields (to, addr).');
-      }
-      return { nodeId: to, address: addr };
-    }
-  } catch (e) {
-    if (e.message && e.message.includes('missing required')) {
-      throw e;
-    }
+    url = new URL(raw);
+  } catch {
+    throw new Error("That doesn't look like a receive URI. Ask the payee to send a fresh one.");
   }
-  throw new Error("That doesn't look like a receive URI. Ask the payee to send a fresh one.");
+  if (url.protocol !== 'cawala:' || url.host !== 'pay') {
+    throw new Error("That doesn't look like a receive URI. Ask the payee to send a fresh one.");
+  }
+
+  const to = url.searchParams.get('to');
+  const addr = url.searchParams.get('addr');
+  if (!to || !addr) {
+    throw new Error('Receive URI is missing required fields (to, addr).');
+  }
+
+  // Optional leaf pin: `ln`/`lk` must appear together, and `lk` must be 64-hex.
+  const ln = url.searchParams.get('ln');
+  const lk = url.searchParams.get('lk');
+  if ((ln == null) !== (lk == null)) {
+    throw new Error("Incomplete leaf pin: 'ln' and 'lk' must appear together.");
+  }
+  if (lk != null && !/^[0-9a-fA-F]{64}$/.test(lk)) {
+    throw new Error('Leaf ledger key must be 64 hex characters.');
+  }
+  const leafNodeId = ln ?? null;
+  const ledgerKeyHex = lk ? lk.toLowerCase() : null;
+  return {
+    nodeId: to,
+    address: addr,
+    leafNodeId,
+    ledgerKeyHex,
+    ln: leafNodeId,
+    lk: ledgerKeyHex,
+  };
 }
 
 /**
@@ -1351,8 +1476,9 @@ export async function getReceiveUri() {
 /**
  * Snapshot of the JS-tracked payments for UI status, keyed by order hash. Each
  * entry starts as `status: 'pending'` and is updated to `applied`/`duplicate`/
- * `rejected` when the matching `order_result` event is drained. The
- * authoritative in-flight count is `ledgerState.pending`.
+ * `partial`/`rejected`/`indeterminate`/`unverified` when the matching
+ * `order_result` event is drained. `unverified` is terminal but not success.
+ * The authoritative in-flight count is `ledgerState.pending`.
  *
  * Note: this map is per-session (not persisted), so sends from a previous page
  * load are not listed even though their orders may still be pending in the

@@ -18,14 +18,17 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cawala_ledger::{
-    AccountRef, Amount, AuthRef, Balances, Entry, EntryBody, Hash, HopRole, LedgerPubKey,
-    LedgerSecretKey, NodeId, OperatorSecretKey, PaymentOrder, PeerKeys, PeerRegistry, PeerRole,
-    Posting, SignedAmount, SignedEntry, verify_balance_attestation,
+    AccountRef, Amount, AuthRef, Balances, Entry, EntryBody, Hash,
+    HopRole, LedgerPubKey, LedgerSecretKey, MAX_ENTRY_PROOF, NodeId, OperatorSecretKey, PaymentOrder,
+    PeerKeys, PeerRegistry, PeerRole, Posting, SignedAmount, SignedCommitment, SignedEntry,
+    build_commitment, entry_hash, entry_inclusion_proof, verify_applied_entry,
+    verify_balance_attestation, verify_entry_inclusion,
 };
 use cawala_msg::{
-    AckStatus, Envelope, LedgerPayloadV1, LedgerPayloadV2, MSG_LEDGER_V1, MSG_SETTLE_V1,
-    OrderRejectV1, OrderResultV2, OrderV2, PeerRef, SettleForwardV1, SettleHopV1, SettlePayloadV1,
-    SettlementStatusV2, VersionedLedgerPayload, append_hop, decode_versioned,
+    AckStatus, Envelope, EntryProofV1, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
+    MSG_LEDGER_V1, MSG_SETTLE_V1, OrderRejectV1, OrderResultV3, OrderV2, PeerRef, SettleForwardV1,
+    SettleHopV1, SettleOutcomeV2, SettlePayloadV2, SettleResultV2, SettlementStatusV2,
+    VersionedLedgerPayload, append_hop, decode_versioned,
 };
 use cawala_node::LedgerService;
 use cawala_node::identity;
@@ -501,14 +504,23 @@ async fn recv_payload(rx: &mut mpsc::Receiver<Envelope>, what: &str) -> LedgerPa
     LedgerPayloadV1::from_bytes(&env.payload).expect("valid ledger payload")
 }
 
-async fn recv_order_result(rx: &mut mpsc::Receiver<Envelope>) -> OrderResultV2 {
+async fn recv_order_result(rx: &mut mpsc::Receiver<Envelope>) -> OrderResultV3 {
     let env = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("order result within timeout")
         .expect("order result envelope");
     match decode_versioned(&env.payload).expect("valid ledger payload") {
-        VersionedLedgerPayload::V2(LedgerPayloadV2::OrderResult(result)) => result,
-        other => panic!("expected v2 OrderResult, got {other:?}"),
+        // `Applied`/`Duplicate` results carry a proof and are v3; the remaining
+        // statuses keep the v2 shape (no proof).
+        VersionedLedgerPayload::V3(LedgerPayloadV3::OrderResult(result)) => result,
+        VersionedLedgerPayload::V2(LedgerPayloadV2::OrderResult(result)) => OrderResultV3 {
+            reply_to: result.reply_to,
+            order_hash: result.order_hash,
+            status: result.status,
+            balance: result.balance,
+            proof: None,
+        },
+        other => panic!("expected a v2/v3 OrderResult, got {other:?}"),
     }
 }
 
@@ -578,6 +590,28 @@ async fn cross_subtree_settlement_success() {
     assert_eq!(receipt.attestation.balance, Amount::new(900));
     verify_balance_attestation(&receipt.attestation, &receipt.commitment, &receipt.ledger_pubkey)
         .unwrap();
+
+    // The origin forwarded the payee leaf's own terminal proof, and it
+    // self-verifies as a `Descend` crediting the payee included in the leaf's
+    // committed entry tree.
+    let proof = result
+        .proof
+        .as_ref()
+        .expect("applied result carries a terminal proof");
+    assert!(proof.validate().is_ok(), "terminal proof must validate");
+    assert_eq!(proof.leaf_addr, "0.2".parse().unwrap());
+    assert!(
+        verify_applied_entry(&proof.entry, &order, false).is_ok(),
+        "terminal entry must credit the payee as a Descend"
+    );
+    assert!(
+        verify_entry_inclusion(
+            &proof.entry,
+            &proof.inclusion,
+            &proof.commitment.commitment.entry_root,
+        ),
+        "terminal entry must be included in the committed tree"
+    );
 
     // uB: pushed receipt with a Descend notice.
     let push = recv_receipt(&mut h.ub.sink).await;
@@ -689,6 +723,10 @@ async fn duplicate_order_is_answered_from_the_cached_terminal() {
         other => panic!("expected Duplicate, got {other:?}"),
     }
     assert_eq!(dup.order_hash, order.hash());
+    assert!(
+        dup.proof.is_some(),
+        "a duplicate answered from the cached terminal forwards its proof"
+    );
     assert_eq!(ledger_len(&h.a).await, a_len);
     assert_eq!(ledger_len(&h.p).await, p_len);
     assert_eq!(ledger_len(&h.b).await, b_len);
@@ -877,7 +915,7 @@ async fn send_forged(
     dst: &str,
 ) {
     let forward = forged_forward(attacker, order, payer_addr, payee_addr, hops);
-    let bytes = SettlePayloadV1::Forward(forward).to_bytes().unwrap();
+    let bytes = SettlePayloadV2::Forward(forward).to_bytes().unwrap();
     let env = build_envelope(
         &attacker.snapshot.routable.this,
         dst.parse().expect("valid octal address"),
@@ -1038,7 +1076,7 @@ async fn relayed_tampered_lca_hop_is_rejected_at_terminal() {
         fabricated_hop("0", &order, HopRole::Lca, 77),
     ];
     let forward = forged_forward(&h.ua, &order, "0.1.3", "0.2.4", hops);
-    let bytes = SettlePayloadV1::Forward(forward).to_bytes().unwrap();
+    let bytes = SettlePayloadV2::Forward(forward).to_bytes().unwrap();
 
     // Relay it as if it had travelled A -> P -> B: the envelope's origin is the
     // payer leaf, its chain carries the payer hop then the LCA hop, and it is
@@ -1079,4 +1117,430 @@ async fn relayed_tampered_lca_hop_is_rejected_at_terminal() {
     for router in h.routers.drain(..) {
         router.shutdown().await.unwrap();
     }
+}
+
+// ── R6a: adversarial terminal-proof verification at the origin ─────────────
+//
+// The origin `A` verifies a terminal `EntryProofV1` for self-consistency
+// before accepting `Applied`; a proof failing any check must resolve the
+// browser's result as `Indeterminate` and must not be recorded as a terminal.
+// The attacker is the LCA `P` (a direct neighbor of `A`), which spoofs
+// `env.src.addr` to the payee leaf `0.2` and injects a forged
+// `SettleResultV2::Applied`.
+//
+// Residual (reported, not patched — tests-only scope): the origin has no
+// registry row binding the sibling leaf's node id to its ledger key, so it
+// cannot distinguish the real payee leaf from any other signer when the proof
+// is fully self-consistent AND correctly credits the payee. These tests
+// exercise exactly the checks the origin *can* make (order binding,
+// signer/commitment binding, structural bounds, Merkle inclusion).
+
+/// Build a self-consistent terminal `EntryProofV1` for `order` under
+/// `leaf_key`, with a `Descend` entry crediting `paid_child` (normally
+/// `order.to`). The commitment and inclusion proof come from a two-entry
+/// in-memory ledger (`OpenAccount(paid_child)`, then the transfer at seq 1).
+fn forged_terminal_proof(
+    order: &PaymentOrder,
+    leaf_key: &LedgerSecretKey,
+    leaf_node: &str,
+    paid_child: &NodeId,
+) -> EntryProofV1 {
+    let op = OperatorSecretKey::from_bytes([0x5a; 32]);
+    let m = i64::try_from(order.amount.get()).expect("amount fits i64");
+
+    let mut ledger = cawala_ledger::Ledger::new_root(leaf_key.public());
+    let open = Entry {
+        ledger_id: leaf_key.public(),
+        seq: 0,
+        height: 0,
+        prev_hash: Hash::ZERO,
+        issued_at: 0,
+        body: EntryBody::OpenAccount {
+            child: paid_child.clone(),
+            kind: ChildKind::User,
+        },
+        postings: vec![],
+        auth: None,
+    };
+    let open_signed = SignedEntry::sign(open, leaf_key).unwrap();
+    let open_hash = entry_hash(&open_signed.entry).unwrap();
+    ledger.append(open_signed).unwrap();
+
+    let transfer = Entry {
+        ledger_id: leaf_key.public(),
+        seq: 1,
+        height: 1,
+        prev_hash: open_hash,
+        issued_at: 0,
+        body: EntryBody::Transfer {
+            payment_id: order.hash(),
+            amount: order.amount,
+            role: HopRole::Descend,
+        },
+        postings: vec![
+            posting(AccountRef::Parent, m),
+            posting(AccountRef::Child(paid_child.clone()), m),
+        ],
+        auth: Some(order.authorize(&op).unwrap()),
+    };
+    let signed = SignedEntry::sign(transfer, leaf_key).unwrap();
+    ledger.append(signed.clone()).unwrap();
+
+    let inclusion = entry_inclusion_proof(&ledger, 1).unwrap();
+    let commitment = build_commitment(&ledger, Hash::ZERO, 0).unwrap();
+    let commitment = SignedCommitment::sign(commitment, leaf_key).unwrap();
+
+    EntryProofV1 {
+        entry: signed,
+        signer: PeerKeys {
+            node_id: NodeId::from(leaf_node),
+            operator: op.public(),
+            ledger: Some(leaf_key.public()),
+            role: PeerRole::Node,
+        },
+        leaf_addr: "0.2".parse().expect("valid octal address"),
+        commitment,
+        inclusion,
+    }
+}
+
+/// The honest outer coordinates for `proof`.
+fn proof_coords(proof: &EntryProofV1) -> (u64, Hash) {
+    (
+        proof.entry.entry.seq,
+        entry_hash(&proof.entry.entry).expect("entry hashes"),
+    )
+}
+
+/// Send a crafted settlement `Result` to the origin `A` from its parent `P`,
+/// spoofing the envelope origin to the payee leaf (`0.2`) and appending `P` so
+/// `A` authenticates it as the last hop of the chain.
+async fn send_forged_result(h: &Harness, result: SettleResultV2) {
+    let b_ref = PeerRef {
+        addr: "0.2".parse().expect("valid octal address"),
+        node: h.b.node_id.clone(),
+    };
+    let p_ref = PeerRef {
+        addr: "0".parse().expect("valid octal address"),
+        node: h.p.node_id.clone(),
+    };
+    let payload = SettlePayloadV2::Result(result).to_bytes().unwrap();
+    // One TTL unit is consumed by the appended hop (the envelope's
+    // `hop_chain.len() + ttl <= MAX_HOPS + 1` invariant).
+    let mut env = build_envelope(
+        &b_ref,
+        "0.1".parse().expect("valid octal address"),
+        MSG_SETTLE_V1,
+        payload,
+        h.config.ttl - 1,
+    )
+    .unwrap();
+    append_hop(&mut env, &p_ref).unwrap();
+    let p_snap = h.p.source.snapshot();
+    let ack = send_envelope(&h.p.endpoint, &p_snap, &env, h.config.hop_timeout)
+        .await
+        .expect("forged result send");
+    assert_eq!(ack.status, AckStatus::Delivered);
+}
+
+/// Set up a stalled terminal (`B` never drains its sink), send one order so the
+/// origin `A` reserves a pending settlement, and return the harness plus the
+/// order. `P` has applied its LCA hop and relayed to the stalled `B`, so no
+/// terminal result has reached `A`.
+async fn setup_pending(nonce: u64) -> (Harness, PaymentOrder) {
+    let h = setup(Mode::StallTerminal).await;
+    let now = unix_now();
+    let order = order(&h.ua, &h.ub.node_id, 100, nonce, now + 3600);
+    let env = order_env(&h.ua, "0.1", &order, "0.2.4");
+    let ack = send_from_user(&h.ua, &env, h.config.hop_timeout).await;
+    assert_eq!(ack, AckStatus::Delivered);
+    // `P`'s Lca applied (its 5th entry); the relay to `B` is stalled.
+    wait_for_len(&h.p, 5).await;
+    (h, order)
+}
+
+/// A rejected proof must produce an `Indeterminate` browser result (no proof),
+/// record no terminal outcome, and resolve the pending settlement.
+async fn assert_rejected_as_indeterminate(h: &Harness, result: &OrderResultV3) {
+    assert!(
+        matches!(result.status, SettlementStatusV2::Indeterminate { .. }),
+        "expected Indeterminate, got {:?}",
+        result.status
+    );
+    assert!(
+        result.proof.is_none(),
+        "an indeterminate result carries no proof"
+    );
+    let mgr = h.a.manager.lock().await;
+    assert_eq!(mgr.terminal_len(), 0, "a failed proof must not be recorded");
+    assert_eq!(mgr.pending_len(), 0, "the pending settlement is resolved");
+}
+
+async fn shutdown_harness(mut h: Harness) {
+    for router in h.routers.drain(..) {
+        router.shutdown().await.unwrap();
+    }
+}
+
+/// **1. Forged `Applied` from a malicious LCA.** `P` spoofs the payee leaf and
+/// injects a fully self-consistent proof (valid signature, commitment, and
+/// inclusion under the attacker's key) whose `Descend` entry credits the wrong
+/// child instead of the order's payee. The old shape-only check accepted this;
+/// `verify_applied_entry` must reject it and the browser must see
+/// `Indeterminate`.
+#[tokio::test]
+async fn forged_applied_from_lca_is_rejected() {
+    let (mut h, order) = setup_pending(101).await;
+    let attacker_key = LedgerSecretKey::from_bytes([0x11; 32]);
+    let wrong_payee = NodeId::from("attacker-account");
+    let proof = forged_terminal_proof(&order, &attacker_key, &h.b.node_id, &wrong_payee);
+    assert!(
+        proof.validate().is_ok(),
+        "the forgery is structurally self-consistent"
+    );
+
+    let (seq, hash) = proof_coords(&proof);
+    send_forged_result(
+        &h,
+        SettleResultV2 {
+            payment_id: order.hash(),
+            outcome: SettleOutcomeV2::Applied {
+                terminal_seq: seq,
+                terminal_hash: hash,
+                proof,
+            },
+        },
+    )
+    .await;
+
+    let result = recv_order_result(&mut h.ua.sink).await;
+    assert_rejected_as_indeterminate(&h, &result).await;
+    shutdown_harness(h).await;
+}
+
+/// **2. Valid entry, wrong signer key.** The entry is signed by `leaf_key` but
+/// the proof declares a different signer ledger key, so the entry does not
+/// verify under `proof.signer.ledger`.
+#[tokio::test]
+async fn wrong_signer_key_is_rejected() {
+    let (mut h, order) = setup_pending(102).await;
+    let leaf_key = LedgerSecretKey::from_bytes([0x21; 32]);
+    let mut proof = forged_terminal_proof(&order, &leaf_key, &h.b.node_id, &order.to);
+    proof.signer.ledger = Some(LedgerSecretKey::from_bytes([0x22; 32]).public());
+
+    let (seq, hash) = proof_coords(&proof);
+    send_forged_result(
+        &h,
+        SettleResultV2 {
+            payment_id: order.hash(),
+            outcome: SettleOutcomeV2::Applied {
+                terminal_seq: seq,
+                terminal_hash: hash,
+                proof,
+            },
+        },
+    )
+    .await;
+
+    let result = recv_order_result(&mut h.ua.sink).await;
+    assert_rejected_as_indeterminate(&h, &result).await;
+    shutdown_harness(h).await;
+}
+
+/// **3. Tampered `terminal_hash` / `terminal_seq`.** The outer coordinates no
+/// longer match `entry_hash(entry)` / `entry.seq`.
+#[tokio::test]
+async fn tampered_terminal_coordinates_are_rejected() {
+    let leaf_key = LedgerSecretKey::from_bytes([0x31; 32]);
+
+    // (a) `terminal_hash` no longer matches the entry hash.
+    let (mut h, order) = setup_pending(103).await;
+    let proof = forged_terminal_proof(&order, &leaf_key, &h.b.node_id, &order.to);
+    let (seq, _) = proof_coords(&proof);
+    send_forged_result(
+        &h,
+        SettleResultV2 {
+            payment_id: order.hash(),
+            outcome: SettleOutcomeV2::Applied {
+                terminal_seq: seq,
+                terminal_hash: Hash::ZERO,
+                proof,
+            },
+        },
+    )
+    .await;
+    let result = recv_order_result(&mut h.ua.sink).await;
+    assert_rejected_as_indeterminate(&h, &result).await;
+    shutdown_harness(h).await;
+
+    // (b) `terminal_seq` no longer matches `entry.seq`.
+    let (mut h, order) = setup_pending(104).await;
+    let proof = forged_terminal_proof(&order, &leaf_key, &h.b.node_id, &order.to);
+    let (_, hash) = proof_coords(&proof);
+    let bad_seq = proof.entry.entry.seq + 7;
+    send_forged_result(
+        &h,
+        SettleResultV2 {
+            payment_id: order.hash(),
+            outcome: SettleOutcomeV2::Applied {
+                terminal_seq: bad_seq,
+                terminal_hash: hash,
+                proof,
+            },
+        },
+    )
+    .await;
+    let result = recv_order_result(&mut h.ua.sink).await;
+    assert_rejected_as_indeterminate(&h, &result).await;
+    shutdown_harness(h).await;
+}
+
+/// **4. Tampered inclusion.** A wrong leaf `index` and an inclusion path bound
+/// to a different commitment root must both be rejected.
+#[tokio::test]
+async fn tampered_inclusion_is_rejected() {
+    let leaf_key = LedgerSecretKey::from_bytes([0x41; 32]);
+
+    // (a) the audit path is presented at the wrong leaf index.
+    let (mut h, order) = setup_pending(105).await;
+    let mut proof = forged_terminal_proof(&order, &leaf_key, &h.b.node_id, &order.to);
+    // The honest proof is for index 1; index 0 reconstructs a different root.
+    proof.inclusion.index = 0;
+    let (seq, hash) = proof_coords(&proof);
+    send_forged_result(
+        &h,
+        SettleResultV2 {
+            payment_id: order.hash(),
+            outcome: SettleOutcomeV2::Applied {
+                terminal_seq: seq,
+                terminal_hash: hash,
+                proof,
+            },
+        },
+    )
+    .await;
+    let result = recv_order_result(&mut h.ua.sink).await;
+    assert_rejected_as_indeterminate(&h, &result).await;
+    shutdown_harness(h).await;
+
+    // (b) the inclusion path is verified against a different commitment root.
+    let (mut h, order) = setup_pending(106).await;
+    let mut proof = forged_terminal_proof(&order, &leaf_key, &h.b.node_id, &order.to);
+    proof.commitment.commitment.entry_root = Hash::from_bytes([0xab; 32]);
+    let (seq, hash) = proof_coords(&proof);
+    send_forged_result(
+        &h,
+        SettleResultV2 {
+            payment_id: order.hash(),
+            outcome: SettleOutcomeV2::Applied {
+                terminal_seq: seq,
+                terminal_hash: hash,
+                proof,
+            },
+        },
+    )
+    .await;
+    let result = recv_order_result(&mut h.ua.sink).await;
+    assert_rejected_as_indeterminate(&h, &result).await;
+    shutdown_harness(h).await;
+}
+
+/// **5. Oversized proof.** An audit path longer than `MAX_ENTRY_PROOF` fails
+/// `EntryProofV1::validate` and must be rejected.
+#[tokio::test]
+async fn oversized_inclusion_proof_is_rejected() {
+    let (mut h, order) = setup_pending(107).await;
+    let leaf_key = LedgerSecretKey::from_bytes([0x51; 32]);
+    let mut proof = forged_terminal_proof(&order, &leaf_key, &h.b.node_id, &order.to);
+    proof.inclusion.proof = vec![Hash::ZERO; MAX_ENTRY_PROOF + 1];
+    assert!(
+        proof.validate().is_err(),
+        "validate rejects an over-long audit path"
+    );
+
+    let (seq, hash) = proof_coords(&proof);
+    send_forged_result(
+        &h,
+        SettleResultV2 {
+            payment_id: order.hash(),
+            outcome: SettleOutcomeV2::Applied {
+                terminal_seq: seq,
+                terminal_hash: hash,
+                proof,
+            },
+        },
+    )
+    .await;
+
+    let result = recv_order_result(&mut h.ua.sink).await;
+    assert_rejected_as_indeterminate(&h, &result).await;
+    shutdown_harness(h).await;
+}
+
+/// **6. Replay.** Re-sending the identical terminal result after the terminal
+/// was recorded is a no-op (no pending settlement, no second browser result,
+/// one terminal record). Re-sending the order is answered `Duplicate` from the
+/// cached terminal carrying the same proof.
+#[tokio::test]
+async fn replaying_the_terminal_result_is_idempotent() {
+    let mut h = setup(Mode::Full).await;
+    let now = unix_now();
+    let order = order(&h.ua, &h.ub.node_id, 100, 9, now + 3600);
+    let env = order_env(&h.ua, "0.1", &order, "0.2.4");
+    let ack = send_from_user(&h.ua, &env, h.config.hop_timeout).await;
+    assert_eq!(ack, AckStatus::Delivered);
+    wait_for_len(&h.b, 3).await;
+
+    let first = recv_order_result(&mut h.ua.sink).await;
+    let (terminal_seq, terminal_hash) = match &first.status {
+        SettlementStatusV2::Applied {
+            entry_seq,
+            entry_hash,
+        } => (*entry_seq, *entry_hash),
+        other => panic!("expected Applied, got {other:?}"),
+    };
+    let proof = first.proof.clone().expect("applied result carries a proof");
+    assert_eq!(h.a.manager.lock().await.terminal_len(), 1);
+
+    // Re-send the identical terminal result. The origin no longer holds a
+    // pending settlement for this payment id, so it must be a silent no-op.
+    send_forged_result(
+        &h,
+        SettleResultV2 {
+            payment_id: order.hash(),
+            outcome: SettleOutcomeV2::Applied {
+                terminal_seq,
+                terminal_hash,
+                proof: proof.clone(),
+            },
+        },
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), h.ua.sink.recv())
+            .await
+            .is_err(),
+        "a replayed result with no pending settlement must not emit a browser result"
+    );
+    assert_eq!(h.a.manager.lock().await.terminal_len(), 1);
+
+    // Re-sending the order is answered `Duplicate` from the cached terminal,
+    // forwarding the same proof.
+    let retry = order_env(&h.ua, "0.1", &order, "0.2.4");
+    let ack = send_from_user(&h.ua, &retry, h.config.hop_timeout).await;
+    assert_eq!(ack, AckStatus::Delivered);
+    let dup = recv_order_result(&mut h.ua.sink).await;
+    assert!(
+        matches!(dup.status, SettlementStatusV2::Duplicate { .. }),
+        "expected Duplicate, got {:?}",
+        dup.status
+    );
+    assert_eq!(
+        dup.proof.as_ref(),
+        Some(&proof),
+        "the duplicate forwards the same proof"
+    );
+    assert_eq!(h.a.manager.lock().await.terminal_len(), 1);
+
+    shutdown_harness(h).await;
 }

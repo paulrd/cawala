@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, VecDeque};
 use cawala_ledger::{
     AccountRef, AuthRef, Hash, HopRole, NodeId, PaymentOrder, SignedEntry, classify_hop,
 };
-use cawala_msg::{MsgId, PeerRef, SettleOutcomeV1, SettleRejectV1};
+use cawala_msg::{EntryProofV1, MsgId, PeerRef, SettleOutcomeV2, SettleRejectV1};
 use cawala_topology::OctAddr;
 
 use crate::record::NodeRecord;
@@ -183,10 +183,14 @@ pub struct TerminalRecord {
     /// The payer's order.
     pub order: PaymentOrder,
     /// The terminal outcome.
-    pub outcome: SettleOutcomeV1,
+    pub outcome: SettleOutcomeV2,
     /// The terminal leaf's signed `Descend` entry, when it applied. Retained for
     /// P5 verification (the result itself is advisory).
     pub terminal_entry: Option<SignedEntry>,
+    /// The verified terminal inclusion proof, when the outcome was accepted.
+    /// Forwarded unmodified to the browser in the V3 `OrderResult`; `None` for a
+    /// downstream rejection, which carries no applied hop.
+    pub proof: Option<EntryProofV1>,
 }
 
 /// Bounded origin-side settlement bookkeeping.
@@ -304,7 +308,10 @@ impl SettlementManager {
 mod tests {
     use super::*;
 
-    use cawala_ledger::{Amount, Entry, EntryBody, LedgerSecretKey, PaymentOrder, expected_hops};
+    use cawala_ledger::{
+        Amount, Commitment, Entry, EntryBody, EntryInclusionProof, LedgerSecretKey,
+        OperatorSecretKey, PaymentOrder, PeerKeys, PeerRole, SignedCommitment, expected_hops,
+    };
     use cawala_topology::{ChildKind, Topology};
 
     use crate::record::{ChildEntry, NodeRecord, ParentLink};
@@ -325,6 +332,40 @@ mod tests {
             auth: None,
         };
         SignedEntry::sign(entry, &key).unwrap()
+    }
+
+    /// A structurally plausible terminal proof (single-leaf tree) used only to
+    /// exercise the retention/duplicate bookkeeping, not verification.
+    fn sample_entry_proof() -> EntryProofV1 {
+        let key = LedgerSecretKey::from_bytes([9u8; 32]);
+        EntryProofV1 {
+            entry: sample_signed_entry(),
+            signer: PeerKeys {
+                node_id: NodeId::from("A"),
+                operator: OperatorSecretKey::from_bytes([2u8; 32]).public(),
+                ledger: Some(key.public()),
+                role: PeerRole::Node,
+            },
+            leaf_addr: addr("0.1"),
+            commitment: SignedCommitment {
+                commitment: Commitment {
+                    ledger_id: key.public(),
+                    ledger_pubkey: key.public(),
+                    height: 1,
+                    entry_count: 1,
+                    entry_root: Hash::ZERO,
+                    state_root: Hash::ZERO,
+                    prev_commitment_hash: Hash::ZERO,
+                    issued_at: 0,
+                },
+                signature: key.sign(b"commitment"),
+            },
+            inclusion: EntryInclusionProof {
+                index: 0,
+                tree_size: 1,
+                proof: vec![],
+            },
+        }
     }
 
     fn addr(s: &str) -> OctAddr {
@@ -562,18 +603,19 @@ mod tests {
                 browser: pending(3, 100).browser,
                 browser_msg_id: MsgId([3; 16]),
                 order: pending(3, 100).order,
-                outcome: SettleOutcomeV1::Applied {
+                outcome: SettleOutcomeV2::Applied {
                     terminal_seq: 7,
                     terminal_hash: Hash::from_bytes([7u8; 32]),
-                    terminal_entry: sample_signed_entry(),
+                    proof: sample_entry_proof(),
                 },
                 terminal_entry: Some(sample_signed_entry()),
+                proof: Some(sample_entry_proof()),
             },
         );
         assert_eq!(manager.terminal_len(), 1);
         assert!(matches!(
             manager.terminal(&payment_id).map(|t| &t.outcome),
-            Some(SettleOutcomeV1::Applied { terminal_seq: 7, .. })
+            Some(SettleOutcomeV2::Applied { terminal_seq: 7, .. })
         ));
     }
 }

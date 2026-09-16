@@ -35,12 +35,13 @@ use cawala_ledger::{
     SignedEntry, classify_hop, hop_postings,
 };
 use cawala_msg::{
-    Ack, AckStatus, Envelope, LedgerPayloadV1, LedgerPayloadV2, MSG_LEDGER_V1, MSG_SETTLE_V1,
-    MessageType, MsgError, MsgId, Neighbor, NeighborKind, OrderRejectV1, OrderResultV1,
-    OrderResultV2, OrderStatusV1, PeerRef, RejectReason, Routable, RouteDecision, RouteError, Seen,
-    SeenConfig, SeenSet, SettleForwardV1, SettleHopV1, SettleOutcomeV1, SettlePayloadV1,
-    SettleRejectV1, SettleResultV1, SettlementStatusV2, ValueNoticeV1, VersionedLedgerPayload,
-    decode_versioned,
+    Ack, AckStatus, Envelope, EntryProofV1, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
+    MSG_LEDGER_V1, MSG_SETTLE_V1, MessageType, MsgError, MsgId, Neighbor, NeighborKind,
+    OrderRejectV1, OrderResultV1, OrderResultV2, OrderResultV3, OrderStatusV1, PeerRef, RejectReason,
+    Routable,
+    RouteDecision, RouteError, Seen, SeenConfig, SeenSet, SettleForwardV1, SettleHopV1,
+    SettleOutcomeV2, SettlePayloadV2, SettleRejectV1, SettleResultV2, SettlementStatusV2,
+    ValueNoticeV1, VersionedLedgerPayload, decode_versioned,
 };
 use cawala_topology::ChildKind;
 
@@ -434,6 +435,7 @@ impl MsgHandler {
                 }
                 MsgError::BadTtl { .. } => RejectReason::TtlExpired,
                 MsgError::HopChain(_) => RejectReason::BadHopChain,
+                MsgError::InvalidEntryProof(_) => RejectReason::BadPayload,
                 MsgError::Codec(_) => RejectReason::Internal,
             };
             return reject(reason);
@@ -760,11 +762,13 @@ pub async fn dispatch_ledger_envelope(
                     endpoint,
                     source,
                     config,
-                    &env,
+                    &env.src,
+                    env.msg_id,
                     order.hash(),
                     SettlementStatusV2::Rejected {
                         reason: OrderRejectV1::NotAChild,
                     },
+                    None,
                     None,
                 )
                 .await;
@@ -800,6 +804,12 @@ pub async fn dispatch_ledger_envelope(
             tracing::debug!(
                 msg_id = %env.msg_id.to_hex(),
                 "ignoring browser-directed v2 order result at a leaf node"
+            );
+        }
+        Ok(VersionedLedgerPayload::V3(LedgerPayloadV3::OrderResult(_))) => {
+            tracing::debug!(
+                msg_id = %env.msg_id.to_hex(),
+                "ignoring browser-directed v3 order result at a leaf node"
             );
         }
         Err(err) => {
@@ -848,6 +858,7 @@ async fn apply_same_leaf_order(
                     reason: Some(OrderRejectV1::NotAChild),
                 },
                 None,
+                None,
             );
         }
         let outcome = service.apply_order(
@@ -857,6 +868,25 @@ async fn apply_same_leaf_order(
             &record,
             now,
         );
+        // A same-leaf move is terminal here; its proof is the `Direct` entry the
+        // browser verifies against this leaf's pinned key. Only a v2 sender
+        // consumes proofs.
+        let proof = if reply_v2 {
+            match &outcome.status {
+                OrderStatusV1::Applied | OrderStatusV1::Duplicate => {
+                    let leaf_addr = record.address.clone();
+                    match (outcome.entry_seq, leaf_addr) {
+                        (Some(seq), Some(leaf_addr)) => {
+                            service.build_entry_proof(seq, leaf_addr).ok()
+                        }
+                        _ => None,
+                    }
+                }
+                OrderStatusV1::Rejected => None,
+            }
+        } else {
+            None
+        };
         let balance = match &outcome.status {
             OrderStatusV1::Applied | OrderStatusV1::Duplicate => {
                 match service.balance_receipt(&order.from, &record, None, None, None) {
@@ -872,11 +902,11 @@ async fn apply_same_leaf_order(
             }
             OrderStatusV1::Rejected => None,
         };
-        (outcome, balance)
+        (outcome, balance, proof)
     })
     .await;
 
-    let (outcome, balance) = match applied {
+    let (outcome, balance, proof) = match applied {
         Ok(applied) => applied,
         Err(err) => {
             tracing::warn!(%err, "ledger apply task failed; skipping order");
@@ -885,7 +915,7 @@ async fn apply_same_leaf_order(
     };
 
     if reply_v2 {
-        // A v2 (`OrderV2`) sender gets a v2 result; a same-leaf move is already
+        // A v2 (`OrderV2`) sender gets a v3 result; a same-leaf move is already
         // terminal, so `Applied`/`Duplicate`/`Rejected` map directly.
         let status = match outcome.status {
             OrderStatusV1::Applied => SettlementStatusV2::Applied {
@@ -900,7 +930,46 @@ async fn apply_same_leaf_order(
                 reason: outcome.reason.unwrap_or(OrderRejectV1::BadRequest),
             },
         };
-        send_settlement_reply(endpoint, source, config, env, order_hash, status, balance).await;
+        // The browser requires a verified proof for `Applied`/`Duplicate`; if it
+        // could not be built, report the committed debit as `Indeterminate`
+        // rather than an unverifiable success.
+        if matches!(
+            status,
+            SettlementStatusV2::Applied { .. } | SettlementStatusV2::Duplicate { .. }
+        ) && proof.is_none()
+        {
+            tracing::warn!(
+                order_hash = %order_hash.to_hex(),
+                "same-leaf entry proof unavailable; reporting Indeterminate"
+            );
+            send_settlement_reply(
+                endpoint,
+                source,
+                config,
+                &env.src,
+                env.msg_id,
+                order_hash,
+                SettlementStatusV2::Indeterminate {
+                    reason: OrderRejectV1::Internal,
+                },
+                balance,
+                None,
+            )
+            .await;
+            return;
+        }
+        send_settlement_reply(
+            endpoint,
+            source,
+            config,
+            &env.src,
+            env.msg_id,
+            order_hash,
+            status,
+            balance,
+            proof,
+        )
+        .await;
         return;
     }
 
@@ -1139,7 +1208,7 @@ async fn handle_settlement_order(
                 source,
                 config,
                 signers[1].clone(),
-                SettlePayloadV1::Forward(forward),
+                SettlePayloadV2::Forward(forward),
             )
             .await;
         }
@@ -1159,27 +1228,43 @@ async fn handle_settlement_order(
             if terminal.is_none() && in_flight {
                 return;
             }
-            let status = match terminal {
-                Some(term) => match term.outcome {
-                    SettleOutcomeV1::Applied {
+            let status = match &terminal {
+                Some(term) => match &term.outcome {
+                    SettleOutcomeV2::Applied {
                         terminal_seq,
                         terminal_hash,
                         ..
                     } => SettlementStatusV2::Duplicate {
-                        entry_seq: terminal_seq,
-                        entry_hash: terminal_hash,
+                        entry_seq: *terminal_seq,
+                        entry_hash: *terminal_hash,
                     },
                     // A cached downstream rejection is surfaced as the real
                     // partial/rejected state, not a bare duplicate.
-                    SettleOutcomeV1::Rejected { reason } => settle_reject_to_status(&reason),
+                    SettleOutcomeV2::Rejected { reason } => settle_reject_to_status(reason),
                 },
+                // No cached terminal (e.g. the pending was evicted or the origin
+                // restarted): the origin holds only its own reservation hop, so
+                // it has no terminal proof to forward and must not synthesize
+                // one.
                 None => SettlementStatusV2::Duplicate {
                     entry_seq: seq,
                     entry_hash: hash,
                 },
             };
+            let proof = terminal.and_then(|term| term.proof);
             let balance = payer_receipt(ledger, record, &order.from).await;
-            send_settlement_reply(endpoint, source, config, env, payment_id, status, balance).await;
+            send_settlement_reply(
+                endpoint,
+                source,
+                config,
+                &env.src,
+                env.msg_id,
+                payment_id,
+                status,
+                balance,
+                proof,
+            )
+            .await;
         }
         HopOutcome::Rejected { reason } => {
             send_settlement_reject(endpoint, source, config, env, payment_id, reason).await;
@@ -1187,25 +1272,46 @@ async fn handle_settlement_order(
     }
 }
 
-/// Reply a v2 settlement result to the browser over `MSG_LEDGER_V1`.
+/// Reply a settlement result to a v2 browser over `MSG_LEDGER_V1`.
 ///
 /// The result is **advisory**; the payer's own signed receipt is ground truth.
+/// `proof` is the verified terminal inclusion proof for an accepted
+/// `Applied`/`Duplicate` outcome and `None` otherwise. `Applied`/`Duplicate`
+/// are sent as a v3 `OrderResultV3` (carrying the proof); the remaining
+/// statuses keep today's v2 `OrderResultV2` shape.
+#[allow(clippy::too_many_arguments)]
 async fn send_settlement_reply(
     endpoint: &Endpoint,
     source: &NeighborSource,
     config: &MsgConfig,
-    env: &Envelope,
+    browser: &PeerRef,
+    reply_to: MsgId,
     order_hash: Hash,
     status: SettlementStatusV2,
     balance: Option<cawala_msg::BalanceReceiptV1>,
+    proof: Option<EntryProofV1>,
 ) {
-    let result = OrderResultV2 {
-        reply_to: env.msg_id,
-        order_hash,
+    if matches!(
         status,
-        balance,
-    };
-    send_order_result_v2_to(endpoint, source, config, &env.src, result).await;
+        SettlementStatusV2::Applied { .. } | SettlementStatusV2::Duplicate { .. }
+    ) {
+        let result = OrderResultV3 {
+            reply_to,
+            order_hash,
+            status,
+            balance,
+            proof,
+        };
+        send_order_result_v3_to(endpoint, source, config, browser, result).await;
+    } else {
+        let result = OrderResultV2 {
+            reply_to,
+            order_hash,
+            status,
+            balance,
+        };
+        send_order_result_v2_to(endpoint, source, config, browser, result).await;
+    }
 }
 
 /// Reply `Rejected(reason)` to a v2 settlement browser.
@@ -1221,9 +1327,11 @@ async fn send_settlement_reject(
         endpoint,
         source,
         config,
-        env,
+        &env.src,
+        env.msg_id,
         order_hash,
         SettlementStatusV2::Rejected { reason },
+        None,
         None,
     )
     .await;
@@ -1341,7 +1449,7 @@ pub async fn dispatch_settle_envelope(
     node_id: &str,
     env: Envelope,
 ) {
-    let payload = match SettlePayloadV1::from_bytes(&env.payload) {
+    let payload = match SettlePayloadV2::from_bytes(&env.payload) {
         Ok(payload) => payload,
         Err(err) => {
             tracing::warn!(
@@ -1353,11 +1461,11 @@ pub async fn dispatch_settle_envelope(
         }
     };
     match payload {
-        SettlePayloadV1::Result(result) => {
+        SettlePayloadV2::Result(result) => {
             handle_settle_result(endpoint, source, config, ledger, manager, data_dir, node_id, env, result)
                 .await;
         }
-        SettlePayloadV1::Forward(forward) => {
+        SettlePayloadV2::Forward(forward) => {
             handle_settle_forward(endpoint, source, config, ledger, data_dir, node_id, env, forward)
                 .await;
         }
@@ -1375,21 +1483,21 @@ async fn handle_settle_result(
     data_dir: &Path,
     node_id: &str,
     env: Envelope,
-    result: SettleResultV1,
+    result: SettleResultV2,
 ) {
     let payment_id = result.payment_id;
-    let pending = {
+    let (pending, status, proof) = {
         let mut mgr = manager.lock().await;
         let Some(pending) = mgr.pending(&payment_id).cloned() else {
             return;
         };
-        // Provenance: `Applied`/`Duplicate` must come from the payee leaf;
-        // a downstream `Rejected`/`Indeterminate` (which implies the payer's
-        // reservation applied) may come from any expected signer — the LCA or
-        // the payee leaf. The immediate sender is only authenticated to the
-        // neighbor, so results remain advisory.
+        // Provenance: `Applied` must come from the payee leaf; a downstream
+        // `Rejected` (which implies the payer's reservation applied) may come
+        // from any expected signer — the LCA or the payee leaf. The immediate
+        // sender is only authenticated to the neighbor, so provenance is no
+        // longer the security boundary: the terminal proof below is.
         match &result.outcome {
-            SettleOutcomeV1::Applied { .. } => {
+            SettleOutcomeV2::Applied { .. } => {
                 if env.src.addr != pending.payee_leaf_addr {
                     tracing::warn!(
                         src = %env.src.node,
@@ -1398,7 +1506,7 @@ async fn handle_settle_result(
                     return;
                 }
             }
-            SettleOutcomeV1::Rejected { .. } => {
+            SettleOutcomeV2::Rejected { .. } => {
                 let expected = expected_signers(&pending.payer_addr, &pending.payee_addr)
                     .map(|signers| signers.iter().any(|addr| addr == &env.src.addr))
                     .unwrap_or(false);
@@ -1411,53 +1519,75 @@ async fn handle_settle_result(
                 }
             }
         }
-        // A carried terminal entry is advisory evidence, not authentication:
-        // accept it only if it is the `Descend` this pending order expects.
-        // Otherwise drop the result and let the origin's timeout sweep — not a
-        // forged success — resolve it.
-        if let SettleOutcomeV1::Applied { terminal_entry, .. } = &result.outcome
-            && !terminal_entry_is_valid(terminal_entry, &pending.order)
-        {
-            tracing::warn!(
-                payment_id = %payment_id.to_hex(),
-                "settlement result carries an invalid terminal entry; ignoring"
-            );
-            return;
-        }
+
+        // Verify the terminal proof before accepting `Applied`. The origin has
+        // no registry row binding a sibling leaf's node id to its ledger key,
+        // so this is self-consistency only; a failure resolves as
+        // `Indeterminate` (the payer's debit is already committed) and is never
+        // stored as a terminal record.
+        let (status, proof, resolved) = match &result.outcome {
+            SettleOutcomeV2::Applied {
+                terminal_seq,
+                terminal_hash,
+                proof,
+            } => {
+                if verify_terminal_proof(
+                    proof,
+                    &pending.order,
+                    &pending.payee_leaf_addr,
+                    *terminal_seq,
+                    terminal_hash,
+                ) {
+                    (
+                        SettlementStatusV2::Applied {
+                            entry_seq: *terminal_seq,
+                            entry_hash: *terminal_hash,
+                        },
+                        Some(proof.clone()),
+                        true,
+                    )
+                } else {
+                    tracing::warn!(
+                        payment_id = %payment_id.to_hex(),
+                        "settlement result carries an invalid terminal proof; resolving Indeterminate"
+                    );
+                    (
+                        SettlementStatusV2::Indeterminate {
+                            reason: OrderRejectV1::Internal,
+                        },
+                        None,
+                        false,
+                    )
+                }
+            }
+            // `IntermediateRejected` means the payer's local hop (the origin
+            // reservation) already applied, so it is a `Partial` cascade rather
+            // than a plain rejection.
+            SettleOutcomeV2::Rejected { reason } => (settle_reject_to_status(reason), None, true),
+        };
+
         let Some(pending) = mgr.take_pending(&payment_id) else {
             return;
         };
-        mgr.record_terminal(
-            payment_id,
-            TerminalRecord {
-                browser: pending.browser.clone(),
-                browser_msg_id: pending.browser_msg_id,
-                order: pending.order.clone(),
-                terminal_entry: match &result.outcome {
-                    SettleOutcomeV1::Applied { terminal_entry, .. } => {
-                        Some(terminal_entry.clone())
-                    }
-                    SettleOutcomeV1::Rejected { .. } => None,
+        // A failed proof must not poison the terminal record: only a resolved
+        // (accepted or downstream-rejected) outcome is remembered.
+        if resolved {
+            mgr.record_terminal(
+                payment_id,
+                TerminalRecord {
+                    browser: pending.browser.clone(),
+                    browser_msg_id: pending.browser_msg_id,
+                    order: pending.order.clone(),
+                    terminal_entry: match &result.outcome {
+                        SettleOutcomeV2::Applied { proof, .. } => Some(proof.entry.clone()),
+                        SettleOutcomeV2::Rejected { .. } => None,
+                    },
+                    proof: proof.clone(),
+                    outcome: result.outcome.clone(),
                 },
-                outcome: result.outcome.clone(),
-            },
-        );
-        pending
-    };
-
-    // Map the terminal outcome: `IntermediateRejected` means the payer's local
-    // hop (the origin reservation) already applied, so it is a `Partial`
-    // cascade rather than a plain rejection.
-    let status = match &result.outcome {
-        SettleOutcomeV1::Applied {
-            terminal_seq,
-            terminal_hash,
-            ..
-        } => SettlementStatusV2::Applied {
-            entry_seq: *terminal_seq,
-            entry_hash: *terminal_hash,
-        },
-        SettleOutcomeV1::Rejected { reason } => settle_reject_to_status(reason),
+            );
+        }
+        (pending, status, proof)
     };
 
     // Any outcome other than a pre-reservation `Rejected` implies the payer's
@@ -1476,17 +1606,16 @@ async fn handle_settle_result(
     };
 
     if pending.reply_v2 {
-        send_order_result_v2_to(
+        send_settlement_reply(
             endpoint,
             source,
             config,
             &pending.browser,
-            OrderResultV2 {
-                reply_to: pending.browser_msg_id,
-                order_hash: pending.order.hash(),
-                status,
-                balance,
-            },
+            pending.browser_msg_id,
+            pending.order.hash(),
+            status,
+            balance,
+            proof,
         )
         .await;
     } else {
@@ -1608,7 +1737,7 @@ async fn handle_settle_forward(
             config,
             signers[0].clone(),
             forward.order.hash(),
-            SettleOutcomeV1::Rejected {
+            SettleOutcomeV2::Rejected {
                 reason: SettleRejectV1::IntermediateRejected {
                     at: cawala_ledger::NodeId::from(this.node.clone()),
                     reason: OrderRejectV1::NotAChild,
@@ -1627,7 +1756,7 @@ async fn handle_settle_forward(
             config,
             signers[0].clone(),
             forward.order.hash(),
-            SettleOutcomeV1::Rejected {
+            SettleOutcomeV2::Rejected {
                 reason: SettleRejectV1::Malformed,
             },
         )
@@ -1719,7 +1848,7 @@ async fn handle_settle_forward(
                 config,
                 signers[0].clone(),
                 forward.order.hash(),
-                SettleOutcomeV1::Rejected {
+                SettleOutcomeV2::Rejected {
                     reason: SettleRejectV1::IntermediateRejected {
                         at: cawala_ledger::NodeId::from(this.node.clone()),
                         reason,
@@ -1731,12 +1860,31 @@ async fn handle_settle_forward(
         }
     };
 
-    // Recover the appended (or already-applied) entry as evidence.
+    // Recover the appended (or already-applied) entry as evidence, and, at the
+    // terminal leaf, assemble the full inclusion proof the origin verifies. A
+    // terminal leaf builds it once from its own live ledger; an intermediate
+    // signer skips it.
     let ledger_arc = Arc::clone(ledger);
-    let entry = tokio::task::spawn_blocking(move || ledger_arc.blocking_lock().entry_at(seq).ok())
-        .await
-        .ok()
-        .flatten();
+    let leaf_addr = this.addr.clone();
+    let recovered = tokio::task::spawn_blocking(move || {
+        let service = ledger_arc.blocking_lock();
+        let entry = service.entry_at(seq).ok();
+        let proof = if is_terminal {
+            service.build_entry_proof(seq, leaf_addr).ok()
+        } else {
+            None
+        };
+        (entry, proof)
+    })
+    .await;
+
+    let (entry, proof) = match recovered {
+        Ok(recovered) => recovered,
+        Err(err) => {
+            tracing::warn!(%err, "settlement evidence task failed");
+            return;
+        }
+    };
     let mut hops = forward.hops.clone();
     if let Some(entry) = &entry
         && !hops.iter().any(|hop| hop.signer_addr == this.addr)
@@ -1748,10 +1896,11 @@ async fn handle_settle_forward(
     }
 
     if is_terminal {
-        // A terminal `Applied` result carries the signed `Descend` entry so the
-        // origin retains signed ground truth; without it we cannot vouch for the
-        // outcome, so stay silent rather than emit a forged-looking success.
-        let Some(terminal_entry) = entry else {
+        // A terminal `Applied` result carries the signed `Descend` entry with a
+        // full inclusion proof so the origin retains verifiable ground truth;
+        // without a proof we cannot vouch for the outcome, so stay silent
+        // rather than emit an unverifiable success.
+        let Some(proof) = proof else {
             return;
         };
         send_settle_result(
@@ -1760,10 +1909,10 @@ async fn handle_settle_forward(
             config,
             signers[0].clone(),
             forward.order.hash(),
-            SettleOutcomeV1::Applied {
+            SettleOutcomeV2::Applied {
                 terminal_seq: seq,
                 terminal_hash: hash,
-                terminal_entry,
+                proof,
             },
         )
         .await;
@@ -1885,14 +2034,14 @@ async fn send_settle_result(
     config: &MsgConfig,
     origin: cawala_msg::OctAddr,
     payment_id: Hash,
-    outcome: SettleOutcomeV1,
+    outcome: SettleOutcomeV2,
 ) {
     send_settle_payload_to(
         endpoint,
         source,
         config,
         origin,
-        SettlePayloadV1::Result(SettleResultV1 {
+        SettlePayloadV2::Result(SettleResultV2 {
             payment_id,
             outcome,
         }),
@@ -2036,13 +2185,48 @@ async fn send_ledger_payload_v2_to(
     }
 }
 
+/// Encode a v3 ledger `payload` and send it to `dst` over `MSG_LEDGER_V1`.
+/// Replies for v2 senders stay on the ledger message type.
+async fn send_ledger_payload_v3_to(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    dst: cawala_msg::OctAddr,
+    payload: LedgerPayloadV3,
+) {
+    let bytes = match payload.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(%err, "failed to encode v3 ledger payload");
+            return;
+        }
+    };
+    let snapshot = source.snapshot();
+    let src = snapshot.routable.this.clone();
+    let env = match build_envelope(&src, dst, MSG_LEDGER_V1, bytes, config.ttl) {
+        Ok(env) => env,
+        Err(err) => {
+            tracing::warn!(%err, "failed to build v3 ledger envelope");
+            return;
+        }
+    };
+    match send_envelope(endpoint, &snapshot, &env, config.hop_timeout).await {
+        Ok(ack) => tracing::debug!(
+            msg_id = %env.msg_id.to_hex(),
+            status = ack.status_str(),
+            "sent v3 ledger payload"
+        ),
+        Err(err) => tracing::warn!(%err, "failed to send v3 ledger payload"),
+    }
+}
+
 /// Encode a settlement `payload` and send it to `dst` over `MSG_SETTLE_V1`.
 async fn send_settle_payload_to(
     endpoint: &Endpoint,
     source: &NeighborSource,
     config: &MsgConfig,
     dst: cawala_msg::OctAddr,
-    payload: SettlePayloadV1,
+    payload: SettlePayloadV2,
 ) {
     let bytes = match payload.to_bytes() {
         Ok(bytes) => bytes,
@@ -2080,7 +2264,7 @@ async fn relay_settle_forward(
     next: cawala_msg::OctAddr,
     forward: SettleForwardV1,
 ) {
-    let bytes = match SettlePayloadV1::Forward(forward).to_bytes() {
+    let bytes = match SettlePayloadV2::Forward(forward).to_bytes() {
         Ok(bytes) => bytes,
         Err(err) => {
             tracing::warn!(%err, "failed to encode settle forward");
@@ -2148,6 +2332,24 @@ async fn send_order_result_v2_to(
     .await;
 }
 
+/// Send an `OrderResultV3` to a v2 browser over `MSG_LEDGER_V1`.
+async fn send_order_result_v3_to(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    browser: &PeerRef,
+    result: OrderResultV3,
+) {
+    send_ledger_payload_v3_to(
+        endpoint,
+        source,
+        config,
+        browser.addr.clone(),
+        LedgerPayloadV3::OrderResult(result),
+    )
+    .await;
+}
+
 /// The derived address of `child_id` in `record`, if it is a `User` child.
 fn user_child_address(record: &NodeRecord, child_id: &str) -> Option<cawala_msg::OctAddr> {
     let address = record.address.as_ref()?;
@@ -2158,17 +2360,81 @@ fn user_child_address(record: &NodeRecord, child_id: &str) -> Option<cawala_msg:
         .map(|child| address.child(child.slot))
 }
 
-/// Whether a carried terminal entry is the `Descend` the pending order expects.
+/// Fully verify a terminal leaf's inclusion proof before the origin accepts an
+/// `Applied` outcome.
 ///
-/// This is an advisory structural check, not authentication: it prevents a
-/// forged/mismatched entry from being stored as signed ground truth.
-fn terminal_entry_is_valid(entry: &SignedEntry, order: &PaymentOrder) -> bool {
-    matches!(
-        &entry.entry.body,
-        cawala_ledger::EntryBody::Transfer { payment_id, amount, role }
-            if *role == HopRole::Descend
-                && *payment_id == order.hash()
-                && *amount == order.amount
+/// Self-consistency only: the origin has no registry row binding a sibling
+/// leaf's node id to its ledger key, so this proves the presented terminal hop
+/// is internally consistent (correct order binding, valid terminal shape,
+/// signed by the key the commitment names, included in the committed Merkle
+/// tree) rather than that the sibling authored it. The leaf-address binding and
+/// transport provenance remain the routing guard, and the origin must never
+/// synthesize a proof itself.
+///
+/// All of the following must hold:
+///
+/// 1. `proof.leaf_addr ==` the pending payee leaf address;
+/// 2. `terminal_seq == proof.entry.entry.seq` and `terminal_hash` is the real
+///    entry hash;
+/// 3. [`cawala_ledger::verify_applied_entry`] with `payer_leaf = false` (the
+///    terminal hop is a `Descend` that credits the order's payee);
+/// 4. the entry verifies under `proof.signer.ledger`, the signer is a `Node`,
+///    and the commitment names that same ledger key;
+/// 5. the proof structurally validates and the Merkle inclusion verifies
+///    against the commitment's entry root.
+fn verify_terminal_proof(
+    proof: &EntryProofV1,
+    order: &PaymentOrder,
+    payee_leaf_addr: &cawala_msg::OctAddr,
+    terminal_seq: u64,
+    terminal_hash: &Hash,
+) -> bool {
+    // 1. Address binding.
+    if proof.leaf_addr != *payee_leaf_addr {
+        return false;
+    }
+    // 2. The claimed terminal coordinates must describe this exact entry.
+    let Ok(entry_hash) = cawala_ledger::entry_hash(&proof.entry.entry) else {
+        return false;
+    };
+    if terminal_seq != proof.entry.entry.seq || *terminal_hash != entry_hash {
+        return false;
+    }
+    // 3. A terminal `Descend` that credits the order's payee.
+    if cawala_ledger::verify_applied_entry(&proof.entry, order, false).is_err() {
+        return false;
+    }
+    // 4. A ledger-bearing node signed the entry and the commitment names that
+    //    same key.
+    if proof.signer.role != PeerRole::Node {
+        return false;
+    }
+    let Some(signer_ledger) = proof.signer.ledger.as_ref() else {
+        return false;
+    };
+    if proof.entry.verify(signer_ledger).is_err() {
+        return false;
+    }
+    if &proof.commitment.commitment.ledger_pubkey != signer_ledger {
+        return false;
+    }
+    // 5. Structural bounds and Merkle inclusion against the committed root.
+    if proof.validate().is_err() {
+        return false;
+    }
+    if proof.commitment.commitment.entry_count != u64::from(proof.inclusion.tree_size) {
+        return false;
+    }
+    if proof.inclusion.index >= proof.inclusion.tree_size {
+        return false;
+    }
+    if proof.entry.entry.seq >= u64::from(proof.inclusion.tree_size) {
+        return false;
+    }
+    cawala_ledger::verify_entry_inclusion(
+        &proof.entry,
+        &proof.inclusion,
+        &proof.commitment.commitment.entry_root,
     )
 }
 
