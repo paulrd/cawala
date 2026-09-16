@@ -795,7 +795,18 @@ impl ControlNode {
             Some(outbound) if outbound.parent != signed.origin => {
                 ControlReply::Rejected(RejectCode::Unauthorized)
             }
-            Some(_) => {
+            Some(outbound) => {
+                // An invite pins the parent's operator key: the rejection must
+                // be signed by exactly that key, not merely by any
+                // self-consistent one. On mismatch the outbound join is left
+                // intact (a spoofed rejection must not cancel a real join).
+                // A direct `--parent` join (`pinned_operator == None`) keeps the
+                // old trust-on-first-use behavior, as with approvals.
+                if let Some(expected) = outbound.pinned_operator
+                    && signed.controller != expected
+                {
+                    return ControlReply::Rejected(RejectCode::Unauthorized);
+                }
                 self.pending.clear_outbound();
                 if self.pending.save().is_err() {
                     return ControlReply::Rejected(RejectCode::Internal);
@@ -1894,6 +1905,105 @@ mod tests {
             ControlReply::Accepted
         );
         assert_eq!(engine.record().parent.as_ref().unwrap().parent_id, "parent");
+        assert!(engine.pending().outbound().is_none());
+    }
+
+    /// A pinned (invite) join refuses a rejection signed by any key other than
+    /// the pinned parent operator, and leaves the outbound join intact; the
+    /// pinned key's rejection is accepted and clears it.
+    #[tokio::test]
+    async fn pinned_rejection_requires_the_pinned_signer() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = OperatorSecretKey::from_bytes([9u8; 32]);
+        let attacker = OperatorSecretKey::from_bytes([10u8; 32]);
+        let (mut engine, request) = outbound_applicant(dir.path(), Some(pinned.public()));
+        let remote = EndpointId::from(SecretKey::generate().public());
+        let rejection = JoinRejection {
+            child: NodeId::from("me"),
+            reason: "cancelled".to_string(),
+            nonce: request.nonce,
+        };
+
+        // A self-consistent rejection signed by another key must not cancel the
+        // in-flight join.
+        let forged = authorize_at(
+            "parent",
+            &attacker,
+            1,
+            ControlRequest::JoinRejected(rejection.clone()),
+        );
+        assert_eq!(
+            engine.receive_at(remote, forged, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+        assert!(
+            engine.pending().outbound().is_some(),
+            "the outbound join survives a spoofed rejection"
+        );
+
+        // The pinned key's rejection is accepted and clears the outbound join.
+        let good = authorize_at(
+            "parent",
+            &pinned,
+            2,
+            ControlRequest::JoinRejected(rejection),
+        );
+        assert_eq!(
+            engine.receive_at(remote, good, 0).await,
+            ControlReply::Accepted
+        );
+        assert!(engine.pending().outbound().is_none());
+    }
+
+    /// A rejection with no outstanding outbound join is a no-op `Accepted`,
+    /// regardless of who signed it.
+    #[tokio::test]
+    async fn rejection_without_outbound_is_accepted_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, request) = outbound_applicant(dir.path(), None);
+        engine.pending.clear_outbound();
+        engine.pending.save().unwrap();
+        let remote = EndpointId::from(SecretKey::generate().public());
+        let rejection = JoinRejection {
+            child: NodeId::from("me"),
+            reason: "late".to_string(),
+            nonce: request.nonce,
+        };
+        let signed = authorize_at(
+            "parent",
+            &OperatorSecretKey::from_bytes([11u8; 32]),
+            1,
+            ControlRequest::JoinRejected(rejection),
+        );
+        assert_eq!(
+            engine.receive_at(remote, signed, 0).await,
+            ControlReply::Accepted
+        );
+        assert!(engine.pending().outbound().is_none());
+    }
+
+    /// A direct (unpinned) join still accepts a self-consistent rejection
+    /// (trust-on-first-use, unchanged), clearing the outbound join.
+    #[tokio::test]
+    async fn unpinned_rejection_accepts_any_self_consistent_signer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, request) = outbound_applicant(dir.path(), None);
+        let remote = EndpointId::from(SecretKey::generate().public());
+        let rejection = JoinRejection {
+            child: NodeId::from("me"),
+            reason: "direct".to_string(),
+            nonce: request.nonce,
+        };
+        let signed = authorize_at(
+            "parent",
+            &OperatorSecretKey::from_bytes([12u8; 32]),
+            1,
+            ControlRequest::JoinRejected(rejection),
+        );
+        assert_eq!(
+            engine.receive_at(remote, signed, 0).await,
+            ControlReply::Accepted
+        );
         assert!(engine.pending().outbound().is_none());
     }
 

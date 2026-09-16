@@ -264,25 +264,36 @@ impl LocalStateV1 {
     /// Apply an inbound `JoinRejected`.
     ///
     /// The caller has already verified the signature and validated the
-    /// payload. A rejection for a different parent is refused; a rejection
-    /// with no matching outbound join is a no-op (`Accepted`, as native).
-    pub fn on_join_rejected(&mut self, rejection: &JoinRejection, origin: &NodeId) -> Transition {
-        match self.outbound.as_ref() {
-            None => Transition::None,
-            Some(outbound) if &outbound.parent != origin => {
-                Transition::Denied(RejectCode::Unauthorized)
-            }
-            Some(_) => {
-                self.outbound = None;
-                self.last_rejection = Some(Rejection {
-                    code: "rejected".to_string(),
-                    reason: Some(rejection.reason.clone()),
-                });
-                Transition::Rejected {
-                    parent: origin.clone(),
-                    reason: rejection.reason.clone(),
-                }
-            }
+    /// payload. A rejection for a different parent is refused (`Denied`); when
+    /// the join pinned an operator key (an invite), the signer must match it,
+    /// else the rejection is denied and the outbound join is **retained** (a
+    /// spoofed rejection must not cancel a real join). A rejection with no
+    /// matching outbound join is a no-op (`None`).
+    pub fn on_join_rejected(
+        &mut self,
+        rejection: &JoinRejection,
+        origin: &NodeId,
+        controller: &OperatorPubKey,
+    ) -> Transition {
+        let Some(outbound) = self.outbound.as_ref() else {
+            return Transition::None;
+        };
+        if &outbound.parent != origin {
+            return Transition::Denied(RejectCode::Unauthorized);
+        }
+        if let Some(expected) = &outbound.pinned_operator
+            && controller != expected
+        {
+            return Transition::Denied(RejectCode::Unauthorized);
+        }
+        self.outbound = None;
+        self.last_rejection = Some(Rejection {
+            code: "rejected".to_string(),
+            reason: Some(rejection.reason.clone()),
+        });
+        Transition::Rejected {
+            parent: origin.clone(),
+            reason: rejection.reason.clone(),
         }
     }
 
@@ -496,7 +507,7 @@ mod tests {
             reason: "no free slot".to_string(),
             nonce: 7,
         };
-        let transition = state.on_join_rejected(&rejection, &node("parent"));
+        let transition = state.on_join_rejected(&rejection, &node("parent"), &operator(9).public());
         assert_eq!(
             transition,
             Transition::Rejected {
@@ -522,7 +533,7 @@ mod tests {
             nonce: 1,
         };
         assert_eq!(
-            state.on_join_rejected(&rejection, &node("parent")),
+            state.on_join_rejected(&rejection, &node("parent"), &operator(9).public()),
             Transition::None
         );
         assert!(state.last_rejection.is_none());
@@ -537,10 +548,55 @@ mod tests {
             nonce: 7,
         };
         assert_eq!(
-            state.on_join_rejected(&rejection, &node("other")),
+            state.on_join_rejected(&rejection, &node("other"), &operator(9).public()),
             Transition::Denied(RejectCode::Unauthorized)
         );
         assert!(state.outbound.is_some());
+    }
+
+    #[test]
+    fn pinned_rejection_requires_the_pinned_signer() {
+        let pinned = operator(9).public();
+        let (mut state, _) = pending(Some(pinned));
+        let rejection = JoinRejection {
+            child: node("me"),
+            reason: "cancelled".to_string(),
+            nonce: 7,
+        };
+
+        // A self-consistent rejection signed by a different key is denied and
+        // leaves the outbound join intact.
+        let forged = state.on_join_rejected(&rejection, &node("parent"), &operator(10).public());
+        assert_eq!(forged, Transition::Denied(RejectCode::Unauthorized));
+        assert!(state.outbound.is_some(), "outbound is retained on denial");
+        assert!(state.last_rejection.is_none());
+
+        // The pinned key's rejection is accepted and clears the outbound join.
+        let good = state.on_join_rejected(&rejection, &node("parent"), &pinned);
+        assert_eq!(good.reply(), ControlReply::Accepted);
+        assert!(state.outbound.is_none());
+        assert_eq!(state.status_label(), "rejected");
+        assert_eq!(
+            state.last_rejection.as_ref().unwrap().reason.as_deref(),
+            Some("cancelled")
+        );
+    }
+
+    #[test]
+    fn unpinned_rejection_accepts_any_self_consistent_signer() {
+        // A direct (`--parent`) join has no pin, so a self-consistent rejection
+        // signed by an arbitrary key is accepted (unchanged TOFU behavior).
+        let (mut state, _) = pending(None);
+        let rejection = JoinRejection {
+            child: node("me"),
+            reason: "direct".to_string(),
+            nonce: 7,
+        };
+        let transition =
+            state.on_join_rejected(&rejection, &node("parent"), &operator(10).public());
+        assert_eq!(transition.reply(), ControlReply::Accepted);
+        assert!(state.outbound.is_none());
+        assert_eq!(state.status_label(), "rejected");
     }
 
     #[test]

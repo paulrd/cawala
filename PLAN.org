@@ -470,10 +470,12 @@
        transport without changing the admin DTO surface. Rejected alternatives:
        holding the node operator seed in the browser; collapsing user/leaf
        identity.
-     - Companion gap to fix while in here: `JoinRejected` is only
-       signature-checked (not pinned-operator-checked) on both applicants, so
-       anyone who knows the parent id can cancel an in-flight join
-       (pre-existing, not introduced by admin control).
+     - Companion gap (DONE): `JoinRejected` now requires the invite-pinned
+       parent operator on both applicants (native `handle_join_rejected` and
+       wasm `LocalState1::on_join_rejected`), mirroring `JoinApproved`; a spoofed
+       self-signed rejection can no longer cancel an in-flight join (the outbound
+       join is left intact on mismatch). Deferred: a `rejection.nonce` staleness
+       check (edge case when the parent has no pending row, so its nonce is 0).
 
 * Top Risks
   1. Iroh WASM maturity -> M0 spike before any other work.

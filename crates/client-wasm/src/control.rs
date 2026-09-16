@@ -177,10 +177,11 @@ impl ControlHandler {
         if rejection.validate().is_err() {
             return ControlReply::Rejected(RejectCode::BadRequest);
         }
-        let transition = self
-            .shared
-            .lock_state()
-            .on_join_rejected(rejection, &signed.origin);
+        let transition = self.shared.lock_state().on_join_rejected(
+            rejection,
+            &signed.origin,
+            &signed.controller,
+        );
         if let Transition::Rejected { parent, reason } = &transition {
             self.shared
                 .push_event(ControlEventDto::rejected(parent, Some(reason.clone())));
