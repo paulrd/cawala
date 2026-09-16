@@ -137,6 +137,10 @@ pub enum Transition {
         /// The parent's reason.
         reason: String,
     },
+    /// A parent-signed `Rebase` moved this client's asserted address in place.
+    Rebased,
+    /// The parent detached this client: parent and address were cleared.
+    Detached,
     /// Nothing to do; reply `Accepted` (mirrors the native idempotent case).
     None,
 }
@@ -147,9 +151,11 @@ impl Transition {
         match self {
             Transition::NotAttached => ControlReply::Rejected(RejectCode::NotAttached),
             Transition::Denied(code) => ControlReply::Rejected(*code),
-            Transition::Approved | Transition::Rejected { .. } | Transition::None => {
-                ControlReply::Accepted
-            }
+            Transition::Approved
+            | Transition::Rejected { .. }
+            | Transition::Rebased
+            | Transition::Detached
+            | Transition::None => ControlReply::Accepted,
         }
     }
 }
@@ -311,6 +317,58 @@ impl LocalStateV1 {
             parent: origin.clone(),
             reason: rejection.reason.clone(),
         }
+    }
+
+    /// Apply a parent-signed `Rebase`: update the asserted address in place.
+    ///
+    /// A browser is a leaf, so its address is always
+    /// `parent_address.child(record.parent.slot)`; the caller has already
+    /// checked the notice against this client's node id and its current parent
+    /// link. This method re-derives the expected address from the recorded slot
+    /// (defence in depth, so a mis-dispatched call cannot install an arbitrary
+    /// address) and:
+    ///
+    /// - returns [`Transition::Denied`]`(Unauthorized)` when there is no parent
+    ///   link or the target does not descend from `parent_address` by the
+    ///   recorded slot;
+    /// - returns [`Transition::None`] (an idempotent no-op) when the target
+    ///   already equals the asserted address;
+    /// - otherwise replaces `record.address` and returns
+    ///   [`Transition::Rebased`].
+    ///
+    /// The [`ParentLink`] is deliberately left untouched: a re-base moves the
+    /// prefix, not the parent, and a browser never becomes root.
+    pub fn apply_rebase(&mut self, parent_address: &OctAddr, address: &OctAddr) -> Transition {
+        let Some(parent) = self.record.parent.as_ref() else {
+            return Transition::Denied(RejectCode::Unauthorized);
+        };
+        if address != &parent_address.child(parent.slot) {
+            return Transition::Denied(RejectCode::Unauthorized);
+        }
+        if self.record.address.as_ref() == Some(address) {
+            return Transition::None;
+        }
+        self.record.address = Some(address.clone());
+        Transition::Rebased
+    }
+
+    /// Apply a `DetachNotice` (or a local [`leave`](crate::ClientNode::leave)):
+    /// clear the parent link and the asserted address.
+    ///
+    /// A [`ChildKind::User`](cawala_control::ChildKind::User) leaf takes the
+    /// clear-both branch of the address law (it has no meaningful root `0`
+    /// leaf), so after this [`Self::status_label`] returns `"none"`. Any
+    /// in-flight outbound join is dropped too. Idempotent: detaching an already
+    /// detached record is a no-op returning [`Transition::None`]. Child links
+    /// are left alone (a browser is a leaf and keeps none in practice).
+    pub fn apply_detach(&mut self) -> Transition {
+        if self.record.parent.is_none() && self.record.address.is_none() {
+            return Transition::None;
+        }
+        self.record.parent = None;
+        self.record.address = None;
+        self.outbound = None;
+        Transition::Detached
     }
 
     /// The control-plane view of this state, as a [`NodeSnapshot`].
@@ -714,5 +772,107 @@ mod tests {
         state.reject_outbound("slot_taken", None);
         assert_eq!(state.status_label(), "rejected");
         assert_eq!(state.rejection_code(), Some("slot_taken"));
+    }
+
+    /// A joined leaf at `address` under `parent_id` in `slot`.
+    fn joined(address: &str, parent_id: &str, slot: u8) -> LocalStateV1 {
+        let mut state = LocalStateV1::new();
+        state.record.address = Some(address.parse().unwrap());
+        state.record.parent = Some(ParentLink {
+            node_id: node(parent_id),
+            slot,
+        });
+        state
+    }
+
+    #[test]
+    fn rebase_updates_address_in_place_and_keeps_parent() {
+        let mut state = joined("0.2.3", "parent", 3);
+        let transition = state.apply_rebase(&"0.4".parse().unwrap(), &"0.4.3".parse().unwrap());
+        assert_eq!(transition, Transition::Rebased);
+        assert_eq!(transition.reply(), ControlReply::Accepted);
+        assert_eq!(state.record.address, Some("0.4.3".parse().unwrap()));
+        // The parent link (the slot) is unchanged by a prefix move.
+        assert_eq!(
+            state.record.parent,
+            Some(ParentLink {
+                node_id: node("parent"),
+                slot: 3,
+            })
+        );
+        assert_eq!(state.status_label(), "joined");
+    }
+
+    #[test]
+    fn rebase_to_current_address_is_a_noop() {
+        let mut state = joined("0.2.3", "parent", 3);
+        assert_eq!(
+            state.apply_rebase(&"0.2".parse().unwrap(), &"0.2.3".parse().unwrap()),
+            Transition::None
+        );
+        assert_eq!(state.record.address, Some("0.2.3".parse().unwrap()));
+    }
+
+    #[test]
+    fn rebase_without_parent_or_wrong_derivation_is_denied() {
+        // No parent link: a re-base from anyone is refused.
+        let mut detached = LocalStateV1::new();
+        assert_eq!(
+            detached.apply_rebase(&"0".parse().unwrap(), &"0.3".parse().unwrap()),
+            Transition::Denied(RejectCode::Unauthorized)
+        );
+        assert!(detached.record.address.is_none());
+
+        // The target must equal `parent_address.child(slot)`.
+        let mut state = joined("0.2.3", "parent", 3);
+        assert_eq!(
+            state.apply_rebase(&"0.2".parse().unwrap(), &"0.2.4".parse().unwrap()),
+            Transition::Denied(RejectCode::Unauthorized)
+        );
+        assert_eq!(state.record.address, Some("0.2.3".parse().unwrap()));
+    }
+
+    #[test]
+    fn detach_clears_parent_address_and_outbound() {
+        let (mut state, _) = pending(None);
+        state.record.address = Some("0.2".parse().unwrap());
+        state.record.parent = Some(ParentLink {
+            node_id: node("parent"),
+            slot: 2,
+        });
+        assert!(state.outbound.is_some());
+
+        assert_eq!(state.apply_detach(), Transition::Detached);
+        assert_eq!(Transition::Detached.reply(), ControlReply::Accepted);
+        assert!(state.record.parent.is_none());
+        assert!(state.record.address.is_none());
+        assert!(state.outbound.is_none());
+        assert_eq!(state.status_label(), "none");
+
+        // Detaching an already detached record is an idempotent no-op.
+        assert_eq!(state.apply_detach(), Transition::None);
+    }
+
+    #[test]
+    fn rebase_and_detach_round_trip_at_version_1() {
+        // No fields were added for exit rights, so the blob version is
+        // unchanged and both transitions serialize losslessly.
+        assert_eq!(LOCAL_STATE_VERSION, 1);
+
+        let mut rebased = joined("0.2.3", "parent", 3);
+        assert_eq!(
+            rebased.apply_rebase(&"0.5".parse().unwrap(), &"0.5.3".parse().unwrap()),
+            Transition::Rebased
+        );
+        let back = LocalStateV1::from_bytes(&rebased.to_bytes()).unwrap();
+        assert_eq!(back.version, LOCAL_STATE_VERSION);
+        assert_eq!(back, rebased);
+
+        let mut detached = back;
+        assert_eq!(detached.apply_detach(), Transition::Detached);
+        let back = LocalStateV1::from_bytes(&detached.to_bytes()).unwrap();
+        assert_eq!(back.version, LOCAL_STATE_VERSION);
+        assert_eq!(back, detached);
+        assert_eq!(back.status_label(), "none");
     }
 }

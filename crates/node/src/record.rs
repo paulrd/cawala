@@ -323,6 +323,25 @@ impl RecordStore {
         Ok(())
     }
 
+    /// Detach to an independent root network in a single validated mutation.
+    ///
+    /// Clears the parent link **and** sets the asserted address to the root `0`
+    /// together, so the record is never observably in the illegal
+    /// `parent = Some` + `address = 0` state. This is the exit/rebase primitive:
+    /// the independent subtree is re-rooted at `0`, and its descendants are
+    /// re-based by their own parents.
+    ///
+    /// A no-op re-application is legal and idempotent: clearing an absent parent
+    /// and re-asserting `0` both validate.
+    pub fn rebase_to_root(&mut self) -> Result<(), RecordError> {
+        self.record.parent = None;
+        self.record.address = Some(
+            OctAddr::from_digits(vec![0]).expect("the root address \"0\" is always valid"),
+        );
+        self.record.validate()?;
+        Ok(())
+    }
+
     /// Assert this node's octal address (admin-set, never derived).
     pub fn set_address(&mut self, address: OctAddr) -> Result<(), RecordError> {
         self.record.address = Some(address);
@@ -727,6 +746,34 @@ mod tests {
                 parent_slot: 2,
             })
         );
+    }
+
+    #[test]
+    fn rebase_to_root_clears_parent_and_sets_root_in_one_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(dir.path());
+        store.set_parent("parent-x", 2).unwrap();
+        store.set_address("0.1.2".parse().unwrap()).unwrap();
+        store
+            .attach_child("c1", ChildKind::Node, Some(0), JOINED)
+            .unwrap();
+
+        store.rebase_to_root().unwrap();
+        assert!(store.record().parent.is_none());
+        assert_eq!(store.record().address, Some("0".parse().unwrap()));
+        // Children are untouched (they are re-based by their own parent).
+        assert_eq!(store.record().children.len(), 1);
+        store.record().validate().unwrap();
+
+        // Idempotent: re-applying on an already-root record is a legal no-op.
+        store.rebase_to_root().unwrap();
+        assert!(store.record().parent.is_none());
+        assert_eq!(store.record().address, Some("0".parse().unwrap()));
+
+        // The root-0 record round-trips through disk.
+        store.save().unwrap();
+        let loaded = RecordStore::open(dir.path(), "node-a").unwrap();
+        assert_eq!(loaded.record(), store.record());
     }
 
     #[test]

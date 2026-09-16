@@ -219,6 +219,19 @@ fn commit_peer(peer: &Peer, ledger: &Ledger<MemLog>, ts: u64) -> SignedCommitmen
     signed
 }
 
+/// Build a fresh in-memory ledger for `peer`, persist every entry to
+/// `entries.log`, and record one linked commitment.
+fn seed_peer(
+    peer: &Peer,
+    ts: u64,
+    build: impl FnOnce(&mut Ledger<MemLog>, &LedgerSecretKey),
+) {
+    let mut ledger = Ledger::new_non_root_with_log(peer.key.public(), MemLog::new());
+    build(&mut ledger, &peer.key);
+    persist(peer, &ledger);
+    commit_peer(peer, &ledger, ts);
+}
+
 /// Rewrite `commitments.log` verbatim (no validation), so a broken chain can be
 /// planted.
 fn write_chain(dir: &Path, chain: &[SignedCommitment]) {
@@ -733,4 +746,435 @@ fn multi_commitment_chain_verifies_and_a_broken_link_is_rejected() {
         format!("{err:#}").contains("invalid commitment chain"),
         "unexpected error: {err:#}"
     );
+}
+
+// ── 10. Exited network: multiple components (M5 exit rights, P4) ───────────
+
+/// A primary network plus two exited islands, both rebased to root `0`, load
+/// and audit independently with no hard error. The islands surface as advisory
+/// `Detached` findings and in the component partition.
+#[test]
+fn islands_both_rooted_at_zero_load_and_audit_independently() {
+    let root = tempfile::tempdir().unwrap();
+
+    // Primary R -> A (A holds user uA).
+    let r = make_peer_at(
+        &root.path().join("r"),
+        "R",
+        "0",
+        None,
+        &[("A", ChildKind::Node, 1)],
+    );
+    let a = make_peer_at(
+        &root.path().join("a"),
+        "A",
+        "0.1",
+        Some(("R", 1)),
+        &[("uA", ChildKind::User, 0)],
+    );
+    // Two independent islands, each a root-0 subtree with a stranded claim.
+    let x = make_peer_at(
+        &root.path().join("x"),
+        "X",
+        "0",
+        None,
+        &[("uX", ChildKind::User, 0)],
+    );
+    let y = make_peer_at(
+        &root.path().join("y"),
+        "Y",
+        "0",
+        None,
+        &[("uY", ChildKind::User, 0)],
+    );
+
+    // Primary is mirror-consistent: R funds A, A descends to uA.
+    seed_peer(&r, 1, |ledger, key| {
+        open(ledger, key, &n("A"), ChildKind::Node);
+        issue(ledger, key, &n("A"), 100);
+    });
+    seed_peer(&a, 1, |ledger, key| {
+        open(ledger, key, &n("uA"), ChildKind::User);
+        descend(ledger, key, &n("uA"), 100);
+    });
+    // Each island descends to its own user without a parent extension, leaving
+    // a stranded `Parent` claim.
+    seed_peer(&x, 1, |ledger, key| {
+        open(ledger, key, &n("uX"), ChildKind::User);
+        descend(ledger, key, &n("uX"), 100);
+    });
+    seed_peer(&y, 1, |ledger, key| {
+        open(ledger, key, &n("uY"), ChildKind::User);
+        descend(ledger, key, &n("uY"), 50);
+    });
+
+    let peers = vec![r.dir.clone(), a.dir.clone(), x.dir.clone(), y.dir.clone()];
+    let inputs = netting_harness::load(&peers, None, None).unwrap();
+    assert_eq!(inputs.components.len(), 3, "primary + two islands");
+    assert_eq!(inputs.topology.root_id(), "R");
+    assert_eq!(inputs.components[1].topology.root_id(), "X");
+    assert_eq!(inputs.components[2].topology.root_id(), "Y");
+
+    let report = netting_harness::report(&inputs);
+    assert!(
+        report.findings.is_empty(),
+        "islands must not be a hard failure: {:?}",
+        report.findings
+    );
+    let detached: Vec<&Finding> = report
+        .advisories
+        .iter()
+        .filter(|f| matches!(f, Finding::Detached { .. }))
+        .collect();
+    assert_eq!(detached.len(), 2, "advisories: {:?}", report.advisories);
+    assert!(report.advisories.iter().all(|f| f.is_advisory()));
+    assert_eq!(report.components.len(), 3);
+    assert!(report.components[0].primary);
+    assert_eq!(report.components[0].root, "R");
+    assert!(!report.components[1].primary);
+    assert!(report.components[1].nodes.contains(&"X".to_string()));
+    assert!(report.components[1].nodes.contains(&"uX".to_string()));
+    assert!(report
+        .notes
+        .iter()
+        .any(|note| note.contains("topology components: 3")));
+}
+
+/// A stale parent-side `children` row (the old parent still lists an exited
+/// child) is ignored: the child's own parentless link wins and the row is an
+/// advisory `StaleChildLink`.
+#[test]
+fn stale_parent_child_row_is_ignored_with_stale_child_link() {
+    let root = tempfile::tempdir().unwrap();
+
+    // R's record still lists X, but X rebased to root 0. A keeps R primary.
+    let r = make_peer_at(
+        &root.path().join("r"),
+        "R",
+        "0",
+        None,
+        &[("A", ChildKind::Node, 2), ("X", ChildKind::Node, 1)],
+    );
+    let a = make_peer_at(
+        &root.path().join("a"),
+        "A",
+        "0.2",
+        Some(("R", 2)),
+        &[],
+    );
+    let x = make_peer_at(
+        &root.path().join("x"),
+        "X",
+        "0",
+        None,
+        &[("uX", ChildKind::User, 0)],
+    );
+
+    let peers = vec![r.dir.clone(), a.dir.clone(), x.dir.clone()];
+    let inputs = netting_harness::load(&peers, None, None).unwrap();
+    assert_eq!(inputs.components.len(), 2, "primary R/A + island X");
+    assert_eq!(inputs.topology.root_id(), "R");
+    assert_eq!(inputs.components[1].topology.root_id(), "X");
+    assert_eq!(inputs.components[1].stranded_parent, Some(n("R")));
+
+    let stale: Vec<&Finding> = inputs
+        .topology_findings
+        .iter()
+        .filter(|f| matches!(f, Finding::StaleChildLink { parent, child } if parent == &n("R") && child == &n("X")))
+        .collect();
+    assert_eq!(
+        stale.len(),
+        1,
+        "topology findings: {:?}",
+        inputs.topology_findings
+    );
+
+    let report = netting_harness::report(&inputs);
+    assert!(
+        report.findings.is_empty(),
+        "a stale link must not be a hard finding: {:?}",
+        report.findings
+    );
+    assert!(report
+        .advisories
+        .iter()
+        .any(|f| matches!(f, Finding::StaleChildLink { .. })));
+    assert!(report
+        .advisories
+        .iter()
+        .any(|f| matches!(f, Finding::Detached { root, .. } if root == &n("X"))));
+}
+
+/// An order whose endpoints span two components has no common root and is an
+/// advisory `RouteInvalid`, not a hard failure.
+#[test]
+fn cross_component_order_is_an_advisory_route_invalid() {
+    let root = tempfile::tempdir().unwrap();
+    let r = make_peer_at(
+        &root.path().join("r"),
+        "R",
+        "0",
+        None,
+        &[("A", ChildKind::Node, 1)],
+    );
+    let a = make_peer_at(
+        &root.path().join("a"),
+        "A",
+        "0.1",
+        Some(("R", 1)),
+        &[("uA", ChildKind::User, 0)],
+    );
+    let x = make_peer_at(
+        &root.path().join("x"),
+        "X",
+        "0",
+        None,
+        &[("uX", ChildKind::User, 0)],
+    );
+
+    let order = PaymentOrder {
+        from: n("uA"),
+        to: n("uX"),
+        amount: Amount::new(100),
+        nonce: 1,
+        expiry: 1_000,
+    };
+    let path = root.path().join("orders.json");
+    std::fs::write(&path, serde_json::to_string(&order).unwrap()).unwrap();
+
+    let peers = vec![r.dir.clone(), a.dir.clone(), x.dir.clone()];
+    let inputs = netting_harness::load(&peers, Some(path.to_str().unwrap()), None).unwrap();
+    let report = netting_harness::report(&inputs);
+    assert!(
+        report.findings.is_empty(),
+        "a cross-component order is advisory: {:?}",
+        report.findings
+    );
+    assert!(report.advisories.iter().any(
+        |f| matches!(f, Finding::RouteInvalid { payment_id, .. } if *payment_id == order.hash())
+    ));
+    assert!(report.nets.is_empty());
+}
+
+/// After re-attach, the previously stranded pair is a normal single-root edge
+/// and surfaces exactly once as an `UnbackedClaim` mirror mismatch.
+#[test]
+fn reattached_stranded_pair_surfaces_exactly_once() {
+    let root = tempfile::tempdir().unwrap();
+    let r = make_peer_at(
+        &root.path().join("r"),
+        "R",
+        "0",
+        None,
+        &[("A", ChildKind::Node, 1)],
+    );
+    let a = make_peer_at(
+        &root.path().join("a"),
+        "A",
+        "0.1",
+        Some(("R", 1)),
+        &[("uA", ChildKind::User, 0)],
+    );
+
+    // A exited, kept a 100 Parent claim, then re-attached; R never extended
+    // Child(A).
+    seed_peer(&a, 1, |ledger, key| {
+        open(ledger, key, &n("uA"), ChildKind::User);
+        descend(ledger, key, &n("uA"), 100);
+    });
+
+    let peers = vec![r.dir.clone(), a.dir.clone()];
+    let inputs = netting_harness::load(&peers, None, None).unwrap();
+    let report = netting_harness::report(&inputs);
+    let mismatches: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| matches!(f, Finding::MirrorMismatch { .. }))
+        .collect();
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "the re-attached stranded pair must surface once: {:?}",
+        report.findings
+    );
+    assert!(matches!(
+        mismatches[0],
+        Finding::MirrorMismatch {
+            direction: MirrorDirection::UnbackedClaim,
+            ..
+        }
+    ));
+}
+
+// ── 11. Netting gate: exit advisories don't suppress nets (G1) ─────────────
+
+/// `Detached` and `StaleChildLink` are steady-state exit signals and must not
+/// suppress `nets` for the still-healthy components.
+#[test]
+fn exit_advisories_do_not_suppress_nets() {
+    let mut b = Benches::new();
+    b.fund_setup(1000);
+    let order = order(1);
+    b.apply(&order);
+
+    // An extra independent island Y, plus a stale parent-side row for it on R.
+    let y = make_peer_at(
+        &b.root.path().join("y"),
+        "Y",
+        "0",
+        None,
+        &[("uY", ChildKind::User, 0)],
+    );
+    let mut r_store = record::RecordStore::open(&b.r.dir, &b.r.node_id).unwrap();
+    r_store
+        .attach_child("Y", ChildKind::Node, Some(0), 0)
+        .unwrap();
+    r_store.save().unwrap();
+
+    let peers = vec![
+        b.r.dir.clone(),
+        b.a.dir.clone(),
+        b.b.dir.clone(),
+        y.dir.clone(),
+    ];
+    let path = b.orders_path(std::slice::from_ref(&order));
+    let inputs = netting_harness::load(&peers, Some(path.to_str().unwrap()), None).unwrap();
+    let report = netting_harness::report(&inputs);
+
+    assert!(
+        report.findings.is_empty(),
+        "exit advisories must not be hard findings: {:?}",
+        report.findings
+    );
+    assert!(report
+        .advisories
+        .iter()
+        .any(|f| matches!(f, Finding::Detached { root, .. } if root == &n("Y"))));
+    assert!(report
+        .advisories
+        .iter()
+        .any(|f| matches!(f, Finding::StaleChildLink { parent, child } if parent == &b.r.id() && child == &n("Y"))));
+    assert_eq!(
+        report.nets,
+        vec![NetTransfer {
+            parent: b.r.id(),
+            from: b.a.id(),
+            to: b.b.id(),
+            amount: Amount::new(100),
+        }],
+        "an island and a stale link must not suppress the primary's nets"
+    );
+    // Advisory-only: the CLI exits 0.
+    assert!(!(!report.findings.is_empty()));
+}
+
+// ── 12. Accepted residual: re-attach with a stranded Parent is hard ───────
+
+/// Pin the accepted residual: a node that exits carrying a non-zero `Parent`
+/// balance and then re-joins a **new** parent leaves a hard
+/// `MirrorMismatch::UnbackedClaim` on the new edge (exit 1), while the old
+/// severed edge is advisory — the orphaned old parent network is one
+/// `Detached` island and the stale parent-side row is one `StaleChildLink` —
+/// and is never a `MirrorMismatch`.
+///
+/// This is the operational rule "exit with zero `Parent` for a clean
+/// re-attach": until v2 `EdgeClose`, a non-zero stranded claim blocks netting
+/// on the new network.
+#[test]
+fn reattach_with_stranded_parent_blocks_netting_on_new_edge() {
+    let root = tempfile::tempdir().unwrap();
+
+    // N is the new parent (root 0); X re-joined it at slot 1.
+    let new_parent = make_peer_at(
+        &root.path().join("n"),
+        "N",
+        "0",
+        None,
+        &[("X", ChildKind::Node, 1)],
+    );
+    // X carries a 100 Parent claim from its exit and now hangs under N.
+    let x = make_peer_at(
+        &root.path().join("x"),
+        "X",
+        "0.1",
+        Some(("N", 1)),
+        &[("uX", ChildKind::User, 0)],
+    );
+    // P is the old parent: it still lists X (stale) and has no other links,
+    // so its now-independent network is an island.
+    let old_parent = make_peer_at(
+        &root.path().join("p"),
+        "P",
+        "0",
+        None,
+        &[("X", ChildKind::Node, 1)],
+    );
+
+    seed_peer(&x, 1, |ledger, key| {
+        open(ledger, key, &n("uX"), ChildKind::User);
+        descend(ledger, key, &n("uX"), 100);
+    });
+
+    let peers = vec![
+        old_parent.dir.clone(),
+        new_parent.dir.clone(),
+        x.dir.clone(),
+    ];
+    let inputs = netting_harness::load(&peers, None, None).unwrap();
+    let report = netting_harness::report(&inputs);
+
+    // The new edge N -> X is a hard UnbackedClaim.
+    let hard: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| matches!(f, Finding::MirrorMismatch { .. }))
+        .collect();
+    assert_eq!(
+        hard.len(),
+        1,
+        "exactly one hard mismatch on the new edge: {:?}",
+        report.findings
+    );
+    assert!(matches!(
+        hard[0],
+        Finding::MirrorMismatch { edge, parent_view, child_view, direction }
+            if edge.parent == n("N")
+                && edge.child == n("X")
+                && *parent_view == Amount::ZERO
+                && *child_view == Amount::new(100)
+                && *direction == MirrorDirection::UnbackedClaim
+    ));
+
+    // The old severed edge P -> X is advisory and never a MirrorMismatch.
+    assert!(
+        report
+            .findings
+            .iter()
+            .all(|f| !matches!(f, Finding::MirrorMismatch { edge, .. } if edge.parent == n("P"))),
+        "the severed old edge must never be a hard MirrorMismatch: {:?}",
+        report.findings
+    );
+    assert!(report.advisories.iter().any(
+        |f| matches!(f, Finding::Detached { root, .. } if root == &n("P"))
+    ));
+    assert!(report.advisories.iter().any(
+        |f| matches!(f, Finding::StaleChildLink { parent, child } if parent == &n("P") && child == &n("X"))
+    ));
+    assert_eq!(
+        report
+            .advisories
+            .iter()
+            .filter(|f| matches!(
+                f,
+                Finding::Detached { .. } | Finding::StaleChildLink { .. }
+            ))
+            .count(),
+        2,
+        "the severed pair is reported exactly twice, both advisory: {:?}",
+        report.advisories
+    );
+
+    // Exit 1 and no netting: a hard finding always blocks.
+    assert!(!report.findings.is_empty());
+    assert!(report.nets.is_empty());
 }

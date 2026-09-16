@@ -551,6 +551,53 @@
        best-effort); pruning uses the wall clock. Advisories (not done):
        parent-dir fsync, corrupt-sidecar observability, write coalescing for the
        per-`Fresh` rewrite, cap-only eviction.
+     - Exit rights (DONE): any node may leave unilaterally, non-leaf included;
+       the subtree becomes an independent network with **topology-true
+       addresses** (independence rebases onto root `0`; re-homing swaps the
+       prefix). `CONTROL_FORMAT_VERSION` 4 (inbound-only dual-accept of 3/4 -
+       minted frames are always v4, so mixed-version control is effectively
+       lockstep for node->child and routed frames) adds four appended variants:
+       `Exit` (child -> parent, self-operator, not seniority-gated),
+       `DetachNotice` (parent -> child, best-effort; also sent by `DetachChild`),
+       `Rebase` (each direct parent signs its child's new address; requires
+       `address == parent_address.child(slot)`) and `RebasePull` (child -> parent,
+       self-operator, answered with the existing `Snapshot`). Direct
+       `cawala/control/0` only; all four are refused on the routed path. Exit is
+       best-effort and convergent: notify the parent, flip to root `0` locally in
+       one validated `rebase_to_root()` (so an unreachable parent cannot trap the
+       node), then push `Rebase` down the subtree; offline descendants heal via an
+       in-memory pending-notice retry plus a startup/periodic `RebasePull`.
+       Stranded value is tolerated (no `ENTRY_FORMAT_VERSION` bump): the severed
+       edge pair remains, and the operational rule is "exit with a zero `Parent`
+       balance for a clean re-attach" - otherwise the stranded claim surfaces as a
+       hard `MirrorMismatch::UnbackedClaim` on the new parent's books until v2
+       `EdgeClose` (CLI `control exit` warns on a non-zero balance and still
+       succeeds). Re-attach is idempotent for a former parent (its retained
+       `PeerKeys` row no longer fails the approval) and for a stale row left by an
+       unprocessed exit. `receive_at` re-reads `node.json` (record) and
+       `ledger_peers.json` (peer registry) per request, warn-and-continue, so a
+       live node observes external CLI writes. Audit is component-aware: one
+       `Topology` per weakly connected component, the child's own parent link wins
+       over a stale parent-side row (`Finding::StaleChildLink`), each island
+       reports `Finding::Detached { root, nodes, stranded_parent, parent_balance
+       }`, both are advisory, and `nets` are suppressed by
+       `Finding::suppresses_netting()` (everything except those two) so islands no
+       longer disable reconciliation; exit codes unchanged. Browser: `leave()`
+       (self-signed; clears parent+address regardless of the reply, replacing the
+       mock-only `detachChild`), `Rebase`/`DetachNotice` handlers, a `"detached"`
+       control event, the MyAccountPage "Leave network" card (confirm + aftermath
+       + balance-stays-on-their-books warning) and a Dashboard post-detach CTA; no
+       `LOCAL_STATE_VERSION` change. Leaf rejoin uses the existing join flow.
+       Verified: `crates/node/tests/exit_rebase.rs` (7), `routed_control` (13),
+       `netting_harness` (15), `seen_restart` (3), ledger 223, client 82, plus
+       workspace clippy and the wasm32 check; web `npm test` (29) + `npm run
+       build`. Deferred to v2: whole-subtree rejoin (`Rebase` prefix-swap with
+       per-node consent and a persisted generation), foster-parent recovery
+       (non-response claim + `Recover` + registry cleanup), `EdgeClose`, moved
+       pointers, signed topology/registry distribution, per-peer control version
+       negotiation, a netting `--primary-root` selector, an optional `OctAddr`
+       depth cap, and hoisting the per-request control-plane reload into
+       `receive_routed_at`.
 
 * Top Risks
   1. Iroh WASM maturity -> M0 spike before any other work.

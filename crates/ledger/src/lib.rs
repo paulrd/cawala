@@ -70,7 +70,8 @@ pub use merkle::{
     verify_inclusion, verify_state_inclusion,
 };
 pub use netting::{
-    Finding, MirrorDirection, NetTransfer, NettingReport, entry_hop_accounts, net, verify_cascade,
+    Finding, MirrorDirection, NetComponent, NetTransfer, NettingReport, entry_hop_accounts, net,
+    net_partition, verify_cascade,
 };
 pub use proof::{
     EntryInclusionProof, MAX_ENTRY_PROOF, entry_inclusion_proof, verify_applied_entry,

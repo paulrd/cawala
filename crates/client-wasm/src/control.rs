@@ -11,10 +11,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use cawala_control::{
-    CONTROL_ALPN, CONTROL_FORMAT_VERSION, CONTROL_REQUEST_TTL_SECS, ControlReply, ControlRequest,
-    Invite, JoinApproval, JoinRejection, MAX_CONTROL_FRAME, NodeId, OperatorPubKey,
-    OperatorSecretKey, ROUTED_CONTROL_VERSION, RejectCode, RoutedControlV1, RoutedForward,
-    SignedControl, SignedRoutedReply,
+    CONTROL_ALPN, CONTROL_REQUEST_TTL_SECS, ControlReply, ControlRequest, DetachNotice, Invite,
+    JoinApproval, JoinRejection, MAX_CONTROL_FRAME, NodeId, OperatorPubKey, OperatorSecretKey,
+    ROUTED_CONTROL_VERSION, RebaseNotice, RejectCode, RoutedControlV1, RoutedForward,
+    SignedControl, SignedRoutedReply, is_supported_control_version,
 };
 use cawala_msg::{Envelope, MSG_CONTROL_V1, MsgId, PeerRef};
 use iroh::endpoint::Connection;
@@ -136,7 +136,7 @@ impl ControlHandler {
 
     /// Dispatch exactly one signed request, synchronously.
     fn handle(&self, signed: &SignedControl) -> ControlReply {
-        if signed.version != CONTROL_FORMAT_VERSION {
+        if !is_supported_control_version(signed.version) {
             return ControlReply::Rejected(RejectCode::BadVersion);
         }
         // Companion to the v3 wire change: never act on an already-expired
@@ -147,9 +147,106 @@ impl ControlHandler {
         match &signed.request {
             ControlRequest::JoinApproved(approval) => self.handle_join_approved(signed, approval),
             ControlRequest::JoinRejected(rejection) => self.handle_join_rejected(signed, rejection),
+            ControlRequest::Rebase(notice) => self.handle_rebase(signed, notice),
+            ControlRequest::DetachNotice(notice) => self.handle_detach_notice(signed, notice),
             ControlRequest::Query => self.handle_query(signed),
             _ => ControlReply::Rejected(RejectCode::Unauthorized),
         }
+    }
+
+    /// Apply a parent-signed [`RebaseNotice`] to the local address.
+    ///
+    /// # Trust rule
+    ///
+    /// A browser keeps no [`PeerRegistry`](cawala_ledger::PeerRegistry), so the
+    /// native `verify_control` binding (origin → registered operator → signed
+    /// controller) is reconstructed from what a joined leaf actually knows:
+    ///
+    /// 1. the frame self-signature verifies under `signed.controller`
+    ///    ([`SignedControl::verify_signature`]);
+    /// 2. `signed.controller` is the operator key named by `signed.origin`
+    ///    ([`origin_binds_controller`]) — the node-id == operator-key invariant
+    ///    the rest of this client already relies on
+    ///    ([`operator_key_from_node`]), which closes the "claim the parent's
+    ///    origin under an attacker key" forgery;
+    /// 3. the sender is exactly the **endpoint id the join was sent to**,
+    ///    recorded in `record.parent` — the sole routing neighbor whose
+    ///    `JoinApproved` created the link — which is the same recorded-parent
+    ///    match [`LocalStateV1::on_join_approved`] applies to approvals; steps 2
+    ///    and 3 together bind the signing key to that endpoint id (node id ==
+    ///    operator key), so the sender cannot claim the parent's origin under a
+    ///    different key;
+    /// 4. the notice targets this client and `notice.address ==
+    ///    notice.parent_address.child(record.parent.slot)`, enforced again in
+    ///    [`LocalStateV1::apply_rebase`].
+    ///
+    /// A stale former parent or a sibling fails step 3 (or step 2 if it forges
+    /// the origin) and is refused. This is not an unpinned trust-on-first-use
+    /// gap: the parent operator is key-bound to the endpoint id this client
+    /// dialed, the same invariant `JoinApproved` relies on. An invite is
+    /// stronger only in that it additionally pins the operator key out of band
+    /// before the join; that pin is checked in `on_join_approved`.
+    fn handle_rebase(&self, signed: &SignedControl, notice: &RebaseNotice) -> ControlReply {
+        if signed.verify_signature().is_err() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        if notice.validate().is_err() {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        if notice.node.as_str() != self.shared.node_id() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        // Clone the parent link out of the lock before mutating the state.
+        let parent = self.shared.lock_state().record.parent.clone();
+        let Some(parent) = parent else {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        };
+        if signed.origin != parent.node_id || !origin_binds_controller(signed) {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        if notice.address != notice.parent_address.child(parent.slot) {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        self.shared
+            .lock_state()
+            .apply_rebase(&notice.parent_address, &notice.address)
+            .reply()
+    }
+
+    /// Apply a parent-signed [`DetachNotice`]: clear the local parent and
+    /// address (a browser is a `User` leaf, so it takes the clear-both branch
+    /// of the address law).
+    ///
+    /// The trust rule is exactly [`ControlHandler::handle_rebase`]'s: valid
+    /// self-signature, controller bound to the origin, and the sender equal to
+    /// the recorded parent. This is a deliberate duplicate of that parent check
+    /// rather than a shared helper because the two handlers differ in the
+    /// topology validation they apply after it. An already-detached client
+    /// accepts idempotently (mirroring the native handler) and emits no event.
+    fn handle_detach_notice(&self, signed: &SignedControl, notice: &DetachNotice) -> ControlReply {
+        if signed.verify_signature().is_err() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        if notice.validate().is_err() {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        if notice.node.as_str() != self.shared.node_id() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        // Already detached: nothing to verify or apply.
+        let parent = self.shared.lock_state().record.parent.clone();
+        let Some(parent) = parent else {
+            return ControlReply::Accepted;
+        };
+        if signed.origin != parent.node_id || !origin_binds_controller(signed) {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        let transition = self.shared.lock_state().apply_detach();
+        if matches!(transition, Transition::Detached) {
+            self.shared
+                .push_event(ControlEventDto::detached(&parent.node_id));
+        }
+        transition.reply()
     }
 
     /// Apply a parent's approval to the local record.
@@ -457,6 +554,18 @@ fn operator_key_from_node(node: &str) -> Result<OperatorPubKey, String> {
     OperatorPubKey::from_bytes(endpoint.as_bytes()).map_err(|err| err.to_string())
 }
 
+/// Whether `signed.controller` is the operator key named by `signed.origin`.
+///
+/// Native nodes and browser leaves derive their operator key from the same
+/// Ed25519 seed as their endpoint id, so a node id and its operator public key
+/// are one key ([`operator_key_from_node`] is exactly that conversion). The
+/// browser has no `PeerRegistry`, so this key identity is the binding
+/// `verify_control` would otherwise supply; it fails closed when the origin is
+/// not a parseable endpoint id.
+fn origin_binds_controller(signed: &SignedControl) -> bool {
+    operator_key_from_node(signed.origin.as_str()).is_ok_and(|key| key == signed.controller)
+}
+
 /// Whether a failed *direct* admin exchange should be retried over the routed
 /// tree.
 ///
@@ -676,5 +785,204 @@ mod tests {
 
         let accepted: Result<ControlReply, &str> = Ok(ControlReply::Accepted);
         assert!(!should_try_routed(&accepted));
+    }
+
+    // ── M5 exit rights (format 4): Rebase / DetachNotice ─────────────
+
+    /// A browser control handler joined at `0.2.3` under slot 3 of a parent
+    /// whose node id and operator key are the same Ed25519 key.
+    fn joined_browser() -> (Arc<SharedControl>, OperatorSecretKey, NodeId) {
+        let browser_op = operator(1);
+        let parent_op = operator(2);
+        let browser_id = browser_op.public().to_string();
+        let parent_id = NodeId::from(parent_op.public().to_string());
+        let shared = Arc::new(SharedControl::new(browser_id, Some(browser_op)));
+        {
+            let mut state = shared.lock_state();
+            state.record.address = Some("0.2.3".parse().expect("sample address parses"));
+            state.record.parent = Some(crate::state::ParentLink {
+                node_id: parent_id.clone(),
+                slot: 3,
+            });
+        }
+        (shared, parent_op, parent_id)
+    }
+
+    /// Sign `request` as `origin` under `key` with a far-future expiry.
+    fn signed_by(
+        origin: &NodeId,
+        key: &OperatorSecretKey,
+        request: ControlRequest,
+    ) -> SignedControl {
+        SignedControl::authorize(origin.clone(), key, 7, u64::MAX, request).expect("frame signs")
+    }
+
+    fn rebase_request(
+        node: &str,
+        parent_address: &str,
+        address: &str,
+        generation: u64,
+    ) -> ControlRequest {
+        ControlRequest::Rebase(RebaseNotice {
+            node: NodeId::from(node),
+            parent_address: parent_address.parse().expect("parent address parses"),
+            address: address.parse().expect("address parses"),
+            generation,
+        })
+    }
+
+    #[test]
+    fn rebase_from_recorded_parent_updates_address_in_place() {
+        let (shared, parent_op, parent_id) = joined_browser();
+        let handler = ControlHandler::new(Arc::clone(&shared));
+        let signed = signed_by(
+            &parent_id,
+            &parent_op,
+            rebase_request(shared.node_id(), "0.4", "0.4.3", 2),
+        );
+
+        assert_eq!(handler.handle(&signed), ControlReply::Accepted);
+        let state = shared.lock_state();
+        assert_eq!(state.record.address, Some("0.4.3".parse().unwrap()));
+        // The parent link (and slot) survives the prefix move.
+        assert_eq!(
+            state.record.parent,
+            Some(crate::state::ParentLink {
+                node_id: parent_id,
+                slot: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn rebase_to_current_address_is_an_idempotent_accept() {
+        let (shared, parent_op, parent_id) = joined_browser();
+        let handler = ControlHandler::new(Arc::clone(&shared));
+        let signed = signed_by(
+            &parent_id,
+            &parent_op,
+            rebase_request(shared.node_id(), "0.2", "0.2.3", 1),
+        );
+
+        assert_eq!(handler.handle(&signed), ControlReply::Accepted);
+        assert_eq!(
+            shared.lock_state().record.address,
+            Some("0.2.3".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn rebase_with_wrong_derivation_is_bad_request() {
+        let (shared, parent_op, parent_id) = joined_browser();
+        let handler = ControlHandler::new(Arc::clone(&shared));
+        // The slot is 3, so `0.4.4` is not `0.4.child(3)`.
+        let signed = signed_by(
+            &parent_id,
+            &parent_op,
+            rebase_request(shared.node_id(), "0.4", "0.4.4", 2),
+        );
+
+        assert_eq!(
+            handler.handle(&signed),
+            ControlReply::Rejected(RejectCode::BadRequest)
+        );
+        assert_eq!(
+            shared.lock_state().record.address,
+            Some("0.2.3".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn rebase_claiming_parent_origin_under_attacker_key_is_rejected() {
+        let (shared, _parent_op, parent_id) = joined_browser();
+        let handler = ControlHandler::new(Arc::clone(&shared));
+        let attacker = operator(9);
+        // `origin` claims the parent node id, but the frame is signed by the
+        // attacker's operator key; the origin/controller binding must fail.
+        let signed = signed_by(
+            &parent_id,
+            &attacker,
+            rebase_request(shared.node_id(), "0.4", "0.4.3", 2),
+        );
+
+        assert_eq!(
+            handler.handle(&signed),
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+        assert_eq!(
+            shared.lock_state().record.address,
+            Some("0.2.3".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn rebase_from_a_stale_or_sibling_parent_is_rejected() {
+        let (shared, _parent_op, _parent_id) = joined_browser();
+        let handler = ControlHandler::new(Arc::clone(&shared));
+        // A different node (a former parent or a sibling) signs a plausible
+        // re-base: the origin does not match the recorded parent.
+        let other = operator(3);
+        let signed = signed_by(
+            &NodeId::from(other.public().to_string()),
+            &other,
+            rebase_request(shared.node_id(), "0.4", "0.4.3", 2),
+        );
+
+        assert_eq!(
+            handler.handle(&signed),
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+        assert_eq!(
+            shared.lock_state().record.address,
+            Some("0.2.3".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn detach_notice_from_recorded_parent_clears_parent_and_address() {
+        let (shared, parent_op, parent_id) = joined_browser();
+        let handler = ControlHandler::new(Arc::clone(&shared));
+        let signed = signed_by(
+            &parent_id,
+            &parent_op,
+            ControlRequest::DetachNotice(DetachNotice {
+                node: NodeId::from(shared.node_id()),
+            }),
+        );
+
+        assert_eq!(handler.handle(&signed), ControlReply::Accepted);
+        {
+            let state = shared.lock_state();
+            assert!(state.record.parent.is_none());
+            assert!(state.record.address.is_none());
+            assert_eq!(state.status_label(), "none");
+        }
+        let events = shared.lock_events();
+        let event = events.front().expect("a detached event is queued");
+        assert_eq!(event.kind(), "detached");
+        assert_eq!(event.parent(), parent_id.to_string());
+    }
+
+    #[test]
+    fn detach_notice_from_a_wrong_origin_is_rejected_and_state_retained() {
+        let (shared, _parent_op, _parent_id) = joined_browser();
+        let handler = ControlHandler::new(Arc::clone(&shared));
+        let other = operator(3);
+        let signed = signed_by(
+            &NodeId::from(other.public().to_string()),
+            &other,
+            ControlRequest::DetachNotice(DetachNotice {
+                node: NodeId::from(shared.node_id()),
+            }),
+        );
+
+        assert_eq!(
+            handler.handle(&signed),
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+        let state = shared.lock_state();
+        assert!(state.record.parent.is_some());
+        assert!(state.record.address.is_some());
+        assert!(shared.lock_events().is_empty());
     }
 }

@@ -225,6 +225,142 @@ pub struct SetAddress {
     pub address: Option<OctAddr>,
 }
 
+/// A child's unilateral request to leave its parent and become the root of an
+/// independent network.
+///
+/// Self-signed by the exiting node's operator key. The receiver is the parent,
+/// which removes the child link; the child independently rebases itself onto
+/// root `0`. `subtree_nodes` is an **audit-only** declaration: it is never a
+/// gate, so a mismatch (or an outright lie) cannot block a legitimate exit.
+/// Added in [`CONTROL_FORMAT_VERSION`](crate::CONTROL_FORMAT_VERSION) 4
+/// (variant 13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitRequest {
+    /// The exiting child (must equal the signed origin, whose registered
+    /// operator must equal the signed controller).
+    pub node: NodeId,
+    /// A **best-effort declared count of the nodes this node directly accounts
+    /// for** (itself plus its direct children), audit-only.
+    ///
+    /// It is unverifiable — a node cannot see below its direct children — so
+    /// the producer emits `1 + direct_children` and the receiver must never
+    /// gate on it.
+    pub subtree_nodes: u32,
+}
+
+impl ExitRequest {
+    /// Check the node-id length bound and that `subtree_nodes >= 1`.
+    ///
+    /// Whether `node` is actually a child of the receiver, and whether the
+    /// signer is that child's operator, are the node's concern.
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_node_id("node", self.node.as_str())?;
+        if self.subtree_nodes < 1 {
+            return Err(ControlError::FieldBelowMinimum {
+                field: "subtree_nodes",
+                value: u64::from(self.subtree_nodes),
+                min: 1,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A parent's notice that it has detached a child, so the child must flip
+/// itself to an independent root.
+///
+/// Parent-signed; the receiver is the named child. Added in
+/// [`CONTROL_FORMAT_VERSION`](crate::CONTROL_FORMAT_VERSION) 4 (variant 14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetachNotice {
+    /// The detached child (must equal the receiver's own node id).
+    pub node: NodeId,
+}
+
+impl DetachNotice {
+    /// Check the node-id length bound.
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_node_id("node", self.node.as_str())
+    }
+}
+
+/// A parent-signed re-base of a child's local address.
+///
+/// The receiver is the child; `parent_address` is the sender's own (new)
+/// address and `address` is the child's new address, which must equal
+/// `parent_address.child(child.slot)` — a topology rule the receiver enforces
+/// against its own current parent link, so it is deliberately not checked in
+/// [`RebaseNotice::validate`] (which has no view of that link). Added in
+/// [`CONTROL_FORMAT_VERSION`](crate::CONTROL_FORMAT_VERSION) 4 (variant 15).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebaseNotice {
+    /// The child whose address is being set (must equal the receiver's id).
+    pub node: NodeId,
+    /// The sender's own address, from which `address` must descend by one slot.
+    pub parent_address: OctAddr,
+    /// The child's new asserted address.
+    pub address: OctAddr,
+    /// Epoch of this re-base (`>= 1`), carried for a future re-homing protocol.
+    ///
+    /// v1 has a single generation and the node does **not** enforce ordering:
+    /// the receiver applies a notice whenever the derived address differs and
+    /// treats an equal address as an idempotent no-op. Out-of-order/epoch
+    /// handling is a v2 concern.
+    pub generation: u64,
+}
+
+impl RebaseNotice {
+    /// Check the node-id length bound and that `generation >= 1`.
+    ///
+    /// The `address == parent_address.child(slot)` derivation is a topology
+    /// check against the receiver's current parent link and is enforced by the
+    /// node, not here.
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_node_id("node", self.node.as_str())?;
+        if self.generation < 1 {
+            return Err(ControlError::FieldBelowMinimum {
+                field: "generation",
+                value: 0,
+                min: 1,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A child's request that its parent answer with its current
+/// [`ControlReply::Snapshot`](crate::ControlReply::Snapshot).
+///
+/// Used to heal after a missed `Rebase` notice: the snapshot carries the
+/// parent's address and its children's addresses, from which the child derives
+/// its expected address. Self-signed by the requesting node. Added in
+/// [`CONTROL_FORMAT_VERSION`](crate::CONTROL_FORMAT_VERSION) 4 (variant 16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebasePull {
+    /// The requesting child (must equal the signed origin).
+    pub node: NodeId,
+}
+
+impl RebasePull {
+    /// Check the node-id length bound.
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_node_id("node", self.node.as_str())
+    }
+}
+
+/// Reject a node id longer than [`MAX_NODE_ID_LEN`].
+fn validate_node_id(field: &'static str, id: &str) -> Result<(), ControlError> {
+    let len = id.len();
+    if len > MAX_NODE_ID_LEN {
+        return Err(ControlError::FieldTooLong {
+            field,
+            len,
+            max: MAX_NODE_ID_LEN,
+        });
+    }
+    Ok(())
+}
+
 /// An admin's approval of a join that a node queued for approval.
 ///
 /// The enclosing [`SignedControl`](crate::SignedControl) must be signed by the
@@ -357,6 +493,14 @@ pub enum ControlRequest {
     AdminRejectJoin(AdminJoinReject),
     /// Re-send the stored decision for a child as the node's admin.
     AdminRedeliverJoin(AdminRedeliverJoin),
+    /// A child's unilateral request to leave its parent (variant 13, format 4).
+    Exit(ExitRequest),
+    /// A parent's notice it detached a child (variant 14, format 4).
+    DetachNotice(DetachNotice),
+    /// A parent-signed child address re-base (variant 15, format 4).
+    Rebase(RebaseNotice),
+    /// A child's request for the parent's snapshot (variant 16, format 4).
+    RebasePull(RebasePull),
 }
 
 impl ControlRequest {
@@ -375,6 +519,10 @@ impl ControlRequest {
             ControlRequest::AdminApproveJoin(_) => "admin-approve-join",
             ControlRequest::AdminRejectJoin(_) => "admin-reject-join",
             ControlRequest::AdminRedeliverJoin(_) => "admin-redeliver-join",
+            ControlRequest::Exit(_) => "exit",
+            ControlRequest::DetachNotice(_) => "detach-notice",
+            ControlRequest::Rebase(_) => "rebase",
+            ControlRequest::RebasePull(_) => "rebase-pull",
         }
     }
 
@@ -480,6 +628,22 @@ mod tests {
             ControlRequest::AdminRedeliverJoin(AdminRedeliverJoin {
                 child: node("applicant"),
             }),
+            ControlRequest::Exit(ExitRequest {
+                node: node("applicant"),
+                subtree_nodes: 3,
+            }),
+            ControlRequest::DetachNotice(DetachNotice {
+                node: node("applicant"),
+            }),
+            ControlRequest::Rebase(RebaseNotice {
+                node: node("applicant"),
+                parent_address: "0.1".parse().unwrap(),
+                address: "0.1.3".parse().unwrap(),
+                generation: 2,
+            }),
+            ControlRequest::RebasePull(RebasePull {
+                node: node("applicant"),
+            }),
         ]
     }
 
@@ -501,8 +665,201 @@ mod tests {
                 "admin-approve-join",
                 "admin-reject-join",
                 "admin-redeliver-join",
+                "exit",
+                "detach-notice",
+                "rebase",
+                "rebase-pull",
             ]
         );
+    }
+
+    #[test]
+    fn exit_rights_variants_are_not_admin() {
+        for request in [
+            ControlRequest::Exit(ExitRequest {
+                node: node("applicant"),
+                subtree_nodes: 1,
+            }),
+            ControlRequest::DetachNotice(DetachNotice {
+                node: node("applicant"),
+            }),
+            ControlRequest::Rebase(RebaseNotice {
+                node: node("applicant"),
+                parent_address: "0".parse().unwrap(),
+                address: "0.3".parse().unwrap(),
+                generation: 1,
+            }),
+            ControlRequest::RebasePull(RebasePull {
+                node: node("applicant"),
+            }),
+        ] {
+            assert!(!request.is_admin(), "{request:?}");
+            assert!(!is_admin_request(&request), "{request:?}");
+        }
+    }
+
+    #[test]
+    fn exit_validate_rejects_zero_subtree_nodes_and_long_node() {
+        let valid = ExitRequest {
+            node: node("applicant"),
+            subtree_nodes: 1,
+        };
+        assert_eq!(valid.validate(), Ok(()));
+
+        let zero = ExitRequest {
+            node: node("applicant"),
+            subtree_nodes: 0,
+        };
+        assert_eq!(
+            zero.validate(),
+            Err(ControlError::FieldBelowMinimum {
+                field: "subtree_nodes",
+                value: 0,
+                min: 1,
+            })
+        );
+
+        let long = ExitRequest {
+            node: node(&"n".repeat(MAX_NODE_ID_LEN + 1)),
+            subtree_nodes: 1,
+        };
+        assert_eq!(
+            long.validate(),
+            Err(ControlError::FieldTooLong {
+                field: "node",
+                len: MAX_NODE_ID_LEN + 1,
+                max: MAX_NODE_ID_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn detach_notice_and_rebase_pull_validate_node_bound() {
+        assert_eq!(DetachNotice { node: node("c") }.validate(), Ok(()));
+        assert_eq!(RebasePull { node: node("c") }.validate(), Ok(()));
+        for err in [
+            DetachNotice {
+                node: node(&"n".repeat(MAX_NODE_ID_LEN + 1)),
+            }
+            .validate(),
+            RebasePull {
+                node: node(&"n".repeat(MAX_NODE_ID_LEN + 1)),
+            }
+            .validate(),
+        ] {
+            assert_eq!(
+                err,
+                Err(ControlError::FieldTooLong {
+                    field: "node",
+                    len: MAX_NODE_ID_LEN + 1,
+                    max: MAX_NODE_ID_LEN,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn rebase_validate_rejects_zero_generation() {
+        let notice = RebaseNotice {
+            node: node("c"),
+            parent_address: "0".parse().unwrap(),
+            address: "0.3".parse().unwrap(),
+            generation: 1,
+        };
+        assert_eq!(notice.validate(), Ok(()));
+
+        let zero = RebaseNotice {
+            generation: 0,
+            ..notice.clone()
+        };
+        assert_eq!(
+            zero.validate(),
+            Err(ControlError::FieldBelowMinimum {
+                field: "generation",
+                value: 0,
+                min: 1,
+            })
+        );
+
+        let long = RebaseNotice {
+            node: node(&"n".repeat(MAX_NODE_ID_LEN + 1)),
+            ..notice
+        };
+        assert_eq!(
+            long.validate(),
+            Err(ControlError::FieldTooLong {
+                field: "node",
+                len: MAX_NODE_ID_LEN + 1,
+                max: MAX_NODE_ID_LEN,
+            })
+        );
+    }
+
+    /// Pin the frozen postcard field order of a struct by asserting its encoding
+    /// equals the concatenation of its fields' encodings, in declaration order.
+    fn assert_postcard_field_order<T: Serialize>(value: &T, fields: &[Vec<u8>]) {
+        let mut expected = Vec::new();
+        for field in fields {
+            expected.extend_from_slice(field);
+        }
+        assert_eq!(
+            postcard::to_allocvec(value).unwrap(),
+            expected,
+            "field order changed"
+        );
+    }
+
+    #[test]
+    fn exit_rights_variants_frozen_field_order() {
+        let exit = ExitRequest {
+            node: node("applicant"),
+            subtree_nodes: 7,
+        };
+        assert_postcard_field_order(
+            &exit,
+            &[
+                postcard::to_allocvec(&exit.node).unwrap(),
+                postcard::to_allocvec(&exit.subtree_nodes).unwrap(),
+            ],
+        );
+
+        let detach = DetachNotice {
+            node: node("applicant"),
+        };
+        assert_postcard_field_order(&detach, &[postcard::to_allocvec(&detach.node).unwrap()]);
+
+        let rebase = RebaseNotice {
+            node: node("applicant"),
+            parent_address: "0.1".parse().unwrap(),
+            address: "0.1.3".parse().unwrap(),
+            generation: 9,
+        };
+        assert_postcard_field_order(
+            &rebase,
+            &[
+                postcard::to_allocvec(&rebase.node).unwrap(),
+                postcard::to_allocvec(&rebase.parent_address).unwrap(),
+                postcard::to_allocvec(&rebase.address).unwrap(),
+                postcard::to_allocvec(&rebase.generation).unwrap(),
+            ],
+        );
+        // `parent_address` and `address` are both `OctAddr`: swapping them keeps
+        // the length but must change the encoding, so this catches a reorder the
+        // plain round-trip would miss.
+        let swapped = RebaseNotice {
+            parent_address: rebase.address.clone(),
+            address: rebase.parent_address.clone(),
+            ..rebase.clone()
+        };
+        assert_ne!(
+            postcard::to_allocvec(&rebase).unwrap(),
+            postcard::to_allocvec(&swapped).unwrap()
+        );
+
+        let pull = RebasePull {
+            node: node("applicant"),
+        };
+        assert_postcard_field_order(&pull, &[postcard::to_allocvec(&pull.node).unwrap()]);
     }
 
     #[test]

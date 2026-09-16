@@ -10,7 +10,9 @@ use cawala_control::{
 };
 use cawala_ledger::{AccountRef, Amount, LedgerPubKey, commitment_hash, verify_chain};
 use cawala_msg::{MSG_CONTROL_V1, MSG_LEDGER_V1, MSG_SETTLE_V1};
-use cawala_node::control::spawn_control_node_live;
+use cawala_node::control::{
+    pull_rebase_from_parent, spawn_control_node_live, sweep_pending_rebase,
+};
 use cawala_node::msg::{
     NeighborSource, dispatch_control_envelope, dispatch_ledger_envelope, dispatch_settle_envelope,
     sweep_settlements,
@@ -207,6 +209,13 @@ enum ControlCommand {
         #[arg(long, value_name = "ENDPOINT_ID")]
         node: String,
     },
+    /// Leave the current parent and become the root (`0`) of an independent
+    /// network, taking this node's whole subtree with it.
+    ///
+    /// Best-effort: the parent is notified so it drops this link, but the local
+    /// exit (re-root at `0` + re-base the children) succeeds even if the parent
+    /// is unreachable.
+    Exit,
     /// Manage this node's admin grants (operator-signed delegations).
     Admin {
         #[command(subcommand)]
@@ -333,10 +342,13 @@ enum LedgerCommand {
     /// order journal, then runs the ledger crate's `net`. `RouteInvalid`
     /// findings are printed as advisories (topology is live control-plane
     /// state, so route findings need operator adjudication) and do not fail the
-    /// command unless `--strict` is given. The ledger crate only collapses
-    /// flows (`nets`) when there are **zero** findings, so a route advisory
-    /// will suppress nets until resolved; pass `--topology` with a saved
-    /// snapshot to remove stale-geography false positives.
+    /// command unless `--strict` is given. Flows (`nets`) collapse only when no
+    /// finding `Finding::suppresses_netting()`: `Detached` and
+    /// `StaleChildLink` are exempt (an exited subtree is a legitimate
+    /// independent network), while `RouteInvalid` and the hard findings still
+    /// suppress, so a route advisory will suppress nets until resolved; pass
+    /// `--topology` with a saved snapshot to remove stale-geography false
+    /// positives.
     Net {
         /// Peer data dirs (repeatable). Defaults to the global `--data-dir`.
         #[arg(long, value_name = "DATA_DIR")]
@@ -474,8 +486,9 @@ async fn run(data_dir: PathBuf) -> Result<()> {
 
         // Must stay alive for the accept loop; dropped at process exit.
         // Clone the control handle first: `spawn_control_node_live` takes
-        // ownership, but the drain loop still needs it for routed control.
+        // ownership, but the drain loop and the sweeps still need it.
         let dispatch_control = Arc::clone(&control);
+        let sweep_control = Arc::clone(&control);
         let (router, mut received) =
             spawn_control_node_live(secret_key, source.clone(), config.clone(), control).await?;
         let endpoint = router.endpoint().clone();
@@ -483,6 +496,21 @@ async fn run(data_dir: PathBuf) -> Result<()> {
         println!("EndpointId: {node_id}");
         println!("Address: {address}");
         println!("Serving cawala/ping/0, cawala/msg/0, and cawala/control/0");
+
+        // Startup healing (A3): a node with a parent link asks it for the
+        // current prefix, so a `Rebase` missed while offline converges before
+        // serving. Best effort: an unreachable parent just leaves the node at
+        // its last known address until the next periodic probe.
+        if let Err(err) = pull_rebase_from_parent(
+            &endpoint,
+            &sweep_control,
+            Duration::from_secs(CONTROL_TIMEOUT_SECONDS),
+            now_unix_seconds(),
+        )
+        .await
+        {
+            tracing::warn!(%err, "startup rebase pull failed; keeping the local address");
+        }
 
         // Drain locally delivered envelopes. `Delivered` means "queued": ledger
         // and settlement payloads are dispatched (and applied) here, off the
@@ -554,8 +582,10 @@ async fn run(data_dir: PathBuf) -> Result<()> {
         let sweep_dir = data_dir.clone();
         let sweep_node = node_id.clone();
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        let mut tick: u64 = 0;
         loop {
             ticker.tick().await;
+            tick = tick.wrapping_add(1);
             sweep_settlements(
                 &sweep_endpoint,
                 &sweep_source,
@@ -567,6 +597,28 @@ async fn run(data_dir: PathBuf) -> Result<()> {
                 now_unix_seconds(),
             )
             .await;
+            // Retry topology notices whose immediate dial failed.
+            sweep_pending_rebase(&sweep_endpoint, &sweep_control).await;
+            // Low-frequency healing probe: repeated hop rejections are not
+            // visible to the control engine (routing lives in the msg layer), so
+            // a node with a parent re-asks it for the current prefix every ~30s.
+            // A verified difference re-bases this node and its subtree.
+            if tick.is_multiple_of(6) {
+                match pull_rebase_from_parent(
+                    &sweep_endpoint,
+                    &sweep_control,
+                    Duration::from_secs(CONTROL_TIMEOUT_SECONDS),
+                    now_unix_seconds(),
+                )
+                .await
+                {
+                    Ok(true) => info!("healing rebase pull applied a new address"),
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::debug!(%err, "healing rebase pull did not apply");
+                    }
+                }
+            }
         }
     }
 
@@ -1000,6 +1052,26 @@ fn describe_finding(finding: &cawala_ledger::Finding) -> String {
             "overdraw node={node} account={} deficit={deficit}",
             netting_harness::account_label(account)
         ),
+        Finding::Detached {
+            root,
+            nodes,
+            stranded_parent,
+            parent_balance,
+        } => format!(
+            "detached root={root} nodes=[{}] stranded_parent={} parent_balance={parent_balance}",
+            nodes
+                .iter()
+                .map(|node| node.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            stranded_parent
+                .as_ref()
+                .map(|parent| parent.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        Finding::StaleChildLink { parent, child } => {
+            format!("stale_child_link parent={parent} child={child}")
+        }
     }
 }
 
@@ -1464,6 +1536,82 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
         }
         ControlCommand::Query { node } => {
             send_control_command(&secret_key, &node, me, &operator, ControlRequest::Query).await?;
+        }
+        ControlCommand::Exit => {
+            let now = now_unix_seconds();
+            let mut engine = ControlNode::open(data_dir, &node_id, operator.clone())?;
+            let Some(parent) = engine
+                .record()
+                .parent
+                .as_ref()
+                .map(|link| link.parent_id.clone())
+            else {
+                anyhow::bail!(
+                    "this node has no parent to exit from (it is already a root at address 0)"
+                );
+            };
+            // Operational rule (accepted residual): a clean re-attach needs a
+            // zero `Parent` balance. The severed edge stays a stranded claim, so
+            // re-attaching with a non-zero `Parent` surfaces as a hard
+            // `UnbackedClaim` on the new parent's books (no `EdgeClose` until
+            // v2). Warn only: exit is a right and must still succeed, and an
+            // unreadable ledger must not block it either.
+            if let Ok(service) = LedgerService::open(data_dir, &node_id)
+                && let Some(balance) = service.ledger().balances().parent_balance()
+                && balance > Amount::ZERO
+            {
+                eprintln!(
+                    "warning: Parent account balance is {balance}; a clean re-attach needs a \
+                     zero Parent balance, otherwise the stranded claim surfaces as a hard \
+                     UnbackedClaim on the new parent's books. The exit still succeeds."
+                );
+            }
+            // Best-effort: tell the parent to drop this link. An unreachable
+            // parent must never block the unilateral exit.
+            let signed = engine.sign_exit_request(now)?;
+            match send_control(&secret_key, &parent, &signed).await {
+                Ok(reply) => {
+                    println!("parent {parent}:");
+                    print_reply(&reply);
+                }
+                Err(err) => {
+                    // Best-effort and audited, never fatal: the local exit is
+                    // unilateral, and a missed parent notification is healed by
+                    // the parent's own peer-row retention.
+                    eprintln!("warning: could not notify parent {parent}: {err}");
+                    cawala_node::audit::append(
+                        data_dir,
+                        serde_json::json!({
+                            "event": "exit-parent-notify-failed",
+                            "node": node_id,
+                            "parent": parent,
+                            "detail": err.to_string(),
+                        }),
+                    );
+                }
+            }
+            // Apply locally regardless: re-root at `0` and queue a `Rebase` per
+            // child, then deliver them best-effort.
+            engine.apply_exit(now)?;
+            for item in engine.take_outbound() {
+                if let Err(err) = send_control(&secret_key, item.target.as_str(), &item.signed).await
+                {
+                    eprintln!("warning: could not re-base child {}: {err}", item.target);
+                    cawala_node::audit::append(
+                        data_dir,
+                        serde_json::json!({
+                            "event": "exit-rebase-notify-failed",
+                            "node": node_id,
+                            "child": item.target.to_string(),
+                            "detail": err.to_string(),
+                        }),
+                    );
+                }
+            }
+            println!(
+                "exited: now root address 0 with {} child(ren)",
+                engine.record().children.len()
+            );
         }
         ControlCommand::Admin { command } => {
             admin_command(data_dir, &node_id, &operator, command)?;

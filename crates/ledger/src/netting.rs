@@ -160,6 +160,107 @@ pub enum Finding {
         /// The magnitude by which the balance is below zero.
         deficit: i128,
     },
+    /// An independent (exited) subtree that is a weakly connected component of
+    /// its own, rooted at `0`. Its root carries a stranded `Parent` claim the
+    /// severed old parent never settled.
+    ///
+    /// This replaces the old single-root hard failure for islands. It is an
+    /// **advisory**: the exit is a legitimate topology event, and the stranded
+    /// claim is tolerated (the M5 "exit rights" decision), so it is visible but
+    /// never gates reconciliation into a hard failure.
+    Detached {
+        /// The island's root node (address `0`).
+        root: NodeId,
+        /// The island's member node ids (sorted).
+        nodes: Vec<NodeId>,
+        /// The severed old parent, when a stale parent-side link identified it.
+        stranded_parent: Option<NodeId>,
+        /// The island root's `Parent` asset: its stranded claim.
+        parent_balance: Amount,
+    },
+    /// A record's own `parent` link disagrees with a stale parent-side
+    /// `children` row. The child's link wins; this names the stale row, which
+    /// was ignored.
+    ///
+    /// Advisory for the same reason as [`Finding::Detached`]: a unilateral exit
+    /// can leave the old parent listing a child that has already rebased to
+    /// `0`.
+    StaleChildLink {
+        /// The parent named by the stale `children` row.
+        parent: NodeId,
+        /// The child whose own (authoritative) link won.
+        child: NodeId,
+    },
+}
+
+impl Finding {
+    /// Whether this finding is **advisory**: visible to the operator but not a
+    /// hard failure.
+    ///
+    /// Advisories are live-topology signals that need operator adjudication
+    /// rather than a rejected reconciliation:
+    ///
+    /// - [`Finding::RouteInvalid`]: the topology a route was audited against is
+    ///   live control-plane state (e.g. a re-slotted child);
+    /// - [`Finding::Detached`]: an exited subtree is a legitimate independent
+    ///   network with a tolerated stranded claim;
+    /// - [`Finding::StaleChildLink`]: a stale parent-side link from before an
+    ///   exit.
+    ///
+    /// Classification is independent of the netting gate: a caller must apply
+    /// [`Finding::suppresses_netting`] to decide whether flows may collapse.
+    pub fn is_advisory(&self) -> bool {
+        matches!(
+            self,
+            Finding::RouteInvalid { .. }
+                | Finding::Detached { .. }
+                | Finding::StaleChildLink { .. }
+        )
+    }
+
+    /// Whether this finding is a soundness objection that **suppresses the
+    /// netting collapse**.
+    ///
+    /// Every finding suppresses except the two steady-state exit signals:
+    ///
+    /// - [`Finding::Detached`] — an exited subtree is a legitimate independent
+    ///   network; its stranded claim is tolerated by design, so it must not
+    ///   permanently disable reconciliation of the (still healthy) components;
+    /// - [`Finding::StaleChildLink`] — a stale parent-side link from before an
+    ///   exit, likewise a steady state.
+    ///
+    /// [`Finding::RouteInvalid`] **keeps suppressing** (as it always has): an
+    /// unroutable order is a live-topology signal that needs adjudication
+    /// before flows are collapsed. `Fork`/`ChainInvalid`/`MirrorMismatch`/
+    /// `Replay`/`Overdraw` all suppress too.
+    ///
+    /// This is deliberately separate from [`Finding::is_advisory`]: severity
+    /// (exit code) and the netting gate are orthogonal. `RouteInvalid` is
+    /// advisory yet suppresses; `Detached`/`StaleChildLink` are advisory and do
+    /// not.
+    pub fn suppresses_netting(&self) -> bool {
+        !matches!(
+            self,
+            Finding::Detached { .. } | Finding::StaleChildLink { .. }
+        )
+    }
+}
+
+/// One independent network for a partitioned audit: a normal single-root
+/// topology, plus the severed old parent of its root when a stale link
+/// identified one.
+///
+/// A network that has split through exit is a set of weakly connected
+/// components, each rooted at `0`. Each component is audited exactly like an
+/// ordinary single-root network by [`net_partition`]; [`Finding::Detached`]
+/// reports the islands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetComponent {
+    /// The component's single-root topology.
+    pub topology: Topology,
+    /// The severed old parent of this component's root, when a stale link
+    /// identified it (`None` for the primary component).
+    pub stranded_parent: Option<NodeId>,
 }
 
 /// Verify that the on-ledger cascade for `order` exactly matches the unique
@@ -285,11 +386,58 @@ pub fn verify_cascade(
 ///
 /// # Output gate
 ///
-/// `nets` is only populated when `findings` is empty. A reconciliation with any
-/// anomaly is not a sound basis for settlement collapse, so callers must treat
-/// a non-empty `findings` as "do not net yet".
+/// `nets` is populated only when no finding objects to collapsing flows
+/// ([`Finding::suppresses_netting`]). `Fork`/`ChainInvalid`/`MirrorMismatch`/
+/// `Replay`/`Overdraw`/`RouteInvalid` suppress; the steady-state exit signals
+/// `Detached`/`StaleChildLink` do not, so an island never permanently disables
+/// reconciliation. Callers still classify findings with
+/// [`Finding::is_advisory`] for the process exit code.
 pub fn net(
     topology: &Topology,
+    ledgers: &LedgerSet,
+    registry: &PeerRegistry,
+    orders: &[PaymentOrder],
+    commitments: &BTreeMap<NodeId, Vec<SignedCommitment>>,
+) -> NettingReport {
+    net_partition(
+        &[NetComponent {
+            topology: topology.clone(),
+            stranded_parent: None,
+        }],
+        ledgers,
+        registry,
+        orders,
+        commitments,
+    )
+}
+
+/// Run a full netting reconciliation over a **partition** of the network.
+///
+/// Exiting a subtree rebases it onto root `0`, so the whole tree can
+/// legitimately contain several weakly connected components, each rooted at
+/// `0`. `components[0]` is the **primary** network and each later component is
+/// an island; every component is a normal single-root tree and is audited
+/// exactly as [`net`] audits one, with these differences:
+///
+/// 1. **Chains** and **overdraw** are global (one pass over every ledger).
+/// 2. **Mirrors** are audited per component (island-internal parent/child edges
+///    are compared normally). Each island additionally yields a
+///    [`Finding::Detached`] carrying its root, members, severed parent (when
+///    known) and stranded `Parent` balance.
+/// 3. **Routes** are audited against the order's own component. An order whose
+///    endpoints are in *different* components has no common root and is
+///    reported once as [`Finding::RouteInvalid`].
+/// 4. **Netting collapse** is global, as in [`net`], and runs unless some
+///    finding suppresses netting (see [`Finding::suppresses_netting`]).
+///    `Detached` and `StaleChildLink` are steady-state exit signals and do
+///    **not** suppress, so an island's own healthy components still net;
+///    [`Finding::RouteInvalid`] and every hard finding still do.
+///
+/// A severed edge (an island root whose old parent still lists it) is **not**
+/// part of any component topology, so it is reported once via
+/// [`Finding::Detached`] and never as a permanent [`Finding::MirrorMismatch`].
+pub fn net_partition(
+    components: &[NetComponent],
     ledgers: &LedgerSet,
     registry: &PeerRegistry,
     orders: &[PaymentOrder],
@@ -298,18 +446,78 @@ pub fn net(
     let mut findings = Vec::new();
 
     audit_chains(commitments, registry, &mut findings);
-    audit_mirrors(topology, ledgers, &mut findings);
-    audit_routes(orders, topology, ledgers, registry, &mut findings);
+
+    if components.is_empty() {
+        audit_overdraw(ledgers, &mut findings);
+        return NettingReport {
+            findings,
+            nets: Vec::new(),
+        };
+    }
+
+    // Node id -> component index. Components are disjoint by construction, but
+    // keep the first (primary) assignment if a caller supplies overlap.
+    let mut membership: BTreeMap<&str, usize> = BTreeMap::new();
+    for (index, component) in components.iter().enumerate() {
+        for id in component.topology.node_ids() {
+            membership.entry(id.as_str()).or_insert(index);
+        }
+    }
+
+    for (index, component) in components.iter().enumerate() {
+        audit_mirrors(&component.topology, ledgers, &mut findings);
+
+        // Every non-primary component is an independent (exited) network.
+        if index > 0 {
+            let root = NodeId::from(component.topology.root_id());
+            let mut nodes: Vec<NodeId> = component
+                .topology
+                .node_ids()
+                .map(|id| NodeId::from(id.as_str()))
+                .collect();
+            nodes.sort();
+            let parent_balance = ledgers
+                .get(&root)
+                .and_then(|ledger| ledger.balances().parent_balance())
+                .unwrap_or(Amount::ZERO);
+            findings.push(Finding::Detached {
+                root,
+                nodes,
+                stranded_parent: component.stranded_parent.clone(),
+                parent_balance,
+            });
+        }
+    }
+
+    audit_routes_partition(orders, components, &membership, ledgers, registry, &mut findings);
     audit_overdraw(ledgers, &mut findings);
 
-    // Only an anomaly-free reconciliation may collapse flows.
-    let nets = if findings.is_empty() {
-        collapse_nets(ledgers)
-    } else {
+    // Only a reconciliation free of netting-suppressing findings may collapse
+    // flows. `Detached`/`StaleChildLink` are steady-state exit signals and are
+    // deliberately exempt (see `Finding::suppresses_netting`).
+    let nets = if findings.iter().any(Finding::suppresses_netting) {
         Vec::new()
+    } else {
+        collapse_nets(ledgers)
     };
 
     NettingReport { findings, nets }
+}
+
+/// A per-component view of `ledgers`: only the ledgers owned by nodes in
+/// `topology`. Route/replay auditing must be scoped to the order's own
+/// component so a hop that lives in another (now independent) network is not
+/// counted as part of this route.
+fn component_ledgers(ledgers: &LedgerSet, topology: &Topology) -> LedgerSet {
+    let mut subset = LedgerSet::new();
+    for id in topology.node_ids() {
+        let node = NodeId::from(id.as_str());
+        if let Some(ledger) = ledgers.get(&node) {
+            // `insert` fails only on a duplicate, which cannot happen here.
+            let _ = subset.insert(node, ledger.clone());
+        }
+    }
+    subset
 }
 
 /// Every transfer entry backed by `order`'s authorisation hash.
@@ -509,50 +717,101 @@ fn audit_mirrors(topology: &Topology, ledgers: &LedgerSet, findings: &mut Vec<Fi
     }
 }
 
-/// Step 3: audit each order's route, separating replay from misrouting.
+/// Step 3: audit each order's route against its own component, separating
+/// replay from misrouting.
 ///
-/// Entries are selected by the signed authorisation, not the body `payment_id`,
-/// so a rewritten body is audited too. A replay shows up as more authorised
-/// hops than the route has, or as one signing ledger producing several hops.
-fn audit_routes(
+/// An order whose endpoints lie in **different** components has no common root,
+/// so it is reported once as [`Finding::RouteInvalid`] (advisory). Every other
+/// order is audited against the single component its endpoints share, using a
+/// component-scoped ledger view so a hop in another independent network is not
+/// counted.
+fn audit_routes_partition(
     orders: &[PaymentOrder],
-    topology: &Topology,
+    components: &[NetComponent],
+    membership: &BTreeMap<&str, usize>,
     ledgers: &LedgerSet,
     registry: &PeerRegistry,
     findings: &mut Vec<Finding>,
 ) {
-    for order in orders {
-        let payment_id = order.hash();
-        let actual = collect_authorized_transfers(ledgers, order);
-        let expected = expected_hops(topology, order);
-        let expected_len = expected.as_ref().map(|hops| hops.len()).ok();
+    // Lazily build (and cache) a per-component ledger view; most audits are
+    // single-component and never need one.
+    let mut subsets: Vec<Option<LedgerSet>> = vec![None; components.len()];
 
-        // A replay shows up as more on-ledger hops than the route has, or as
-        // one signer producing several hops for the same payment.
-        let too_many = expected_len.is_some_and(|len| actual.len() > len);
-        if too_many || has_duplicate_ledger(&actual) {
-            let expected = expected_len
-                .map(|len| len.to_string())
-                .unwrap_or_else(|| "an unresolvable route".to_string());
-            findings.push(Finding::Replay {
-                payment_id,
+    for order in orders {
+        let from_component = membership.get(order.from.as_str()).copied();
+        let to_component = membership.get(order.to.as_str()).copied();
+
+        if let (Some(from), Some(to)) = (from_component, to_component)
+            && from != to
+        {
+            findings.push(Finding::RouteInvalid {
+                payment_id: order.hash(),
                 reason: format!(
-                    "payer {} replayed payment {} across {} on-ledger hops (expected {})",
-                    order.from,
-                    payment_id.to_hex(),
-                    actual.len(),
-                    expected
+                    "{} -> {} endpoints are in different topology components",
+                    order.from, order.to
                 ),
             });
             continue;
         }
 
-        if let Err(err) = verify_cascade(topology, order, ledgers, registry) {
-            findings.push(Finding::RouteInvalid {
-                payment_id,
-                reason: format!("{} -> {} cascade rejected: {err}", order.from, order.to),
-            });
+        // Both endpoints are in one component, or an endpoint is unknown (fall
+        // back to the primary component so `expected_hops` reports it).
+        let index = from_component.or(to_component).unwrap_or(0);
+        let Some(component) = components.get(index) else {
+            continue;
+        };
+        if subsets[index].is_none() {
+            subsets[index] = Some(component_ledgers(ledgers, &component.topology));
         }
+        let scoped = subsets[index]
+            .as_ref()
+            .expect("component ledger view was just built");
+        audit_one_order(order, &component.topology, scoped, registry, findings);
+    }
+}
+
+/// Audit one order's route/replay against a single component.
+///
+/// Entries are selected by the signed authorisation, not the body `payment_id`,
+/// so a rewritten body is audited too. A replay shows up as more authorised
+/// hops than the route has, or as one signing ledger producing several hops.
+fn audit_one_order(
+    order: &PaymentOrder,
+    topology: &Topology,
+    ledgers: &LedgerSet,
+    registry: &PeerRegistry,
+    findings: &mut Vec<Finding>,
+) {
+    let payment_id = order.hash();
+    let actual = collect_authorized_transfers(ledgers, order);
+    let expected = expected_hops(topology, order);
+    let expected_len = expected.as_ref().map(|hops| hops.len()).ok();
+
+    // A replay shows up as more on-ledger hops than the route has, or as
+    // one signer producing several hops for the same payment.
+    let too_many = expected_len.is_some_and(|len| actual.len() > len);
+    if too_many || has_duplicate_ledger(&actual) {
+        let expected = expected_len
+            .map(|len| len.to_string())
+            .unwrap_or_else(|| "an unresolvable route".to_string());
+        findings.push(Finding::Replay {
+            payment_id,
+            reason: format!(
+                "payer {} replayed payment {} across {} on-ledger hops (expected {})",
+                order.from,
+                payment_id.to_hex(),
+                actual.len(),
+                expected
+            ),
+        });
+        return;
+    }
+
+    if let Err(err) = verify_cascade(topology, order, ledgers, registry) {
+        findings.push(Finding::RouteInvalid {
+            payment_id,
+            reason: format!("{} -> {} cascade rejected: {err}", order.from, order.to),
+        });
     }
 }
 

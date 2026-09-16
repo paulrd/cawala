@@ -20,10 +20,10 @@ use std::collections::BTreeMap;
 
 use cawala_ledger::{
     AccountRef, Amount, AuthRef, EdgeAccount, Entry, EntryBody, Finding, Hash, HopRole, Ledger,
-    LedgerLog, LedgerSecretKey, LedgerSet, MemLog, MirrorDirection, NetTransfer, NodeId,
-    OperatorSecretKey, PaymentOrder, PeerKeys, PeerRegistry, PeerRole, PlannedHop, Posting,
+    LedgerLog, LedgerSecretKey, LedgerSet, MemLog, MirrorDirection, NetComponent, NetTransfer,
+    NodeId, OperatorSecretKey, PaymentOrder, PeerKeys, PeerRegistry, PeerRole, PlannedHop, Posting,
     SettlementPlan, SignedAmount, SignedCommitment, SignedEntry, build_commitment, entry_hop_accounts,
-    execute_plan, net, plan_transfer, verify_cascade,
+    execute_plan, net, net_partition, plan_transfer, verify_cascade,
 };
 use cawala_topology::{ChildKind, Topology};
 
@@ -1104,4 +1104,385 @@ fn entry_hop_accounts_is_exported_and_enforces_canonical_shape() {
         ],
     );
     assert!(entry_hop_accounts(&with_parent, HopRole::Direct).is_err());
+}
+
+// ── Component-aware audit (M5 exit rights, P4) ────────────────────────────
+
+/// Island-internal parent/child edges are audited exactly like a single-root
+/// tree's, and the island itself is reported once as an advisory `Detached`.
+#[test]
+fn island_internal_edges_are_compared_and_island_is_detached() {
+    let mut primary = Topology::new_root("R");
+    primary.add_node("A", ChildKind::Node).unwrap();
+    primary.attach("R", "A", Some(0)).unwrap();
+
+    let mut island = Topology::new_root("X");
+    island.add_node("Y", ChildKind::Node).unwrap();
+    island.add_node("uY", ChildKind::User).unwrap();
+    island.attach("X", "Y", Some(0)).unwrap();
+    island.attach("Y", "uY", Some(0)).unwrap();
+
+    let (r_key, a_key, x_key, y_key) = (k(101), k(102), k(103), k(104));
+    let mut set = LedgerSet::new();
+    set.insert(n("R"), Ledger::new_root(r_key.public())).unwrap();
+    set.insert(n("A"), Ledger::new_non_root(a_key.public()))
+        .unwrap();
+    set.insert(n("X"), Ledger::new_non_root(x_key.public()))
+        .unwrap();
+    set.insert(n("Y"), Ledger::new_non_root(y_key.public()))
+        .unwrap();
+
+    // X opens a liability to Y but never funds it; Y holds a 100 Parent claim.
+    open(
+        set.get_mut(&n("X")).unwrap(),
+        &x_key,
+        "Y",
+        ChildKind::Node,
+    );
+    open(
+        set.get_mut(&n("Y")).unwrap(),
+        &y_key,
+        "uY",
+        ChildKind::User,
+    );
+    descend(set.get_mut(&n("Y")).unwrap(), &y_key, "uY", 100);
+
+    let components = vec![
+        NetComponent {
+            topology: primary,
+            stranded_parent: None,
+        },
+        NetComponent {
+            topology: island,
+            stranded_parent: Some(n("P")),
+        },
+    ];
+    let report = net_partition(&components, &set, &PeerRegistry::new(), &[], &BTreeMap::new());
+
+    let mismatch = report.findings.iter().find_map(|f| match f {
+        Finding::MirrorMismatch {
+            edge,
+            parent_view,
+            child_view,
+            direction,
+        } if edge.parent == n("X") && edge.child == n("Y") => {
+            Some((*parent_view, *child_view, *direction))
+        }
+        _ => None,
+    });
+    assert_eq!(
+        mismatch,
+        Some((Amount::ZERO, Amount::new(100), MirrorDirection::UnbackedClaim)),
+        "island edge X->Y must be compared normally, got {:?}",
+        report.findings
+    );
+
+    let detached: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| matches!(f, Finding::Detached { .. }))
+        .collect();
+    assert_eq!(detached.len(), 1, "expected one Detached island");
+    assert!(detached[0].is_advisory());
+}
+
+/// A severed pair (the island root's stranded `Parent` claim) is reported once
+/// as `Detached` and never as a permanent `MirrorMismatch`.
+#[test]
+fn severed_pair_is_detached_once_and_never_a_mirror_mismatch() {
+    let mut primary = Topology::new_root("R");
+    primary.add_node("A", ChildKind::Node).unwrap();
+    primary.attach("R", "A", Some(0)).unwrap();
+
+    let island = Topology::new_root("X");
+    let x_key = k(103);
+    let mut set = LedgerSet::new();
+    set.insert(n("R"), Ledger::new_root(k(101).public()))
+        .unwrap();
+    set.insert(n("A"), Ledger::new_non_root(k(102).public()))
+        .unwrap();
+    set.insert(n("X"), Ledger::new_non_root(x_key.public()))
+        .unwrap();
+
+    // X exited: it kept a stranded Parent claim from its old parent P.
+    open(
+        set.get_mut(&n("X")).unwrap(),
+        &x_key,
+        "uX",
+        ChildKind::User,
+    );
+    descend(set.get_mut(&n("X")).unwrap(), &x_key, "uX", 100);
+
+    let components = vec![
+        NetComponent {
+            topology: primary,
+            stranded_parent: None,
+        },
+        NetComponent {
+            topology: island,
+            stranded_parent: Some(n("P")),
+        },
+    ];
+    let report = net_partition(&components, &set, &PeerRegistry::new(), &[], &BTreeMap::new());
+
+    assert!(
+        report
+            .findings
+            .iter()
+            .all(|f| !matches!(f, Finding::MirrorMismatch { .. })),
+        "the severed pair must not be a MirrorMismatch: {:?}",
+        report.findings
+    );
+    assert_eq!(
+        report.findings,
+        vec![Finding::Detached {
+            root: n("X"),
+            nodes: vec![n("X")],
+            stranded_parent: Some(n("P")),
+            parent_balance: Amount::new(100),
+        }],
+        "the severed pair must be reported exactly once as Detached"
+    );
+    assert!(report.findings[0].is_advisory());
+}
+
+/// An order whose endpoints are in different components has no common root and
+/// is reported once as an advisory `RouteInvalid`.
+#[test]
+fn cross_component_order_is_route_invalid_advisory() {
+    let mut primary = Topology::new_root("R");
+    primary.add_node("A", ChildKind::Node).unwrap();
+    primary.add_node("uA", ChildKind::User).unwrap();
+    primary.attach("R", "A", Some(0)).unwrap();
+    primary.attach("A", "uA", Some(0)).unwrap();
+
+    let mut island = Topology::new_root("X");
+    island.add_node("uX", ChildKind::User).unwrap();
+    island.attach("X", "uX", Some(0)).unwrap();
+
+    let mut set = LedgerSet::new();
+    set.insert(n("R"), Ledger::new_root(k(101).public()))
+        .unwrap();
+    set.insert(n("A"), Ledger::new_non_root(k(102).public()))
+        .unwrap();
+    set.insert(n("X"), Ledger::new_non_root(k(103).public()))
+        .unwrap();
+
+    let components = vec![
+        NetComponent {
+            topology: primary,
+            stranded_parent: None,
+        },
+        NetComponent {
+            topology: island,
+            stranded_parent: None,
+        },
+    ];
+    let order = order("uA", "uX", 10, 1);
+    let report = net_partition(
+        &components,
+        &set,
+        &PeerRegistry::new(),
+        std::slice::from_ref(&order),
+        &BTreeMap::new(),
+    );
+
+    let route = report
+        .findings
+        .iter()
+        .find(|f| matches!(f, Finding::RouteInvalid { payment_id, .. } if *payment_id == order.hash()))
+        .expect("a cross-component order must be RouteInvalid");
+    assert!(route.is_advisory());
+    assert!(report.nets.is_empty());
+}
+
+/// A re-attached stranded pair is a normal single-root edge and surfaces once
+/// as an `UnbackedClaim` mirror mismatch.
+#[test]
+fn reattached_stranded_pair_is_reported_exactly_once() {
+    let mut topo = Topology::new_root("R");
+    topo.add_node("A", ChildKind::Node).unwrap();
+    topo.attach("R", "A", Some(0)).unwrap();
+
+    let r_key = k(101);
+    let a_key = k(102);
+    let mut set = LedgerSet::new();
+    set.insert(n("R"), Ledger::new_root(r_key.public()))
+        .unwrap();
+    set.insert(n("A"), Ledger::new_non_root(a_key.public()))
+        .unwrap();
+
+    // A re-attached but R never extended Child(A): A's stranded Parent remains.
+    open(
+        set.get_mut(&n("A")).unwrap(),
+        &a_key,
+        "uA",
+        ChildKind::User,
+    );
+    descend(set.get_mut(&n("A")).unwrap(), &a_key, "uA", 100);
+
+    let report = net(&topo, &set, &PeerRegistry::new(), &[], &BTreeMap::new());
+    let mismatches: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| matches!(f, Finding::MirrorMismatch { .. }))
+        .collect();
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "the re-attached stranded pair must surface exactly once: {:?}",
+        report.findings
+    );
+    assert!(matches!(
+        mismatches[0],
+        Finding::MirrorMismatch {
+            direction: MirrorDirection::UnbackedClaim,
+            ..
+        }
+    ));
+}
+
+// ── Netting gate: exit advisories must not suppress `nets` (G1) ───────────
+
+/// Every finding suppresses netting except the two steady-state exit signals;
+/// `RouteInvalid` keeps suppressing.
+#[test]
+fn suppresses_netting_rule_is_exact() {
+    let det = Finding::Detached {
+        root: n("X"),
+        nodes: vec![n("X")],
+        stranded_parent: None,
+        parent_balance: Amount::ZERO,
+    };
+    let stale = Finding::StaleChildLink {
+        parent: n("P"),
+        child: n("X"),
+    };
+    let route = Finding::RouteInvalid {
+        payment_id: Hash::from_bytes([1u8; 32]),
+        reason: "test".to_string(),
+    };
+    let replay = Finding::Replay {
+        payment_id: Hash::from_bytes([2u8; 32]),
+        reason: "test".to_string(),
+    };
+    let chain = Finding::ChainInvalid {
+        node: n("N"),
+        reason: "test".to_string(),
+    };
+    let mirror = Finding::MirrorMismatch {
+        edge: EdgeAccount {
+            parent: n("N"),
+            child: n("X"),
+        },
+        parent_view: Amount::ZERO,
+        child_view: Amount::new(1),
+        direction: MirrorDirection::UnbackedClaim,
+    };
+    let overdraw = Finding::Overdraw {
+        node: n("N"),
+        account: AccountRef::Parent,
+        deficit: 1,
+    };
+
+    assert!(!det.suppresses_netting(), "Detached must not suppress");
+    assert!(!stale.suppresses_netting(), "StaleChildLink must not suppress");
+    // Advisory severity does not imply a free pass at the netting gate.
+    assert!(route.is_advisory());
+    assert!(route.suppresses_netting(), "RouteInvalid must keep suppressing");
+    assert!(replay.suppresses_netting());
+    assert!(chain.suppresses_netting());
+    assert!(mirror.suppresses_netting());
+    assert!(overdraw.suppresses_netting());
+}
+
+/// An island (`Detached`, advisory) with no hard finding still collapses nets
+/// for the healthy components.
+#[test]
+fn island_without_hard_findings_still_nets() {
+    let mut fx = Fixture::new();
+    let order = order("uA", "uB", 100, 1);
+    let auth = order.authorize(&op(11)).unwrap();
+    let plan = plan_transfer(&fx.topo, &order, &auth, &fx.set, 42).unwrap();
+    execute_plan(&plan, &mut fx.set, &fx.keys, &fx.registry, 50).unwrap();
+
+    let components = vec![
+        NetComponent {
+            topology: fx.topo.clone(),
+            stranded_parent: None,
+        },
+        NetComponent {
+            topology: Topology::new_root("X"),
+            stranded_parent: None,
+        },
+    ];
+    let report = net_partition(
+        &components,
+        &fx.set,
+        &fx.registry,
+        std::slice::from_ref(&order),
+        &BTreeMap::new(),
+    );
+
+    assert!(
+        report.findings.iter().all(|f| matches!(f, Finding::Detached { .. })),
+        "the only finding must be the Detached island: {:?}",
+        report.findings
+    );
+    assert_eq!(
+        report.nets,
+        vec![NetTransfer {
+            parent: n("R"),
+            from: n("A"),
+            to: n("B"),
+            amount: Amount::new(100),
+        }],
+        "a Detached advisory must not suppress the healthy components' nets"
+    );
+}
+
+/// A hard finding alongside an island keeps `nets` empty (the island does not
+/// rescue a genuine soundness objection).
+#[test]
+fn hard_finding_plus_island_suppresses_nets() {
+    let mut fx = Fixture::new();
+    let order = order("uA", "uB", 100, 1);
+    let auth = order.authorize(&op(11)).unwrap();
+    let plan = plan_transfer(&fx.topo, &order, &auth, &fx.set, 42).unwrap();
+    execute_plan(&plan, &mut fx.set, &fx.keys, &fx.registry, 50).unwrap();
+
+    // A descends to L_A without R extending it: a hard MirrorMismatch.
+    let a_key = fx.keys[&n("A")].clone();
+    descend(fx.set.get_mut(&n("A")).unwrap(), &a_key, "L_A", 50);
+
+    let components = vec![
+        NetComponent {
+            topology: fx.topo.clone(),
+            stranded_parent: None,
+        },
+        NetComponent {
+            topology: Topology::new_root("X"),
+            stranded_parent: None,
+        },
+    ];
+    let report = net_partition(
+        &components,
+        &fx.set,
+        &fx.registry,
+        std::slice::from_ref(&order),
+        &BTreeMap::new(),
+    );
+
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::MirrorMismatch { .. })));
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::Detached { .. })));
+    assert!(
+        report.nets.is_empty(),
+        "a hard MirrorMismatch must keep suppressing even with an island present"
+    );
 }

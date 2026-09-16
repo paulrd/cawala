@@ -62,6 +62,8 @@ export const JOIN_OUTCOME = {
 export const CONTROL_EVENT = {
   ACCEPTED: 'accepted',
   REJECTED: 'rejected',
+  /** The leaf left (or was detached from) its parent: parent and address cleared. */
+  DETACHED: 'detached',
 };
 
 /**

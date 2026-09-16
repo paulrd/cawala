@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 
 use cawala_control::{
     AdminJoinApprove, AdminJoinReject, AdminRedeliverJoin, CONTROL_ALPN, CONTROL_REQUEST_TTL_SECS,
-    ChildKind, ControlReply, ControlRequest, Invite, JoinRequest, NodeId, OperatorSecretKey,
-    RejectCode, SignedControl,
+    ChildKind, ControlReply, ControlRequest, ExitRequest, Invite, JoinRequest, NodeId,
+    OperatorSecretKey, RejectCode, SignedControl,
 };
 use cawala_msg::{
     Ack, AckStatus, BalanceQueryV1, Envelope, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
@@ -52,11 +52,12 @@ use crate::control::{
     routed_request_envelope, should_try_routed, sign_admin_request, verify_routed_reply_bytes,
 };
 use crate::dto::{
-    AdminActionDto, AdminSnapshotDto, ControlEventDto, JoinOutcome, JoinStatus, LedgerEventDto,
-    LedgerStatusDto, PaymentOutcome, SnapshotDto, parse_operator_hex, reject_code_str,
+    AdminActionDto, AdminSnapshotDto, ControlEventDto, JoinOutcome, JoinStatus, LeaveOutcome,
+    LedgerEventDto, LedgerStatusDto, PaymentOutcome, SnapshotDto, parse_operator_hex,
+    reject_code_str,
 };
 use crate::ledger_state::LedgerStateV1;
-use crate::state::{LocalStateV1, ParentLink};
+use crate::state::{LocalStateV1, ParentLink, Transition};
 
 /// WASM entry point, called once when the module is instantiated.
 #[wasm_bindgen(start)]
@@ -821,6 +822,68 @@ impl ClientNode {
     /// A local summary of the join handshake state.
     pub fn join_status(&self) -> JoinStatus {
         JoinStatus::from_state(&self.control.lock_state())
+    }
+
+    /// Leave the current parent: sign an [`ExitRequest`], best-effort deliver
+    /// it to the parent over `cawala/control/0`, then clear the local parent
+    /// and address **regardless of the reply**.
+    ///
+    /// Requires a joined state (an assigned address and a parent link). A
+    /// browser is a `User` leaf, so leaving clears both links (there is no
+    /// meaningful root `0` leaf). The parent notice is best-effort and
+    /// eventual-convergence: even when the send fails, times out, or the parent
+    /// refuses, the local state is cleared and the caller gets
+    /// `status == "detached"`, so an unreachable parent cannot trap the user.
+    /// `subtree_nodes` is `1` — audit-only, and a browser leaf has no children.
+    ///
+    /// A `"detached"` [`ControlEventDto`] is queued for
+    /// [`ClientNode::try_recv_control_event`] so the UI can react. The returned
+    /// `delivery` reports the former parent's reply bucket and is diagnostic
+    /// only.
+    pub async fn leave(&self) -> Result<LeaveOutcome, JsError> {
+        let operator = self
+            .control
+            .operator
+            .clone()
+            .ok_or_else(|| JsError::new("client has no control identity; use spawn_control"))?;
+        // Require a joined state up front: leaving an unjoined client is a
+        // caller error, not a silent no-op.
+        let (_self_addr, parent) = self.joined_context()?;
+        let me = NodeId::from(self.control.node_id().to_string());
+
+        let mut nonce_bytes = [0u8; 8];
+        getrandom::fill(&mut nonce_bytes).map_err(to_js_err)?;
+        let signed = SignedControl::authorize(
+            me.clone(),
+            &operator,
+            u64::from_le_bytes(nonce_bytes),
+            now_unix_seconds().saturating_add(CONTROL_REQUEST_TTL_SECS),
+            ControlRequest::Exit(ExitRequest {
+                node: me,
+                subtree_nodes: 1,
+            }),
+        )
+        .map_err(to_js_err)?;
+
+        // Best-effort: the parent may be gone. Dialing uses an id-only
+        // `EndpointAddr`, exactly like the join path, and reuses the shared
+        // `exchange_control` deadline.
+        let target: EndpointId = parent.node_id.as_str().parse().map_err(to_js_err)?;
+        let delivery =
+            match exchange_control(self.router.endpoint(), EndpointAddr::from(target), &signed).await
+            {
+                Ok(reply) => leave_delivery(&reply),
+                Err(_) => "unreachable".to_string(),
+            };
+
+        // Clear locally no matter what the parent said (or if it never
+        // answered), so a failed parent cannot trap the user.
+        let transition = self.control.lock_state().apply_detach();
+        if matches!(transition, Transition::Detached) {
+            self.control
+                .push_event(ControlEventDto::detached(&parent.node_id));
+        }
+        Ok(LeaveOutcome::new(delivery))
     }
 
     /// Install a delegated admin key (K_admin) used by the `admin_*` methods.
@@ -1773,6 +1836,20 @@ fn admin_rejected(code: RejectCode) -> JsError {
 /// Build the error for a structurally unexpected reply to an admin action.
 fn unexpected_admin_reply(what: &str) -> JsError {
     JsError::new(&format!("unexpected reply to {what}"))
+}
+
+/// Stable `delivery` bucket for the parent's reply to a [`ClientNode::leave`]
+/// `Exit` notice.
+///
+/// The native handler answers an `Exit` with `Accepted`/`Rejected`; any other
+/// reply shape is structurally impossible and is reported as `"unexpected"`
+/// rather than being mistaken for success.
+fn leave_delivery(reply: &ControlReply) -> String {
+    match reply {
+        ControlReply::Accepted => "accepted".to_string(),
+        ControlReply::Rejected(code) => format!("rejected:{}", reject_code_str(*code)),
+        _ => "unexpected".to_string(),
+    }
 }
 
 pub(crate) fn to_js_err(err: impl std::fmt::Display) -> JsError {

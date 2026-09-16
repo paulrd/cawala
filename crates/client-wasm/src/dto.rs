@@ -281,6 +281,46 @@ impl JoinStatus {
     }
 }
 
+/// The outcome of [`crate::ClientNode::leave`].
+///
+/// `status` is always `"detached"`: the local parent and address are cleared
+/// before this is returned, so a failed or unreachable parent can never trap
+/// the user. `delivery` reports the best-effort `Exit` notice to the former
+/// parent and is one of `"accepted"`, `"rejected:<code>"`, `"unreachable"` (a
+/// transport error or timeout), or `"unexpected"` (a structurally impossible
+/// reply shape); it is diagnostic only.
+#[wasm_bindgen]
+pub struct LeaveOutcome {
+    status: String,
+    delivery: String,
+}
+
+impl LeaveOutcome {
+    /// Build a `"detached"` outcome with the parent-notice `delivery` bucket.
+    pub(crate) fn new(delivery: String) -> Self {
+        LeaveOutcome {
+            status: "detached".to_string(),
+            delivery,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl LeaveOutcome {
+    /// Always `"detached"`.
+    #[wasm_bindgen(getter)]
+    pub fn status(&self) -> String {
+        self.status.clone()
+    }
+
+    /// The former parent's view of the `Exit` notice: `"accepted"`,
+    /// `"rejected:<code>"`, `"unreachable"`, or `"unexpected"`.
+    #[wasm_bindgen(getter)]
+    pub fn delivery(&self) -> String {
+        self.delivery.clone()
+    }
+}
+
 /// A control-plane event drained by [`crate::ClientNode::try_recv_control_event`].
 #[wasm_bindgen]
 pub struct ControlEventDto {
@@ -316,11 +356,24 @@ impl ControlEventDto {
             reason,
         }
     }
+
+    /// This client left (or was detached from) `parent`; parent and address
+    /// were cleared. `parent` is the former parent, carried for display.
+    pub(crate) fn detached(parent: &NodeId) -> Self {
+        ControlEventDto {
+            kind: "detached".to_string(),
+            parent: parent.as_str().to_string(),
+            slot: None,
+            address: None,
+            date_joined: None,
+            reason: None,
+        }
+    }
 }
 
 #[wasm_bindgen]
 impl ControlEventDto {
-    /// Event kind: `"accepted"` or `"rejected"`.
+    /// Event kind: `"accepted"`, `"rejected"`, or `"detached"`.
     #[wasm_bindgen(getter)]
     pub fn kind(&self) -> String {
         self.kind.clone()

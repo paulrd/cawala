@@ -32,10 +32,11 @@ use cawala_control::{
     AdminRedeliverJoin, AdminRejected, AdminScope, AdminSnapshot, CONTROL_ALPN,
     CONTROL_FORMAT_VERSION, CONTROL_REQUEST_MAX_TTL_SECS, CONTROL_REQUEST_TTL_SECS, ChildKind,
     ChildSnapshot, ControlError, ControlReply, ControlRequest, CreateChild, DeliveryStatus,
-    DetachChild, Invite, JoinApproval, JoinRejection, JoinRequest, MAX_CONTROL_FRAME, MoveChild,
-    NodeId, NodeSnapshot, OperatorPubKey, OperatorSecretKey, ParentSnapshot, ROUTED_REPLY_VERSION,
-    RejectCode, RoutedControlV1, RoutedForward, RoutedReplyV1, SetAddress, SignedAdminGrant,
-    SignedControl, SignedRoutedReply, is_admin_request, senior_child, verify_control,
+    DetachChild, DetachNotice, ExitRequest, Invite, JoinApproval, JoinRejection, JoinRequest,
+    MAX_CONTROL_FRAME, MoveChild, NodeId, NodeSnapshot, OctAddr, OperatorPubKey, OperatorSecretKey,
+    ParentSnapshot, ROUTED_REPLY_VERSION, RebaseNotice, RebasePull, RejectCode, RoutedControlV1,
+    RoutedForward, RoutedReplyV1, SetAddress, SignedAdminGrant, SignedControl, SignedRoutedReply,
+    is_admin_request, is_supported_control_version, senior_child, verify_control,
 };
 use cawala_ledger::{LedgerPubKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::{MsgId, PeerRef, Seen, SeenConfig};
@@ -75,6 +76,14 @@ const CONTROL_SEEN_CONFIG: SeenConfig = SeenConfig {
 /// Maximum number of most-recent per-child decisions retained for redelivery.
 const MAX_STORED_DECISIONS: usize = 64;
 
+/// Bound on the in-memory pending re-base queue.
+///
+/// Re-base notices are cheap to re-derive (a parent can always answer a
+/// `RebasePull`), so the queue is a best-effort retry buffer, not durable state:
+/// the oldest entry is dropped once the bound is reached. A restart heals via
+/// the child's startup pull instead.
+const MAX_PENDING_REBASE: usize = 32;
+
 /// Placeholder delivery status in a reply produced by the engine; the
 /// [`ControlHandler`] patches it after dialing the applicant.
 const PENDING_DELIVERY: DeliveryStatus = DeliveryStatus::Unreachable;
@@ -101,6 +110,10 @@ pub enum OutboundKind {
     Approved,
     /// An operator-signed `JoinRejected`.
     Rejected,
+    /// An operator-signed `Rebase` notice pushed to a child.
+    Rebase,
+    /// An operator-signed `DetachNotice` pushed to a detached child.
+    DetachNotice,
 }
 
 impl OutboundKind {
@@ -109,6 +122,8 @@ impl OutboundKind {
         match self {
             OutboundKind::Approved => "join-approved",
             OutboundKind::Rejected => "join-rejected",
+            OutboundKind::Rebase => "rebase",
+            OutboundKind::DetachNotice => "detach-notice",
         }
     }
 }
@@ -131,6 +146,20 @@ pub struct OutboundControl {
 /// One instance is shared behind a [`tokio::sync::Mutex`] by the
 /// [`ControlHandler`]. `receive` takes `&mut self` because applying a request
 /// mutates the record/peer/pending stores and persists them.
+///
+/// # Per-request state freshness
+///
+/// The **control-plane** state — the node record (`node.json`) and the peer
+/// registry (`ledger_peers.json`) — is re-read from disk at the start of every
+/// [`ControlNode::receive_at`], so mutations made by a separate process (CLI
+/// `control exit`, `control admin approve`, node-to-node join approval) are
+/// observed without a restart. Both reloads warn and continue on failure: they
+/// describe topology/identity, not authority to refuse service on.
+///
+/// The pending-join store and the replay sidecar ([`SeenStore`]) are
+/// deliberately **not** reloaded per request: the former is this process's own
+/// queue (persisted on every mutation), and the latter is seeded once at open so
+/// a per-request reload could un-observe a nonce.
 #[derive(Debug)]
 pub struct ControlNode {
     data_dir: PathBuf,
@@ -143,6 +172,17 @@ pub struct ControlNode {
     /// Frames to deliver after the current request is answered. Drained by the
     /// `ControlHandler` while it still holds the engine lock.
     outbound: VecDeque<OutboundControl>,
+    /// Re-base/`DetachNotice` frames whose immediate delivery failed, retried by
+    /// the bounded periodic sweep ([`sweep_pending_rebase`]). In-memory only: a
+    /// restart heals via the child's startup `RebasePull` instead.
+    pending_rebase: VecDeque<OutboundControl>,
+    /// Whether this process is a node or a browser-style user leaf.
+    ///
+    /// A native node is always [`ChildKind::Node`]; the wasm client handles the
+    /// [`ChildKind::User`] case itself (P3a). It is stored so the detach-notice
+    /// flip (root `0` for a node, clear both for a user) is one tested code
+    /// path.
+    self_kind: ChildKind,
     /// Most-recent operator-signed decision per child, for redelivery.
     decisions: VecDeque<SignedControl>,
     /// Per-node replay guard keyed `origin:controller`, id = request nonce.
@@ -177,6 +217,8 @@ impl ControlNode {
             pending,
             admins,
             outbound: VecDeque::new(),
+            pending_rebase: VecDeque::new(),
+            self_kind: ChildKind::Node,
             decisions: VecDeque::new(),
             seen: SeenStore::empty(CONTROL_SEEN_CONFIG),
         }
@@ -211,6 +253,8 @@ impl ControlNode {
             pending,
             admins,
             outbound: VecDeque::new(),
+            pending_rebase: VecDeque::new(),
+            self_kind: ChildKind::Node,
             decisions: VecDeque::new(),
             seen,
         })
@@ -254,6 +298,193 @@ impl ControlNode {
     /// Drain the frames queued for delivery by the last `receive*` call.
     pub fn take_outbound(&mut self) -> Vec<OutboundControl> {
         self.outbound.drain(..).collect()
+    }
+
+    /// Drain the re-base notices awaiting a retry sweep.
+    ///
+    /// The sweep ([`sweep_pending_rebase`]) removes entries whose target is no
+    /// longer a child before dialing; this accessor hands the rest to it.
+    pub fn take_pending_rebase(&mut self) -> Vec<OutboundControl> {
+        self.pending_rebase.drain(..).collect()
+    }
+
+    /// Put failed re-base notices back for a later sweep.
+    ///
+    /// Drops any entry whose target is no longer a current child (an exited or
+    /// re-parented child can no longer be re-based by this node), de-duplicates
+    /// by `(target, kind)`, and caps the queue at [`MAX_PENDING_REBASE`] by
+    /// evicting the oldest entries.
+    pub fn requeue_pending_rebase(&mut self, failed: Vec<OutboundControl>) {
+        let children: Vec<String> = self
+            .record
+            .record()
+            .children
+            .iter()
+            .map(|child| child.child_id.clone())
+            .collect();
+        for item in failed {
+            if !children.iter().any(|id| id == item.target.as_str()) {
+                continue;
+            }
+            self.pending_rebase
+                .retain(|pending| !(pending.target == item.target && pending.kind == item.kind));
+            self.pending_rebase.push_back(item);
+        }
+        while self.pending_rebase.len() > MAX_PENDING_REBASE {
+            self.pending_rebase.pop_front();
+        }
+    }
+
+    /// The node's best-effort subtree size (itself plus its direct children).
+    ///
+    /// A node only knows its direct child links, so it cannot count deeper
+    /// descendants. This is the audit-only `subtree_nodes` value in
+    /// [`ExitRequest`]; it never gates an exit.
+    fn subtree_size(&self) -> u32 {
+        self.record.record().children.len() as u32 + 1
+    }
+
+    /// Sign an [`ExitRequest`] naming this node, for its current parent.
+    ///
+    /// Self-signed with this node's own operator key (the parent authorizes it
+    /// via `verify_control`). A node with no parent still produces a well-formed
+    /// request; the caller decides whether to deliver it.
+    pub fn sign_exit_request(&self, now: u64) -> Result<SignedControl, ControlError> {
+        self.sign_decision(
+            ControlRequest::Exit(ExitRequest {
+                node: NodeId::from(self.node_id.clone()),
+                subtree_nodes: self.subtree_size(),
+            }),
+            now,
+        )
+        .map_err(|code| ControlError::Codec(format!("cannot sign exit request: {code:?}")))
+    }
+
+    /// Apply the **local** half of an exit: re-root this node at `0` and queue a
+    /// `Rebase` for each child.
+    ///
+    /// This is the durable, unilateral step and never depends on the parent
+    /// being reachable. Delivering the `ExitRequest` to the parent is the
+    /// caller's best-effort job; the queued child notices are drained by the
+    /// caller (CLI) or retried by [`sweep_pending_rebase`].
+    pub fn apply_exit(&mut self, now: u64) -> Result<(), ControlError> {
+        self.record
+            .rebase_to_root()
+            .map_err(|err| ControlError::Codec(err.to_string()))?;
+        self.record
+            .save()
+            .map_err(|err| ControlError::Codec(err.to_string()))?;
+        let address = self
+            .record
+            .record()
+            .address
+            .clone()
+            .expect("rebase_to_root always asserts the root address");
+        self.propagate_rebase(&address, 1, now);
+        self.audit(serde_json::json!({
+            "ts": now,
+            "event": "exit-applied",
+            "node": self.node_id,
+            "address": address.to_string(),
+            "children": self.record.record().children.len(),
+        }));
+        Ok(())
+    }
+
+    /// Sign a `RebasePull` for this node, or `None` when it has no parent link.
+    pub fn sign_rebase_pull(&self, now: u64) -> Option<SignedControl> {
+        self.record.record().parent.as_ref()?;
+        self.sign_decision(
+            ControlRequest::RebasePull(RebasePull {
+                node: NodeId::from(self.node_id.clone()),
+            }),
+            now,
+        )
+        .ok()
+    }
+
+    /// Verify a `RebasePull` reply snapshot and, if it names a different
+    /// address for this node, apply it and recurse to this node's children.
+    ///
+    /// The reply is an **unsigned** [`ControlReply::Snapshot`] carried over
+    /// direct control (the transport does not authenticate it), so nothing is
+    /// applied until the snapshot is internally consistent *with this node's own
+    /// parent link*:
+    /// - `snapshot.node_id == record.parent.parent_id`;
+    /// - the snapshot's own address derives this node's expected address as
+    ///   `snapshot.address.child(record.parent.slot)`;
+    /// - the snapshot lists this node with exactly that derived address.
+    ///
+    /// Returns `Ok(true)` when a different (verified) address was applied,
+    /// `Ok(false)` when it was already current, and `Err` when the snapshot does
+    /// not verify (the caller logs and ignores it — no mutation).
+    pub fn apply_pull_snapshot(
+        &mut self,
+        snapshot: &NodeSnapshot,
+        now: u64,
+    ) -> Result<bool, ControlError> {
+        let Some(parent) = self.record.record().parent.clone() else {
+            return Err(ControlError::Codec(
+                "cannot apply a pull without a parent link".to_string(),
+            ));
+        };
+        if snapshot.node_id.as_str() != parent.parent_id {
+            return Err(ControlError::Codec(format!(
+                "pull snapshot names '{}', expected parent '{}'",
+                snapshot.node_id, parent.parent_id
+            )));
+        }
+        let Some(parent_address) = snapshot.address.clone() else {
+            return Err(ControlError::Codec(
+                "pull snapshot carries no address".to_string(),
+            ));
+        };
+        let expected = parent_address.child(parent.slot);
+        let child = snapshot
+            .children
+            .iter()
+            .find(|child| child.child_id.as_str() == self.node_id)
+            .ok_or_else(|| {
+                ControlError::Codec("pull snapshot does not list this node".to_string())
+            })?;
+        if child.address.as_ref() != Some(&expected) {
+            return Err(ControlError::Codec(format!(
+                "pull snapshot derives {} for this node, expected {expected}",
+                child
+                    .address
+                    .as_ref()
+                    .map_or_else(|| "none".to_string(), |address| address.to_string())
+            )));
+        }
+        if self.record.record().address.as_ref() == Some(&expected) {
+            return Ok(false);
+        }
+        self.record
+            .set_address(expected.clone())
+            .map_err(|err| ControlError::Codec(err.to_string()))?;
+        self.record
+            .save()
+            .map_err(|err| ControlError::Codec(err.to_string()))?;
+        self.audit(serde_json::json!({
+            "ts": now,
+            "event": "rebase-pull-applied",
+            "node": self.node_id,
+            "parent": parent.parent_id,
+            "address": expected.to_string(),
+        }));
+        self.propagate_rebase(&expected, 1, now);
+        Ok(true)
+    }
+
+    /// Override this process's own child kind (defaults to
+    /// [`ChildKind::Node`]).
+    ///
+    /// A native node is always a node, so this is test-only: it exists so the
+    /// shared detach-notice flip can be exercised for the [`ChildKind::User`]
+    /// shape (which the wasm client otherwise owns).
+    #[cfg(test)]
+    pub fn set_self_kind(&mut self, kind: ChildKind) {
+        self.self_kind = kind;
     }
 
     /// The senior child rule: `origin` may control this node iff it is this
@@ -356,16 +587,24 @@ impl ControlNode {
     /// 1. wire version is [`CONTROL_FORMAT_VERSION`];
     /// 2. the operator signature verifies under `signed.controller`;
     /// 3. `now <= expiry <= now + CONTROL_REQUEST_MAX_TTL_SECS`;
-    /// 4. admin grants are reloaded from disk (fail closed to empty);
-    /// 5. the `(origin, controller, nonce)` replay guard;
-    /// 6. dispatch.
+    /// 4. the persisted node record is reloaded from disk (warn-and-continue);
+    /// 5. the peer registry is reloaded from disk (warn-and-continue);
+    /// 6. admin grants are reloaded from disk (fail closed to empty);
+    /// 7. the `(origin, controller, nonce)` replay guard;
+    /// 8. dispatch.
     pub async fn receive_at(
         &mut self,
         _remote: EndpointId,
         signed: SignedControl,
         now: u64,
     ) -> ControlReply {
-        if signed.version != CONTROL_FORMAT_VERSION {
+        if !is_supported_control_version(signed.version) {
+            return ControlReply::Rejected(RejectCode::BadVersion);
+        }
+        // A v3 frame may carry only the pre-existing variants: the four exit
+        // variants are v4-additive, so a v3 declaration over one is malformed
+        // and must not be dispatched.
+        if signed.version != CONTROL_FORMAT_VERSION && carries_v4_variant(&signed.request) {
             return ControlReply::Rejected(RejectCode::BadVersion);
         }
         if signed.verify_signature().is_err() {
@@ -376,6 +615,40 @@ impl ControlNode {
         }
         if signed.expiry > now.saturating_add(CONTROL_REQUEST_MAX_TTL_SECS) {
             return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        // Full reload of the persisted record so a topology mutation made by a
+        // *separate process* is observed without a restart. The CLI `control
+        // exit` rewrites `node.json` directly (it does not go through this
+        // engine), so without this a live node would keep serving its stale
+        // parent/children and never run the healing path. Topology is not
+        // authority, so a failed reload warns and keeps the in-memory record
+        // rather than failing closed. A harness that never persisted a record
+        // has no file to reload and keeps its in-memory state.
+        if self.data_dir.join(crate::record::NODE_RECORD_FILE).exists() {
+            match RecordStore::open(&self.data_dir, &self.node_id) {
+                Ok(record) => self.record = record,
+                Err(err) => {
+                    warn!(%err, "node record reload failed; using the in-memory record");
+                }
+            }
+        }
+        // Full reload so a peer row registered by a *separate process* is
+        // observed without a restart. A child operator registered by `control
+        // admin approve` / node-to-node join approval lives only on disk until
+        // now, and exit/healing frames from that child are verified against this
+        // registry (`verify_control` in `authorize`), so without this a live
+        // node would keep refusing an otherwise-valid `Exit`/`RebasePull` with
+        // `Unauthorized` until restart. Like the record, the registry is not
+        // authority to refuse service on, so a failed reload warns and keeps the
+        // in-memory registry rather than failing closed. A harness that never
+        // persisted peers has no file to reload and keeps its in-memory state.
+        if self.data_dir.join(ledger_peers::PEERS_FILE).exists() {
+            match ledger_peers::load_peers(&self.data_dir) {
+                Ok(peers) => self.peers = peers,
+                Err(err) => {
+                    warn!(%err, "peer registry reload failed; using the in-memory registry");
+                }
+            }
         }
         // Full reload so a grant/revoke performed by a separate operator CLI
         // process is observed without a restart. On any load failure, serve no
@@ -439,6 +712,10 @@ impl ControlNode {
             ControlRequest::AdminRedeliverJoin(redeliver) => {
                 self.handle_admin_redeliver_join(&signed, redeliver, now)
             }
+            ControlRequest::Exit(exit) => self.handle_exit(&signed, exit, now),
+            ControlRequest::DetachNotice(notice) => self.handle_detach_notice(&signed, notice, now),
+            ControlRequest::Rebase(notice) => self.handle_rebase(&signed, notice, now),
+            ControlRequest::RebasePull(pull) => self.handle_rebase_pull(&signed, pull, now),
         };
         self.audit_request(&signed, &reply, now);
         reply
@@ -524,13 +801,19 @@ impl ControlNode {
             return ControlReply::Rejected(RejectCode::Unauthorized);
         }
 
-        // Join traffic is direct-only: a routed `Join`/`JoinApproved`/
-        // `JoinRejected` is never accepted, whatever its signatures say.
+        // Join traffic and exit-rights traffic are direct-only: a routed
+        // `Join`/`JoinApproved`/`JoinRejected`/`Exit`/`DetachNotice`/`Rebase`/
+        // `RebasePull` is never accepted, whatever its signatures say. Exit
+        // authority is peer-scoped and its propagation is a direct dial.
         if matches!(
             &routed.intent.request,
             ControlRequest::Join(_)
                 | ControlRequest::JoinApproved(_)
                 | ControlRequest::JoinRejected(_)
+                | ControlRequest::Exit(_)
+                | ControlRequest::DetachNotice(_)
+                | ControlRequest::Rebase(_)
+                | ControlRequest::RebasePull(_)
         ) {
             self.audit(serde_json::json!({
                 "ts": now,
@@ -710,6 +993,18 @@ impl ControlNode {
     /// It is carried in the approval so the child can persist the parent's row
     /// and later verify the parent's signed settlement hops.
     ///
+    /// # Idempotent re-approval
+    ///
+    /// `Exit` retains the child's [`PeerKeys`] row and, when the parent never
+    /// processed the `Exit`, its child link too. Approving a re-join must
+    /// therefore reconcile rather than fail:
+    /// - an **identical** retained row is success and is not re-inserted
+    ///   (`PeerRegistry::insert` rejects duplicates);
+    /// - a child the record **already lists** is already attached: its existing
+    ///   slot/address are returned and it is not re-attached;
+    /// - a **conflicting** row (different operator/ledger/role) or a slot taken
+    ///   by a *different* child is still an error.
+    ///
     /// Requires this node to have an asserted [`NodeRecord::address`].
     pub fn approve_pending(
         &mut self,
@@ -728,32 +1023,6 @@ impl ControlNode {
                 ControlError::Codec("this node has no asserted address".to_string())
             })?;
 
-        let slot = match slot {
-            Some(s) => {
-                if s > cawala_topology::MAX_SLOT {
-                    return Err(ControlError::SlotOutOfRange(s));
-                }
-                if self.record.record().children.iter().any(|c| c.slot == s) {
-                    return Err(ControlError::Codec(format!("slot {s} is already taken")));
-                }
-                s
-            }
-            None => lowest_free_slot(self.record.record())
-                .ok_or_else(|| ControlError::Codec("node is full".to_string()))?,
-        };
-        let child_address = base_address.child(slot);
-
-        // Only now consume the pending row.
-        self.pending.remove_pending(&node_id);
-
-        if let Err(err) =
-            self.record
-                .attach_child(request.node.as_str(), request.kind, Some(slot), now)
-        {
-            self.pending.add_pending(request);
-            return Err(ControlError::Codec(err.to_string()));
-        }
-
         let role = match request.kind {
             ChildKind::Node => PeerRole::Node,
             ChildKind::User => PeerRole::User,
@@ -764,8 +1033,77 @@ impl ControlNode {
             ledger: request.ledger,
             role,
         };
-        if let Err(err) = self.peers.insert(peer) {
-            let _ = self.record.detach_child(request.node.as_str());
+        // Reconcile the retained registry row before any mutation: an identical
+        // row must not be re-inserted, a genuine conflict is refused outright.
+        let peer_state = self.existing_peer_state(&peer);
+        if peer_state == Some(false) {
+            return Err(ControlError::Codec(format!(
+                "peer row for '{}' conflicts with the approved operator/ledger/role",
+                request.node
+            )));
+        }
+        let peer_present = peer_state == Some(true);
+
+        // A child the record already lists is already approved; keep its
+        // existing slot and never re-attach it.
+        let already_listed = self
+            .record
+            .record()
+            .children
+            .iter()
+            .find(|c| c.child_id == request.node.as_str())
+            .map(|c| c.slot);
+
+        let slot = match already_listed {
+            Some(existing) => {
+                if let Some(requested) = slot {
+                    if requested > cawala_topology::MAX_SLOT {
+                        return Err(ControlError::SlotOutOfRange(requested));
+                    }
+                    if requested != existing
+                        && self.record.record().children.iter().any(|c| c.slot == requested)
+                    {
+                        return Err(ControlError::Codec(format!(
+                            "slot {requested} is already taken"
+                        )));
+                    }
+                }
+                existing
+            }
+            None => match slot {
+                Some(s) => {
+                    if s > cawala_topology::MAX_SLOT {
+                        return Err(ControlError::SlotOutOfRange(s));
+                    }
+                    if self.record.record().children.iter().any(|c| c.slot == s) {
+                        return Err(ControlError::Codec(format!("slot {s} is already taken")));
+                    }
+                    s
+                }
+                None => lowest_free_slot(self.record.record())
+                    .ok_or_else(|| ControlError::Codec("node is full".to_string()))?,
+            },
+        };
+        let child_address = base_address.child(slot);
+
+        // Only now consume the pending row.
+        self.pending.remove_pending(&node_id);
+
+        if already_listed.is_none()
+            && let Err(err) =
+                self.record
+                    .attach_child(request.node.as_str(), request.kind, Some(slot), now)
+        {
+            self.pending.add_pending(request);
+            return Err(ControlError::Codec(err.to_string()));
+        }
+
+        if !peer_present
+            && let Err(err) = self.peers.insert(peer)
+        {
+            if already_listed.is_none() {
+                let _ = self.record.detach_child(request.node.as_str());
+            }
             self.pending.add_pending(request);
             return Err(ControlError::Codec(err.to_string()));
         }
@@ -857,17 +1195,30 @@ impl ControlNode {
         if self.pending.pending_for(&join.node).is_some() {
             return ControlReply::Pending;
         }
-        // Capacity check: an explicit slot must be free, otherwise the parent
-        // picks the lowest free slot; a full node refuses.
-        match join.desired_slot {
-            Some(slot) => {
-                if self.record.record().children.iter().any(|c| c.slot == slot) {
-                    return ControlReply::Rejected(RejectCode::SlotTaken);
+        // An applicant the record already lists is a re-join of a child whose
+        // `Exit` the parent never processed (or a duplicate of an existing
+        // child): it is already attached, so queue it rather than reject it for
+        // its own slot or for capacity. `approve_pending` then returns the
+        // idempotent approval with the child's existing slot.
+        let already_listed = self
+            .record
+            .record()
+            .children
+            .iter()
+            .any(|c| c.child_id == join.node.as_str());
+        if !already_listed {
+            // Capacity check: an explicit slot must be free, otherwise the
+            // parent picks the lowest free slot; a full node refuses.
+            match join.desired_slot {
+                Some(slot) => {
+                    if self.record.record().children.iter().any(|c| c.slot == slot) {
+                        return ControlReply::Rejected(RejectCode::SlotTaken);
+                    }
                 }
-            }
-            None => {
-                if lowest_free_slot(self.record.record()).is_none() {
-                    return ControlReply::Rejected(RejectCode::Capacity);
+                None => {
+                    if lowest_free_slot(self.record.record()).is_none() {
+                        return ControlReply::Rejected(RejectCode::Capacity);
+                    }
                 }
             }
         }
@@ -952,10 +1303,20 @@ impl ControlNode {
 
         let record_backup = self.record.clone();
         let peers_backup = self.peers.clone();
+        // Attach order matters: a node re-attaching from an independent root is
+        // currently at `address = 0, parent = None`, and setting the parent
+        // first would leave `parent = Some` + `address = 0`, which fails
+        // validation (`AddressSlotMismatch`). Clear the address, set the parent,
+        // then install the assigned address; each intermediate state is legal.
+        if let Err(err) = self.record.unset_address() {
+            self.record = record_backup;
+            return ControlReply::Rejected(map_record_error(&err));
+        }
         if let Err(err) = self
             .record
             .set_parent(signed.origin.as_str(), approval.slot)
         {
+            self.record = record_backup;
             return ControlReply::Rejected(map_record_error(&err));
         }
         if let Err(err) = self.record.set_address(approval.address.clone()) {
@@ -1021,6 +1382,23 @@ impl ControlNode {
                 .insert(expected)
                 .map_err(|_| RejectCode::Unauthorized),
         }
+    }
+
+    /// Classify the registry row for `expected`'s node.
+    ///
+    /// Returns `None` when no row exists, `Some(true)` when the existing row is
+    /// byte-identical to `expected` (a re-approval: success, do **not**
+    /// re-insert — `PeerRegistry::insert` rejects a duplicate), and
+    /// `Some(false)` when a row exists but conflicts (a different
+    /// operator/ledger/role for the same node id).
+    ///
+    /// `Exit` deliberately retains the child's row, so "exit then change your
+    /// mind" must treat the identical retained row as already registered rather
+    /// than as a `DuplicateKey` conflict.
+    fn existing_peer_state(&self, expected: &PeerKeys) -> Option<bool> {
+        self.peers
+            .get(&expected.node_id)
+            .map(|existing| existing == expected)
     }
 
     /// Replace an existing parent row's ledger key, preserving its operator.
@@ -1114,15 +1492,6 @@ impl ControlNode {
         if let Err(code) = self.authorize(signed, now) {
             return ControlReply::Rejected(code);
         }
-        let backup = self.record.clone();
-        if let Err(err) = self.record.attach_child(
-            create.child.as_str(),
-            create.kind,
-            create.slot,
-            create.date_joined,
-        ) {
-            return ControlReply::Rejected(map_record_error(&err));
-        }
         let role = match create.kind {
             ChildKind::Node => PeerRole::Node,
             ChildKind::User => PeerRole::User,
@@ -1133,7 +1502,46 @@ impl ControlNode {
             ledger: create.ledger,
             role,
         };
-        if let Err(err) = self.peers.insert(peer) {
+        // A retained identical row (a child that exited, or a replayed create)
+        // must not be re-inserted; a genuine conflict is refused.
+        let peer_state = self.existing_peer_state(&peer);
+        if peer_state == Some(false) {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        let peer_present = peer_state == Some(true);
+
+        // A child the record already lists is already created: idempotent
+        // `Accepted`, no re-attach.
+        let already_listed = self
+            .record
+            .record()
+            .children
+            .iter()
+            .any(|c| c.child_id == create.child.as_str());
+        if already_listed {
+            if !peer_present {
+                if let Err(err) = self.peers.insert(peer) {
+                    return ControlReply::Rejected(map_ledger_error(&err));
+                }
+                if ledger_peers::save_peers(&self.data_dir, &self.peers).is_err() {
+                    return ControlReply::Rejected(RejectCode::Internal);
+                }
+            }
+            return ControlReply::Accepted;
+        }
+
+        let backup = self.record.clone();
+        if let Err(err) = self.record.attach_child(
+            create.child.as_str(),
+            create.kind,
+            create.slot,
+            create.date_joined,
+        ) {
+            return ControlReply::Rejected(map_record_error(&err));
+        }
+        if !peer_present
+            && let Err(err) = self.peers.insert(peer)
+        {
             self.record = backup;
             return ControlReply::Rejected(map_ledger_error(&err));
         }
@@ -1162,7 +1570,292 @@ impl ControlNode {
         if self.record.save().is_err() {
             return ControlReply::Rejected(RejectCode::Internal);
         }
+        // Best-effort: tell the child it has been detached so it flips to an
+        // independent root. A failed dial is audited by the delivery plumbing,
+        // never surfaced to the requester.
+        self.queue_notice(&detach.child, OutboundKind::DetachNotice, |node| {
+            ControlRequest::DetachNotice(DetachNotice { node })
+        }, now);
         ControlReply::Accepted
+    }
+
+    /// Queue one parent→child notice (signed by this node) for best-effort
+    /// delivery.
+    ///
+    /// Signing is local and effectively infallible; on the theoretical failure
+    /// it is logged and skipped rather than failing an already-applied mutation.
+    fn queue_notice(
+        &mut self,
+        child: &NodeId,
+        kind: OutboundKind,
+        build: impl FnOnce(NodeId) -> ControlRequest,
+        now: u64,
+    ) {
+        match self.sign_decision(build(child.clone()), now) {
+            Ok(signed) => self.outbound.push_back(OutboundControl {
+                target: child.clone(),
+                signed,
+                kind,
+            }),
+            Err(code) => warn!(child = %child, ?code, "could not sign outbound notice"),
+        }
+    }
+
+    /// Parent side: a child unilaterally exits, so remove it from this node's
+    /// child list.
+    ///
+    /// Authority is the child's **own** operator: `exit.node` must equal the
+    /// signed `origin`, whose registered operator key must equal the signed
+    /// `controller` (`verify_control`). This is deliberately **not**
+    /// seniority-gated — any child may leave. `subtree_nodes` is audit-only and
+    /// never gates the request. The child's [`PeerRegistry`] row is retained so
+    /// it can re-attach; an already-removed child whose row still exists is an
+    /// idempotent [`ControlReply::Accepted`], while an entirely unknown node is
+    /// [`RejectCode::Unauthorized`].
+    fn handle_exit(&mut self, signed: &SignedControl, exit: &ExitRequest, now: u64) -> ControlReply {
+        if exit.validate().is_err() {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        if exit.node != signed.origin {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        // Binds `signed.origin` to its registered operator key and proves a
+        // registry row exists, so an unknown node is refused here.
+        if verify_control(signed, &self.peers).is_err() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        let listed = self
+            .record
+            .record()
+            .children
+            .iter()
+            .any(|child| child.child_id == exit.node.as_str());
+        if listed {
+            if let Err(err) = self.record.detach_child(exit.node.as_str()) {
+                return ControlReply::Rejected(map_record_error(&err));
+            }
+            if self.record.save().is_err() {
+                return ControlReply::Rejected(RejectCode::Internal);
+            }
+        }
+        self.audit(serde_json::json!({
+            "ts": now,
+            "event": "exit",
+            "child": exit.node.to_string(),
+            "parent": self.node_id,
+            "subtree_nodes": exit.subtree_nodes,
+            "removed": listed,
+        }));
+        ControlReply::Accepted
+    }
+
+    /// Child side: the current direct parent detached this node, so flip to an
+    /// independent root.
+    ///
+    /// Only the **current** direct parent may issue this (a stale former
+    /// parent's notice is refused), and its operator must bind to `origin`. A
+    /// [`ChildKind::Node`] receiver rebases to root `0`; a [`ChildKind::User`]
+    /// receiver (a browser leaf) has no meaningful root address, so it clears
+    /// both its parent link and its address. An already-detached node accepts
+    /// this as a no-op.
+    fn handle_detach_notice(
+        &mut self,
+        signed: &SignedControl,
+        notice: &DetachNotice,
+        now: u64,
+    ) -> ControlReply {
+        if notice.validate().is_err() {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        if notice.node.as_str() != self.node_id {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        let Some(parent) = self.record.record().parent.clone() else {
+            // Already detached: a pure idempotent no-op. There is no state to
+            // apply and, with no parent link, no origin to check against — a
+            // redelivered notice (or one from a stale former parent) is accepted
+            // rather than refused. Nothing is mutated, so accepting is safe.
+            self.audit(serde_json::json!({
+                "ts": now,
+                "event": "detach-notice",
+                "node": self.node_id,
+                "outcome": "noop",
+            }));
+            return ControlReply::Accepted;
+        };
+        if signed.origin.as_str() != parent.parent_id {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        if verify_control(signed, &self.peers).is_err() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        let result = match self.self_kind {
+            ChildKind::Node => self.record.rebase_to_root(),
+            ChildKind::User => self
+                .record
+                .unset_address()
+                .and_then(|()| self.record.unset_parent()),
+        };
+        if let Err(err) = result {
+            return ControlReply::Rejected(map_record_error(&err));
+        }
+        if self.record.save().is_err() {
+            return ControlReply::Rejected(RejectCode::Internal);
+        }
+        self.audit(serde_json::json!({
+            "ts": now,
+            "event": "detach-notice",
+            "node": self.node_id,
+            "parent": parent.parent_id,
+            "kind": child_kind_label(self.self_kind),
+            "outcome": "applied",
+        }));
+        // A node that becomes a root must re-base its own children.
+        if self.self_kind == ChildKind::Node {
+            let root = self.record.record().address.clone();
+            if let Some(root) = root {
+                self.propagate_rebase(&root, 1, now);
+            }
+        }
+        ControlReply::Accepted
+    }
+
+    /// Child side: apply a parent-signed address re-base, then recurse down.
+    ///
+    /// The receiver is the child. Authority is the **current** direct parent's
+    /// operator (`origin == record.parent.parent_id`, bound by
+    /// `verify_control`), and the topology rule `address ==
+    /// parent_address.child(record.parent.slot)` is enforced here (a pure
+    /// [`RebaseNotice::validate`] has no view of the parent link). Applying the
+    /// already-current address is an idempotent [`ControlReply::Accepted`] that
+    /// does not re-propagate.
+    fn handle_rebase(
+        &mut self,
+        signed: &SignedControl,
+        notice: &RebaseNotice,
+        now: u64,
+    ) -> ControlReply {
+        if notice.validate().is_err() {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        if notice.node.as_str() != self.node_id {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        let Some(parent) = self.record.record().parent.clone() else {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        };
+        if signed.origin.as_str() != parent.parent_id {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        if verify_control(signed, &self.peers).is_err() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        if notice.address != notice.parent_address.child(parent.slot) {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        if self.record.record().address.as_ref() == Some(&notice.address) {
+            self.audit(serde_json::json!({
+                "ts": now,
+                "event": "rebase",
+                "node": self.node_id,
+                "parent": parent.parent_id,
+                "address": notice.address.to_string(),
+                "generation": notice.generation,
+                "outcome": "noop",
+            }));
+            return ControlReply::Accepted;
+        }
+        if let Err(err) = self.record.set_address(notice.address.clone()) {
+            return ControlReply::Rejected(map_record_error(&err));
+        }
+        if self.record.save().is_err() {
+            return ControlReply::Rejected(RejectCode::Internal);
+        }
+        self.audit(serde_json::json!({
+            "ts": now,
+            "event": "rebase",
+            "node": self.node_id,
+            "parent": parent.parent_id,
+            "address": notice.address.to_string(),
+            "generation": notice.generation,
+            "outcome": "applied",
+        }));
+        self.propagate_rebase(&notice.address, notice.generation, now);
+        ControlReply::Accepted
+    }
+
+    /// Queue a `Rebase` notice for every child, deriving each child's new
+    /// address as `parent_address.child(slot)`.
+    ///
+    /// Best-effort: a child that cannot be reached is retried by the P2 sweep
+    /// seam, never surfaced to the requester.
+    fn propagate_rebase(&mut self, parent_address: &OctAddr, generation: u64, now: u64) {
+        let children: Vec<(NodeId, u8)> = self
+            .record
+            .record()
+            .children
+            .iter()
+            .map(|child| (NodeId::from(child.child_id.clone()), child.slot))
+            .collect();
+        for (child, slot) in children {
+            let notice = RebaseNotice {
+                node: child.clone(),
+                parent_address: parent_address.clone(),
+                address: parent_address.child(slot),
+                generation,
+            };
+            self.queue_notice(&child, OutboundKind::Rebase, |node| {
+                ControlRequest::Rebase(RebaseNotice {
+                    node,
+                    ..notice.clone()
+                })
+            }, now);
+        }
+    }
+
+    /// Parent side: answer a child's healing pull with this node's snapshot.
+    ///
+    /// Authority is the requester's own operator (`pull.node == origin`, bound
+    /// by `verify_control`) **and** the requester must be a *current child*: the
+    /// reply is a full routing snapshot, and this node's own parent (or a former
+    /// child whose peer row was retained across an `Exit`) must not be able to
+    /// pull it. The snapshot already carries this node's address and each
+    /// child's derived address, from which the child can compute its expected
+    /// `parent_address.child(slot)` — no DTO change is needed.
+    fn handle_rebase_pull(
+        &mut self,
+        signed: &SignedControl,
+        pull: &RebasePull,
+        now: u64,
+    ) -> ControlReply {
+        if pull.validate().is_err() {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        if pull.node != signed.origin {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        // Only a current child may pull: the registry row (checked by
+        // `verify_control` below) survives an `Exit`, and the parent link is
+        // never a child link.
+        if !self
+            .record
+            .record()
+            .children
+            .iter()
+            .any(|child| child.child_id == pull.node.as_str())
+        {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        if verify_control(signed, &self.peers).is_err() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        self.audit(serde_json::json!({
+            "ts": now,
+            "event": "rebase-pull",
+            "node": self.node_id,
+            "requester": pull.node.to_string(),
+        }));
+        ControlReply::Snapshot(self.snapshot())
     }
 
     fn handle_move_child(
@@ -1439,12 +2132,29 @@ impl ControlNode {
         if self.record.record().address.is_none() {
             return Err(RejectCode::NotAttached);
         }
+        // A re-join of a child the record already lists is already approved: its
+        // own slot is not a conflict, and its presence does not consume capacity.
+        let already_listed = self
+            .record
+            .record()
+            .children
+            .iter()
+            .any(|c| c.child_id == child.as_str());
         match slot {
             Some(slot) if slot > cawala_topology::MAX_SLOT => Err(RejectCode::SlotOutOfRange),
-            Some(slot) if self.record.record().children.iter().any(|c| c.slot == slot) => {
+            Some(slot)
+                if self
+                    .record
+                    .record()
+                    .children
+                    .iter()
+                    .any(|c| c.slot == slot && c.child_id != child.as_str()) =>
+            {
                 Err(RejectCode::SlotTaken)
             }
-            None if lowest_free_slot(self.record.record()).is_none() => Err(RejectCode::Capacity),
+            None if !already_listed && lowest_free_slot(self.record.record()).is_none() => {
+                Err(RejectCode::Capacity)
+            }
             _ => Ok(()),
         }
     }
@@ -1699,7 +2409,14 @@ impl ProtocolHandler for ControlHandler {
 
         // Deliver decisions owned by this node and patch the reply with the
         // applicant's view. Never hold the engine mutex across `send_direct`.
-        deliver_outbound_decisions(&self.endpoint, &data_dir, outbound, &mut reply).await;
+        let failed_notices =
+            deliver_outbound_decisions(&self.endpoint, &data_dir, outbound, &mut reply).await;
+        if !failed_notices.is_empty() {
+            // Topology notices have no reply field, so a failed dial is kept in
+            // memory for the periodic retry sweep instead of being lost.
+            let mut engine = self.node.lock().await;
+            engine.requeue_pending_rebase(failed_notices);
+        }
         info!(%remote, kind = signed_kind(&reply), "control reply");
 
         proto::write_framed(&mut send, &reply).await?;
@@ -1832,6 +2549,28 @@ fn nonce_msg_id(nonce: u64) -> MsgId {
     MsgId::from_bytes(id)
 }
 
+/// Whether `request` is one of the four variants appended in control format 4.
+///
+/// A v3-declared frame must not carry one of these; the node rejects such a
+/// frame as [`RejectCode::BadVersion`] rather than dispatching it.
+fn carries_v4_variant(request: &ControlRequest) -> bool {
+    matches!(
+        request,
+        ControlRequest::Exit(_)
+            | ControlRequest::DetachNotice(_)
+            | ControlRequest::Rebase(_)
+            | ControlRequest::RebasePull(_)
+    )
+}
+
+/// Stable `"node"`/`"user"` label for a [`ChildKind`], for audit lines.
+fn child_kind_label(kind: ChildKind) -> &'static str {
+    match kind {
+        ChildKind::Node => "node",
+        ChildKind::User => "user",
+    }
+}
+
 /// The child a stored decision answers, if it is an approval/rejection.
 fn decision_target(signed: &SignedControl) -> Option<&NodeId> {
     match &signed.request {
@@ -1878,6 +2617,21 @@ fn delivery_status(result: Result<ControlReply, ControlError>) -> DeliveryStatus
     }
 }
 
+/// Dial one queued outbound frame and map the exchange to a [`DeliveryStatus`].
+async fn deliver_one(endpoint: &Endpoint, item: &OutboundControl) -> DeliveryStatus {
+    match item.target.as_str().parse::<EndpointId>() {
+        Ok(target) => {
+            delivery_status(
+                ControlNode::send_direct(endpoint, target, &item.signed, DELIVERY_TIMEOUT).await,
+            )
+        }
+        Err(err) => {
+            warn!(child = %item.target, %err, "invalid outbound endpoint id");
+            DeliveryStatus::Unreachable
+        }
+    }
+}
+
 /// Reverse-dial each queued outbound decision and patch `reply` with the last
 /// applicant's delivery outcome.
 ///
@@ -1885,29 +2639,156 @@ fn delivery_status(result: Result<ControlReply, ControlError>) -> DeliveryStatus
 /// `AdminApproved.delivery`/`AdminRejected.delivery` stay correct whichever
 /// transport carried the request. The caller must have dropped the engine lock
 /// (this awaits `send_direct`).
+///
+/// Returns the failed [`OutboundKind::Rebase`]/[`OutboundKind::DetachNotice`]
+/// frames (best-effort topology notices have no reply field to surface a
+/// failure), so the caller can requeue them via
+/// [`ControlNode::requeue_pending_rebase`] for the retry sweep. Join decisions
+/// are *not* returned: their outcome is carried in the patched reply.
 pub(crate) async fn deliver_outbound_decisions(
     endpoint: &Endpoint,
     data_dir: &Path,
     outbound: Vec<OutboundControl>,
     reply: &mut ControlReply,
-) {
+) -> Vec<OutboundControl> {
     let mut last_status = None;
+    let mut failed_notices = Vec::new();
     for item in outbound {
-        let status = match item.target.as_str().parse::<EndpointId>() {
-            Ok(target) => delivery_status(
-                ControlNode::send_direct(endpoint, target, &item.signed, DELIVERY_TIMEOUT).await,
-            ),
-            Err(err) => {
-                warn!(child = %item.target, %err, "invalid applicant endpoint id");
-                DeliveryStatus::Unreachable
-            }
-        };
+        let status = deliver_one(endpoint, &item).await;
         audit_delivery(data_dir, &item.target, item.kind, &status);
+        if !matches!(status, DeliveryStatus::Delivered)
+            && matches!(
+                item.kind,
+                OutboundKind::Rebase | OutboundKind::DetachNotice
+            )
+        {
+            failed_notices.push(item);
+        }
         last_status = Some(status);
     }
     if let Some(status) = last_status {
         patch_delivery(reply, status);
     }
+    failed_notices
+}
+
+/// Retry the re-base/`DetachNotice` frames whose immediate delivery failed.
+///
+/// One bounded pass: entries whose target is no longer a current child are
+/// dropped (a re-based-by-another-parent child is no longer ours to re-base),
+/// still-unreachable entries are put back for a later sweep, and the queue is
+/// capped by [`ControlNode::requeue_pending_rebase`]. In-memory only; a restart
+/// heals through the child's startup `RebasePull`.
+pub async fn sweep_pending_rebase(endpoint: &Endpoint, control: &Arc<Mutex<ControlNode>>) {
+    let (pending, children, data_dir) = {
+        let mut engine = control.lock().await;
+        let children: Vec<String> = engine
+            .record
+            .record()
+            .children
+            .iter()
+            .map(|child| child.child_id.clone())
+            .collect();
+        (
+            engine.take_pending_rebase(),
+            children,
+            engine.data_dir().to_path_buf(),
+        )
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let mut retry = Vec::new();
+    for item in pending {
+        if !children.iter().any(|id| id == item.target.as_str()) {
+            crate::audit::append(
+                &data_dir,
+                serde_json::json!({
+                    "event": "delivery",
+                    "child": item.target.to_string(),
+                    "kind": item.kind.label(),
+                    "outcome": "stale",
+                }),
+            );
+            continue;
+        }
+        let status = deliver_one(endpoint, &item).await;
+        audit_delivery(&data_dir, &item.target, item.kind, &status);
+        if !matches!(status, DeliveryStatus::Delivered) {
+            retry.push(item);
+        }
+    }
+    if retry.is_empty() {
+        return;
+    }
+    let mut engine = control.lock().await;
+    engine.requeue_pending_rebase(retry);
+}
+
+/// Ask this node's parent for its snapshot and apply a verified re-base.
+///
+/// The pull is self-signed and sent over direct control. The reply is verified
+/// by [`ControlNode::apply_pull_snapshot`] against the local parent link before
+/// anything is applied; an unreachable parent (or an unverifiable snapshot) is
+/// ignored, not fatal.
+///
+/// Returns `Ok(true)` when a different address was applied and `Ok(false)`
+/// otherwise (no parent, no verifiable reply, or already current). Used at
+/// startup and as the periodic healing probe.
+pub async fn pull_rebase_from_parent(
+    endpoint: &Endpoint,
+    control: &Arc<Mutex<ControlNode>>,
+    timeout: Duration,
+    now: u64,
+) -> Result<bool, ControlError> {
+    let (target, signed) = {
+        let engine = control.lock().await;
+        let Some(parent) = engine.record.record().parent.as_ref() else {
+            return Ok(false);
+        };
+        let Some(signed) = engine.sign_rebase_pull(now) else {
+            return Ok(false);
+        };
+        (parent.parent_id.clone(), signed)
+    };
+    let target: EndpointId = target.parse().map_err(|err| {
+        ControlError::Codec(format!("parent id '{target}' is not an endpoint id: {err}"))
+    })?;
+    let reply = ControlNode::send_direct(endpoint, target, &signed, timeout).await?;
+    let ControlReply::Snapshot(snapshot) = reply else {
+        return Err(ControlError::Codec(format!(
+            "unexpected rebase-pull reply: {reply:?}"
+        )));
+    };
+    let (applied, notices, data_dir) = {
+        let mut engine = control.lock().await;
+        let applied = engine.apply_pull_snapshot(&snapshot, now)?;
+        let notices = if applied {
+            engine.take_outbound()
+        } else {
+            Vec::new()
+        };
+        (applied, notices, engine.data_dir().to_path_buf())
+    };
+    if !applied {
+        return Ok(false);
+    }
+    // A verified re-base queues a `Rebase` for each child; deliver them here so
+    // the healing pull converges the whole subtree, keeping failures for the
+    // periodic sweep.
+    let mut retry = Vec::new();
+    for item in notices {
+        let status = deliver_one(endpoint, &item).await;
+        audit_delivery(&data_dir, &item.target, item.kind, &status);
+        if !matches!(status, DeliveryStatus::Delivered) {
+            retry.push(item);
+        }
+    }
+    if !retry.is_empty() {
+        let mut engine = control.lock().await;
+        engine.requeue_pending_rebase(retry);
+    }
+    Ok(true)
 }
 
 /// Patch the `delivery` field of an admin reply with the real outcome.
@@ -1974,6 +2855,7 @@ fn map_control_error(err: &ControlError) -> RejectCode {
         | ControlError::UnexpectedLedgerForUser
         | ControlError::SlotOutOfRange(_)
         | ControlError::FieldTooLong { .. }
+        | ControlError::FieldBelowMinimum { .. }
         | ControlError::GrantExpiryNotAfterGrant { .. }
         | ControlError::GrantTtlTooLong { .. } => RejectCode::BadRequest,
         ControlError::Codec(_) => RejectCode::Internal,
@@ -2942,5 +3824,1340 @@ mod tests {
             engine.receive_at(remote, query, 0).await,
             ControlReply::Rejected(RejectCode::Unauthorized)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M5 exit rights (format 4): Exit / DetachNotice / Rebase / RebasePull
+    // -----------------------------------------------------------------------
+
+    fn secret(seed: u8) -> OperatorSecretKey {
+        OperatorSecretKey::from_bytes([seed; 32])
+    }
+
+    fn node_peer(id: &str, op: &OperatorSecretKey, ledger_seed: u8) -> PeerKeys {
+        PeerKeys {
+            node_id: NodeId::from(id),
+            operator: op.public(),
+            ledger: Some(ledger(ledger_seed)),
+            role: PeerRole::Node,
+        }
+    }
+
+    fn user_peer(id: &str, op: &OperatorSecretKey) -> PeerKeys {
+        PeerKeys {
+            node_id: NodeId::from(id),
+            operator: op.public(),
+            ledger: None,
+            role: PeerRole::User,
+        }
+    }
+
+    /// A `RecordStore` with the given links (parent set before address, so a
+    /// non-root address validates).
+    fn record_store(
+        dir: &std::path::Path,
+        node_id: &str,
+        address: Option<&str>,
+        parent: Option<(&str, u8)>,
+        children: &[(&str, ChildKind, u8, u64)],
+    ) -> RecordStore {
+        let mut store = RecordStore::open(dir, node_id).unwrap();
+        if let Some((parent, slot)) = parent {
+            store.set_parent(parent, slot).unwrap();
+        }
+        if let Some(address) = address {
+            store.set_address(address.parse().unwrap()).unwrap();
+        }
+        for (id, kind, slot, date) in children {
+            store.attach_child(*id, *kind, Some(*slot), *date).unwrap();
+        }
+        store
+    }
+
+    fn engine_with(
+        dir: &std::path::Path,
+        node_id: &str,
+        operator: OperatorSecretKey,
+        record: RecordStore,
+        peers: &[PeerKeys],
+    ) -> ControlNode {
+        let mut registry = PeerRegistry::new();
+        for row in peers {
+            registry.insert(row.clone()).unwrap();
+        }
+        let store = ControlStore::open(dir).unwrap();
+        ControlNode::new(
+            dir.to_path_buf(),
+            node_id,
+            operator,
+            record,
+            registry,
+            store,
+            AdminStore::empty(),
+        )
+    }
+
+    /// A `SignedControl` that declares `version`, re-signing so the version byte
+    /// is inside the signed preimage exactly as a real peer would have it.
+    fn authorize_version(
+        origin: &str,
+        op: &OperatorSecretKey,
+        nonce: u64,
+        request: ControlRequest,
+        version: u8,
+    ) -> SignedControl {
+        let mut signed = authorize_at(origin, op, nonce, request);
+        signed.version = version;
+        signed.signature = op.sign(signed.signing_hash().as_bytes());
+        signed
+    }
+
+    fn any_remote() -> EndpointId {
+        EndpointId::from(SecretKey::generate().public())
+    }
+
+    fn exit_request(node: &str, subtree_nodes: u32) -> ControlRequest {
+        ControlRequest::Exit(ExitRequest {
+            node: NodeId::from(node),
+            subtree_nodes,
+        })
+    }
+
+    #[tokio::test]
+    async fn exit_non_senior_node_child_can_leave() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[
+                ("senior", ChildKind::Node, 0, 1),
+                ("child", ChildKind::Node, 3, 2),
+            ],
+        );
+        let peers = [
+            node_peer("senior", &secret(3), 3),
+            node_peer("child", &child_op, 2),
+        ];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+
+        let signed = authorize_at("child", &child_op, 1, exit_request("child", 1));
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+        let children = &engine.record().children;
+        assert!(
+            !children.iter().any(|c| c.child_id == "child"),
+            "the exiting child is removed"
+        );
+        assert!(
+            children.iter().any(|c| c.child_id == "senior"),
+            "other children are untouched"
+        );
+        assert!(
+            engine.peers().get(&NodeId::from("child")).is_some(),
+            "the peer row is retained for a possible re-attach"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_user_child_can_leave() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let user_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[("browser", ChildKind::User, 5, 7)],
+        );
+        let peers = [user_peer("browser", &user_op)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+
+        let signed = authorize_at("browser", &user_op, 1, exit_request("browser", 1));
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+        assert!(
+            !engine
+                .record()
+                .children
+                .iter()
+                .any(|c| c.child_id == "browser")
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_wrong_origin_or_controller_is_unauthorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[
+                ("senior", ChildKind::Node, 0, 1),
+                ("child", ChildKind::Node, 3, 2),
+            ],
+        );
+        let peers = [
+            node_peer("senior", &secret(3), 3),
+            node_peer("child", &child_op, 2),
+        ];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+
+        // The request names `child` but is signed by a different (registered)
+        // origin.
+        let wrong_origin = authorize_at("senior", &secret(3), 1, exit_request("child", 1));
+        assert_eq!(
+            engine.receive_at(any_remote(), wrong_origin, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+
+        // Same origin node, but signed by a key that is not its registered
+        // operator.
+        let wrong_controller = authorize_at("child", &secret(9), 2, exit_request("child", 1));
+        assert_eq!(
+            engine.receive_at(any_remote(), wrong_controller, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+        assert!(
+            engine
+                .record()
+                .children
+                .iter()
+                .any(|c| c.child_id == "child"),
+            "no mutation on refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_without_registry_row_is_unauthorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &[]);
+        let signed = authorize_at("ghost", &secret(8), 1, exit_request("ghost", 1));
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_absent_but_registered_is_idempotent_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        // The parent no longer lists the child, but the registry row remains.
+        let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
+        let peers = [node_peer("child", &child_op, 2)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+        let signed = authorize_at("child", &child_op, 1, exit_request("child", 1));
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_replay_returns_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[("child", ChildKind::Node, 3, 2)],
+        );
+        let peers = [node_peer("child", &child_op, 2)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+        let signed = authorize_at("child", &child_op, 1, exit_request("child", 1));
+        assert_eq!(
+            engine.receive_at(any_remote(), signed.clone(), 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Rejected(RejectCode::Replay)
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_notice_rebases_node_child_to_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_op = secret(1);
+        let parent_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "child",
+            Some("0.2"),
+            Some(("parent", 2)),
+            &[("c1", ChildKind::Node, 0, 1)],
+        );
+        let peers = [node_peer("parent", &parent_op, 3)];
+        let mut engine = engine_with(dir.path(), "child", child_op, record, &peers);
+
+        let signed = authorize_at(
+            "parent",
+            &parent_op,
+            1,
+            ControlRequest::DetachNotice(DetachNotice {
+                node: NodeId::from("child"),
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+        assert!(engine.record().parent.is_none());
+        assert_eq!(engine.record().address, Some("0".parse().unwrap()));
+
+        // The new root pushes a Rebase to each of its own children.
+        let outbound = engine.take_outbound();
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].kind, OutboundKind::Rebase);
+        assert_eq!(outbound[0].target, NodeId::from("c1"));
+        let ControlRequest::Rebase(notice) = &outbound[0].signed.request else {
+            panic!("expected a Rebase frame");
+        };
+        assert_eq!(notice.node, NodeId::from("c1"));
+        assert_eq!(notice.parent_address, "0".parse().unwrap());
+        assert_eq!(notice.address, "0.0".parse().unwrap());
+        assert_eq!(outbound[0].signed.origin, NodeId::from("child"));
+    }
+
+    #[tokio::test]
+    async fn detach_notice_clears_user_parent_and_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_op = secret(1);
+        let parent_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "browser",
+            Some("0.2"),
+            Some(("parent", 2)),
+            &[],
+        );
+        let peers = [node_peer("parent", &parent_op, 3)];
+        let mut engine = engine_with(dir.path(), "browser", user_op, record, &peers);
+        engine.set_self_kind(ChildKind::User);
+
+        let signed = authorize_at(
+            "parent",
+            &parent_op,
+            1,
+            ControlRequest::DetachNotice(DetachNotice {
+                node: NodeId::from("browser"),
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+        assert!(engine.record().parent.is_none());
+        assert_eq!(engine.record().address, None, "a user has no root address");
+        assert!(engine.take_outbound().is_empty());
+    }
+
+    #[tokio::test]
+    async fn detach_notice_wrong_node_origin_and_stale_former_parent_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_op = secret(1);
+        let parent_op = secret(2);
+        let other_op = secret(3);
+        let record = record_store(
+            dir.path(),
+            "child",
+            Some("0.2"),
+            Some(("parent", 2)),
+            &[],
+        );
+        let peers = [
+            node_peer("parent", &parent_op, 3),
+            node_peer("other", &other_op, 4),
+        ];
+        let mut engine = engine_with(dir.path(), "child", child_op.clone(), record, &peers);
+
+        // Names a different node.
+        let wrong_node = authorize_at(
+            "parent",
+            &parent_op,
+            1,
+            ControlRequest::DetachNotice(DetachNotice {
+                node: NodeId::from("other"),
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), wrong_node, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+
+        // Signed by a registered peer that is not the current parent.
+        let wrong_origin = authorize_at(
+            "other",
+            &other_op,
+            2,
+            ControlRequest::DetachNotice(DetachNotice {
+                node: NodeId::from("child"),
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), wrong_origin, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+
+        // A former parent: the current parent is `newparent`.
+        let dir2 = tempfile::tempdir().unwrap();
+        let record = record_store(
+            dir2.path(),
+            "child",
+            Some("0.3"),
+            Some(("newparent", 3)),
+            &[],
+        );
+        let peers = [node_peer("parent", &parent_op, 3)];
+        let mut stale = engine_with(dir2.path(), "child", child_op.clone(), record, &peers);
+        let stale_notice = authorize_at(
+            "parent",
+            &parent_op,
+            1,
+            ControlRequest::DetachNotice(DetachNotice {
+                node: NodeId::from("child"),
+            }),
+        );
+        assert_eq!(
+            stale.receive_at(any_remote(), stale_notice, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+        assert!(stale.record().parent.is_some(), "no mutation on refusal");
+    }
+
+    #[tokio::test]
+    async fn detach_notice_already_detached_is_accepted_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_op = secret(1);
+        let parent_op = secret(2);
+        let record = record_store(dir.path(), "child", None, None, &[]);
+        let peers = [node_peer("parent", &parent_op, 3)];
+        let mut engine = engine_with(dir.path(), "child", child_op, record, &peers);
+        let signed = authorize_at(
+            "parent",
+            &parent_op,
+            1,
+            ControlRequest::DetachNotice(DetachNotice {
+                node: NodeId::from("child"),
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+        assert!(engine.record().parent.is_none());
+    }
+
+    fn rebase_request(
+        address: &str,
+        parent_address: &str,
+        generation: u64,
+    ) -> ControlRequest {
+        ControlRequest::Rebase(RebaseNotice {
+            node: NodeId::from("child"),
+            parent_address: parent_address.parse().unwrap(),
+            address: address.parse().unwrap(),
+            generation,
+        })
+    }
+
+    #[tokio::test]
+    async fn rebase_applies_parent_derived_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_op = secret(1);
+        let parent_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "child",
+            Some("0.2"),
+            Some(("parent", 2)),
+            &[],
+        );
+        let peers = [node_peer("parent", &parent_op, 3)];
+        let mut engine = engine_with(dir.path(), "child", child_op, record, &peers);
+        let signed = authorize_at("parent", &parent_op, 1, rebase_request("0.5.2", "0.5", 1));
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(engine.record().address, Some("0.5.2".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn rebase_rejects_address_slot_mismatch_and_stale_former_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_op = secret(1);
+        let parent_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "child",
+            Some("0.2"),
+            Some(("parent", 2)),
+            &[],
+        );
+        let peers = [node_peer("parent", &parent_op, 3)];
+        let mut engine = engine_with(dir.path(), "child", child_op.clone(), record, &peers);
+
+        // `parent_address.child(2)` is `0.5.2`, not `0.5.3`.
+        let mismatch = authorize_at("parent", &parent_op, 1, rebase_request("0.5.3", "0.5", 1));
+        assert_eq!(
+            engine.receive_at(any_remote(), mismatch, 0).await,
+            ControlReply::Rejected(RejectCode::BadRequest)
+        );
+        assert_eq!(engine.record().address, Some("0.2".parse().unwrap()));
+
+        // Current parent is `newparent`; `parent` is stale.
+        let dir2 = tempfile::tempdir().unwrap();
+        let record = record_store(
+            dir2.path(),
+            "child",
+            Some("0.3"),
+            Some(("newparent", 3)),
+            &[],
+        );
+        let peers = [node_peer("parent", &parent_op, 3)];
+        let mut stale = engine_with(dir2.path(), "child", child_op.clone(), record, &peers);
+        let stale_rebase = authorize_at("parent", &parent_op, 1, rebase_request("0.5.3", "0.5", 1));
+        assert_eq!(
+            stale.receive_at(any_remote(), stale_rebase, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+    }
+
+    #[tokio::test]
+    async fn rebase_is_idempotent_on_reapply() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_op = secret(1);
+        let parent_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "child",
+            Some("0.5.2"),
+            Some(("parent", 2)),
+            &[],
+        );
+        let peers = [node_peer("parent", &parent_op, 3)];
+        let mut engine = engine_with(dir.path(), "child", child_op, record, &peers);
+        let signed = authorize_at("parent", &parent_op, 1, rebase_request("0.5.2", "0.5", 1));
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(engine.record().address, Some("0.5.2".parse().unwrap()));
+        assert!(
+            engine.take_outbound().is_empty(),
+            "an idempotent re-apply must not re-propagate"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebase_queues_notices_to_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_op = secret(1);
+        let parent_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "child",
+            Some("0.2"),
+            Some(("parent", 2)),
+            &[
+                ("c1", ChildKind::Node, 0, 1),
+                ("c2", ChildKind::Node, 4, 2),
+            ],
+        );
+        let peers = [node_peer("parent", &parent_op, 3)];
+        let mut engine = engine_with(dir.path(), "child", child_op, record, &peers);
+        let signed = authorize_at("parent", &parent_op, 1, rebase_request("0.5.2", "0.5", 1));
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+
+        let outbound = engine.take_outbound();
+        assert_eq!(outbound.len(), 2);
+        let mut addresses: Vec<(String, String)> = outbound
+            .iter()
+            .map(|item| {
+                assert_eq!(item.kind, OutboundKind::Rebase);
+                assert_eq!(item.signed.origin, NodeId::from("child"));
+                let ControlRequest::Rebase(notice) = &item.signed.request else {
+                    panic!("expected a Rebase frame");
+                };
+                (
+                    item.target.to_string(),
+                    notice.address.to_string(),
+                )
+            })
+            .collect();
+        addresses.sort();
+        assert_eq!(
+            addresses,
+            vec![
+                ("c1".to_string(), "0.5.2.0".to_string()),
+                ("c2".to_string(), "0.5.2.4".to_string()),
+            ]
+        );
+        // The notice's generation is carried down.
+        for item in &outbound {
+            let ControlRequest::Rebase(notice) = &item.signed.request else {
+                unreachable!();
+            };
+            assert_eq!(notice.generation, 1);
+            assert_eq!(notice.parent_address, "0.5.2".parse().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn rebase_pull_replies_with_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0.5"),
+            Some(("grand", 5)),
+            &[("child", ChildKind::Node, 2, 1)],
+        );
+        let peers = [node_peer("child", &child_op, 3)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+        let signed = authorize_at(
+            "child",
+            &child_op,
+            1,
+            ControlRequest::RebasePull(RebasePull {
+                node: NodeId::from("child"),
+            }),
+        );
+        let reply = engine.receive_at(any_remote(), signed, 0).await;
+        let ControlReply::Snapshot(snapshot) = reply else {
+            panic!("expected Snapshot, got {reply:?}");
+        };
+        assert_eq!(snapshot.address, Some("0.5".parse().unwrap()));
+        assert_eq!(snapshot.children.len(), 1);
+        assert_eq!(snapshot.children[0].child_id, NodeId::from("child"));
+        assert_eq!(
+            snapshot.children[0].address,
+            Some("0.5.2".parse().unwrap()),
+            "the snapshot carries the child's derived address"
+        );
+    }
+
+    /// **M1**: a node's own parent must not be able to pull the node's full
+    /// routing snapshot. It is registered (so `verify_control` passes) but is
+    /// not a child.
+    #[tokio::test]
+    async fn rebase_pull_from_own_parent_is_unauthorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_op = secret(1);
+        let parent_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "child",
+            Some("0.5.2"),
+            Some(("parent", 2)),
+            &[],
+        );
+        let peers = [node_peer("parent", &parent_op, 3)];
+        let mut engine = engine_with(dir.path(), "child", child_op, record, &peers);
+        let signed = authorize_at(
+            "parent",
+            &parent_op,
+            1,
+            ControlRequest::RebasePull(RebasePull {
+                node: NodeId::from("parent"),
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+    }
+
+    /// **M1**: a former child's registry row is retained across `Exit`, but an
+    /// already-exited child is no longer a child and must not be able to pull.
+    #[tokio::test]
+    async fn rebase_pull_from_retained_former_child_is_unauthorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        // `child` is registered but not listed as a child (it has exited).
+        let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
+        let peers = [node_peer("child", &child_op, 3)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+        let signed = authorize_at(
+            "child",
+            &child_op,
+            1,
+            ControlRequest::RebasePull(RebasePull {
+                node: NodeId::from("child"),
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+    }
+
+    #[tokio::test]
+    async fn rebase_pull_wrong_node_is_unauthorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0.5"),
+            Some(("grand", 5)),
+            &[("child", ChildKind::Node, 2, 1)],
+        );
+        let peers = [node_peer("child", &child_op, 3)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+        // Signed by `child`, but claims a different requester.
+        let signed = authorize_at(
+            "child",
+            &child_op,
+            1,
+            ControlRequest::RebasePull(RebasePull {
+                node: NodeId::from("other"),
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+    }
+
+    #[tokio::test]
+    async fn v3_frame_cannot_carry_exit_but_v4_query_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[("child", ChildKind::Node, 3, 2)],
+        );
+        let peers = [node_peer("child", &child_op, 2)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &peers);
+
+        let v3_exit = authorize_version("child", &child_op, 1, exit_request("child", 1), 3);
+        assert_eq!(
+            engine.receive_at(any_remote(), v3_exit, 0).await,
+            ControlReply::Rejected(RejectCode::BadVersion)
+        );
+
+        // A v4 frame over a pre-existing variant is dispatched normally.
+        let query = authorize_at("parent", &parent_op, 2, ControlRequest::Query);
+        assert!(matches!(
+            engine.receive_at(any_remote(), query, 0).await,
+            ControlReply::Snapshot(_)
+        ));
+    }
+
+    /// **A6**: the v3 shape gate covers all four v4 variants, not just `Exit`.
+    #[test]
+    fn carries_v4_variant_covers_all_four_appended_variants() {
+        let v4 = [
+            exit_request("child", 1),
+            ControlRequest::DetachNotice(DetachNotice {
+                node: NodeId::from("child"),
+            }),
+            rebase_request("0.5.2", "0.5", 1),
+            ControlRequest::RebasePull(RebasePull {
+                node: NodeId::from("child"),
+            }),
+        ];
+        for request in v4 {
+            assert!(carries_v4_variant(&request), "{request:?}");
+        }
+        // Pre-existing variants are not covered by the gate.
+        for request in [
+            ControlRequest::Query,
+            ControlRequest::SetAddress(SetAddress { address: None }),
+            ControlRequest::DetachChild(DetachChild {
+                child: NodeId::from("child"),
+            }),
+        ] {
+            assert!(!carries_v4_variant(&request), "{request:?}");
+        }
+    }
+
+    /// **A6**: a v3-declared frame carrying an *old* (pre-v4) variant still
+    /// dispatches under a v4 node; only the four appended variants are gated.
+    #[tokio::test]
+    async fn v3_frame_carrying_old_variant_still_dispatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let applicant_op = secret(2);
+        let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &[]);
+
+        let join = JoinRequest {
+            node: NodeId::from("applicant"),
+            kind: ChildKind::User,
+            operator: applicant_op.public(),
+            ledger: None,
+            desired_slot: None,
+            location_hint: None,
+            nonce: 7,
+            expiry: u64::MAX,
+        };
+        let v3_join = authorize_version(
+            "applicant",
+            &applicant_op,
+            1,
+            ControlRequest::Join(join),
+            3,
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), v3_join, 0).await,
+            ControlReply::Pending,
+            "a v3 frame over a pre-existing variant must dispatch"
+        );
+    }
+
+    /// **A4**: a failed notice whose target is no longer a child is dropped, and
+    /// the pending queue de-duplicates by `(target, kind)`.
+    #[test]
+    fn requeue_pending_rebase_drops_non_children_and_dedups() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[("child", ChildKind::Node, 1, 1)],
+        );
+        let op = secret(1);
+        let mut engine = engine_with(dir.path(), "parent", op.clone(), record, &[]);
+        let item = |target: &str, nonce: u64| OutboundControl {
+            target: NodeId::from(target),
+            signed: authorize_at(
+                "parent",
+                &op,
+                nonce,
+                ControlRequest::Rebase(RebaseNotice {
+                    node: NodeId::from(target),
+                    parent_address: "0".parse().unwrap(),
+                    address: "0.1".parse().unwrap(),
+                    generation: 1,
+                }),
+            ),
+            kind: OutboundKind::Rebase,
+        };
+
+        engine.requeue_pending_rebase(vec![item("child", 1), item("ghost", 2)]);
+        assert_eq!(engine.take_pending_rebase().len(), 1, "ghost is not a child");
+
+        engine.requeue_pending_rebase(vec![item("child", 3), item("child", 4)]);
+        assert_eq!(engine.take_pending_rebase().len(), 1, "de-duplicated");
+    }
+
+    /// **A3**: a `RebasePull` reply is verified against the local parent link
+    /// before anything is applied.
+    #[test]
+    fn apply_pull_snapshot_verifies_parent_and_derived_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = record_store(
+            dir.path(),
+            "child",
+            Some("0.5.2"),
+            Some(("parent", 2)),
+            &[],
+        );
+        let mut engine = engine_with(dir.path(), "child", secret(1), record, &[]);
+        let snapshot = |node_id: &str, address: &str, child_address: Option<&str>| NodeSnapshot {
+            node_id: NodeId::from(node_id),
+            address: Some(address.parse().unwrap()),
+            parent: None,
+            children: vec![ChildSnapshot {
+                child_id: NodeId::from("child"),
+                kind: ChildKind::Node,
+                slot: 2,
+                address: child_address.map(|a| a.parse().unwrap()),
+                date_joined: 1,
+            }],
+        };
+
+        // Already current: verifies, no mutation, no propagation.
+        assert_eq!(
+            engine.apply_pull_snapshot(&snapshot("parent", "0.5", Some("0.5.2")), 0),
+            Ok(false)
+        );
+        assert!(engine.take_outbound().is_empty());
+
+        // A different, consistent prefix is applied and propagated.
+        assert_eq!(
+            engine.apply_pull_snapshot(&snapshot("parent", "0.7", Some("0.7.2")), 0),
+            Ok(true)
+        );
+        assert_eq!(engine.record().address, Some("0.7.2".parse().unwrap()));
+
+        // The snapshot must name the current parent...
+        assert!(
+            engine
+                .apply_pull_snapshot(&snapshot("impostor", "0.7", Some("0.7.2")), 0)
+                .is_err()
+        );
+        // ...and derive exactly this node's address.
+        assert!(
+            engine
+                .apply_pull_snapshot(&snapshot("parent", "0.7", Some("0.7.3")), 0)
+                .is_err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration-gate remediation: G2 (idempotent re-approval) and G3 (live
+    // record reload).
+    // -----------------------------------------------------------------------
+
+    /// Build a persisted root engine so the record-reload path has a file to
+    /// read (unlike the in-memory-only `engine_with` harnesses).
+    fn persisted_root_engine(dir: &std::path::Path, op: OperatorSecretKey) -> ControlNode {
+        let mut record = RecordStore::open(dir, "parent").unwrap();
+        record.set_address("0".parse().unwrap()).unwrap();
+        record.save().unwrap();
+        ControlNode::new(
+            dir,
+            "parent",
+            op,
+            record,
+            PeerRegistry::new(),
+            ControlStore::open(dir).unwrap(),
+            AdminStore::empty(),
+        )
+    }
+
+    /// **G3**: a control request observes a `node.json` rewritten by a separate
+    /// process (e.g. CLI `control exit`), not the stale in-memory record.
+    #[tokio::test]
+    async fn receive_at_observes_externally_rewritten_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let operator = secret(1);
+        let mut engine = persisted_root_engine(dir.path(), operator.clone());
+        let remote = any_remote();
+
+        let before = engine
+            .receive_at(
+                remote,
+                authorize_at("parent", &operator, 1, ControlRequest::Query),
+                0,
+            )
+            .await;
+        let ControlReply::Snapshot(before) = before else {
+            panic!("expected Snapshot, got {before:?}");
+        };
+        assert!(before.children.is_empty());
+
+        // An external process rewrites `node.json`.
+        let mut external = RecordStore::open(dir.path(), "parent").unwrap();
+        external
+            .attach_child("browser", ChildKind::User, Some(2), 5)
+            .unwrap();
+        external.save().unwrap();
+
+        let after = engine
+            .receive_at(
+                remote,
+                authorize_at("parent", &operator, 2, ControlRequest::Query),
+                0,
+            )
+            .await;
+        let ControlReply::Snapshot(after) = after else {
+            panic!("expected Snapshot, got {after:?}");
+        };
+        assert!(
+            after
+                .children
+                .iter()
+                .any(|c| c.child_id.as_str() == "browser"),
+            "the reloaded record must be visible: {after:?}"
+        );
+    }
+
+    /// **G3**: a failed record reload warns and keeps serving the in-memory
+    /// record (topology is not authority, so it must not fail closed).
+    #[tokio::test]
+    async fn receive_at_keeps_in_memory_record_when_reload_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let operator = secret(1);
+        let mut engine = persisted_root_engine(dir.path(), operator.clone());
+        std::fs::write(dir.path().join(crate::record::NODE_RECORD_FILE), b"not json").unwrap();
+
+        let reply = engine
+            .receive_at(
+                any_remote(),
+                authorize_at("parent", &operator, 1, ControlRequest::Query),
+                0,
+            )
+            .await;
+        let ControlReply::Snapshot(snapshot) = reply else {
+            panic!("expected Snapshot, got {reply:?}");
+        };
+        assert_eq!(snapshot.address, Some("0".parse().unwrap()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration-gate remediation, G3 follow-up: live peer-registry reload.
+    // -----------------------------------------------------------------------
+
+    /// A persisted root engine whose `node.json` lists `child` but whose
+    /// `ledger_peers.json` is absent (the child's row is not registered yet).
+    fn persisted_parent_with_child(
+        dir: &std::path::Path,
+        parent_op: OperatorSecretKey,
+        child_id: &str,
+    ) -> ControlNode {
+        let mut record = RecordStore::open(dir, "parent").unwrap();
+        record.set_address("0".parse().unwrap()).unwrap();
+        record
+            .attach_child(child_id, ChildKind::Node, Some(0), 1)
+            .unwrap();
+        record.save().unwrap();
+        ControlNode::new(
+            dir,
+            "parent",
+            parent_op,
+            record,
+            PeerRegistry::new(),
+            ControlStore::open(dir).unwrap(),
+            AdminStore::empty(),
+        )
+    }
+
+    /// **G3 follow-up**: a peer row written to `ledger_peers.json` by a separate
+    /// process (CLI `control admin approve` / node-to-node join approval) is
+    /// visible to the next `receive_at`, so a child's signed `Exit` verifies
+    /// where it previously failed `Unauthorized`.
+    #[tokio::test]
+    async fn receive_at_observes_externally_written_peer_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        let mut engine = persisted_parent_with_child(dir.path(), parent_op, "child");
+
+        // Before the external write there is no row to verify the child against.
+        let before = engine
+            .receive_at(
+                any_remote(),
+                authorize_at("child", &child_op, 1, exit_request("child", 1)),
+                0,
+            )
+            .await;
+        assert_eq!(
+            before,
+            ControlReply::Rejected(RejectCode::Unauthorized),
+            "an unregistered child must not pass `verify_control`"
+        );
+
+        // A separate process registers the child's keys on disk.
+        let mut external = PeerRegistry::new();
+        external.insert(node_peer("child", &child_op, 2)).unwrap();
+        ledger_peers::save_peers(dir.path(), &external).unwrap();
+
+        // The next request re-reads the registry and the child's exit applies.
+        let after = engine
+            .receive_at(
+                any_remote(),
+                authorize_at("child", &child_op, 2, exit_request("child", 1)),
+                0,
+            )
+            .await;
+        assert_eq!(
+            after,
+            ControlReply::Accepted,
+            "the externally written peer row must be visible to the next request"
+        );
+        assert!(
+            !engine
+                .record()
+                .children
+                .iter()
+                .any(|c| c.child_id == "child"),
+            "the exit must have detached the child"
+        );
+    }
+
+    /// **G3 follow-up**: with no `ledger_peers.json` on disk (the in-memory-only
+    /// `engine_with` harness shape), a request must keep the constructed
+    /// registry rather than replacing it with the loader's empty result.
+    #[tokio::test]
+    async fn receive_at_keeps_in_memory_peers_when_file_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        // `record_store` persists nothing, so neither `node.json` nor
+        // `ledger_peers.json` exists: both reloads are correctly skipped.
+        let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
+        let peers = [node_peer("child", &child_op, 2)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &peers);
+        assert!(engine.peers().get(&NodeId::from("child")).is_some());
+
+        let reply = engine
+            .receive_at(
+                any_remote(),
+                authorize_at("parent", &parent_op, 1, ControlRequest::Query),
+                0,
+            )
+            .await;
+        assert!(matches!(reply, ControlReply::Snapshot(_)));
+        assert!(
+            engine.peers().get(&NodeId::from("child")).is_some(),
+            "a missing peer file must not wipe the in-memory registry"
+        );
+    }
+
+    /// **G3 follow-up**: a normal in-process `approve_pending` still works after
+    /// a reload, and its persisted row survives the next request (not lost and
+    /// not duplicated).
+    #[tokio::test]
+    async fn in_process_approve_survives_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        let mut record = RecordStore::open(dir.path(), "parent").unwrap();
+        record.set_address("0".parse().unwrap()).unwrap();
+        record.save().unwrap();
+        let mut engine = ControlNode::new(
+            dir.path().to_path_buf(),
+            "parent",
+            parent_op.clone(),
+            record,
+            PeerRegistry::new(),
+            ControlStore::open(dir.path()).unwrap(),
+            AdminStore::empty(),
+        );
+
+        // A request first runs the reload phase (no peer file yet; skipped).
+        let snapshot = engine
+            .receive_at(
+                any_remote(),
+                authorize_at("parent", &parent_op, 1, ControlRequest::Query),
+                0,
+            )
+            .await;
+        assert!(matches!(snapshot, ControlReply::Snapshot(_)));
+
+        // The normal in-process approve path (the pending store is intentionally
+        // not reloaded, so the queued row survives) persists the child's row.
+        engine.pending.add_pending(JoinRequest {
+            node: NodeId::from("child"),
+            kind: ChildKind::Node,
+            operator: child_op.public(),
+            ledger: Some(ledger(2)),
+            desired_slot: Some(0),
+            location_hint: None,
+            nonce: 3,
+            expiry: u64::MAX,
+        });
+        let approval = engine
+            .approve_pending("child", Some(0), 5, ledger(1))
+            .unwrap();
+        assert_eq!(approval.slot, 0);
+        assert!(
+            ledger_peers::load_peers(dir.path())
+                .unwrap()
+                .get(&NodeId::from("child"))
+                .is_some(),
+            "the approve must have persisted the child's row"
+        );
+
+        // The child's signed exit now verifies against the reloaded registry.
+        let reply = engine
+            .receive_at(
+                any_remote(),
+                authorize_at("child", &child_op, 2, exit_request("child", 1)),
+                0,
+            )
+            .await;
+        assert_eq!(reply, ControlReply::Accepted);
+        assert!(engine.peers().get(&NodeId::from("child")).is_some());
+    }
+
+    /// **G2**: re-approving a child the record already lists at its existing
+    /// slot succeeds with the identical retained row (no re-attach, no
+    /// duplicate-insert error). This is the stale-row case where the parent
+    /// never processed the `Exit`.
+    #[tokio::test]
+    async fn approve_pending_reapproves_listed_child_with_retained_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[("child", ChildKind::Node, 3, 1)],
+        );
+        let peers = [node_peer("child", &child_op, 2)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+
+        let join = JoinRequest {
+            node: NodeId::from("child"),
+            kind: ChildKind::Node,
+            operator: child_op.public(),
+            ledger: Some(ledger(2)),
+            desired_slot: Some(3),
+            location_hint: None,
+            nonce: 1,
+            expiry: u64::MAX,
+        };
+        let signed = authorize_at("child", &child_op, 1, ControlRequest::Join(join));
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Pending,
+            "a listed child's own slot must not be refused at join time"
+        );
+
+        let approval = engine
+            .approve_pending("child", Some(3), 0, ledger(1))
+            .expect("idempotent re-approval");
+        assert_eq!(approval.slot, 3);
+        assert_eq!(approval.address, "0.3".parse().unwrap());
+        assert_eq!(engine.record().children.len(), 1, "no re-attach");
+        assert_eq!(engine.peers().len(), 1, "no duplicate row");
+    }
+
+    /// **G2**: a retained row for the same node under a *different* operator is
+    /// a genuine conflict and is refused.
+    #[tokio::test]
+    async fn approve_pending_conflicting_operator_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let applicant_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[("child", ChildKind::Node, 3, 1)],
+        );
+        // The retained row names a different operator (secret 9).
+        let peers = [node_peer("child", &secret(9), 9)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+
+        let join = JoinRequest {
+            node: NodeId::from("child"),
+            kind: ChildKind::Node,
+            operator: applicant_op.public(),
+            ledger: Some(ledger(2)),
+            desired_slot: Some(3),
+            location_hint: None,
+            nonce: 1,
+            expiry: u64::MAX,
+        };
+        let signed = authorize_at("child", &applicant_op, 1, ControlRequest::Join(join));
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Pending
+        );
+        assert!(
+            engine.approve_pending("child", Some(3), 0, ledger(1)).is_err(),
+            "a conflicting retained operator must error"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_refuses_all_exit_rights_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
+        let fwd_secret = SecretKey::generate();
+        let fwd_id = fwd_secret.public().to_string();
+        let fwd_op = secret(9);
+        let peers = [node_peer(&fwd_id, &fwd_op, 9)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &peers);
+        let remote = EndpointId::from(fwd_secret.public());
+
+        let requests = vec![
+            exit_request("child", 1),
+            ControlRequest::DetachNotice(DetachNotice {
+                node: NodeId::from("child"),
+            }),
+            rebase_request("0.5.2", "0.5", 1),
+            ControlRequest::RebasePull(RebasePull {
+                node: NodeId::from("child"),
+            }),
+        ];
+        for (index, request) in requests.into_iter().enumerate() {
+            let nonce = 100 + index as u64;
+            let intent = authorize_at("parent", &parent_op, nonce, request.clone());
+            let forward = authorize_at(&fwd_id, &fwd_op, nonce, request);
+            let routed = RoutedControlV1 {
+                version: cawala_control::ROUTED_CONTROL_VERSION,
+                target: PeerRef {
+                    addr: "0".parse().unwrap(),
+                    node: "parent".to_string(),
+                },
+                requester: PeerRef {
+                    addr: "0.1".parse().unwrap(),
+                    node: fwd_id.clone(),
+                },
+                intent,
+                grant: None,
+                forwards: vec![RoutedForward::new(
+                    PeerRef {
+                        addr: "0.1".parse().unwrap(),
+                        node: fwd_id.clone(),
+                    },
+                    forward,
+                )],
+            };
+            assert_eq!(
+                engine.receive_routed_at(remote, routed, 0).await,
+                ControlReply::Rejected(RejectCode::Unauthorized),
+                "variant {index}"
+            );
+        }
+    }
+
+    /// A node at an independent root can re-attach: the approval clears the
+    /// root address before linking the new parent (no `AddressSlotMismatch`).
+    #[tokio::test]
+    async fn join_approved_reattaches_a_root_zero_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(3);
+        let (mut engine, request) = outbound_applicant(dir.path(), None);
+        // The applicant is now an independent root.
+        engine.record.rebase_to_root().unwrap();
+        assert_eq!(engine.record().address, Some("0".parse().unwrap()));
+        engine.record.save().unwrap();
+
+        let approval = approval_for(&request);
+        let signed = authorize_at(
+            "parent",
+            &parent_op,
+            1,
+            ControlRequest::JoinApproved(approval.clone()),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(engine.record().parent.as_ref().unwrap().parent_id, "parent");
+        assert_eq!(engine.record().address, Some(approval.address));
     }
 }

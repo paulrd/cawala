@@ -14,9 +14,13 @@
     requestBalance,
     parseReceiveUri,
     getReceiveUri,
+    leave,
+    getLastControlEvent,
   } from '../../lib/api.js';
-  import { ORDER_REJECT, ORDER_STATUS, ORDER_STATUS_LABELS, ORDER_STATUS_DESCRIPTIONS } from '../../lib/constants.js';
+  import { ORDER_REJECT, ORDER_STATUS, ORDER_STATUS_LABELS, ORDER_STATUS_DESCRIPTIONS, CONTROL_EVENT, ROUTES } from '../../lib/constants.js';
   import { truncateMiddle, timeAgo, formatTime, copyToClipboard } from '../../lib/utils.js';
+  import { navigate } from '../../lib/router.svelte.js';
+  import ConfirmDialog from '../shared/ConfirmDialog.svelte';
 
   let isLive = $derived(!isMockMode());
 
@@ -234,6 +238,73 @@
     }
   }
 
+  // ── Leave network state ───────────────────────────────────
+  let leaveConfirmOpen = $state(false);
+  let leaving = $state(false);
+  let leaveError = $state('');
+  let leaveResult = $state(null); // { status, delivery } | null
+
+  // Detect the "detached" event from the control drain so the UI transitions
+  // to the aftermath state even if the component was already mounted.
+  let detachedSeen = $state(false);
+
+  // Poll for the detached control event while the component is mounted.
+  let _detachedPoller = $state(null);
+
+  function _startDetachedPoller() {
+    _stopDetachedPoller();
+    _detachedPoller = setInterval(() => {
+      if (detachedSeen) { _stopDetachedPoller(); return; }
+      const ev = getLastControlEvent();
+      if (ev?.kind === CONTROL_EVENT.DETACHED) {
+        detachedSeen = true;
+        _stopDetachedPoller();
+      }
+    }, 2000);
+  }
+
+  function _stopDetachedPoller() {
+    if (_detachedPoller) {
+      clearInterval(_detachedPoller);
+      _detachedPoller = null;
+    }
+  }
+
+  // Whether we are in the "not joined" state (address absent).
+  let isJoined = $derived(!!clientState.address);
+  // The detached aftermath: either we detected the event or we just completed
+  // a leave() call and the address cleared.
+  let hasLeft = $derived(detachedSeen || (leaveResult?.status === 'detached'));
+
+  async function handleLeave() {
+    leaveConfirmOpen = true;
+  }
+
+  async function confirmLeave() {
+    leaveConfirmOpen = false;
+    leaving = true;
+    leaveError = '';
+    try {
+      const result = await leave();
+      leaveResult = result;
+      // The API clears clientState.address immediately. Also detect the
+      // control event for the aftermath banner.
+      const ev = getLastControlEvent();
+      if (ev?.kind === CONTROL_EVENT.DETACHED) {
+        detachedSeen = true;
+      }
+      showToast('Left the network.', 'ok');
+    } catch (err) {
+      leaveError = err.message || 'Failed to leave the network.';
+    } finally {
+      leaving = false;
+    }
+  }
+
+  function cancelLeave() {
+    leaveConfirmOpen = false;
+  }
+
   // ── Mock transaction history ──────────────────────────────
   let mockTransactions = $state([
     { id: 1, type: 'transfer', to: '0.3.2', amount: 150, timestamp: new Date(Date.now() - 3600000).toISOString() },
@@ -251,8 +322,10 @@
   });
 
   onMount(() => {
+    _startDetachedPoller();
     return () => {
       _stopSendPoller();
+      _stopDetachedPoller();
       if (_parseDebounce) clearTimeout(_parseDebounce);
     };
   });
@@ -277,6 +350,8 @@
             <p class="info-hint">
               Assigned by your parent node when you joined.
             </p>
+          {:else if hasLeft}
+            <span class="text-sm muted">Not assigned — you left this network.</span>
           {:else}
             <span class="text-sm muted">Not assigned yet — waiting for join approval.</span>
           {/if}
@@ -694,6 +769,84 @@
       </div>
     {/if}
   </Card>
+  <!-- ── Leave Network Card ─────────────────────────────── -->
+  {#if isLive}
+    {#if isJoined && !hasLeft}
+      <Card title="Network">
+        <div class="leave-section">
+          <div class="leave-info">
+            <p class="text-sm">
+              You are connected to a parent node.
+              Address: <Address address={clientState.address} size="sm" />
+            </p>
+          </div>
+
+          <div class="leave-danger-block">
+            <h4 class="leave-heading">Leave the network</h4>
+            <p class="leave-desc muted text-sm">
+              This will disconnect you from your parent node. It cannot be undone.
+            </p>
+            <button
+              type="button"
+              class="btn btn--danger-outline"
+              disabled={leaving}
+              onclick={handleLeave}
+            >
+              {#if leaving}Leaving...{:else}Leave network{/if}
+            </button>
+          </div>
+
+          {#if leaveError}
+            <div class="leave-error" role="alert">
+              {leaveError}
+            </div>
+          {/if}
+        </div>
+      </Card>
+    {:else if hasLeft || (!isJoined && leaveResult?.status === 'detached')}
+      <!-- Aftermath: user has left the network -->
+      <Card title="Network">
+        <div class="left-network-state">
+          <div class="left-network-body">
+            <h4 class="left-network-title">Not connected to a network</h4>
+            <p class="text-sm muted">
+              You are no longer part of a network. Your address has been cleared.
+            </p>
+            <div class="warn-box">
+              <span class="warn-icon">!</span>
+              <span>
+                Any balance you still held with your former parent node stays on
+                their books until you re-join and settle it.
+              </span>
+            </div>
+            <p class="text-sm muted">
+              You can join a different network, or re-join this one, using a new
+              invitation from a node operator.
+            </p>
+            <button
+              type="button"
+              class="btn btn--primary"
+              onclick={() => navigate(ROUTES.JOIN_FLOW)}
+            >
+              Join a network
+            </button>
+          </div>
+        </div>
+      </Card>
+    {/if}
+  {/if}
+
+  <!-- Leave network confirm dialog -->
+  <ConfirmDialog
+    open={leaveConfirmOpen}
+    title="Leave this network?"
+    message="You will be disconnected from your parent node and lose your network address. Any balance you still hold with that parent stays on their books until you re-join and settle it. You can re-join this or another network later using a new invitation."
+    confirmLabel="Leave network"
+    cancelLabel="Stay"
+    variant="danger"
+    onConfirm={confirmLeave}
+    onCancel={cancelLeave}
+  />
 </div>
 
 <style>
@@ -996,8 +1149,95 @@
   .btn--ghost:hover:not(:disabled) {
     background: var(--bg-hover);
   }
+  .btn--danger-outline {
+    background: transparent;
+    color: var(--danger);
+    border: 1px solid var(--danger);
+  }
+  .btn--danger-outline:hover:not(:disabled) {
+    background: var(--danger-dim);
+  }
   .btn--sm {
     font-size: var(--text-xs);
     padding: var(--sp-1) var(--sp-3);
+  }
+
+  /* Leave network section */
+  .leave-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-4);
+  }
+  .leave-info {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+  }
+  .leave-danger-block {
+    padding: var(--sp-4);
+    border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--border));
+    border-radius: var(--radius-lg);
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+  }
+  .leave-heading {
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--danger);
+    margin: 0;
+  }
+  .leave-desc {
+    line-height: var(--leading-normal);
+  }
+  .leave-error {
+    padding: var(--sp-2) var(--sp-3);
+    background: var(--danger-dim);
+    color: var(--danger);
+    border-radius: var(--radius-md);
+    font-size: var(--text-sm);
+  }
+
+  /* Left-network aftermath state */
+  .left-network-state {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+  }
+  .left-network-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+  }
+  .left-network-title {
+    font-size: var(--text-sm);
+    font-weight: 600;
+    margin: 0;
+  }
+  .warn-box {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--sp-2);
+    padding: var(--sp-3);
+    background: var(--warn-dim);
+    border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent);
+    border-radius: var(--radius-md);
+    font-size: var(--text-xs);
+    color: var(--warn);
+    line-height: var(--leading-normal);
+  }
+  .warn-icon {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--warn);
+    color: #000;
+    font-weight: 700;
+    font-size: 11px;
+    margin-top: 1px;
   }
 </style>

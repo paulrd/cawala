@@ -508,7 +508,9 @@ function _stopControlPoller() {
 
 /**
  * Drain all queued control events into `_lastControlEvent`, copying each DTO to
- * a plain object and freeing it. Persists state when anything was drained.
+ * a plain object and freeing it. Kinds are `accepted`, `rejected`, and
+ * `detached`; a `detached` event also clears the mirrored join address.
+ * Persists state when anything was drained.
  */
 function _drainControlEvents() {
   if (_useMock || !_clientNode) return;
@@ -527,6 +529,11 @@ function _drainControlEvents() {
         reason: ev.reason ?? null,
       };
       if (_lastControlEvent.kind === CONTROL_EVENT.ACCEPTED) accepted = true;
+      if (_lastControlEvent.kind === CONTROL_EVENT.DETACHED) {
+        // The wasm state is parentless now; clear the mirrored address so the
+        // UI drops out of the joined view ("Left network") immediately.
+        clientState.address = null;
+      }
       ev.free?.();
       drained = true;
     }
@@ -1921,16 +1928,54 @@ export async function moveChild(childAddress, newParentAddress, newSlot) {
 }
 
 /**
- * Detach a child.
- * @param {string} childAddress
- * @returns {Promise<{ status: string }>}
+ * Leave the current parent network.
+ *
+ * Live mode calls the wasm client's `leave()`: it signs an `ExitRequest`,
+ * best-effort delivers it to the current parent over `cawala/control/0`, then
+ * clears the local parent and address **regardless of the reply** — so an
+ * unreachable or refusing parent cannot trap the user. The returned `delivery`
+ * is the former parent's reply bucket (`accepted` / `rejected:<code>` /
+ * `unreachable`) and is diagnostic only; `status` is always `detached`.
+ *
+ * The wasm client also queues a `detached` control event, surfaced through the
+ * existing drain (`getLastControlEvent()`), which clears the mirrored join
+ * address so the UI can show "Left network".
+ *
+ * Mock mode keeps a plausible fake result.
+ *
+ * @returns {Promise<{ status: string, delivery?: string }>}
  */
-export async function detachChild(childAddress) {
+export async function leave() {
   if (_useMock) {
     await mockDelay(400);
     return { status: 'detached' };
   }
-  throw new Error('Not implemented: real detachChild');
+
+  const node = _requireNode();
+  if (typeof node.leave !== 'function') {
+    throw new Error('This client build does not support leaving the network.');
+  }
+
+  let outcome;
+  try {
+    outcome = await node.leave();
+  } catch (err) {
+    throw new Error(`Leave failed: ${_errorMessage(err)}`);
+  }
+
+  try {
+    const result = {
+      status: outcome.status,
+      delivery: outcome.delivery ?? null,
+    };
+    // The local wasm state is now parentless: mirror and persist immediately
+    // (the poller would also pick this up on its next tick).
+    _syncJoinStateIntoStore();
+    _persistState();
+    return result;
+  } finally {
+    outcome.free?.();
+  }
 }
 
 /**

@@ -9,8 +9,8 @@
   import EmptyState from '../shared/EmptyState.svelte';
   import ErrorState from '../shared/ErrorState.svelte';
   import { clientState, ledgerState, nodeState, loadingState, errorState, apiCapabilities, showToast } from '../../lib/stores.svelte.js';
-  import { getChildren, getAccounts, getJoinRequests, isMockMode, requestBalance } from '../../lib/api.js';
-  import { ROUTES } from '../../lib/constants.js';
+  import { getChildren, getAccounts, getJoinRequests, isMockMode, requestBalance, getLastControlEvent } from '../../lib/api.js';
+  import { ROUTES, CONTROL_EVENT } from '../../lib/constants.js';
   import { navigate } from '../../lib/router.svelte.js';
   import { formatDate, timeAgo } from '../../lib/utils.js';
 
@@ -66,6 +66,43 @@
   // Show join CTA when live and not yet joined (no address assigned).
   let showJoinCta = $derived(isLive && clientState.address == null);
 
+  // Detect the "detached" event from the control drain so the Dashboard can
+  // show "Left the network" instead of the generic "not connected" copy.
+  let hasLeft = $state(false);
+  let _detachedPoller = $state(null);
+
+  $effect(() => {
+    if (showJoinCta && isLive) {
+      _startDetachedPoller();
+    } else {
+      _stopDetachedPoller();
+    }
+    return () => _stopDetachedPoller();
+  });
+
+  function _startDetachedPoller() {
+    _stopDetachedPoller();
+    // Check immediately, then every 2 s.
+    _checkDetached();
+    _detachedPoller = setInterval(_checkDetached, 2000);
+  }
+
+  function _stopDetachedPoller() {
+    if (_detachedPoller) {
+      clearInterval(_detachedPoller);
+      _detachedPoller = null;
+    }
+  }
+
+  function _checkDetached() {
+    if (hasLeft) { _stopDetachedPoller(); return; }
+    const ev = getLastControlEvent();
+    if (ev?.kind === CONTROL_EVENT.DETACHED) {
+      hasLeft = true;
+      _stopDetachedPoller();
+    }
+  }
+
   // Live mode: balance availability
   let balanceReady = $derived(isLive && ledgerState.balance != null);
   let balanceFresh = $derived(
@@ -120,8 +157,13 @@
       {#if showJoinCta}
         <div class="join-cta">
           <div class="join-cta-body">
-            <h3 class="join-cta-title">Join the network</h3>
-            <p class="join-cta-text">You are not connected to a node yet. Paste an invite from a node operator to join.</p>
+            {#if hasLeft}
+              <h3 class="join-cta-title">Not connected to a network</h3>
+              <p class="join-cta-text">You have left your previous network. You can join a new one or re-join using a fresh invitation from a node operator.</p>
+            {:else}
+              <h3 class="join-cta-title">Join the network</h3>
+              <p class="join-cta-text">You are not connected to a node yet. Paste an invite from a node operator to join.</p>
+            {/if}
             <button
               type="button"
               class="btn btn--primary"

@@ -61,8 +61,9 @@ pub use reply::{
 };
 pub use request::{
     AdminJoinApprove, AdminJoinReject, AdminRedeliverJoin, ControlRequest, CreateChild,
-    DetachChild, JoinApproval, JoinRejection, JoinRequest, MAX_LOCATION_HINT_LEN, MAX_NODE_ID_LEN,
-    MAX_REASON_LEN, MoveChild, SetAddress, is_admin_request,
+    DetachChild, DetachNotice, ExitRequest, JoinApproval, JoinRejection, JoinRequest,
+    MAX_LOCATION_HINT_LEN, MAX_NODE_ID_LEN, MAX_REASON_LEN, MoveChild, RebaseNotice, RebasePull,
+    SetAddress, is_admin_request,
 };
 pub use routed::{
     MAX_ROUTED_FORWARDS, ROUTED_CONTROL_VERSION, ROUTED_REPLY_CONTEXT, ROUTED_REPLY_VERSION,
@@ -71,5 +72,6 @@ pub use routed::{
 pub use senior::senior_child;
 pub use sign::{
     CONTROL_CONTEXT, CONTROL_FORMAT_VERSION, CONTROL_REQUEST_MAX_TTL_SECS,
-    CONTROL_REQUEST_TTL_SECS, ControlError, SignedControl, verify_control,
+    CONTROL_REQUEST_TTL_SECS, ControlError, SignedControl, is_supported_control_version,
+    verify_control,
 };

@@ -36,7 +36,40 @@ use crate::request::ControlRequest;
 /// Bumped to 3 when [`SignedControl`] gained `nonce` and `expiry`: the signed
 /// preimage changed again, so a v2 verifier must likewise reject a v3 message
 /// rather than misparse it.
-pub const CONTROL_FORMAT_VERSION: u8 = 3;
+///
+/// Bumped to 4 when the four exit-rights variants ([`ControlRequest::Exit`],
+/// [`ControlRequest::DetachNotice`], [`ControlRequest::Rebase`],
+/// [`ControlRequest::RebasePull`]) were appended. Those variants are only
+/// *additive*, so a v3 verifier parses every pre-existing variant identically;
+/// [`is_supported_control_version`] therefore accepts both 3 and 4 for rolling
+/// upgrades.
+///
+/// # Dual-accept is inbound-only
+///
+/// This build always **mints** frames at [`CONTROL_FORMAT_VERSION`] (4):
+/// `sign_decision`/`sign_forward` in the node and
+/// [`SignedControl::authorize`] everywhere stamp v4. A v3 peer therefore cannot
+/// consume a v4 `JoinApproved`, an admin reply, or a routed forward that carries
+/// a v4 variant, and a v4 node emits only v4. The upgrade is effectively
+/// **lockstep for node-to-child and routed frames**; version negotiation is a
+/// v2 item. Accepting v3 here keeps a v3 peer's *pre-existing* requests
+/// readable during a rolling upgrade, nothing more.
+pub const CONTROL_FORMAT_VERSION: u8 = 4;
+
+/// Whether `version` is a [`SignedControl`] wire version this build accepts
+/// **inbound**.
+///
+/// Accepts [`CONTROL_FORMAT_VERSION`] (4) and the immediately preceding
+/// version 3. Version 4 only *appended* request variants, so every pre-existing
+/// variant is byte-identical in both versions and a v3 frame may carry only the
+/// pre-existing variants (the node enforces that shape gate). Anything else is
+/// rejected up front.
+///
+/// This does **not** mean minted frames are ever v3: see the inbound-only note
+/// on [`CONTROL_FORMAT_VERSION`].
+pub fn is_supported_control_version(version: u8) -> bool {
+    matches!(version, 3 | CONTROL_FORMAT_VERSION)
+}
 
 /// Recommended lifetime, in seconds, of a control request (`nonce`/`expiry`).
 ///
@@ -156,7 +189,7 @@ impl SignedControl {
 /// Verify a signed control request against the peer registry.
 ///
 /// Steps, in order:
-/// 1. `signed.version == CONTROL_FORMAT_VERSION`, else
+/// 1. [`is_supported_control_version`]`(signed.version)`, else
 ///    [`ControlError::UnsupportedVersion`];
 /// 2. `origin` is registered, else [`ControlError::UnknownOrigin`];
 /// 3. the registered operator equals `signed.controller`, else
@@ -169,7 +202,7 @@ pub fn verify_control<'a>(
     signed: &SignedControl,
     registry: &'a PeerRegistry,
 ) -> Result<&'a PeerKeys, ControlError> {
-    if signed.version != CONTROL_FORMAT_VERSION {
+    if !is_supported_control_version(signed.version) {
         return Err(ControlError::UnsupportedVersion(signed.version));
     }
     let peer = registry
@@ -215,6 +248,16 @@ pub enum ControlError {
         len: usize,
         /// The permitted maximum length in bytes.
         max: usize,
+    },
+    /// A numeric field is below its permitted minimum.
+    #[error("{field} is {value}, minimum is {min}")]
+    FieldBelowMinimum {
+        /// The field name, for diagnostics.
+        field: &'static str,
+        /// The observed value.
+        value: u64,
+        /// The minimum permitted value.
+        min: u64,
     },
     /// Canonical postcard encoding/decoding failed.
     #[error("postcard encode/decode: {0}")]
@@ -408,10 +451,11 @@ mod tests {
 
     #[test]
     fn verify_control_rejects_v1_version() {
-        // The format is now 3 (v1 predates `JoinApproval::parent_ledger`). A v1
-        // envelope must be rejected up front rather than parsed with the new
+        // v1 predates `JoinApproval::parent_ledger`, so it is never a supported
+        // inbound version regardless of the current `CONTROL_FORMAT_VERSION`. A
+        // v1 envelope must be rejected up front rather than parsed with the new
         // shape; the check is version-exact, not `>=`.
-        assert_ne!(CONTROL_FORMAT_VERSION, 1, "this test assumes format 3");
+        assert_ne!(CONTROL_FORMAT_VERSION, 1);
         let op = operator(1);
         let registry = registry_with(&[("origin", &op, &ledger(11))]);
         let mut signed = signed_with(&op);
@@ -428,9 +472,10 @@ mod tests {
 
     #[test]
     fn verify_control_rejects_v2_version() {
-        // v2 predates `SignedControl::nonce`/`expiry`; a v2 envelope must be
-        // rejected rather than parsed with the v3 shape.
-        assert_ne!(CONTROL_FORMAT_VERSION, 2, "this test assumes format 3");
+        // v2 predates `SignedControl::nonce`/`expiry`, so it is never a
+        // supported inbound version. A v2 envelope must be rejected rather than
+        // parsed with the newer shape.
+        assert_ne!(CONTROL_FORMAT_VERSION, 2);
         let op = operator(1);
         let registry = registry_with(&[("origin", &op, &ledger(11))]);
         let mut signed = signed_with(&op);
@@ -446,18 +491,66 @@ mod tests {
     }
 
     #[test]
+    fn is_supported_control_version_accepts_3_and_4_only() {
+        assert!(is_supported_control_version(3));
+        assert!(is_supported_control_version(4));
+        assert_eq!(CONTROL_FORMAT_VERSION, 4);
+        for version in [0, 1, 2, 5, 6, u8::MAX] {
+            assert!(
+                !is_supported_control_version(version),
+                "version {version} must be unsupported"
+            );
+        }
+    }
+
+    /// Build a frame that declares `version`, re-signing so the version byte is
+    /// inside the signed preimage exactly as a real peer would have produced it.
+    fn signed_version(op: &OperatorSecretKey, version: u8) -> SignedControl {
+        let mut signed = signed_with(op);
+        signed.version = version;
+        signed.signature = op.sign(signed.signing_hash().as_bytes());
+        signed
+    }
+
+    #[test]
+    fn verify_control_accepts_v3_and_v4_frames() {
+        let op = operator(1);
+        let registry = registry_with(&[("origin", &op, &ledger(11))]);
+
+        // The current (v4) frame.
+        let v4 = signed_version(&op, CONTROL_FORMAT_VERSION);
+        assert_eq!(v4.verify_signature(), Ok(()));
+        assert!(verify_control(&v4, &registry).is_ok());
+
+        // A real v3 frame: the version byte is covered by the signature, so it
+        // must be re-signed after the downgrade.
+        let v3 = signed_version(&op, 3);
+        assert_eq!(v3.verify_signature(), Ok(()));
+        assert!(verify_control(&v3, &registry).is_ok());
+
+        // A v3 frame whose signature was produced over the v4 preimage fails.
+        let mut tampered = signed_with(&op);
+        tampered.version = 3;
+        assert_eq!(
+            verify_control(&tampered, &registry),
+            Err(ControlError::InvalidSignature)
+        );
+    }
+
+    #[test]
     fn signing_hash_is_stable() {
         // Golden vector. This pins the frozen field order and domain-separated
         // encoding of `(version, origin, controller, nonce, expiry, request)`: a
         // reordered, added, or removed field changes this hash, so the pinned
         // value must only ever change as part of a deliberate protocol version
         // bump. It changed at version 2 when `JoinApproval` gained
-        // `parent_ledger`, and again at version 3 when `SignedControl` gained
-        // `nonce` and `expiry`.
+        // `parent_ledger`, at version 3 when `SignedControl` gained
+        // `nonce` and `expiry`, and at version 4 when the exit-rights variants
+        // were appended (the version byte is inside the preimage).
         let signed = signed_with(&operator(7));
         assert_eq!(
             signed.signing_hash().to_hex(),
-            "467b9187602e4441c8da24021d858826a4e915426155987cb3b4e47c06b83978"
+            "48852479306c362910af678b54a9ece6f06b17dd9bd182f52ff7954e4ab25676"
         );
     }
 

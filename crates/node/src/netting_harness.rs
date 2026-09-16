@@ -1,12 +1,15 @@
 //! Operator netting harness: load real node data dirs and drive
-//! [`cawala_ledger::net`] / [`cawala_ledger::verify_cascade`] over them.
+//! [`cawala_ledger::net_partition`] / [`cawala_ledger::verify_cascade`] over
+//! them.
 //!
 //! The ledger crate's reconciliation functions are pure and have no I/O, so an
 //! operator needs a loader that assembles their inputs from the data dirs a
 //! running network actually wrote:
 //!
 //! - the **topology** from each dir's `node.json` (parent/child links), or a
-//!   saved [`Topology`] snapshot for historical re-slotting;
+//!   saved [`Topology`] snapshot for historical re-slotting. A network that has
+//!   split through exit is assembled as **one [`Topology`] per weakly connected
+//!   component**, primary first (see [`build_topology_partition`]);
 //! - the **peer registry** from each dir's self row plus every
 //!   `ledger_peers.json` row, rejecting any conflict;
 //! - the **ledgers** by replaying each `entries.log` into an in-memory
@@ -15,14 +18,19 @@
 //! - the **orders** by merging every dir's journal with an optional
 //!   operator-supplied source.
 //!
-//! `net`'s `RouteInvalid` findings are reported as **advisories**: topology is
-//! live control-plane state, so a route that no longer reconstructs (e.g. a
-//! re-slotted child) needs operator adjudication rather than a hard failure.
-//! Everything else (`Fork`, `ChainInvalid`, `MirrorMismatch`, `Replay`,
-//! `Overdraw`) is a hard finding. Advisories still suppress `nets`: the ledger
-//! crate only collapses flows when `findings.is_empty()`, so a `RouteInvalid`
-//! advisory yields no nets until it is resolved (e.g. by loading the matching
-//! `--topology` snapshot).
+//! `Finding::is_advisory` splits the report. `RouteInvalid` is advisory because
+//! topology is live control-plane state, and the exit findings
+//! (`Detached`/`StaleChildLink`) are advisory because an exited subtree is a
+//! legitimate independent network with a tolerated stranded claim. Everything
+//! else (`Fork`, `ChainInvalid`, `MirrorMismatch`, `Replay`, `Overdraw`) is a
+//! hard finding.
+//!
+//! Severity and the netting gate are separate: `Finding::suppresses_netting`
+//! decides whether `nets` may collapse. `RouteInvalid` and every hard finding
+//! suppress (so a route advisory still yields no nets until resolved, e.g. by
+//! loading the matching `--topology` snapshot), while the steady-state exit
+//! signals `Detached`/`StaleChildLink` do **not** — an island must not
+//! permanently disable reconciliation.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
@@ -30,10 +38,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use cawala_ledger::{
-    AccountRef, Finding, HopRole, Ledger, LedgerSet, MemLog, NetTransfer, NodeId, OperatorPubKey,
-    PaymentOrder, PeerKeys, PeerRegistry, PeerRole, SignedCommitment,
+    AccountRef, Finding, HopRole, Ledger, LedgerSet, MemLog, NetComponent, NetTransfer, NodeId,
+    OperatorPubKey, PaymentOrder, PeerKeys, PeerRegistry, PeerRole, SignedCommitment,
 };
-use cawala_topology::{ChildKind, Topology};
+use cawala_topology::{ChildKind, MAX_SLOT, Topology};
 use serde::Serialize;
 
 use crate::identity;
@@ -62,8 +70,18 @@ pub struct PeerReport {
 /// The assembled inputs for one reconciliation run.
 #[derive(Debug)]
 pub struct HarnessInputs {
-    /// The derived (or supplied) topology.
+    /// The **primary** component's topology (the operator's own network).
+    ///
+    /// Kept for callers that only need the primary tree; [`Self::components`]
+    /// carries every weakly connected component.
     pub topology: Topology,
+    /// Every weakly connected component, primary first, each a normal
+    /// single-root tree. An exiting subtree rebases onto root `0`, so a whole
+    /// network can legitimately contain several of these.
+    pub components: Vec<NetComponent>,
+    /// Topology-level findings (currently [`Finding::StaleChildLink`]) found
+    /// while assembling the components.
+    pub topology_findings: Vec<Finding>,
     /// The merged, conflict-free peer registry.
     pub registry: PeerRegistry,
     /// Each peer's replayed ledger.
@@ -78,6 +96,20 @@ pub struct HarnessInputs {
     pub notes: Vec<String>,
 }
 
+/// A weakly connected component in the serializable report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ComponentReport {
+    /// The component's root node id.
+    pub root: String,
+    /// The component's member node ids (sorted, including the root).
+    pub nodes: Vec<String>,
+    /// Whether this is the primary (operator) network; every other component is
+    /// an independent island.
+    pub primary: bool,
+    /// The severed old parent of an island root, when a stale row named one.
+    pub stranded_parent: Option<String>,
+}
+
 /// The serializable reconciliation report.
 #[derive(Debug, Clone, Serialize)]
 pub struct HarnessReport {
@@ -85,11 +117,16 @@ pub struct HarnessReport {
     pub peers: Vec<PeerReport>,
     /// Node ids with a non-empty commitment chain.
     pub chains_present: Vec<String>,
-    /// `RouteInvalid` findings, kept separate for operator adjudication.
+    /// The weakly connected components, primary first. Surfaced so an operator
+    /// can see an exited subtree as an independent island.
+    pub components: Vec<ComponentReport>,
+    /// Advisory findings (`RouteInvalid`/`Detached`/`StaleChildLink`), kept
+    /// separate for operator adjudication.
     pub advisories: Vec<Finding>,
     /// Hard findings (`Fork`/`ChainInvalid`/`MirrorMismatch`/`Replay`/`Overdraw`).
     pub findings: Vec<Finding>,
-    /// Collapsed flows (only when there are no findings at all).
+    /// Collapsed flows (only when there are no findings at all, advisory or
+    /// hard).
     pub nets: Vec<NetTransfer>,
     /// Report-level notes.
     pub notes: Vec<String>,
@@ -131,10 +168,25 @@ pub fn load(
     for dir in peer_dirs {
         records.push(read_record(dir)?);
     }
-    let topology = match topology_file {
-        Some(path) => load_topology_snapshot(path)?,
-        None => build_topology(&records)?,
+    // A supplied snapshot is authoritative and single-rooted; otherwise derive
+    // the component-aware partition (primary first) plus topology findings.
+    let (components, topology_findings) = match topology_file {
+        Some(path) => (
+            vec![NetComponent {
+                topology: load_topology_snapshot(path)?,
+                stranded_parent: None,
+            }],
+            Vec::new(),
+        ),
+        None => {
+            let partition = build_topology_partition(&records, None)?;
+            (partition.components, partition.findings)
+        }
     };
+    let topology = components
+        .first()
+        .map(|component| component.topology.clone())
+        .context("topology partition has no components")?;
 
     // --- registry + per-peer keys ------------------------------------------
     let mut candidates: BTreeMap<String, PeerKeys> = BTreeMap::new();
@@ -236,6 +288,8 @@ pub fn load(
 
     Ok(HarnessInputs {
         topology,
+        components,
+        topology_findings,
         registry,
         ledgers,
         commitments,
@@ -245,21 +299,59 @@ pub fn load(
     })
 }
 
-/// Run [`cawala_ledger::net`] over `inputs` and classify its findings.
+/// Run [`cawala_ledger::net_partition`] over `inputs` and classify its
+/// findings.
 pub fn report(inputs: &HarnessInputs) -> HarnessReport {
-    let netting = cawala_ledger::net(
-        &inputs.topology,
+    let netting = cawala_ledger::net_partition(
+        &inputs.components,
         &inputs.ledgers,
         &inputs.registry,
         &inputs.orders,
         &inputs.commitments,
     );
 
-    let (advisories, findings) = classify_findings(netting.findings);
+    // Topology-level findings (stale links) join the ledger findings.
+    let mut all_findings = inputs.topology_findings.clone();
+    all_findings.extend(netting.findings);
+    let (advisories, findings) = classify_findings(all_findings);
+
+    // Do not re-gate: the ledger crate already decided which findings suppress
+    // netting via `Finding::suppresses_netting`. `Detached`/`StaleChildLink`
+    // are steady-state exit signals and must not permanently disable
+    // reconciliation, while `RouteInvalid` and every hard finding still do.
+    let nets = netting.nets;
+
+    let components: Vec<ComponentReport> = inputs
+        .components
+        .iter()
+        .enumerate()
+        .map(|(index, component)| {
+            let mut nodes: Vec<String> = component.topology.node_ids().cloned().collect();
+            nodes.sort();
+            ComponentReport {
+                root: component.topology.root_id().to_string(),
+                nodes,
+                primary: index == 0,
+                stranded_parent: component.stranded_parent.as_ref().map(|p| p.to_string()),
+            }
+        })
+        .collect();
 
     let mut notes = inputs.notes.clone();
     if inputs.orders.is_empty() {
         notes.push("no orders supplied; route/replay audit skipped".to_string());
+    }
+    if inputs.components.len() > 1 {
+        let islands: Vec<&str> = inputs.components[1..]
+            .iter()
+            .map(|component| component.topology.root_id())
+            .collect();
+        notes.push(format!(
+            "topology components: {} (primary root {}; islands: {})",
+            inputs.components.len(),
+            inputs.components[0].topology.root_id(),
+            islands.join(", ")
+        ));
     }
 
     HarnessReport {
@@ -270,20 +362,25 @@ pub fn report(inputs: &HarnessInputs) -> HarnessReport {
             .filter(|peer| peer.chain_present)
             .map(|peer| peer.node_id.clone())
             .collect(),
+        components,
         advisories,
         findings,
-        nets: netting.nets,
+        nets,
         notes,
     }
 }
 
-/// Split findings into `(advisories, hard)`. Route findings are advisories
-/// because the topology they are audited against is live control-plane state.
+/// Split findings into `(advisories, hard)`.
+///
+/// [`Finding::is_advisory`] defines the split: route findings are advisories
+/// because the topology they are audited against is live control-plane state,
+/// and the exit findings (`Detached`/`StaleChildLink`) are tolerated topology
+/// events. Everything else is a hard finding.
 pub fn classify_findings(findings: Vec<Finding>) -> (Vec<Finding>, Vec<Finding>) {
     let mut advisories = Vec::new();
     let mut hard = Vec::new();
     for finding in findings {
-        if matches!(finding, Finding::RouteInvalid { .. }) {
+        if finding.is_advisory() {
             advisories.push(finding);
         } else {
             hard.push(finding);
@@ -459,95 +556,292 @@ fn ensure_node(
     Ok(())
 }
 
-fn set_parent(
-    nodes: &mut HashMap<String, NodeBuilder>,
-    id: &str,
-    parent: &str,
-    slot: u8,
-) -> Result<()> {
-    let builder = nodes
-        .get_mut(id)
-        .expect("ensure_node must run before set_parent");
-    match &builder.parent {
-        Some((existing_parent, existing_slot))
-            if existing_parent != parent || *existing_slot != slot =>
-        {
-            bail!(
-                "topology node '{id}' has conflicting parent links \
-                 ('{existing_parent}'@{existing_slot} vs '{parent}'@{slot})"
-            );
-        }
-        _ => builder.parent = Some((parent.to_string(), slot)),
-    }
-    Ok(())
+/// A partition of a (possibly exited) network: one single-root topology per
+/// weakly connected component, primary first, plus topology-level findings.
+#[derive(Debug)]
+pub struct TopologyPartition {
+    /// Every component, primary first, each a normal single-root tree.
+    pub components: Vec<NetComponent>,
+    /// Topology-level findings ([`Finding::StaleChildLink`]).
+    pub findings: Vec<Finding>,
 }
 
-/// Build a topology from peer records: each dir's node plus its recorded
-/// children by parent/slot.
-pub fn build_topology(records: &[record::NodeRecord]) -> Result<Topology> {
-    let mut nodes: HashMap<String, NodeBuilder> = HashMap::new();
+impl TopologyPartition {
+    /// The primary component's topology (the operator's own network).
+    pub fn primary(&self) -> &Topology {
+        &self.components[0].topology
+    }
+}
 
+/// Minimal union-find for weakly connected components.
+struct UnionFind {
+    parent: Vec<usize>,
+    rank: Vec<u8>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        UnionFind {
+            parent: (0..n).collect(),
+            rank: vec![0; n],
+        }
+    }
+
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]];
+            x = self.parent[x];
+        }
+        x
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra == rb {
+            return;
+        }
+        if self.rank[ra] < self.rank[rb] {
+            self.parent[ra] = rb;
+        } else if self.rank[ra] > self.rank[rb] {
+            self.parent[rb] = ra;
+        } else {
+            self.parent[rb] = ra;
+            self.rank[ra] += 1;
+        }
+    }
+}
+
+/// Build the **primary** component's topology from peer records.
+///
+/// A thin wrapper over [`build_topology_partition`] that returns the primary
+/// (largest, ties by root id) component. Use the partition form to audit an
+/// exited network's islands.
+pub fn build_topology(records: &[record::NodeRecord]) -> Result<Topology> {
+    let partition = build_topology_partition(records, None)?;
+    partition
+        .components
+        .into_iter()
+        .next()
+        .map(|component| component.topology)
+        .context("no topology components built from peer records")
+}
+
+/// Build a component-aware topology partition from peer records.
+///
+/// Each record's own `parent` link is authoritative. When a record lists a
+/// child whose own record disagrees — it was re-parented, or it exited and
+/// rebased to root `0` — the child's link wins and the stale parent-side row is
+/// reported as [`Finding::StaleChildLink`] (advisory) instead of failing. This
+/// is what makes a unilateral (possibly failed-parent) exit loadable.
+///
+/// Surviving links group the records into weakly connected components, and one
+/// [`Topology`] is built per component, each rooted at its single parentless
+/// node. `primary_root` optionally designates the primary component by naming
+/// any member node id; when `None`, the **largest** component is primary (ties
+/// by root id). Every other component is an island. A designated id that names
+/// no node is a hard error.
+pub fn build_topology_partition(
+    records: &[record::NodeRecord],
+    primary_root: Option<&str>,
+) -> Result<TopologyPartition> {
+    let mut nodes: HashMap<String, NodeBuilder> = HashMap::new();
+    // Authoritative parent links, keyed by child.
+    let mut child_links: BTreeMap<String, (String, u8)> = BTreeMap::new();
+    let mut has_record: BTreeSet<String> = BTreeSet::new();
+    let mut findings: Vec<Finding> = Vec::new();
+
+    // Pass 1: every record is a node; its own parent link is authoritative.
     for rec in records {
+        has_record.insert(rec.node_id.clone());
         ensure_node(&mut nodes, &rec.node_id, ChildKind::Node)?;
         if let Some(parent) = &rec.parent {
-            set_parent(&mut nodes, &rec.node_id, &parent.parent_id, parent.slot)?;
-        }
-        for child in &rec.children {
-            ensure_node(&mut nodes, &child.child_id, child.kind)?;
-            set_parent(&mut nodes, &child.child_id, &rec.node_id, child.slot)?;
-            nodes
-                .get_mut(&rec.node_id)
-                .expect("parent ensured")
-                .children
-                .insert(child.slot);
+            if parent.slot > MAX_SLOT {
+                bail!(
+                    "topology node '{}' parent slot {} out of range",
+                    rec.node_id,
+                    parent.slot
+                );
+            }
+            child_links.insert(
+                rec.node_id.clone(),
+                (parent.parent_id.clone(), parent.slot),
+            );
         }
     }
 
-    // A child's `parent` link is authoritative for attachment, so synthesize
-    // the reciprocal slot in the parent's children set when the parent's own
-    // record did not list it (e.g. a re-parented child whose old parent record
-    // is stale). Done in a second pass so the parent need not have been seen
-    // first. A truly absent parent is left dangling for the root/validate
-    // checks to reject.
+    // Pass 2: parent-side `children` rows. The child's own link (including its
+    // absence, for a rebased root) wins; a disagreeing row is stale.
     for rec in records {
-        if let Some(parent) = &rec.parent
-            && let Some(builder) = nodes.get_mut(&parent.parent_id)
-        {
-            builder.children.insert(parent.slot);
+        for child in &rec.children {
+            if child.slot > MAX_SLOT {
+                bail!(
+                    "topology child '{}' slot {} out of range",
+                    child.child_id,
+                    child.slot
+                );
+            }
+            ensure_node(&mut nodes, &child.child_id, child.kind)?;
+            if has_record.contains(&child.child_id) {
+                match child_links.get(&child.child_id) {
+                    Some((parent_id, slot))
+                        if parent_id == &rec.node_id && *slot == child.slot => {}
+                    _ => findings.push(Finding::StaleChildLink {
+                        parent: NodeId::from(rec.node_id.as_str()),
+                        child: NodeId::from(child.child_id.as_str()),
+                    }),
+                }
+            } else {
+                // No record of its own (e.g. a user): the parent-side row is
+                // the only link. Conflicting rows are an error.
+                match child_links.get(&child.child_id) {
+                    Some(existing) if existing != &(rec.node_id.clone(), child.slot) => {
+                        bail!(
+                            "topology child '{}' has conflicting parent links \
+                             ('{}'@{} vs '{}'@{})",
+                            child.child_id,
+                            existing.0,
+                            existing.1,
+                            rec.node_id,
+                            child.slot
+                        )
+                    }
+                    Some(_) => {}
+                    None => {
+                        child_links.insert(
+                            child.child_id.clone(),
+                            (rec.node_id.clone(), child.slot),
+                        );
+                    }
+                }
+            }
         }
     }
 
-    let roots: Vec<String> = nodes
-        .iter()
-        .filter(|(_, builder)| builder.parent.is_none())
-        .map(|(id, _)| id.clone())
-        .collect();
-    if roots.len() != 1 {
-        bail!(
-            "expected exactly one parent-less root, found {} ({})",
-            roots.len(),
-            roots.join(", ")
-        );
+    // A child's link is authoritative, so its parent must exist.
+    for (child, (parent, _)) in &child_links {
+        if !nodes.contains_key(parent) {
+            bail!("topology node '{child}' references missing parent '{parent}'");
+        }
     }
 
-    let mut topo_nodes = HashMap::with_capacity(nodes.len());
-    for (id, builder) in nodes {
-        topo_nodes.insert(
-            id.clone(),
-            cawala_topology::NodeRecord {
-                node_id: id,
-                kind: builder.kind,
-                parent: builder.parent.as_ref().map(|(parent, _)| parent.clone()),
-                slot: builder.parent.as_ref().map(|(_, slot)| *slot),
-                children: builder.children,
-            },
-        );
+    // Apply authoritative links and synthesize reciprocal child slots.
+    for (child, (parent, slot)) in &child_links {
+        let builder = nodes
+            .get_mut(child)
+            .expect("child node ensured in a record or children pass");
+        match &builder.parent {
+            Some((existing_parent, existing_slot))
+                if existing_parent != parent || existing_slot != slot =>
+            {
+                bail!("topology node '{child}' has conflicting parent links");
+            }
+            _ => builder.parent = Some((parent.clone(), *slot)),
+        }
+        nodes
+            .get_mut(parent)
+            .expect("parent existence checked")
+            .children
+            .insert(*slot);
     }
-    let topology = Topology::from_parts(topo_nodes, roots[0].clone());
-    topology
-        .validate()
-        .context("peer records do not form a valid topology")?;
-    Ok(topology)
+
+    // Weakly connected components over the surviving links.
+    let ids: Vec<String> = nodes.keys().cloned().collect();
+    let mut index: HashMap<&str, usize> = HashMap::with_capacity(ids.len());
+    for (position, id) in ids.iter().enumerate() {
+        index.insert(id.as_str(), position);
+    }
+    let mut union_find = UnionFind::new(ids.len());
+    for (child, (parent, _)) in &child_links {
+        union_find.union(index[child.as_str()], index[parent.as_str()]);
+    }
+
+    let mut groups: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for (position, id) in ids.iter().enumerate() {
+        groups
+            .entry(union_find.find(position))
+            .or_default()
+            .push(id.clone());
+    }
+
+    // Each component must be a tree with exactly one parentless root.
+    let mut components: Vec<(String, Vec<String>)> = Vec::new();
+    for (_, mut members) in groups {
+        members.sort();
+        let roots: Vec<String> = members
+            .iter()
+            .filter(|id| nodes[id.as_str()].parent.is_none())
+            .cloned()
+            .collect();
+        if roots.len() != 1 {
+            bail!(
+                "topology component has {} parent-less roots ({})",
+                roots.len(),
+                members.join(", ")
+            );
+        }
+        components.push((roots[0].clone(), members));
+    }
+
+    // Deterministic default order: largest first, ties by root id.
+    components.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+
+    let primary_position = match primary_root {
+        Some(root) => {
+            if !index.contains_key(root) {
+                bail!("designated primary root '{root}' not found in the peer records");
+            }
+            components
+                .iter()
+                .position(|(_, members)| members.iter().any(|id| id == root))
+                .expect("every node belongs to exactly one component")
+        }
+        None => 0,
+    };
+    components.swap(0, primary_position);
+
+    let mut built: Vec<NetComponent> = Vec::with_capacity(components.len());
+    for (position, (root, members)) in components.iter().enumerate() {
+        let mut topo_nodes = HashMap::with_capacity(members.len());
+        for id in members {
+            let builder = &nodes[id.as_str()];
+            topo_nodes.insert(
+                id.clone(),
+                cawala_topology::NodeRecord {
+                    node_id: id.clone(),
+                    kind: builder.kind,
+                    parent: builder.parent.as_ref().map(|(parent, _)| parent.clone()),
+                    slot: builder.parent.as_ref().map(|(_, slot)| *slot),
+                    children: builder.children.clone(),
+                },
+            );
+        }
+        let topology = Topology::from_parts(topo_nodes, root.clone());
+        topology.validate().with_context(|| {
+            format!("peer records do not form a valid topology component rooted at '{root}'")
+        })?;
+
+        // Only an island root's severed parent is meaningful; a stale row
+        // pointing at a re-parented node is not a detachment.
+        let stranded_parent = if position > 0 {
+            findings.iter().find_map(|finding| match finding {
+                Finding::StaleChildLink { parent, child } if child.as_str() == root => {
+                    Some(parent.clone())
+                }
+                _ => None,
+            })
+        } else {
+            None
+        };
+        built.push(NetComponent {
+            topology,
+            stranded_parent,
+        });
+    }
+
+    Ok(TopologyPartition {
+        components: built,
+        findings,
+    })
 }
 
 fn load_topology_snapshot(path: &Path) -> Result<Topology> {
@@ -642,14 +936,16 @@ mod tests {
     }
 
     #[test]
-    fn build_topology_rejects_zero_or_multiple_roots() {
+    fn build_topology_partition_groups_roots_and_rejects_dangling_parent() {
         let orphan = record::NodeRecord {
             node_id: "orphan".to_string(),
             address: Some("0".parse().unwrap()),
             parent: None,
             children: vec![],
         };
-        assert!(build_topology(std::slice::from_ref(&orphan)).is_ok());
+        let single = build_topology_partition(std::slice::from_ref(&orphan), None).unwrap();
+        assert_eq!(single.components.len(), 1);
+        assert_eq!(single.primary().root_id(), "orphan");
 
         let other = record::NodeRecord {
             node_id: "other".to_string(),
@@ -657,9 +953,23 @@ mod tests {
             parent: None,
             children: vec![],
         };
-        // Two parent-less roots.
-        let err = build_topology(&[orphan, other]).unwrap_err();
-        assert!(err.to_string().contains("exactly one parent-less root"));
+        // Two isolated roots: two components, the tie broken by root id.
+        let partition =
+            build_topology_partition(&[orphan.clone(), other.clone()], None).unwrap();
+        assert_eq!(partition.components.len(), 2);
+        assert_eq!(partition.components[0].topology.root_id(), "orphan");
+        assert_eq!(partition.components[1].topology.root_id(), "other");
+        assert!(partition.findings.is_empty());
+
+        // An explicit primary selector reorders the partition.
+        let selected =
+            build_topology_partition(&[orphan.clone(), other], Some("other")).unwrap();
+        assert_eq!(selected.components[0].topology.root_id(), "other");
+        assert_eq!(selected.components[1].topology.root_id(), "orphan");
+        // A designated root that names no node is a hard error.
+        assert!(
+            build_topology_partition(std::slice::from_ref(&orphan), Some("nope")).is_err()
+        );
 
         // A child whose parent is absent: the parent reference is dangling.
         let dangling = record::NodeRecord {
@@ -671,7 +981,7 @@ mod tests {
             }),
             children: vec![],
         };
-        assert!(build_topology(&[dangling]).is_err());
+        assert!(build_topology(std::slice::from_ref(&dangling)).is_err());
     }
 
     #[test]
@@ -756,8 +1066,14 @@ mod tests {
         assert!(matches!(findings[0], Finding::ChainInvalid { .. }));
 
         // An empty-but-valid harness: no ledgers, no orders -> no findings.
-        let inputs = HarnessInputs {
+        let primary = NetComponent {
             topology: Topology::new_root("root"),
+            stranded_parent: None,
+        };
+        let inputs = HarnessInputs {
+            topology: primary.topology.clone(),
+            components: vec![primary],
+            topology_findings: vec![],
             registry: PeerRegistry::new(),
             ledgers: LedgerSet::new(),
             commitments: BTreeMap::new(),

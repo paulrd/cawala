@@ -47,7 +47,7 @@ use cawala_msg::{MAX_HOPS, MsgId, PeerRef};
 
 use crate::admin::SignedAdminGrant;
 use crate::reply::ControlReply;
-use crate::sign::{CONTROL_FORMAT_VERSION, SignedControl};
+use crate::sign::{SignedControl, is_supported_control_version};
 
 /// Wire format version for [`RoutedControlV1`].
 pub const ROUTED_CONTROL_VERSION: u8 = 1;
@@ -82,7 +82,7 @@ pub struct RoutedControlV1 {
     pub target: PeerRef,
     /// Who asked (must equal the envelope `src`; checked at the destination).
     pub requester: PeerRef,
-    /// The end-to-end human request (a v3 [`SignedControl`], advisory for
+    /// The end-to-end human request (a v3/v4 [`SignedControl`], advisory for
     /// non-admin classes).
     pub intent: SignedControl,
     /// Carried admin evidence, if any. It is audit evidence only: a
@@ -104,7 +104,7 @@ pub struct RoutedControlV1 {
 pub struct RoutedForward {
     /// The hop that produced `signed` (id + address).
     pub hop: PeerRef,
-    /// The hop's own v3 [`SignedControl`] over the same request.
+    /// The hop's own v3/v4 [`SignedControl`] over the same request.
     pub signed: SignedControl,
 }
 
@@ -125,10 +125,11 @@ impl RoutedControlV1 {
     /// 1. `version == `[`ROUTED_CONTROL_VERSION`];
     /// 2. `forwards.len() <= `[`MAX_ROUTED_FORWARDS`] (an origin-only payload
     ///    need not carry a forward here; empty is accepted);
-    /// 3. `intent.version == `[`CONTROL_FORMAT_VERSION`];
-    /// 4. for every forward `i`: `signed.version == `
-    ///    [`CONTROL_FORMAT_VERSION`], `signed.request == intent.request`, and
-    ///    `hop.node` equals the signed `origin` node string.
+    /// 3. [`is_supported_control_version`]`(intent.version)`, i.e. the intent is
+    ///    v3 or v4;
+    /// 4. for every forward `i`: [`is_supported_control_version`]`(signed.version)`,
+    ///    `signed.request == intent.request`, and `hop.node` equals the signed
+    ///    `origin` node string.
     ///
     /// This is structural only. Signatures are verified by intermediate hops
     /// (each against its own registry) and by the destination node; the
@@ -143,11 +144,11 @@ impl RoutedControlV1 {
                 max: MAX_ROUTED_FORWARDS,
             });
         }
-        if self.intent.version != CONTROL_FORMAT_VERSION {
+        if !is_supported_control_version(self.intent.version) {
             return Err(RoutedError::UnsupportedVersion(self.intent.version));
         }
         for (index, forward) in self.forwards.iter().enumerate() {
-            if forward.signed.version != CONTROL_FORMAT_VERSION {
+            if !is_supported_control_version(forward.signed.version) {
                 return Err(RoutedError::UnsupportedVersion(forward.signed.version));
             }
             if forward.signed.request != self.intent.request {
@@ -476,7 +477,7 @@ mod tests {
 
     use crate::admin::{ADMIN_GRANT_CONTEXT, ADMIN_GRANT_VERSION, AdminGrant, AdminScope};
     use crate::request::ControlRequest;
-    use crate::sign::CONTROL_CONTEXT;
+    use crate::sign::{CONTROL_CONTEXT, CONTROL_FORMAT_VERSION};
 
     fn node(id: &str) -> NodeId {
         NodeId::from(id)
@@ -594,7 +595,7 @@ mod tests {
         assert_eq!(bytes.len(), 253);
         assert_eq!(
             blake3::hash(&bytes).to_hex().as_str(),
-            "a21b2624aa721c92c1311c2b4d0465a37f4e1b73038da82ce56c241382d3d75f"
+            "d491100d9e8461af0cd164df56cbb873be9f6973882ec5df12258768ee325ebf"
         );
     }
 
@@ -635,6 +636,20 @@ mod tests {
             bad_forward.validate(),
             Err(RoutedError::UnsupportedVersion(CONTROL_FORMAT_VERSION + 1))
         );
+    }
+
+    #[test]
+    fn validate_accepts_v3_intent_and_forward() {
+        // A rolling-upgrade peer may still stamp v3: every pre-existing variant
+        // is wire-compatible, so `validate` must accept it. The version byte is
+        // inside the signed preimage, so re-sign after downgrading.
+        let mut control = sample_control();
+        control.intent.version = 3;
+        control.intent.signature = operator(1).sign(control.intent.signing_hash().as_bytes());
+        control.forwards[0].signed.version = 3;
+        control.forwards[0].signed.signature =
+            operator(1).sign(control.forwards[0].signed.signing_hash().as_bytes());
+        assert_eq!(control.validate(), Ok(()));
     }
 
     #[test]
