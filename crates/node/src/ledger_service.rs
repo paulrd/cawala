@@ -64,7 +64,7 @@ use cawala_ledger::{
     AccountRef, Amount, AuthRef, BalanceAttestation, Entry, EntryBody, Hash, HopRole, IssueRequest,
     Ledger, LedgerError, LedgerPubKey, LedgerSecretKey, NodeId, OperatorPubKey, OperatorSecretKey,
     PaymentOrder, PeerKeys, PeerRegistry, PeerRole, Posting, PrefundRequest, SignedAmount,
-    SignedCommitment, SignedEntry, attest_balance, build_commitment, entry_hash,
+    SignedCommitment, SignedEntry, attest_balance, build_commitment, commitment_hash, entry_hash,
     entry_inclusion_proof, hop_postings, verify_issue, verify_prefund, verify_transfer,
 };
 use cawala_msg::{
@@ -74,6 +74,7 @@ use cawala_msg::{
 use cawala_topology::ChildKind;
 
 use crate::identity;
+use crate::ledger_commitments::CommitmentLog;
 use crate::ledger_keys::load_or_create_ledger_key;
 use crate::ledger_peers::load_peers;
 use crate::ledger_store::{FileLog, LedgerLock, init_ledger, open_ledger};
@@ -278,6 +279,11 @@ impl LedgerService {
             .cloned()
             .context("effective registry is missing this node's self row")?;
         let inclusion = entry_inclusion_proof(&self.ledger, seq)?;
+        // Anchored to `Hash::ZERO` and deliberately **not** written to
+        // `<data-dir>/ledger/commitments.log`: this commitment binds one proof
+        // to the current head. Persisting it (and the receipt commitment below)
+        // would duplicate an existing height and break `verify_chain`. Only
+        // [`LedgerService::commit`] appends to the commitment log.
         let commitment = build_commitment(&self.ledger, Hash::ZERO, unix_now())?;
         let commitment = SignedCommitment::sign(commitment, &self.key)?;
         Ok(EntryProofV1 {
@@ -292,6 +298,46 @@ impl LedgerService {
     /// This node's ledger public key.
     pub fn ledger_key_public(&self) -> LedgerPubKey {
         self.key.public()
+    }
+
+    /// Open and validate this node's persisted commitment chain.
+    ///
+    /// Takes the shared ledger lock so a concurrent writer cannot publish a
+    /// frame mid-read.
+    pub fn commitments(&self) -> Result<CommitmentLog> {
+        let _lock = LedgerLock::acquire_shared(&self.data_dir)?;
+        CommitmentLog::open(&self.data_dir, self.key.public())
+    }
+
+    /// Append one chained commitment at the current ledger head.
+    ///
+    /// Takes the exclusive ledger lock, re-reads the log (so the head is
+    /// authoritative), builds a commitment with
+    /// `prev_commitment_hash = commitments.last_hash()`, signs it with the
+    /// node's ledger key, appends it to `<data-dir>/ledger/commitments.log`, and
+    /// returns `(height, commitment_hash)`.
+    ///
+    /// Refuses to commit when the head has not advanced since the last
+    /// commitment: [`cawala_ledger::verify_chain`] requires strictly increasing
+    /// heights, so a same-height append would publish an invalid chain.
+    pub fn commit(&mut self) -> Result<(u64, Hash)> {
+        let _lock = LedgerLock::acquire_exclusive(&self.data_dir)?;
+        self.refresh_from_disk()?;
+
+        let mut commitments = CommitmentLog::open(&self.data_dir, self.key.public())?;
+        let commitment = build_commitment(&self.ledger, commitments.last_hash(), unix_now())?;
+        if !commitments.is_empty() && commitment.height <= commitments.height() {
+            bail!(
+                "ledger head has not advanced since the last commitment (height {}); \
+                 append entries before committing again",
+                commitments.height()
+            );
+        }
+        let signed = SignedCommitment::sign(commitment, &self.key)?;
+        let hash = commitment_hash(&signed.commitment);
+        let height = signed.commitment.height;
+        commitments.append(signed)?;
+        Ok((height, hash))
     }
 
     /// The current balance of `child`'s liability account (zero if absent).
@@ -748,9 +794,10 @@ impl LedgerService {
     /// Build a signed balance receipt for `user` from the current ledger head.
     ///
     /// The attestation is over the current state and the commitment's parent is
-    /// always [`Hash::ZERO`]: the service keeps no commitment chain, so every
-    /// receipt anchors its own commitment (the browser verifies it against the
-    /// leaf's ledger key rather than a chain).
+    /// always [`Hash::ZERO`]: a receipt is a standalone attestation the browser
+    /// verifies against the leaf's ledger key, independent of the durable
+    /// commitment chain maintained by [`LedgerService::commit`]. It is never
+    /// persisted to that chain.
     ///
     /// `history` carries the recent `Direct` transfers touching `user`, oldest
     /// first, capped at [`MAX_RECEIPT_HISTORY`]. Issue/burn entries are not
@@ -773,6 +820,11 @@ impl LedgerService {
         }
         let leaf = NodeId::from(self.node_id.clone());
         let attestation: BalanceAttestation = attest_balance(&self.ledger, &leaf, user)?;
+        // Anchored to `Hash::ZERO` and deliberately **not** written to
+        // `<data-dir>/ledger/commitments.log`: a receipt's commitment stands
+        // alone and is verified by the browser against the leaf key. Persisting
+        // it would duplicate an existing height and break `verify_chain`. Only
+        // [`LedgerService::commit`] appends to the commitment log.
         let commitment = build_commitment(&self.ledger, Hash::ZERO, unix_now())?;
         let commitment = SignedCommitment::sign(commitment, &self.key)?;
         let history = self.receipt_history(user)?;
@@ -1071,6 +1123,42 @@ mod tests {
         assert_eq!(seq, 1, "seq 0 opens the account, seq 1 issues");
         assert_eq!(service.balance_of(&a), Amount::new(100));
         assert_eq!(service.ledger().len(), 2);
+    }
+
+    #[test]
+    fn commit_chains_commitments_and_refuses_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = LedgerService::open(dir.path(), NODE).unwrap();
+
+        // Genesis commit at the empty head.
+        let (h0, hash0) = service.commit().unwrap();
+        assert_eq!(h0, 0);
+        let chain = service.commitments().unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain.last_hash(), hash0);
+        assert_eq!(chain.chain()[0].commitment.prev_commitment_hash, Hash::ZERO);
+
+        // Nothing new: a second commit must not publish a duplicate height.
+        assert!(service.commit().is_err());
+        assert_eq!(service.commitments().unwrap().len(), 1);
+
+        // Advance the head, then commit again: the new commitment links to the
+        // first.
+        let a = user("user-a");
+        let operator = node_operator(dir.path());
+        service
+            .fund(&a, ChildKind::User, 10, &operator, 1, 1_000)
+            .unwrap();
+        let (h1, hash1) = service.commit().unwrap();
+        assert!(h1 > h0);
+        let chain = service.commitments().unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain.last_hash(), hash1);
+        assert_eq!(
+            chain.chain()[1].commitment.prev_commitment_hash,
+            hash0,
+            "the second commitment must link to the first"
+        );
     }
 
     #[test]

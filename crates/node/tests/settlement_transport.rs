@@ -622,6 +622,21 @@ async fn cross_subtree_settlement_success() {
     assert_eq!(notice.amount, Amount::new(100));
     assert_eq!(notice.payment_id, order.hash());
 
+    // S2: each hop journalled the order once its own hop applied — the origin's
+    // reservation (A), the LCA handoff (P), and the terminal (B) — exactly once
+    // per node despite the same order being applied at every hop.
+    for leaf in [&h.a, &h.p, &h.b] {
+        let journal = cawala_node::orders::load_all(leaf._dir.path());
+        assert_eq!(
+            journal.len(),
+            1,
+            "node {} journalled {} entries",
+            leaf.node_id,
+            journal.len()
+        );
+        assert_eq!(journal[0].hash(), order.hash());
+    }
+
     for router in h.routers.drain(..) {
         router.shutdown().await.unwrap();
     }
@@ -693,6 +708,12 @@ async fn expired_order_rejects() {
         other => panic!("expected Rejected, got {other:?}"),
     }
     assert_eq!(ledger_len(&h.a).await, 2);
+    // S2: a fully rejected order must not be journalled (it has no applied hop,
+    // so recording it would create a false `RouteInvalid` finding in `net`).
+    assert!(
+        cawala_node::orders::load_all(h.a._dir.path()).is_empty(),
+        "a rejected order must not be journalled"
+    );
 }
 
 #[tokio::test]

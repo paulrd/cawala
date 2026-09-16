@@ -46,6 +46,7 @@ use cawala_msg::{
 use cawala_topology::ChildKind;
 
 use crate::ledger_service::{ApplyOutcome, HopOutcome, LedgerService};
+use crate::orders;
 use crate::record::{NodeRecord, RecordStore};
 use crate::settlement::{
     DerivedHop, PendingSettlement, SettlementManager, TerminalRecord, derive_hop, expected_signers,
@@ -781,7 +782,7 @@ pub async fn dispatch_ledger_envelope(
                 .any(|child| child.kind == ChildKind::User && child.child_id == order.to.as_str());
             if payee_is_local {
                 apply_same_leaf_order(
-                    endpoint, source, config, ledger, &env, &record, &order, &auth, true,
+                    endpoint, source, config, ledger, data_dir, &env, &record, &order, &auth, true,
                 )
                 .await;
             } else {
@@ -791,6 +792,7 @@ pub async fn dispatch_ledger_envelope(
                     config,
                     ledger,
                     manager,
+                    data_dir,
                     &env,
                     &record,
                     &order,
@@ -829,6 +831,7 @@ async fn apply_same_leaf_order(
     source: &NeighborSource,
     config: &MsgConfig,
     ledger: &Arc<tokio::sync::Mutex<LedgerService>>,
+    data_dir: &Path,
     env: &Envelope,
     record: &NodeRecord,
     order: &PaymentOrder,
@@ -836,6 +839,7 @@ async fn apply_same_leaf_order(
     reply_v2: bool,
 ) {
     let order = order.clone();
+    let order_record = order.clone();
     let auth = auth.clone();
     let record = record.clone();
     let sender = env.src.node.clone();
@@ -913,6 +917,20 @@ async fn apply_same_leaf_order(
             return;
         }
     };
+
+    // Journal the order only now that its hop has actually applied (Applied, or
+    // a previously-applied Duplicate). Journaling at receipt would record
+    // received-but-rejected orders, whose missing cascade then shows up as a
+    // false `RouteInvalid` finding in `net` and suppresses nets. Dedup by order
+    // hash keeps several applied hops at one node to a single line.
+    match outcome.status {
+        OrderStatusV1::Applied | OrderStatusV1::Duplicate => {
+            if let Err(err) = orders::append(data_dir, &order_record) {
+                tracing::warn!(%err, "failed to journal an applied order");
+            }
+        }
+        OrderStatusV1::Rejected => {}
+    }
 
     if reply_v2 {
         // A v2 (`OrderV2`) sender gets a v3 result; a same-leaf move is already
@@ -1018,6 +1036,7 @@ async fn dispatch_ledger_payload_v1(
                 source,
                 config,
                 ledger,
+                data_dir,
                 &env,
                 &record,
                 &order_v1.order,
@@ -1090,6 +1109,7 @@ async fn handle_settlement_order(
     config: &MsgConfig,
     ledger: &Arc<tokio::sync::Mutex<LedgerService>>,
     manager: &Arc<tokio::sync::Mutex<SettlementManager>>,
+    data_dir: &Path,
     env: &Envelope,
     record: &NodeRecord,
     order: &PaymentOrder,
@@ -1198,6 +1218,13 @@ async fn handle_settlement_order(
                 deadline_secs: now + SETTLE_TIMEOUT_SECS,
                 reply_v2: true,
             };
+            // Journal at the reservation point: this branch is reached only
+            // after this origin leaf's own hop applied, so recording here (not
+            // at receipt) avoids false route-audit findings. Idempotent with the
+            // per-hop journals; never fails the request.
+            if let Err(err) = orders::append(data_dir, order) {
+                tracing::warn!(%err, "failed to journal a reserved settlement order");
+            }
             if let Some(evicted) = manager.lock().await.reserve(pending) {
                 send_timeout_result(endpoint, source, config, ledger, Some(record), &evicted).await;
             }
@@ -1859,6 +1886,13 @@ async fn handle_settle_forward(
             return;
         }
     };
+
+    // Journal this order now that this node's hop has actually applied
+    // (Applied, or a previously-applied Duplicate); a rejected hop must not be
+    // recorded, or `net` would report a false `RouteInvalid` for it.
+    if let Err(err) = orders::append(data_dir, &forward.order) {
+        tracing::warn!(%err, "failed to journal an applied settlement hop");
+    }
 
     // Recover the appended (or already-applied) entry as evidence, and, at the
     // terminal leaf, assemble the full inclusion proof the origin verifies. A

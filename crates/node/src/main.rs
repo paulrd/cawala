@@ -8,7 +8,7 @@ use cawala_control::{
     Invite, JoinRejection, JoinRequest, MoveChild, NodeId, OperatorPubKey, OperatorSecretKey,
     SetAddress, SignedControl,
 };
-use cawala_ledger::{AccountRef, Amount, LedgerPubKey};
+use cawala_ledger::{AccountRef, Amount, LedgerPubKey, commitment_hash, verify_chain};
 use cawala_msg::{MSG_LEDGER_V1, MSG_SETTLE_V1};
 use cawala_node::control::spawn_control_node_live;
 use cawala_node::msg::{
@@ -16,8 +16,8 @@ use cawala_node::msg::{
 };
 use cawala_node::{
     ControlNode, LedgerService, MsgConfig, RoutableSnapshot, SettlementManager, admin_cli,
-    build_envelope, identity, ledger_keys, ledger_service, ledger_store, record, send_envelope,
-    spawn_control_only, spawn_with_secret_key,
+    build_envelope, identity, ledger_commitments, ledger_keys, ledger_service, ledger_store,
+    netting_harness, record, send_envelope, spawn_control_only, spawn_with_secret_key,
 };
 use cawala_topology::OctAddr;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -317,6 +317,59 @@ enum LedgerCommand {
         /// `user` (the default) or `node`.
         #[arg(long, value_name = "KIND")]
         kind: Option<String>,
+    },
+    /// Append one chained commitment at the current ledger head.
+    Commit,
+    /// Print and verify the stored commitment chain.
+    Chain {
+        /// Emit the raw commitment array plus the verdict as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the netting reconciliation over peer data dirs.
+    ///
+    /// Loads each peer's topology, registry, ledger, commitment chain, and
+    /// order journal, then runs the ledger crate's `net`. `RouteInvalid`
+    /// findings are printed as advisories (topology is live control-plane
+    /// state, so route findings need operator adjudication) and do not fail the
+    /// command unless `--strict` is given. The ledger crate only collapses
+    /// flows (`nets`) when there are **zero** findings, so a route advisory
+    /// will suppress nets until resolved; pass `--topology` with a saved
+    /// snapshot to remove stale-geography false positives.
+    Net {
+        /// Peer data dirs (repeatable). Defaults to the global `--data-dir`.
+        #[arg(long, value_name = "DATA_DIR")]
+        peer: Vec<PathBuf>,
+        /// Order source: a JSON array/JSONL file, or `-` for stdin.
+        #[arg(long, value_name = "FILE|-")]
+        orders: Option<String>,
+        /// Use a saved topology snapshot instead of deriving from records.
+        #[arg(long, value_name = "FILE")]
+        topology: Option<PathBuf>,
+        /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Treat advisories as failures and require an order source.
+        #[arg(long)]
+        strict: bool,
+    },
+    /// Reconstruct and verify one order's settlement cascade.
+    VerifyCascade {
+        /// Peer data dirs (repeatable). Defaults to the global `--data-dir`.
+        #[arg(long, value_name = "DATA_DIR")]
+        peer: Vec<PathBuf>,
+        /// An inline JSON `PaymentOrder`.
+        #[arg(long, value_name = "JSON", conflicts_with = "order_hash")]
+        order: Option<String>,
+        /// Order source: a JSON array/JSONL file, or `-` for stdin.
+        #[arg(long, value_name = "FILE|-")]
+        orders: Option<String>,
+        /// Select an order from `--orders` by its `hash` hex.
+        #[arg(long, value_name = "HEX", requires = "orders")]
+        order_hash: Option<String>,
+        /// Emit the result as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -635,8 +688,305 @@ fn ledger(data_dir: &std::path::Path, command: LedgerCommand) -> Result<()> {
                     .unwrap_or(Amount::ZERO)
             );
         }
+        LedgerCommand::Commit => {
+            let mut service = LedgerService::open(data_dir, &node_id)?;
+            let (height, hash) = service.commit()?;
+            // Read back the commitment just written for its roots/link.
+            let commitments = service.commitments()?;
+            let signed = commitments
+                .chain()
+                .last()
+                .expect("commit appended a commitment");
+            let commitment = &signed.commitment;
+            println!(
+                "committed height={} entry_count={} entry_root={} state_root={} prev={} hash={}",
+                height,
+                commitment.entry_count,
+                commitment.entry_root,
+                commitment.state_root,
+                commitment.prev_commitment_hash,
+                hash,
+            );
+        }
+        LedgerCommand::Chain { json } => {
+            // Shared read lock: a direct replay must not race a running node.
+            let _lock = ledger_store::LedgerLock::acquire_shared(data_dir)?;
+            let commitments =
+                ledger_commitments::CommitmentLog::open(data_dir, ledger_key.public())?;
+            let chain = commitments.chain();
+            let valid = verify_chain(chain, &ledger_key.public()).is_ok();
+            if json {
+                let value = serde_json::json!({ "valid": valid, "commitments": chain });
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else if chain.is_empty() {
+                println!("no commitments");
+                println!("valid: {valid}");
+            } else {
+                for signed in chain {
+                    let commitment = &signed.commitment;
+                    println!(
+                        "height={} entry_count={} issued_at={} prev={} hash={} entry_root={} state_root={}",
+                        commitment.height,
+                        commitment.entry_count,
+                        commitment.issued_at,
+                        commitment.prev_commitment_hash,
+                        commitment_hash(commitment),
+                        commitment.entry_root,
+                        commitment.state_root,
+                    );
+                }
+                println!("valid: {valid}");
+            }
+        }
+        LedgerCommand::Net {
+            peer,
+            orders,
+            topology,
+            json,
+            strict,
+        } => {
+            let peers = resolve_peers(data_dir, peer);
+            let inputs = match netting_harness::load(&peers, orders.as_deref(), topology.as_deref())
+            {
+                Ok(inputs) => inputs,
+                Err(err) => fail(2, format!("{err:#}")),
+            };
+            if strict && inputs.orders.is_empty() {
+                fail(
+                    2,
+                    "--strict requires an order source, but none was supplied or found".to_string(),
+                );
+            }
+            let report = netting_harness::report(&inputs);
+            if json {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(text) => println!("{text}"),
+                    Err(err) => fail(2, format!("failed to encode report: {err}")),
+                }
+            } else {
+                print_net_report(&report);
+            }
+            let failed = !report.findings.is_empty() || (strict && !report.advisories.is_empty());
+            if failed {
+                std::process::exit(1);
+            }
+        }
+        LedgerCommand::VerifyCascade {
+            peer,
+            order,
+            orders,
+            order_hash,
+            json,
+        } => {
+            let peers = resolve_peers(data_dir, peer);
+            let inputs = match netting_harness::load(&peers, orders.as_deref(), None) {
+                Ok(inputs) => inputs,
+                Err(err) => fail(2, format!("{err:#}")),
+            };
+            let order = match resolve_cascade_order(&inputs, order.as_deref(), order_hash.as_deref())
+            {
+                Ok(order) => order,
+                Err(err) => fail(2, err),
+            };
+
+            let expected = cawala_ledger::expected_hops(&inputs.topology, &order);
+            let result = cawala_ledger::verify_cascade(
+                &inputs.topology,
+                &order,
+                &inputs.ledgers,
+                &inputs.registry,
+            );
+            let valid = result.is_ok();
+            let reason = result.as_ref().err().map(|err| err.to_string());
+
+            let hops: Vec<HopReport> = match &expected {
+                Ok(expected) => expected
+                    .iter()
+                    .map(|hop| HopReport {
+                        signer: hop.signer.to_string(),
+                        role: netting_harness::role_label(hop.role).to_string(),
+                        first: netting_harness::account_label(&hop.first),
+                        second: netting_harness::account_label(&hop.second),
+                        matched: valid,
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            let cascade = CascadeReport {
+                order_hash: order.hash().to_hex(),
+                valid,
+                reason: reason.clone(),
+                hops,
+            };
+
+            if json {
+                match serde_json::to_string_pretty(&cascade) {
+                    Ok(text) => println!("{text}"),
+                    Err(err) => fail(2, format!("failed to encode cascade: {err}")),
+                }
+            } else {
+                println!("order_hash: {}", cascade.order_hash);
+                match &expected {
+                    Ok(expected) => {
+                        for (index, hop) in expected.iter().enumerate() {
+                            println!(
+                                "hop {index}: signer={} role={} first={} second={} match={}",
+                                hop.signer,
+                                netting_harness::role_label(hop.role),
+                                netting_harness::account_label(&hop.first),
+                                netting_harness::account_label(&hop.second),
+                                valid,
+                            );
+                        }
+                    }
+                    Err(err) => println!("route: unresolvable ({err})"),
+                }
+                match &reason {
+                    Some(reason) => println!("valid: false\nreason: {reason}"),
+                    None => println!("valid: true"),
+                }
+            }
+            if !valid {
+                std::process::exit(1);
+            }
+        }
     }
     Ok(())
+}
+
+/// The peer set for a harness command: explicit `--peer` dirs, else the global
+/// `--data-dir`.
+fn resolve_peers(data_dir: &std::path::Path, peer: Vec<PathBuf>) -> Vec<PathBuf> {
+    if peer.is_empty() {
+        vec![data_dir.to_path_buf()]
+    } else {
+        peer
+    }
+}
+
+/// Print `message` to stderr and exit with `code` (2 for usage/IO/load errors).
+fn fail(code: i32, message: String) -> ! {
+    eprintln!("error: {message}");
+    std::process::exit(code);
+}
+
+/// Resolve the order for `verify-cascade` from either `--order` or
+/// `--orders`+`--order-hash`.
+fn resolve_cascade_order(
+    inputs: &netting_harness::HarnessInputs,
+    inline: Option<&str>,
+    order_hash: Option<&str>,
+) -> Result<cawala_ledger::PaymentOrder, String> {
+    if let Some(text) = inline {
+        return serde_json::from_str::<cawala_ledger::PaymentOrder>(text)
+            .map_err(|err| format!("invalid --order JSON: {err}"));
+    }
+    let target = order_hash
+        .ok_or_else(|| "provide --order <json> or --orders <file> --order-hash <hex>".to_string())?
+        .to_lowercase();
+    inputs
+        .orders
+        .iter()
+        .find(|order| order.hash().to_hex() == target)
+        .cloned()
+        .ok_or_else(|| format!("no order with hash {target} in the supplied source"))
+}
+
+/// One hop of a cascade verification report.
+#[derive(serde::Serialize)]
+struct HopReport {
+    signer: String,
+    role: String,
+    first: String,
+    second: String,
+    matched: bool,
+}
+
+/// The `verify-cascade` result, serialized under `--json`.
+#[derive(serde::Serialize)]
+struct CascadeReport {
+    order_hash: String,
+    valid: bool,
+    reason: Option<String>,
+    hops: Vec<HopReport>,
+}
+
+fn print_net_report(report: &netting_harness::HarnessReport) {
+    println!("peers:");
+    for peer in &report.peers {
+        println!("  {} ({})", peer.node_id, peer.data_dir);
+        println!(
+            "    chain: {} ({} commitments)",
+            if peer.chain_present { "present" } else { "absent" },
+            peer.chain_len
+        );
+        for note in &peer.notes {
+            println!("    note: {note}");
+        }
+    }
+    if !report.chains_present.is_empty() {
+        println!("chains_present: {}", report.chains_present.join(", "));
+    }
+    for note in &report.notes {
+        println!("note: {note}");
+    }
+    println!("advisories: {}", report.advisories.len());
+    for finding in &report.advisories {
+        println!("  {}", describe_finding(finding));
+    }
+    println!("findings: {}", report.findings.len());
+    for finding in &report.findings {
+        println!("  {}", describe_finding(finding));
+    }
+    println!("nets: {}", report.nets.len());
+    for net in &report.nets {
+        println!("  {} -> {} via {} : {}", net.from, net.to, net.parent, net.amount);
+    }
+}
+
+/// Name the culprits carried by each [`cawala_ledger::Finding`].
+fn describe_finding(finding: &cawala_ledger::Finding) -> String {
+    use cawala_ledger::Finding;
+    match finding {
+        Finding::Fork {
+            ledger_id,
+            height,
+            heads,
+        } => format!(
+            "fork ledger={ledger_id} height={height} heads=[{}]",
+            heads
+                .iter()
+                .map(|head| head.to_hex())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Finding::ChainInvalid { node, reason } => {
+            format!("chain_invalid node={node} reason={reason}")
+        }
+        Finding::MirrorMismatch {
+            edge,
+            parent_view,
+            child_view,
+            direction,
+        } => format!(
+            "mirror_mismatch edge={}->{} parent_view={parent_view} child_view={child_view} direction={direction:?}",
+            edge.parent, edge.child
+        ),
+        Finding::RouteInvalid { payment_id, reason } => {
+            format!("route_invalid payment={} reason={reason}", payment_id.to_hex())
+        }
+        Finding::Replay { payment_id, reason } => {
+            format!("replay payment={} reason={reason}", payment_id.to_hex())
+        }
+        Finding::Overdraw {
+            node,
+            account,
+            deficit,
+        } => format!(
+            "overdraw node={node} account={} deficit={deficit}",
+            netting_harness::account_label(account)
+        ),
+    }
 }
 
 /// Parse the optional `--kind user|node` flag (`user` when omitted).

@@ -364,9 +364,29 @@
         without a URI pin. Equivocation/withholding and negative-claim
         falsification stay out of scope (commitment chains / per-hop signed
         rejections).
+      - Commitment chains + netting operator harness (DONE): each node persists
+        a prev-linked `<data-dir>/ledger/commitments.log` (`ledger commit`) and
+        journals applied orders to `<data-dir>/ledger/orders.jsonl` (dedup by
+        hash; only orders with an applied hop, so a rejected order cannot pollute
+        the route audit). The offline operator harness
+        (`crates/node/src/netting_harness.rs`) merges peer data dirs into the
+        `net`/`verify_cascade` inputs (topology from `node.json` records or a
+        `--topology` snapshot, one `PeerRegistry`, `LedgerSet`, chains, orders)
+        and exposes `ledger net` / `ledger verify-cascade` with stable exit codes
+        (0 clean/advisory-only, 1 hard finding or invalid cascade, 2 usage/IO).
+        `RouteInvalid` is classified advisory because topology is live state
+        (re-slotting can make an honest historical route look invalid); `nets`
+        are still gated on zero findings by `cawala-ledger`, so advisories
+        suppress them until resolved. No wire change. Verified by a hermetic
+        on-disk multi-peer matrix (`crates/node/tests/netting_harness.rs`, 9
+        tests incl. a genuine `NetTransfer`, `Replay`, `MirrorMismatch`, `Fork`,
+        broken/gapped chain, conflicting registry, advisory, missing chain).
+        Known limitation: the loader validates chains strictly, so a same-height
+        fork on disk is a hard load error rather than a `Fork` finding; nodes
+        themselves keep only local links (self + parent + <=8 children), so the
+        whole-tree view lives with the auditor.
       - Still owed: route-wide carried-prefix verification beyond direct
-        neighbors; commitment-chain assembly + `net`/`verify_cascade` operator
-        harness; no global supply anchor by design; manual prefund liquidity (an
+        neighbors; no global supply anchor by design; manual prefund liquidity (an
         underfunded LCA parent yields a `Partial`: payer debited, payee not
         credited); control format 3 / settlement payload 2 / browser ledger
         payload 3 are hard breaks.
