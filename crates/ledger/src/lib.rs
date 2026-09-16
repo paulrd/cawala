@@ -69,7 +69,9 @@ pub use merkle::{
     entry_root, inclusion_proof, root as merkle_root, state_inclusion_proof, state_root,
     verify_inclusion, verify_state_inclusion,
 };
-pub use netting::{Finding, MirrorDirection, NetTransfer, NettingReport, net, verify_cascade};
+pub use netting::{
+    Finding, MirrorDirection, NetTransfer, NettingReport, entry_hop_accounts, net, verify_cascade,
+};
 pub use proof::{
     EntryInclusionProof, MAX_ENTRY_PROOF, entry_inclusion_proof, verify_applied_entry,
     verify_entry_inclusion,

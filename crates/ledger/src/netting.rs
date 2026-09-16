@@ -357,7 +357,7 @@ fn has_duplicate_ledger(entries: &[SignedEntry]) -> bool {
 /// derived from role and sign so a reordered (but equivalent) posting set is
 /// accepted. The returned order matches [`crate::settlement::ExpectedHop`]'s
 /// `first`/`second`.
-fn entry_hop_accounts(
+pub fn entry_hop_accounts(
     entry: &Entry,
     role: HopRole,
 ) -> Result<(AccountRef, AccountRef), LedgerError> {

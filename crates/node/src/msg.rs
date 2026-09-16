@@ -20,10 +20,10 @@
 //! hop, and it verifies only that the last recorded hop matches that peer and
 //! is a configured neighbor.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use iroh::endpoint::Connection;
@@ -1969,22 +1969,57 @@ async fn handle_settle_forward(
     }
 }
 
+/// Cap on the once-per-signer "unresolvable key" warning dedup.
+///
+/// The set is keyed by an untrusted carried address, so it must be bounded;
+/// once full, new addresses are neither recorded nor warned about (repeats are
+/// silent either way).
+const MAX_UNRESOLVABLE_SIGNER_NOTES: usize = 4096;
+
+/// Process-wide set of unresolvable carried-signer addresses already logged.
+///
+/// The terminal logs each distinct unresolvable signer address **at most once**:
+/// in the depth-1 route the payer leaf's carried hop is always unresolvable at
+/// the terminal, so a per-hop `warn!` on every honest cross-leaf settlement
+/// would be alert noise. Bounded so a hostile flood of distinct addresses cannot
+/// grow it without limit.
+static UNRESOLVABLE_SIGNERS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+/// Record `addr` and return whether this call is the first sighting that fits
+/// under the cap (and therefore should warn). A repeat, or an address seen while
+/// the set is already full, returns `false` (silent).
+fn note_unresolvable_signer(addr: &cawala_msg::OctAddr) -> bool {
+    let set = UNRESOLVABLE_SIGNERS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let mut set = set.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if set.len() >= MAX_UNRESOLVABLE_SIGNER_NOTES {
+        return false;
+    }
+    set.insert(addr.to_string())
+}
+
 /// Defense-in-depth check over carried settlement evidence.
 ///
 /// Every carried hop must name the expected signer, be a canonical transfer of
 /// this order with the role the classifier derives for that signer, and pass
-/// conservation. Where the signer is resolvable — this node itself, or a
-/// direct neighbor whose registry row (with a ledger key) is known — the entry
-/// signature is verified under exactly that signer's key; a mismatch rejects.
+/// conservation. Independently of resolvability, every carried entry must also
+/// be **signed by the key it names** and have the role's **canonical posting
+/// shape** (see [`cawala_ledger::entry_hop_accounts`]); an unsigned, garbage, or
+/// malformed-shape entry is rejected even when the signer's registered key is
+/// unknown here.
+///
+/// Where the signer is resolvable — this node itself, or a direct neighbor whose
+/// registry row (with a ledger key) is known — the entry signature is verified
+/// under exactly that signer's key; a mismatch rejects.
 ///
 /// In the depth-1 route the immediately-preceding hop (`signers[index-1]`,
 /// already authenticated as the transport sender) is a direct neighbor of this
 /// node, so its signature is required at the terminal leaf and at the LCA.
 ///
 /// Residual: a carried hop naming a node that is neither us nor a known direct
-/// neighbor cannot be verified here, so a malicious parent/LCA can still author
-/// a chain it signs with its own registered key. Full route verification is
-/// deferred.
+/// neighbor cannot be bound to that node's registered key here; it is logged and
+/// only the internal self-signature plus structural checks apply. A malicious
+/// parent/LCA can still author such a chain with its own well-formed key. Full
+/// route verification is deferred (Phase 2).
 #[allow(clippy::too_many_arguments)]
 fn carried_hops_match(
     hops: &[SettleHopV1],
@@ -2018,26 +2053,45 @@ fn carried_hops_match(
         {
             return false;
         }
+        // Internal integrity, independent of whether the signer is resolvable:
+        // the entry must be signed by the ledger key it declares, and its
+        // postings must have the role-canonical shape. This rejects unsigned or
+        // garbage entries that merely carry a plausible address.
+        if hop.entry.verify(&entry.ledger_id).is_err() {
+            return false;
+        }
+        if cawala_ledger::entry_hop_accounts(entry, *role).is_err() {
+            return false;
+        }
+
+        // Authoritative binding: where we hold the signer's registered key, the
+        // entry must verify under exactly that key (which also rejects a
+        // `ledger_id` naming any other key).
+        let mut key_verified = false;
         if hop.signer_addr == *this_addr {
             if entry.ledger_id != *self_key || hop.entry.verify(self_key).is_err() {
                 return false;
             }
+            key_verified = true;
         } else if let Some(expected_node) = neighbors
             .iter()
             .find(|(addr, _)| addr == &hop.signer_addr)
             .map(|(_, node)| node)
+            && let Some(expected_key) = registry.ledger_of(expected_node)
         {
-            // The signer is a direct neighbor: when we hold its row, the
-            // carried entry must be signed by exactly that node's ledger key.
-            // (`verify` also rejects a `ledger_id` that is not that key.)
-            if let Some(expected_key) = registry.ledger_of(expected_node)
-                && hop.entry.verify(expected_key).is_err()
-            {
+            if hop.entry.verify(expected_key).is_err() {
                 return false;
             }
+            key_verified = true;
         }
-        // Otherwise the signer's key is not resolvable here; only the
-        // name/role/shape checks above apply.
+        if !key_verified && note_unresolvable_signer(&hop.signer_addr) {
+            tracing::warn!(
+                hop_index = i,
+                signer_addr = %hop.signer_addr,
+                "carried settlement hop signer key is not resolvable here; \
+                 only the entry's self-signature and structural checks applied"
+            );
+        }
     }
     true
 }
@@ -3308,6 +3362,46 @@ mod tests {
         }
     }
 
+    fn posting(account: cawala_ledger::AccountRef, delta: i64) -> cawala_ledger::Posting {
+        cawala_ledger::Posting {
+            account,
+            delta: cawala_ledger::SignedAmount::new(delta),
+        }
+    }
+
+    /// Like [`make_hop`] but with explicit postings, so a non-canonical carried
+    /// entry can be built (the entry is still signed by `ledger_key`).
+    fn make_hop_with_postings(
+        signer_addr: &str,
+        order: &PaymentOrder,
+        ledger_key: &cawala_ledger::LedgerSecretKey,
+        role: HopRole,
+        postings: Vec<cawala_ledger::Posting>,
+    ) -> SettleHopV1 {
+        let entry = cawala_ledger::Entry {
+            ledger_id: ledger_key.public(),
+            seq: 0,
+            height: 0,
+            prev_hash: Hash::ZERO,
+            issued_at: 0,
+            body: cawala_ledger::EntryBody::Transfer {
+                payment_id: order.hash(),
+                amount: order.amount,
+                role,
+            },
+            postings,
+            auth: Some(
+                order
+                    .authorize(&OperatorSecretKey::from_bytes([1u8; 32]))
+                    .unwrap(),
+            ),
+        };
+        SettleHopV1 {
+            signer_addr: signer_addr.parse().unwrap(),
+            entry: SignedEntry::sign(entry, ledger_key).unwrap(),
+        }
+    }
+
     fn ascend_hop(order: &PaymentOrder, key: &cawala_ledger::LedgerSecretKey) -> SettleHopV1 {
         make_hop(
             "0.1",
@@ -3484,5 +3578,109 @@ mod tests {
             &neighbors,
             &PeerRegistry::new(),
         ));
+    }
+
+    /// An unresolvable signer's hop must still be signed by the key it names:
+    /// a forged signature is rejected even though the signer's registered key
+    /// is unknown here.
+    #[test]
+    fn carried_prefix_rejects_unresolvable_invalid_signature() {
+        let order = carried_order();
+        let a_key = cawala_ledger::LedgerSecretKey::from_bytes([11u8; 32]);
+        let p_key = cawala_ledger::LedgerSecretKey::from_bytes([22u8; 32]);
+        let b_key = cawala_ledger::LedgerSecretKey::from_bytes([33u8; 32]);
+        let mut hops = vec![ascend_hop(&order, &a_key), lca_hop(&order, &p_key)];
+        // The entry declares `a_key` but is signed by a different key.
+        hops[0].entry.signature = b_key.sign(b"forged");
+
+        let signers = signer_addrs();
+        let payer = "0.1.3".parse().unwrap();
+        let payee = "0.2.4".parse().unwrap();
+        let this = "0.2".parse().unwrap();
+        // A (`0.1`) is neither this node nor a neighbor at the terminal.
+        let neighbors = vec![("0".parse().unwrap(), NodeId::from("P"))];
+
+        assert!(
+            !carried_hops_match(
+                &hops,
+                &signers,
+                &payer,
+                &payee,
+                &this,
+                &order,
+                &b_key.public(),
+                &neighbors,
+                &PeerRegistry::new(),
+            ),
+            "an unresolvable hop whose signature does not match its declared ledger_id must be rejected"
+        );
+    }
+
+    /// An unresolvable signer's hop must have the role-canonical posting shape;
+    /// a malformed shape is rejected even though the signer's key is unknown.
+    #[test]
+    fn carried_prefix_rejects_unresolvable_non_canonical_shape() {
+        let order = carried_order();
+        let a_key = cawala_ledger::LedgerSecretKey::from_bytes([11u8; 32]);
+        let p_key = cawala_ledger::LedgerSecretKey::from_bytes([22u8; 32]);
+        let b_key = cawala_ledger::LedgerSecretKey::from_bytes([33u8; 32]);
+        let m = i64::try_from(order.amount.get()).unwrap();
+        // `Ascend` must be exactly `Parent + one child`; add a second child leg.
+        let malformed = make_hop_with_postings(
+            "0.1",
+            &order,
+            &a_key,
+            HopRole::Ascend,
+            vec![
+                posting(cawala_ledger::AccountRef::Parent, -m),
+                posting(cawala_ledger::AccountRef::Child(NodeId::from("x")), -m),
+                posting(cawala_ledger::AccountRef::Child(NodeId::from("y")), m),
+            ],
+        );
+        let hops = vec![malformed, lca_hop(&order, &p_key)];
+
+        let signers = signer_addrs();
+        let payer = "0.1.3".parse().unwrap();
+        let payee = "0.2.4".parse().unwrap();
+        let this = "0.2".parse().unwrap();
+        let neighbors = vec![("0".parse().unwrap(), NodeId::from("P"))];
+
+        assert!(
+            !carried_hops_match(
+                &hops,
+                &signers,
+                &payer,
+                &payee,
+                &this,
+                &order,
+                &b_key.public(),
+                &neighbors,
+                &PeerRegistry::new(),
+            ),
+            "an unresolvable hop with a non-canonical posting shape must be rejected"
+        );
+    }
+
+    /// The unresolvable-signer warning fires once per distinct address: the
+    /// first sighting returns `true`, repeats and other-address calls behave as
+    /// documented. This is logging-only and never affects `carried_hops_match`.
+    #[test]
+    fn unresolvable_signer_note_warns_once_per_address() {
+        let addr: cawala_msg::OctAddr = "0.7.7".parse().unwrap();
+        assert!(
+            note_unresolvable_signer(&addr),
+            "the first sighting of an address should warn"
+        );
+        assert!(
+            !note_unresolvable_signer(&addr),
+            "a repeat of the same address should stay silent"
+        );
+
+        let other: cawala_msg::OctAddr = "0.7.6".parse().unwrap();
+        assert!(
+            note_unresolvable_signer(&other),
+            "a distinct address should warn on its first sighting"
+        );
+        assert!(!note_unresolvable_signer(&other));
     }
 }

@@ -22,8 +22,8 @@ use cawala_ledger::{
     AccountRef, Amount, AuthRef, EdgeAccount, Entry, EntryBody, Finding, Hash, HopRole, Ledger,
     LedgerLog, LedgerSecretKey, LedgerSet, MemLog, MirrorDirection, NetTransfer, NodeId,
     OperatorSecretKey, PaymentOrder, PeerKeys, PeerRegistry, PeerRole, PlannedHop, Posting,
-    SettlementPlan, SignedAmount, SignedCommitment, SignedEntry, build_commitment, execute_plan,
-    net, plan_transfer, verify_cascade,
+    SettlementPlan, SignedAmount, SignedCommitment, SignedEntry, build_commitment, entry_hop_accounts,
+    execute_plan, net, plan_transfer, verify_cascade,
 };
 use cawala_topology::{ChildKind, Topology};
 
@@ -1040,4 +1040,68 @@ fn local_issue_yields_no_finding() {
         report.findings
     );
     assert!(report.nets.is_empty());
+}
+
+/// `entry_hop_accounts` is exported and enforces the role-canonical posting
+/// shape (used by the node's carried-prefix hardening): `Ascend`/`Descend` name
+/// `Parent` plus exactly one child; `Lca`/`Direct` name exactly one debited and
+/// one credited child with no `Parent` leg.
+#[test]
+fn entry_hop_accounts_is_exported_and_enforces_canonical_shape() {
+    let entry = |role: HopRole, postings: Vec<Posting>| Entry {
+        ledger_id: k(1).public(),
+        seq: 0,
+        height: 0,
+        prev_hash: Hash::ZERO,
+        issued_at: 0,
+        body: EntryBody::Transfer {
+            payment_id: Hash::ZERO,
+            amount: Amount::new(10),
+            role,
+        },
+        postings,
+        auth: Some(dummy_auth()),
+    };
+
+    // Canonical Ascend: `Parent` + one child.
+    let ascend = entry(
+        HopRole::Ascend,
+        vec![p(AccountRef::Parent, -10), p(ca("x"), -10)],
+    );
+    assert_eq!(
+        entry_hop_accounts(&ascend, HopRole::Ascend).unwrap(),
+        (AccountRef::Parent, ca("x"))
+    );
+
+    // Canonical Lca/Direct: one debit + one credit, no `Parent` leg.
+    let direct = entry(
+        HopRole::Direct,
+        vec![p(ca("x"), -10), p(ca("y"), 10)],
+    );
+    assert_eq!(
+        entry_hop_accounts(&direct, HopRole::Direct).unwrap(),
+        (ca("x"), ca("y"))
+    );
+
+    // Ascend with a second child leg is not canonical.
+    let two_children = entry(
+        HopRole::Ascend,
+        vec![
+            p(AccountRef::Parent, -10),
+            p(ca("x"), -10),
+            p(ca("y"), -10),
+        ],
+    );
+    assert!(entry_hop_accounts(&two_children, HopRole::Ascend).is_err());
+
+    // Direct with a `Parent` leg is not canonical.
+    let with_parent = entry(
+        HopRole::Direct,
+        vec![
+            p(AccountRef::Parent, -10),
+            p(ca("x"), -10),
+            p(ca("y"), 10),
+        ],
+    );
+    assert!(entry_hop_accounts(&with_parent, HopRole::Direct).is_err());
 }

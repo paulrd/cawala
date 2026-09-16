@@ -1565,3 +1565,137 @@ async fn replaying_the_terminal_result_is_idempotent() {
 
     shutdown_harness(h).await;
 }
+
+// ── C1: hardened carried-prefix checks at the terminal ─────────────────────
+
+/// A fabricated hop with arbitrary postings, signed by `key` and declaring that
+/// same key as its `ledger_id`.
+fn fabricated_hop_with_postings(
+    signer_addr: &str,
+    order: &PaymentOrder,
+    role: HopRole,
+    key: &LedgerSecretKey,
+    postings: Vec<Posting>,
+) -> SettleHopV1 {
+    let auth = order
+        .authorize(&OperatorSecretKey::from_bytes([1u8; 32]))
+        .unwrap();
+    let entry = Entry {
+        ledger_id: key.public(),
+        seq: 0,
+        height: 0,
+        prev_hash: Hash::ZERO,
+        issued_at: 0,
+        body: EntryBody::Transfer {
+            payment_id: order.hash(),
+            amount: order.amount,
+            role,
+        },
+        postings,
+        auth: Some(auth),
+    };
+    SettleHopV1 {
+        signer_addr: signer_addr.parse().expect("valid octal address"),
+        entry: SignedEntry::sign(entry, key).unwrap(),
+    }
+}
+
+/// Relay a forged forward to the terminal `B` as if it had travelled A -> P -> B
+/// (sent by `P` so the terminal authenticates the preceding signer over QUIC),
+/// then wait for the terminal's drain to process it.
+async fn relay_to_terminal(h: &Harness, order: &PaymentOrder, hops: Vec<SettleHopV1>) {
+    let forward = forged_forward(&h.ua, order, "0.1.3", "0.2.4", hops);
+    let bytes = SettlePayloadV2::Forward(forward).to_bytes().unwrap();
+    let a_ref = PeerRef {
+        addr: "0.1".parse().unwrap(),
+        node: h.a.node_id.clone(),
+    };
+    let p_ref = PeerRef {
+        addr: "0".parse().unwrap(),
+        node: h.p.node_id.clone(),
+    };
+    let mut env = build_envelope(
+        &a_ref,
+        "0.2".parse().unwrap(),
+        MSG_SETTLE_V1,
+        bytes,
+        config().ttl - 1,
+    )
+    .unwrap();
+    append_hop(&mut env, &p_ref).unwrap();
+    let p_snap = h.p.source.snapshot();
+    let ack = send_envelope(&h.p.endpoint, &p_snap, &env, h.config.hop_timeout)
+        .await
+        .expect("relay");
+    assert_eq!(ack.status, AckStatus::Delivered);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+}
+
+/// **C1**: the relayer forwards a hop signed under its own declared key but with
+/// a posting shape that is not canonical for its role. The terminal cannot
+/// resolve the payer leaf's registered key, so it must fall back to the internal
+/// shape checks and refuse to append.
+#[tokio::test]
+async fn relayed_non_canonical_carried_hop_is_rejected_at_terminal() {
+    let h = setup(Mode::Full).await;
+    let now = unix_now();
+    let order = order(&h.ua, &h.ub.node_id, 100, 51, now + 3600);
+
+    let (a_len, p_len, b_len) = (
+        ledger_len(&h.a).await,
+        ledger_len(&h.p).await,
+        ledger_len(&h.b).await,
+    );
+    let b_before = balances(&h.b).await;
+
+    // `Ascend` must be exactly `Parent + one child`; this hop adds a second
+    // child leg (and is still self-signed under the key it declares).
+    let attacker_key = LedgerSecretKey::from_bytes([44u8; 32]);
+    let m = i64::try_from(order.amount.get()).unwrap();
+    let malformed = fabricated_hop_with_postings(
+        "0.1",
+        &order,
+        HopRole::Ascend,
+        &attacker_key,
+        vec![
+            posting(AccountRef::Parent, -m),
+            posting(AccountRef::Child(NodeId::from("x")), -m),
+            posting(AccountRef::Child(NodeId::from("y")), m),
+        ],
+    );
+    let hops = vec![malformed, fabricated_hop("0", &order, HopRole::Lca, 66)];
+    relay_to_terminal(&h, &order, hops).await;
+
+    assert_eq!(ledger_len(&h.b).await, b_len, "B must not append");
+    assert_eq!(balances(&h.b).await, b_before);
+    assert_eq!(ledger_len(&h.a).await, a_len);
+    assert_eq!(ledger_len(&h.p).await, p_len);
+
+    shutdown_harness(h).await;
+}
+
+/// **C1**: the relayer forwards a hop whose signature does not verify under the
+/// `ledger_id` it declares. The terminal cannot resolve the signer's registered
+/// key, so before this hardening only shape/role/conservation applied; it must
+/// now reject the internally-inconsistent entry.
+#[tokio::test]
+async fn relayed_carried_hop_with_mismatched_signature_is_rejected_at_terminal() {
+    let h = setup(Mode::Full).await;
+    let now = unix_now();
+    let order = order(&h.ua, &h.ub.node_id, 100, 52, now + 3600);
+
+    let b_len = ledger_len(&h.b).await;
+    let b_before = balances(&h.b).await;
+
+    let other = LedgerSecretKey::from_bytes([46u8; 32]);
+    let mut bad = fabricated_hop("0.1", &order, HopRole::Ascend, 45);
+    // The entry declares the `45` key but is signed by a different key.
+    bad.entry.signature = other.sign(b"forged");
+    let hops = vec![bad, fabricated_hop("0", &order, HopRole::Lca, 66)];
+    relay_to_terminal(&h, &order, hops).await;
+
+    assert_eq!(ledger_len(&h.b).await, b_len, "B must not append");
+    assert_eq!(balances(&h.b).await, b_before);
+
+    shutdown_harness(h).await;
+}
