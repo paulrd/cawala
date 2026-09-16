@@ -54,6 +54,30 @@ pub(crate) struct SharedControl {
     admin: Mutex<Option<OperatorSecretKey>>,
     state: Mutex<LocalStateV1>,
     events: Mutex<VecDeque<ControlEventDto>>,
+    /// In-memory ordering guard for inbound `Rebase` notices (see
+    /// [`RebaseGuard`]).
+    rebase_guard: Mutex<RebaseGuard>,
+}
+
+/// In-memory high-water mark of `RebaseNotice.generation` applied from the
+/// current parent.
+///
+/// A browser `User` leaf has no children and runs **no** healing pull, so a
+/// stale notice would otherwise stick until the parent happened to push again.
+/// This guard ignores a notice whose generation is below the highest already
+/// applied from the same parent, refuses an equal generation that disagrees on
+/// the address, and applies a strictly higher one. It is reset whenever the
+/// recorded parent changes (including a fresh join or a detach).
+///
+/// It is deliberately **not** part of [`LocalStateV1`]: adding a persisted field
+/// would force a [`LOCAL_STATE_VERSION`](crate::state::LOCAL_STATE_VERSION) bump
+/// and discard every existing user blob. Residual: the guard is lost across a
+/// reload, so a stale notice that arrives *only after* a reload is theoretically
+/// possible; the parent corrects it on its next push.
+#[derive(Debug, Default)]
+struct RebaseGuard {
+    parent: Option<NodeId>,
+    generation: u64,
 }
 
 impl SharedControl {
@@ -66,7 +90,21 @@ impl SharedControl {
             admin: Mutex::new(None),
             state: Mutex::new(LocalStateV1::new()),
             events: Mutex::new(VecDeque::new()),
+            rebase_guard: Mutex::new(RebaseGuard::default()),
         }
+    }
+
+    /// Lock the in-memory re-base ordering guard, recovering from poisoning.
+    fn lock_rebase_guard(&self) -> MutexGuard<'_, RebaseGuard> {
+        self.rebase_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Drop the re-base ordering guard: the next notice re-seeds it for
+    /// whatever parent is then recorded. Called on a fresh join or a detach.
+    fn reset_rebase_guard(&self) {
+        *self.lock_rebase_guard() = RebaseGuard::default();
     }
 
     /// This endpoint's node id.
@@ -207,10 +245,40 @@ impl ControlHandler {
         if notice.address != notice.parent_address.child(parent.slot) {
             return ControlReply::Rejected(RejectCode::BadRequest);
         }
-        self.shared
+        // In-memory ordering guard, keyed to the current parent. The parent's
+        // `generation` is its own monotonic address epoch; a browser leaf has no
+        // healing pull, so a stale notice must not move it back. Reset whenever
+        // the recorded parent changes.
+        let stored = {
+            let mut guard = self.shared.lock_rebase_guard();
+            if guard.parent.as_ref() != Some(&parent.node_id) {
+                guard.parent = Some(parent.node_id.clone());
+                guard.generation = 0;
+            }
+            guard.generation
+        };
+        if notice.generation < stored {
+            // Stale: ignore, but accept so the parent stops retrying.
+            return ControlReply::Accepted;
+        }
+        if notice.generation == stored {
+            let already =
+                self.shared.lock_state().record.address.as_ref() == Some(&notice.address);
+            if already {
+                return ControlReply::Accepted;
+            }
+            // The same generation must not disagree on the address.
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        // Strictly newer: apply and advance the high-water mark.
+        let transition = self
+            .shared
             .lock_state()
-            .apply_rebase(&notice.parent_address, &notice.address)
-            .reply()
+            .apply_rebase(&notice.parent_address, &notice.address);
+        if matches!(transition, Transition::Rebased | Transition::None) {
+            self.shared.lock_rebase_guard().generation = notice.generation;
+        }
+        transition.reply()
     }
 
     /// Apply a parent-signed [`DetachNotice`]: clear the local parent and
@@ -243,6 +311,8 @@ impl ControlHandler {
         }
         let transition = self.shared.lock_state().apply_detach();
         if matches!(transition, Transition::Detached) {
+            // The parent is gone: drop the ordering guard with it.
+            self.shared.reset_rebase_guard();
             self.shared
                 .push_event(ControlEventDto::detached(&parent.node_id));
         }
@@ -265,6 +335,8 @@ impl ControlHandler {
             &signed.controller,
         );
         if matches!(transition, Transition::Approved) {
+            // A fresh link has no known generation: reset the ordering guard.
+            self.shared.reset_rebase_guard();
             self.shared
                 .push_event(ControlEventDto::accepted(&signed.origin, approval));
         }
@@ -935,6 +1007,149 @@ mod tests {
         assert_eq!(
             shared.lock_state().record.address,
             Some("0.2.3".parse().unwrap())
+        );
+    }
+
+    // ── in-memory re-base ordering guard ─────────────────────────────
+
+    /// A notice whose generation is below the highest already applied from the
+    /// current parent is ignored: the stale address is not installed.
+    #[test]
+    fn rebase_lower_generation_is_ignored() {
+        let (shared, parent_op, parent_id) = joined_browser();
+        let handler = ControlHandler::new(Arc::clone(&shared));
+
+        let newer = signed_by(
+            &parent_id,
+            &parent_op,
+            rebase_request(shared.node_id(), "0.5", "0.5.3", 3),
+        );
+        assert_eq!(handler.handle(&newer), ControlReply::Accepted);
+        assert_eq!(
+            shared.lock_state().record.address,
+            Some("0.5.3".parse().unwrap())
+        );
+
+        let stale = signed_by(
+            &parent_id,
+            &parent_op,
+            rebase_request(shared.node_id(), "0.6", "0.6.3", 1),
+        );
+        assert_eq!(handler.handle(&stale), ControlReply::Accepted);
+        assert_eq!(
+            shared.lock_state().record.address,
+            Some("0.5.3".parse().unwrap()),
+            "a lower generation must not move the leaf"
+        );
+    }
+
+    /// The same generation may repeat the current address (idempotent) but must
+    /// not disagree: a different address is refused and not installed.
+    #[test]
+    fn rebase_equal_generation_different_address_is_refused() {
+        let (shared, parent_op, parent_id) = joined_browser();
+        let handler = ControlHandler::new(Arc::clone(&shared));
+
+        let applied = signed_by(
+            &parent_id,
+            &parent_op,
+            rebase_request(shared.node_id(), "0.5", "0.5.3", 2),
+        );
+        assert_eq!(handler.handle(&applied), ControlReply::Accepted);
+
+        // Equal-and-same is an idempotent accept.
+        let same = signed_by(
+            &parent_id,
+            &parent_op,
+            rebase_request(shared.node_id(), "0.5", "0.5.3", 2),
+        );
+        assert_eq!(handler.handle(&same), ControlReply::Accepted);
+        assert_eq!(
+            shared.lock_state().record.address,
+            Some("0.5.3".parse().unwrap())
+        );
+
+        // Equal-and-different is refused.
+        let disagree = signed_by(
+            &parent_id,
+            &parent_op,
+            rebase_request(shared.node_id(), "0.6", "0.6.3", 2),
+        );
+        assert_eq!(
+            handler.handle(&disagree),
+            ControlReply::Rejected(RejectCode::BadRequest)
+        );
+        assert_eq!(
+            shared.lock_state().record.address,
+            Some("0.5.3".parse().unwrap())
+        );
+    }
+
+    /// A strictly higher generation is applied and advances the guard.
+    #[test]
+    fn rebase_higher_generation_applies() {
+        let (shared, parent_op, parent_id) = joined_browser();
+        let handler = ControlHandler::new(Arc::clone(&shared));
+
+        let first = signed_by(
+            &parent_id,
+            &parent_op,
+            rebase_request(shared.node_id(), "0.5", "0.5.3", 1),
+        );
+        assert_eq!(handler.handle(&first), ControlReply::Accepted);
+        assert_eq!(
+            shared.lock_state().record.address,
+            Some("0.5.3".parse().unwrap())
+        );
+
+        let second = signed_by(
+            &parent_id,
+            &parent_op,
+            rebase_request(shared.node_id(), "0.6", "0.6.3", 2),
+        );
+        assert_eq!(handler.handle(&second), ControlReply::Accepted);
+        assert_eq!(
+            shared.lock_state().record.address,
+            Some("0.6.3".parse().unwrap())
+        );
+    }
+
+    /// The guard is keyed to the parent id: a new parent's first notice (low
+    /// generation) applies rather than being treated as stale.
+    #[test]
+    fn rebase_guard_resets_on_parent_change() {
+        let (shared, parent_op, parent_id) = joined_browser();
+        let handler = ControlHandler::new(Arc::clone(&shared));
+
+        // Apply a high generation from the first parent.
+        let high = signed_by(
+            &parent_id,
+            &parent_op,
+            rebase_request(shared.node_id(), "0.5", "0.5.3", 5),
+        );
+        assert_eq!(handler.handle(&high), ControlReply::Accepted);
+
+        // Re-home the leaf under a different parent, same slot.
+        let new_parent_op = operator(4);
+        let new_parent_id = NodeId::from(new_parent_op.public().to_string());
+        {
+            let mut state = shared.lock_state();
+            state.record.parent = Some(crate::state::ParentLink {
+                node_id: new_parent_id.clone(),
+                slot: 3,
+            });
+        }
+
+        // Generation 1 from the new parent must apply (guard reset).
+        let fresh = signed_by(
+            &new_parent_id,
+            &new_parent_op,
+            rebase_request(shared.node_id(), "0.7", "0.7.3", 1),
+        );
+        assert_eq!(handler.handle(&fresh), ControlReply::Accepted);
+        assert_eq!(
+            shared.lock_state().record.address,
+            Some("0.7.3".parse().unwrap())
         );
     }
 

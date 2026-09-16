@@ -437,6 +437,7 @@ mod tests {
         record.parent = Some(crate::record::ParentLink {
             parent_id: parent.to_string(),
             slot: 0,
+            generation: 0,
         });
         record
     }

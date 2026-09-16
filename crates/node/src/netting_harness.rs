@@ -915,6 +915,7 @@ mod tests {
                 slot: 1,
                 date_joined: 0,
             }],
+            address_epoch: 0,
         };
         let leaf = record::NodeRecord {
             node_id: "leaf".to_string(),
@@ -922,6 +923,7 @@ mod tests {
             parent: Some(record::ParentLink {
                 parent_id: "root".to_string(),
                 slot: 1,
+                generation: 0,
             }),
             children: vec![record::ChildEntry {
                 child_id: "user-a".to_string(),
@@ -929,6 +931,7 @@ mod tests {
                 slot: 3,
                 date_joined: 0,
             }],
+            address_epoch: 0,
         };
 
         // Only peer (node) records are supplied; `user-a` is derived from the
@@ -949,6 +952,7 @@ mod tests {
             address: Some("0".parse().unwrap()),
             parent: None,
             children: vec![],
+            address_epoch: 0,
         };
         let single = build_topology_partition(std::slice::from_ref(&orphan), None).unwrap();
         assert_eq!(single.components.len(), 1);
@@ -959,6 +963,7 @@ mod tests {
             address: Some("0".parse().unwrap()),
             parent: None,
             children: vec![],
+            address_epoch: 0,
         };
         // Two isolated roots: two components, the tie broken by root id.
         let partition =
@@ -985,8 +990,10 @@ mod tests {
             parent: Some(record::ParentLink {
                 parent_id: "missing".to_string(),
                 slot: 1,
+                generation: 0,
             }),
             children: vec![],
+            address_epoch: 0,
         };
         assert!(build_topology(std::slice::from_ref(&dangling)).is_err());
     }
@@ -1017,6 +1024,7 @@ mod tests {
                     address: Some("0".parse().unwrap()),
                     parent: None,
                     children,
+                    address_epoch: 0,
                 },
                 record::NodeRecord {
                     node_id: child_a.to_string(),
@@ -1024,8 +1032,10 @@ mod tests {
                     parent: Some(record::ParentLink {
                         parent_id: "root".to_string(),
                         slot: 0,
+                        generation: 0,
                     }),
                     children: vec![],
+                    address_epoch: 0,
                 },
                 record::NodeRecord {
                     node_id: child_b.to_string(),
@@ -1033,8 +1043,10 @@ mod tests {
                     parent: Some(record::ParentLink {
                         parent_id: "root".to_string(),
                         slot: 1,
+                        generation: 0,
                     }),
                     children: vec![],
+                    address_epoch: 0,
                 },
             ]
         };
@@ -1043,6 +1055,7 @@ mod tests {
             address: Some("0".parse().unwrap()),
             parent: None,
             children: vec![],
+            address_epoch: 0,
         };
         let mut records = three_node("a", "b");
         records.push(island);

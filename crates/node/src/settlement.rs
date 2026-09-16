@@ -393,8 +393,10 @@ mod tests {
             parent: parent.map(|(parent_id, slot)| ParentLink {
                 parent_id: parent_id.to_string(),
                 slot,
+                generation: 0,
             }),
             children,
+            address_epoch: 0,
         }
     }
 

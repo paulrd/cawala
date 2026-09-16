@@ -51,6 +51,16 @@ pub struct NodeRecord {
     pub parent: Option<ParentLink>,
     #[serde(default)]
     pub children: Vec<ChildEntry>,
+    /// This node's own monotonic address epoch.
+    ///
+    /// Bumped whenever the stored asserted address value changes (join,
+    /// re-base apply, exit-to-root, detach-notice). It is carried as the
+    /// `generation` of every outgoing [`cawala_control::RebaseNotice`] so a
+    /// child can order notices from this parent. Local bookkeeping only: it is
+    /// never asserted or derived from peers, and `#[serde(default)]` lets an
+    /// older `node.json` (written before this field existed) load unchanged.
+    #[serde(default)]
+    pub address_epoch: u64,
 }
 
 /// A link to this node's parent.
@@ -58,6 +68,11 @@ pub struct NodeRecord {
 pub struct ParentLink {
     pub parent_id: String,
     pub slot: u8,
+    /// High-water mark of [`cawala_control::RebaseNotice::generation`] applied
+    /// from this parent. `0` on a fresh link (nothing applied yet); it only
+    /// ever increases for a given link and resets when the link is replaced.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// A link to one of this node's children.
@@ -114,7 +129,19 @@ impl NodeRecord {
             address: None,
             parent: None,
             children: Vec::new(),
+            address_epoch: 0,
         }
+    }
+
+    /// This node's own monotonic address epoch (see the field docs).
+    pub fn address_epoch(&self) -> u64 {
+        self.address_epoch
+    }
+
+    /// High-water mark of `RebaseNotice.generation` applied from the current
+    /// parent (`0` when unattached).
+    pub fn parent_generation(&self) -> u64 {
+        self.parent.as_ref().map_or(0, |parent| parent.generation)
     }
 
     /// Validate structural invariants. Must hold on load and after every
@@ -212,6 +239,40 @@ impl RecordStore {
         &self.record.node_id
     }
 
+    /// This node's own monotonic address epoch (see [`NodeRecord::address_epoch`]).
+    pub fn address_epoch(&self) -> u64 {
+        self.record.address_epoch
+    }
+
+    /// The high-water mark of [`cawala_control::RebaseNotice::generation`]
+    /// applied from the current parent (`0` when unattached).
+    pub fn parent_generation(&self) -> u64 {
+        self.record.parent_generation()
+    }
+
+    /// Advance the current parent link's applied-generation high-water mark.
+    ///
+    /// Monotonic: never lowers the stored mark. A no-op when there is no parent
+    /// link (a rebase cannot be applied without one anyway).
+    pub fn set_parent_generation(&mut self, generation: u64) {
+        if let Some(parent) = self.record.parent.as_mut() {
+            parent.generation = parent.generation.max(generation);
+        }
+    }
+
+    /// Set the stored asserted address, bumping
+    /// [`NodeRecord::address_epoch`] exactly when the value actually changes.
+    ///
+    /// This is the single site the epoch advances: every address mutation
+    /// (`set_address`, `unset_address`, `unset_parent`, `rebase_to_root`) goes
+    /// through it, so each stored-value change bumps the epoch exactly once.
+    fn set_address_value(&mut self, address: Option<OctAddr>) {
+        if self.record.address != address {
+            self.record.address = address;
+            self.record.address_epoch = self.record.address_epoch.saturating_add(1);
+        }
+    }
+
     /// Persist the record to `<data_dir>/node.json` (pretty JSON), after
     /// re-validating.
     ///
@@ -305,7 +366,11 @@ impl RecordStore {
         if slot > MAX_SLOT {
             return Err(RecordError::SlotOutOfRange(slot));
         }
-        self.record.parent = Some(ParentLink { parent_id, slot });
+        self.record.parent = Some(ParentLink {
+            parent_id,
+            slot,
+            generation: 0,
+        });
         self.record.validate()?;
         Ok(())
     }
@@ -317,7 +382,7 @@ impl RecordStore {
     pub fn unset_parent(&mut self) -> Result<(), RecordError> {
         self.record.parent = None;
         if self.record.address.as_ref().is_some_and(|a| !a.is_root()) {
-            self.record.address = None;
+            self.set_address_value(None);
         }
         self.record.validate()?;
         Ok(())
@@ -335,23 +400,23 @@ impl RecordStore {
     /// and re-asserting `0` both validate.
     pub fn rebase_to_root(&mut self) -> Result<(), RecordError> {
         self.record.parent = None;
-        self.record.address = Some(
+        self.set_address_value(Some(
             OctAddr::from_digits(vec![0]).expect("the root address \"0\" is always valid"),
-        );
+        ));
         self.record.validate()?;
         Ok(())
     }
 
     /// Assert this node's octal address (admin-set, never derived).
     pub fn set_address(&mut self, address: OctAddr) -> Result<(), RecordError> {
-        self.record.address = Some(address);
+        self.set_address_value(Some(address));
         self.record.validate()?;
         Ok(())
     }
 
     /// Clear this node's asserted address. Always legal.
     pub fn unset_address(&mut self) -> Result<(), RecordError> {
-        self.record.address = None;
+        self.set_address_value(None);
         self.record.validate()?;
         Ok(())
     }
@@ -746,6 +811,84 @@ mod tests {
                 parent_slot: 2,
             })
         );
+    }
+
+    #[test]
+    fn address_epoch_bumps_once_per_address_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(dir.path());
+        assert_eq!(store.address_epoch(), 0);
+
+        store.set_parent("parent-x", 2).unwrap();
+        // None -> Some: one bump.
+        store.set_address("0.1.2".parse().unwrap()).unwrap();
+        assert_eq!(store.address_epoch(), 1);
+        // Re-asserting the same value is a no-op.
+        store.set_address("0.1.2".parse().unwrap()).unwrap();
+        assert_eq!(store.address_epoch(), 1);
+
+        // A different value (exit-to-root): one bump.
+        store.rebase_to_root().unwrap();
+        assert_eq!(store.address_epoch(), 2);
+        // Applying the same root again is a no-op.
+        store.rebase_to_root().unwrap();
+        assert_eq!(store.address_epoch(), 2);
+
+        // Some -> None (detach/user unset): one bump.
+        store.unset_address().unwrap();
+        assert_eq!(store.address_epoch(), 3);
+        // An unattached unset is a no-op.
+        store.unset_address().unwrap();
+        assert_eq!(store.address_epoch(), 3);
+
+        // None -> root `0` (legal without a parent): one bump.
+        store.set_address("0".parse().unwrap()).unwrap();
+        assert_eq!(store.address_epoch(), 4);
+        // unset_parent keeps a root address and does not bump.
+        store.unset_parent().unwrap();
+        assert_eq!(store.address_epoch(), 4);
+    }
+
+    #[test]
+    fn parent_generation_is_monotonic_and_resets_with_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(dir.path());
+        assert_eq!(store.parent_generation(), 0, "unattached");
+
+        store.set_parent("parent-x", 2).unwrap();
+        assert_eq!(store.parent_generation(), 0, "a fresh link is unknown");
+
+        store.set_parent_generation(3);
+        assert_eq!(store.parent_generation(), 3);
+        // Monotonic: a lower value never lowers the mark.
+        store.set_parent_generation(1);
+        assert_eq!(store.parent_generation(), 3);
+
+        // Replacing the link resets the mark.
+        store.set_parent("parent-y", 2).unwrap();
+        assert_eq!(store.parent_generation(), 0);
+    }
+
+    #[test]
+    fn old_node_json_without_new_fields_loads_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        // A pre-epoch `node.json` with neither `address_epoch` nor a parent
+        // `generation`.
+        let json = r#"{"node_id":"node-a","address":null,"parent":null,"children":[]}"#;
+        std::fs::write(dir.path().join(NODE_RECORD_FILE), json).unwrap();
+        let store = RecordStore::open(dir.path(), "node-a").unwrap();
+        assert_eq!(store.address_epoch(), 0);
+        assert_eq!(store.parent_generation(), 0);
+
+        // Same, but with a parent link (validated address).
+        let json = r#"{"node_id":"node-a","address":"0.3","parent":{"parent_id":"parent-x","slot":3},"children":[]}"#;
+        std::fs::write(dir.path().join(NODE_RECORD_FILE), json).unwrap();
+        let mut store = RecordStore::open(dir.path(), "node-a").unwrap();
+        assert_eq!(store.record().address_epoch(), 0);
+        assert_eq!(store.parent_generation(), 0);
+        // The old document's links still work: unset bumps the epoch once.
+        store.unset_address().unwrap();
+        assert_eq!(store.address_epoch(), 1);
     }
 
     #[test]

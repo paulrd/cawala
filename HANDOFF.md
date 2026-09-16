@@ -42,11 +42,13 @@ how to verify, and conventions**. Detail lives elsewhere:
   (`ENTRY_FORMAT_VERSION` 4), moved-pointers, signed topology/registry
   distribution, per-peer control version negotiation. Note: a node **with or
   without children can already join any network by invitation** — `Join`
-  rewrites the joiner's own address immediately and its descendants converge via
-  the periodic healing `RebasePull` (each node is renamed only by its own direct
-  parent, which then re-pushes to its children). The only sharpening left is
-  pushing `Rebase` downward immediately at join plus a persisted per-edge
-  `generation` for repeated renames; neither is needed for the capability.
+  rewrites the joiner's own address and now pushes the new prefix down its
+  subtree immediately, with the periodic `RebasePull` as the healing backstop.
+  `RebaseNotice.generation` is enforced via a persisted per-node `address_epoch`
+  and a per-link high-water mark, so a stale notice cannot regress an address
+  (a browser leaf guards this in memory only). See the PLAN.org M5 "Rebase
+  promptness + generation ordering" entry for the semantics, the bounded-stall
+  argument, and the browser residual.
 - **Carried-prefix Phase 2** (deferred, `SETTLE_PAYLOAD_VERSION` 3): per-hop
   `PeerKeys` + a relayer-signed `HopCertV1` and echoed intermediate
   `EntryProofV1`s so the origin keyed-verifies the LCA hop. Accountability, not

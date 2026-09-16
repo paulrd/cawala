@@ -77,8 +77,10 @@ fn user_record(node_id: &str, address: &str, parent_id: &str, slot: u8) -> NodeR
         parent: Some(ParentLink {
             parent_id: parent_id.to_string(),
             slot,
+            generation: 0,
         }),
         children: Vec::new(),
+        address_epoch: 0,
     }
 }
 

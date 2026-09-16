@@ -1168,3 +1168,276 @@ async fn stale_rebase_from_former_parent_is_refused_after_rehome() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// (F) A joining node with children pushes the new prefix down immediately
+// ---------------------------------------------------------------------------
+
+/// A node that re-joins a new parent while it already has a subtree must
+/// re-base its children **at once**, not wait for the ~30s healing pull. After
+/// the `JoinApproved` is answered, A's children (and their descendants) reflect
+/// the new `0.2.0.*` prefix.
+#[tokio::test]
+async fn node_with_children_rebases_children_immediately_on_join() {
+    let world = World::new();
+    let (nodes, _addrs) = build(world.defs()).await;
+    let now = now_unix_seconds();
+
+    // A exits from P and becomes root `0`. The exit-driven notices are withheld
+    // so C1/C2 still hold the old `0.1.*` prefix: only the join may move them.
+    let exit = {
+        let engine = nodes[&world.a_id].control.lock().await;
+        engine.sign_exit_request(now).expect("sign exit")
+    };
+    assert_eq!(
+        deliver(&nodes[&world.p_id].control, &exit).await,
+        ControlReply::Accepted
+    );
+    nodes[&world.a_id]
+        .control
+        .lock()
+        .await
+        .apply_exit(now)
+        .expect("apply exit");
+    let _ = nodes[&world.a_id].control.lock().await.take_outbound();
+    assert_eq!(
+        nodes[&world.c1_id]
+            .control
+            .lock()
+            .await
+            .record()
+            .address
+            .as_ref()
+            .map(|a| a.to_string())
+            .as_deref(),
+        Some("0.1.0"),
+        "the withheld exit notice must leave C1 on the old prefix"
+    );
+
+    // A re-joins its former sibling B (a root-`0.2` node) as a new parent.
+    let join = JoinRequest {
+        node: node(&world.a_id),
+        kind: ChildKind::Node,
+        operator: world.a_op.public(),
+        ledger: Some(ledger(1)),
+        desired_slot: Some(0),
+        location_hint: None,
+        nonce: fresh_nonce(),
+        expiry: now_unix_seconds() + CONTROL_REQUEST_TTL_SECS,
+    };
+    nodes[&world.a_id]
+        .control
+        .lock()
+        .await
+        .begin_outbound_join(join.clone(), node(&world.b_id), None)
+        .expect("record outbound join");
+    let signed_join = authorize(&world.a_id, &world.a_op, ControlRequest::Join(join));
+    assert_eq!(
+        send_direct(
+            &nodes[&world.a_id].endpoint,
+            &nodes[&world.b_id].addr,
+            &signed_join
+        )
+        .await,
+        ControlReply::Pending
+    );
+
+    // B approves A at slot 0; A installs parent B and address `0.2.0`.
+    let approval: JoinApproval = {
+        let mut engine = nodes[&world.b_id].control.lock().await;
+        engine
+            .approve_pending(&world.a_id, Some(0), now, ledger(2))
+            .expect("approve pending")
+    };
+    let signed_approval = authorize(
+        &world.b_id,
+        &world.b_op,
+        ControlRequest::JoinApproved(approval),
+    );
+    assert_eq!(
+        send_direct(
+            &nodes[&world.b_id].endpoint,
+            &nodes[&world.a_id].addr,
+            &signed_approval
+        )
+        .await,
+        ControlReply::Accepted
+    );
+    wait_record(&nodes[&world.a_id].control, Some(&world.b_id), "0.2.0").await;
+
+    // `handle_join_approved` queued a Rebase for each of A's children before it
+    // answered; the live handler delivers them, and each child recurses. No
+    // pull runs, so this is the join-driven push alone.
+    wait_record(&nodes[&world.c1_id].control, Some(&world.a_id), "0.2.0.0").await;
+    wait_record(&nodes[&world.c2_id].control, Some(&world.a_id), "0.2.0.1").await;
+    wait_record(&nodes[&world.d_id].control, Some(&world.c1_id), "0.2.0.0.0").await;
+    wait_record(
+        &nodes[&world.e_id].control,
+        Some(&world.d_id),
+        "0.2.0.0.0.0",
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// (G) A stale Rebase from the *current* parent is ignored by generation
+// ---------------------------------------------------------------------------
+
+/// A node's stored per-parent generation high-water mark orders notices from
+/// the parent itself: a lower generation that still satisfies the address
+/// derivation is ignored, so an older prefix cannot move the node back.
+#[tokio::test]
+async fn stale_rebase_from_current_parent_is_ignored() {
+    let world = World::new();
+    let (nodes, _addrs) = build(world.defs()).await;
+
+    // A sits at `0.1` under P (slot 1). A newer re-base moves it to `0.6.1`.
+    let newer = authorize(
+        &world.p_id,
+        &world.p_op,
+        ControlRequest::Rebase(RebaseNotice {
+            node: node(&world.a_id),
+            parent_address: "0.6".parse().unwrap(),
+            address: "0.6.1".parse().unwrap(),
+            generation: 2,
+        }),
+    );
+    assert_eq!(
+        deliver(&nodes[&world.a_id].control, &newer).await,
+        ControlReply::Accepted
+    );
+    wait_record(&nodes[&world.a_id].control, Some(&world.p_id), "0.6.1").await;
+
+    // The same current parent now sends an older generation for a different
+    // prefix: it is ignored (accepted so the parent stops retrying).
+    let stale = authorize(
+        &world.p_id,
+        &world.p_op,
+        ControlRequest::Rebase(RebaseNotice {
+            node: node(&world.a_id),
+            parent_address: "0.7".parse().unwrap(),
+            address: "0.7.1".parse().unwrap(),
+            generation: 1,
+        }),
+    );
+    assert_eq!(
+        deliver(&nodes[&world.a_id].control, &stale).await,
+        ControlReply::Accepted
+    );
+    let record = nodes[&world.a_id].control.lock().await.record().clone();
+    assert_eq!(
+        record.address.as_ref().map(|a| a.to_string()).as_deref(),
+        Some("0.6.1"),
+        "a stale same-parent re-base must not change the address"
+    );
+    assert_eq!(
+        record.parent_generation(),
+        2,
+        "the high-water mark is unchanged by a stale notice"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (H) Rolled-back parent: an ignored push stalls only until the healing pull
+// ---------------------------------------------------------------------------
+
+/// The guarantee the ordering rules rest on: when a parent's persisted
+/// `address_epoch` regresses below a child's stored `ParentLink.generation`
+/// (here, A applied a pre-rollback generation 5, while P's live generation is
+/// 1), P's pushed notice is ignored — but the generation-agnostic
+/// `apply_pull_snapshot` path still reads P's real current snapshot and heals A
+/// (and re-propagates to A's children). The stall is therefore bounded to one
+/// probe interval, never permanent.
+///
+/// Chosen over a unit test because the healing path is `pull_rebase_from_parent`
+/// over the real transport: this asserts the full push-ignored → pull-healed
+/// sequence with the same live harness the other re-base tests use.
+#[tokio::test]
+async fn rolled_back_parent_stalls_child_until_pull_heals() {
+    let world = World::new();
+    let (nodes, _addrs) = build(world.defs()).await;
+
+    // A sits under P at slot 1. A notice from P's pre-rollback incarnation
+    // (epoch 5) moves A to `0.6.1` and stores generation 5.
+    let pre_rollback = authorize(
+        &world.p_id,
+        &world.p_op,
+        ControlRequest::Rebase(RebaseNotice {
+            node: node(&world.a_id),
+            parent_address: "0.6".parse().unwrap(),
+            address: "0.6.1".parse().unwrap(),
+            generation: 5,
+        }),
+    );
+    assert_eq!(
+        deliver(&nodes[&world.a_id].control, &pre_rollback).await,
+        ControlReply::Accepted
+    );
+    wait_record(&nodes[&world.a_id].control, Some(&world.p_id), "0.6.1").await;
+    assert_eq!(
+        nodes[&world.a_id]
+            .control
+            .lock()
+            .await
+            .record()
+            .parent_generation(),
+        5
+    );
+    // Discard the notice A queued for C1/C2 so the healing pull below is the
+    // only thing that moves them.
+    let _ = nodes[&world.a_id].control.lock().await.take_outbound();
+
+    // P has since rolled back: its persisted epoch is 1, below A's stored mark.
+    // Its freshly pushed notice is ignored (but accepted so it stops retrying).
+    let rolled_back = authorize(
+        &world.p_id,
+        &world.p_op,
+        ControlRequest::Rebase(RebaseNotice {
+            node: node(&world.a_id),
+            parent_address: "0.7".parse().unwrap(),
+            address: "0.7.1".parse().unwrap(),
+            generation: 1,
+        }),
+    );
+    assert_eq!(
+        deliver(&nodes[&world.a_id].control, &rolled_back).await,
+        ControlReply::Accepted
+    );
+    let record = nodes[&world.a_id].control.lock().await.record().clone();
+    assert_eq!(
+        record.address.as_ref().map(|a| a.to_string()).as_deref(),
+        Some("0.6.1"),
+        "a rolled-back older generation must not move the child"
+    );
+    assert_eq!(record.parent_generation(), 5);
+
+    // The ignore is audited with both generations.
+    let audit = std::fs::read_to_string(
+        nodes[&world.a_id]
+            ._dir
+            .path()
+            .join(cawala_node::audit::CONTROL_AUDIT_FILE),
+    )
+    .expect("audit log");
+    assert!(
+        audit.contains("\"event\":\"rebase-stale-ignored\""),
+        "{audit}"
+    );
+    assert!(audit.contains("\"generation\":1"), "{audit}");
+    assert!(audit.contains("\"stored_generation\":5"), "{audit}");
+
+    // The generation-agnostic pull is still authoritative: A reads P's real
+    // current snapshot (`0`), applies the derived `0.1` (ignoring no
+    // generation), and re-propagates `0.1.0` to its child C1.
+    let applied = pull_rebase_from_parent(
+        &nodes[&world.a_id].endpoint,
+        &nodes[&world.a_id].control,
+        timeout(),
+        now_unix_seconds(),
+    )
+    .await
+    .expect("pull");
+    assert!(applied, "the pull must heal the stalled address");
+    wait_record(&nodes[&world.a_id].control, Some(&world.p_id), "0.1").await;
+    wait_record(&nodes[&world.c1_id].control, Some(&world.a_id), "0.1.0").await;
+}
+

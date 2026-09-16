@@ -76,6 +76,7 @@ fn record(
         parent: parent.map(|(id, slot)| ParentLink {
             parent_id: id.to_string(),
             slot,
+            generation: 0,
         }),
         children: children
             .iter()
@@ -86,6 +87,7 @@ fn record(
                 date_joined: 0,
             })
             .collect(),
+        address_epoch: 0,
     }
 }
 

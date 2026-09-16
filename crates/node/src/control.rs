@@ -400,7 +400,7 @@ impl ControlNode {
             .address
             .clone()
             .expect("rebase_to_root always asserts the root address");
-        self.propagate_rebase(&address, 1, now);
+        self.propagate_rebase(&address, now);
         self.audit(serde_json::json!({
             "ts": now,
             "event": "exit-applied",
@@ -492,7 +492,7 @@ impl ControlNode {
             "parent": parent.parent_id,
             "address": expected.to_string(),
         }));
-        self.propagate_rebase(&expected, 1, now);
+        self.propagate_rebase(&expected, now);
         Ok(true)
     }
 
@@ -725,7 +725,9 @@ impl ControlNode {
         }
         let reply = match &signed.request {
             ControlRequest::Join(join) => self.handle_join(&signed, join, now),
-            ControlRequest::JoinApproved(approval) => self.handle_join_approved(&signed, approval),
+            ControlRequest::JoinApproved(approval) => {
+                self.handle_join_approved(&signed, approval, now)
+            }
             ControlRequest::JoinRejected(rejection) => {
                 self.handle_join_rejected(&signed, rejection)
             }
@@ -1333,6 +1335,7 @@ impl ControlNode {
         &mut self,
         signed: &SignedControl,
         approval: &JoinApproval,
+        now: u64,
     ) -> ControlReply {
         if signed.verify_signature().is_err() {
             return ControlReply::Rejected(RejectCode::Unauthorized);
@@ -1404,6 +1407,16 @@ impl ControlNode {
         self.pending.clear_outbound();
         if self.pending.save().is_err() {
             return ControlReply::Rejected(RejectCode::Internal);
+        }
+        // The record and peers are durably persisted: push the freshly assigned
+        // prefix down immediately so a node that joins with its own subtree is
+        // re-based at once rather than at the next healing pull (~30s). This is
+        // a no-op for a childless joiner, and best-effort per child (a failed
+        // dial is retried by the sweep). Deliberately after every fallible save:
+        // a rollback path never reaches here.
+        let address = self.record.record().address.clone();
+        if let Some(address) = address {
+            self.propagate_rebase(&address, now);
         }
         ControlReply::Accepted
     }
@@ -1857,7 +1870,7 @@ impl ControlNode {
         if self.self_kind == ChildKind::Node {
             let root = self.record.record().address.clone();
             if let Some(root) = root {
-                self.propagate_rebase(&root, 1, now);
+                self.propagate_rebase(&root, now);
             }
         }
         ControlReply::Accepted
@@ -1869,9 +1882,24 @@ impl ControlNode {
     /// operator (`origin == record.parent.parent_id`, bound by
     /// `verify_control`), and the topology rule `address ==
     /// parent_address.child(record.parent.slot)` is enforced here (a pure
-    /// [`RebaseNotice::validate`] has no view of the parent link). Applying the
-    /// already-current address is an idempotent [`ControlReply::Accepted`] that
-    /// does not re-propagate.
+    /// [`RebaseNotice::validate`] has no view of the parent link).
+    ///
+    /// # Ordering
+    ///
+    /// `notice.generation` is the **sender's** own monotonic address epoch, and
+    /// the stored high-water mark lives on the current [`ParentLink`]
+    /// (`record.parent.generation`, reset to `0` by a new parent link). It is
+    /// enforced after all of the above checks:
+    /// - lower than stored: a stale notice, **ignored** (reply `Accepted` so the
+    ///   sender stops retrying) and audited `rebase-stale-ignored`;
+    /// - equal to stored: the address must already equal the target (idempotent
+    ///   `Accepted`, no re-propagation); a disagreement is `BadRequest` — the
+    ///   same generation must not mean two different prefixes;
+    /// - higher than stored: apply, store the new high-water mark, and
+    ///   propagate to children.
+    ///
+    /// A higher generation that repeats the current address advances the mark
+    /// without re-propagating (nothing below changed).
     fn handle_rebase(
         &mut self,
         signed: &SignedControl,
@@ -1896,7 +1924,30 @@ impl ControlNode {
         if notice.address != notice.parent_address.child(parent.slot) {
             return ControlReply::Rejected(RejectCode::BadRequest);
         }
+        // A lower generation is a notice from before the current prefix: ignore
+        // it (accepting stops the parent retrying) without touching the address.
+        let stored = self.record.parent_generation();
+        if notice.generation < stored {
+            self.audit(serde_json::json!({
+                "ts": now,
+                "event": "rebase-stale-ignored",
+                "node": self.node_id,
+                "parent": parent.parent_id,
+                "generation": notice.generation,
+                "stored_generation": stored,
+            }));
+            return ControlReply::Accepted;
+        }
         if self.record.record().address.as_ref() == Some(&notice.address) {
+            // Already at the target: idempotent, no re-propagation. A strictly
+            // newer generation still advances the high-water mark so a later
+            // stale notice cannot move us back.
+            if notice.generation > stored {
+                self.record.set_parent_generation(notice.generation);
+                if self.record.save().is_err() {
+                    return ControlReply::Rejected(RejectCode::Internal);
+                }
+            }
             self.audit(serde_json::json!({
                 "ts": now,
                 "event": "rebase",
@@ -1908,9 +1959,24 @@ impl ControlNode {
             }));
             return ControlReply::Accepted;
         }
+        if notice.generation == stored {
+            // The same generation must not disagree on the address.
+            self.audit(serde_json::json!({
+                "ts": now,
+                "event": "rebase-conflict",
+                "node": self.node_id,
+                "parent": parent.parent_id,
+                "address": notice.address.to_string(),
+                "generation": notice.generation,
+                "stored_generation": stored,
+            }));
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        // Strictly newer: apply, record the high-water mark, then propagate.
         if let Err(err) = self.record.set_address(notice.address.clone()) {
             return ControlReply::Rejected(map_record_error(&err));
         }
+        self.record.set_parent_generation(notice.generation);
         if self.record.save().is_err() {
             return ControlReply::Rejected(RejectCode::Internal);
         }
@@ -1923,16 +1989,24 @@ impl ControlNode {
             "generation": notice.generation,
             "outcome": "applied",
         }));
-        self.propagate_rebase(&notice.address, notice.generation, now);
+        self.propagate_rebase(&notice.address, now);
         ControlReply::Accepted
     }
 
     /// Queue a `Rebase` notice for every child, deriving each child's new
     /// address as `parent_address.child(slot)`.
     ///
+    /// Every notice carries **this node's own current
+    /// [`RecordStore::address_epoch`]** as its `generation` (read here, never
+    /// passed in), so a child can order
+    /// notices from this parent: the epoch is bumped by the address mutation
+    /// that immediately precedes a propagation, so the notice names the epoch
+    /// the new prefix belongs to.
+    ///
     /// Best-effort: a child that cannot be reached is retried by the P2 sweep
     /// seam, never surfaced to the requester.
-    fn propagate_rebase(&mut self, parent_address: &OctAddr, generation: u64, now: u64) {
+    fn propagate_rebase(&mut self, parent_address: &OctAddr, now: u64) {
+        let generation = self.record.address_epoch();
         let children: Vec<(NodeId, u8)> = self
             .record
             .record()
@@ -2760,6 +2834,33 @@ fn delivery_status(result: Result<ControlReply, ControlError>) -> DeliveryStatus
     }
 }
 
+/// Whether a queued topology notice that was not `Delivered` should be kept for
+/// a later retry.
+///
+/// A `Rejected(_)` reply to a [`OutboundKind::Rebase`] is **deterministic**: the
+/// child refused the same frame (embedding the same `generation`) on its own
+/// ordering/derivation rules, and re-dialing it can never succeed. Requeuing it
+/// would make a rolled-back parent dial that child every sweep forever without
+/// any chance of convergence, so it is terminal. Transient failures
+/// ([`DeliveryStatus::Unreachable`]/[`DeliveryStatus::TimedOut`]) stay
+/// retryable.
+///
+/// [`OutboundKind::DetachNotice`] is deliberately left retryable on **every**
+/// non-`Delivered` status, exactly as before this rule. Join decisions
+/// ([`OutboundKind::Approved`]/[`OutboundKind::Rejected`]) are never returned
+/// through the retry path (their outcome is patched into the reply), so they are
+/// reported as non-retryable.
+fn should_requeue_notice(kind: OutboundKind, status: &DeliveryStatus) -> bool {
+    if matches!(status, DeliveryStatus::Delivered) {
+        return false;
+    }
+    match kind {
+        OutboundKind::Rebase => !matches!(status, DeliveryStatus::Rejected(_)),
+        OutboundKind::DetachNotice => true,
+        OutboundKind::Approved | OutboundKind::Rejected => false,
+    }
+}
+
 /// Dial one queued outbound frame and map the exchange to a [`DeliveryStatus`].
 async fn deliver_one(endpoint: &Endpoint, item: &OutboundControl) -> DeliveryStatus {
     match item.target.as_str().parse::<EndpointId>() {
@@ -2799,12 +2900,7 @@ pub(crate) async fn deliver_outbound_decisions(
     for item in outbound {
         let status = deliver_one(endpoint, &item).await;
         audit_delivery(data_dir, &item.target, item.kind, &status);
-        if !matches!(status, DeliveryStatus::Delivered)
-            && matches!(
-                item.kind,
-                OutboundKind::Rebase | OutboundKind::DetachNotice
-            )
-        {
+        if should_requeue_notice(item.kind, &status) {
             failed_notices.push(item);
         }
         last_status = Some(status);
@@ -2857,7 +2953,7 @@ pub async fn sweep_pending_rebase(endpoint: &Endpoint, control: &Arc<Mutex<Contr
         }
         let status = deliver_one(endpoint, &item).await;
         audit_delivery(&data_dir, &item.target, item.kind, &status);
-        if !matches!(status, DeliveryStatus::Delivered) {
+        if should_requeue_notice(item.kind, &status) {
             retry.push(item);
         }
     }
@@ -2923,7 +3019,7 @@ pub async fn pull_rebase_from_parent(
     for item in notices {
         let status = deliver_one(endpoint, &item).await;
         audit_delivery(&data_dir, &item.target, item.kind, &status);
-        if !matches!(status, DeliveryStatus::Delivered) {
+        if should_requeue_notice(item.kind, &status) {
             retry.push(item);
         }
     }
@@ -3029,6 +3125,7 @@ mod tests {
             address: address.map(|a| a.parse().unwrap()),
             parent: None,
             children: Vec::new(),
+            address_epoch: 0,
         }
     }
 
@@ -4265,6 +4362,9 @@ mod tests {
         );
         assert!(engine.record().parent.is_none());
         assert_eq!(engine.record().address, Some("0".parse().unwrap()));
+        // The detach-notice rebase-to-root changed the stored address once,
+        // bumping the epoch (0.2 -> 0).
+        assert_eq!(engine.record().address_epoch(), 2);
 
         // The new root pushes a Rebase to each of its own children.
         let outbound = engine.take_outbound();
@@ -4310,6 +4410,9 @@ mod tests {
         );
         assert!(engine.record().parent.is_none());
         assert_eq!(engine.record().address, None, "a user has no root address");
+        // The user detach-notice cleared the stored address once (0.2 -> None),
+        // bumping the epoch.
+        assert_eq!(engine.record().address_epoch(), 2);
         assert!(engine.take_outbound().is_empty());
     }
 
@@ -4534,6 +4637,7 @@ mod tests {
             ControlReply::Accepted
         );
 
+        let epoch = engine.record().address_epoch();
         let outbound = engine.take_outbound();
         assert_eq!(outbound.len(), 2);
         let mut addresses: Vec<(String, String)> = outbound
@@ -4558,14 +4662,174 @@ mod tests {
                 ("c2".to_string(), "0.5.2.4".to_string()),
             ]
         );
-        // The notice's generation is carried down.
+        // Every notice carries the sender's own epoch (never a hardcoded 1):
+        // applying the re-base bumped `child`'s address epoch to `epoch`.
+        assert_eq!(epoch, 2, "0.2 -> 0.5.2 changes the stored address once");
         for item in &outbound {
             let ControlRequest::Rebase(notice) = &item.signed.request else {
                 unreachable!();
             };
-            assert_eq!(notice.generation, 1);
+            assert_eq!(notice.generation, epoch);
             assert_eq!(notice.parent_address, "0.5.2".parse().unwrap());
         }
+    }
+
+    /// A notice whose generation is below the stored high-water mark is a stale
+    /// prefix: the address must not move, but the reply is `Accepted` so the
+    /// parent stops retrying, and nothing is propagated.
+    #[tokio::test]
+    async fn rebase_lower_generation_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_op = secret(1);
+        let parent_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "child",
+            Some("0.2"),
+            Some(("parent", 2)),
+            &[("c1", ChildKind::Node, 0, 1)],
+        );
+        let peers = [node_peer("parent", &parent_op, 3)];
+        let mut engine = engine_with(dir.path(), "child", child_op, record, &peers);
+
+        // Generation 2 applies and stores the mark.
+        let newer = authorize_at("parent", &parent_op, 1, rebase_request("0.6.2", "0.6", 2));
+        assert_eq!(
+            engine.receive_at(any_remote(), newer, 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(engine.record().address, Some("0.6.2".parse().unwrap()));
+        assert_eq!(engine.record().parent_generation(), 2);
+        let _ = engine.take_outbound();
+
+        // Generation 1 is older: ignored, address unchanged, no propagation.
+        let stale = authorize_at("parent", &parent_op, 2, rebase_request("0.7.2", "0.7", 1));
+        assert_eq!(
+            engine.receive_at(any_remote(), stale, 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(engine.record().address, Some("0.6.2".parse().unwrap()));
+        assert_eq!(engine.record().parent_generation(), 2);
+        assert!(
+            engine.take_outbound().is_empty(),
+            "a stale notice must not propagate"
+        );
+    }
+
+    /// The same generation with the same address is an idempotent `Accepted`
+    /// with no re-propagation.
+    #[tokio::test]
+    async fn rebase_equal_generation_same_address_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_op = secret(1);
+        let parent_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "child",
+            Some("0.6.2"),
+            Some(("parent", 2)),
+            &[("c1", ChildKind::Node, 0, 1)],
+        );
+        let peers = [node_peer("parent", &parent_op, 3)];
+        let mut engine = engine_with(dir.path(), "child", child_op, record, &peers);
+
+        // A higher generation repeating the current address advances the mark
+        // without changing the address or propagating.
+        let prime = authorize_at("parent", &parent_op, 1, rebase_request("0.6.2", "0.6", 2));
+        assert_eq!(
+            engine.receive_at(any_remote(), prime, 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(engine.record().parent_generation(), 2);
+        assert!(engine.take_outbound().is_empty());
+
+        // Equal generation, same address: idempotent.
+        let same = authorize_at("parent", &parent_op, 2, rebase_request("0.6.2", "0.6", 2));
+        assert_eq!(
+            engine.receive_at(any_remote(), same, 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(engine.record().address, Some("0.6.2".parse().unwrap()));
+        assert!(engine.take_outbound().is_empty());
+    }
+
+    /// The same generation must not mean two different prefixes: an
+    /// equal-generation notice naming a different address is refused and the
+    /// address is not moved.
+    #[tokio::test]
+    async fn rebase_equal_generation_different_address_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_op = secret(1);
+        let parent_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "child",
+            Some("0.2"),
+            Some(("parent", 2)),
+            &[],
+        );
+        let peers = [node_peer("parent", &parent_op, 3)];
+        let mut engine = engine_with(dir.path(), "child", child_op, record, &peers);
+
+        let applied = authorize_at("parent", &parent_op, 1, rebase_request("0.6.2", "0.6", 2));
+        assert_eq!(
+            engine.receive_at(any_remote(), applied, 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(engine.record().parent_generation(), 2);
+
+        let disagree = authorize_at("parent", &parent_op, 2, rebase_request("0.7.2", "0.7", 2));
+        assert_eq!(
+            engine.receive_at(any_remote(), disagree, 0).await,
+            ControlReply::Rejected(RejectCode::BadRequest)
+        );
+        assert_eq!(engine.record().address, Some("0.6.2".parse().unwrap()));
+        assert_eq!(engine.record().parent_generation(), 2);
+    }
+
+    /// A strictly higher generation applies, advances the stored high-water
+    /// mark, and propagates the new prefix to children.
+    #[tokio::test]
+    async fn rebase_higher_generation_applies_and_advances_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_op = secret(1);
+        let parent_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "child",
+            Some("0.2"),
+            Some(("parent", 2)),
+            &[("c1", ChildKind::Node, 0, 1)],
+        );
+        let peers = [node_peer("parent", &parent_op, 3)];
+        let mut engine = engine_with(dir.path(), "child", child_op, record, &peers);
+
+        let first = authorize_at("parent", &parent_op, 1, rebase_request("0.5.2", "0.5", 1));
+        assert_eq!(
+            engine.receive_at(any_remote(), first, 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(engine.record().address, Some("0.5.2".parse().unwrap()));
+        assert_eq!(engine.record().parent_generation(), 1);
+        let _ = engine.take_outbound();
+
+        let second = authorize_at("parent", &parent_op, 2, rebase_request("0.6.2", "0.6", 2));
+        assert_eq!(
+            engine.receive_at(any_remote(), second, 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(engine.record().address, Some("0.6.2".parse().unwrap()));
+        assert_eq!(engine.record().parent_generation(), 2);
+
+        // The applied re-base queued a notice for `c1` carrying this node's own
+        // (bumped) epoch, not the parent's generation.
+        let outbound = engine.take_outbound();
+        assert_eq!(outbound.len(), 1);
+        let ControlRequest::Rebase(notice) = &outbound[0].signed.request else {
+            panic!("expected a Rebase frame");
+        };
+        assert_eq!(notice.address, "0.6.2.0".parse().unwrap());
+        assert_eq!(notice.generation, engine.record().address_epoch());
     }
 
     #[tokio::test]
@@ -4815,6 +5079,90 @@ mod tests {
 
         engine.requeue_pending_rebase(vec![item("child", 3), item("child", 4)]);
         assert_eq!(engine.take_pending_rebase().len(), 1, "de-duplicated");
+    }
+
+    /// The deterministic-rejection rule: a `Rejected` `Rebase` reply can never
+    /// succeed on retry, so it is terminal and must not reach `pending_rebase`;
+    /// transient failures (`Unreachable`/`TimedOut`) stay retryable and
+    /// `DetachNotice` behaviour is unchanged.
+    #[test]
+    fn rejected_rebase_is_terminal_but_transient_failures_are_retryable() {
+        // The rule itself.
+        assert!(!should_requeue_notice(
+            OutboundKind::Rebase,
+            &DeliveryStatus::Delivered
+        ));
+        assert!(!should_requeue_notice(
+            OutboundKind::Rebase,
+            &DeliveryStatus::Rejected(RejectCode::BadRequest)
+        ));
+        assert!(should_requeue_notice(
+            OutboundKind::Rebase,
+            &DeliveryStatus::Unreachable
+        ));
+        assert!(should_requeue_notice(
+            OutboundKind::Rebase,
+            &DeliveryStatus::TimedOut
+        ));
+        // Unchanged: a `DetachNotice` rejection is still retried.
+        assert!(should_requeue_notice(
+            OutboundKind::DetachNotice,
+            &DeliveryStatus::Rejected(RejectCode::Unauthorized)
+        ));
+        // Join decisions never travel the topology-notice retry path.
+        assert!(!should_requeue_notice(
+            OutboundKind::Approved,
+            &DeliveryStatus::Rejected(RejectCode::Unauthorized)
+        ));
+        assert!(!should_requeue_notice(
+            OutboundKind::Rejected,
+            &DeliveryStatus::Unreachable
+        ));
+
+        // And end-to-end into the queue: the collection step every delivery
+        // caller performs keeps only the transient failure.
+        let dir = tempfile::tempdir().unwrap();
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[("child", ChildKind::Node, 1, 1)],
+        );
+        let op = secret(1);
+        let mut engine = engine_with(dir.path(), "parent", op.clone(), record, &[]);
+        let item = |nonce: u64| OutboundControl {
+            target: NodeId::from("child"),
+            signed: authorize_at(
+                "parent",
+                &op,
+                nonce,
+                ControlRequest::Rebase(RebaseNotice {
+                    node: NodeId::from("child"),
+                    parent_address: "0".parse().unwrap(),
+                    address: "0.1".parse().unwrap(),
+                    generation: 1,
+                }),
+            ),
+            kind: OutboundKind::Rebase,
+        };
+        let delivered = [
+            (item(1), DeliveryStatus::Rejected(RejectCode::BadRequest)),
+            (item(2), DeliveryStatus::Unreachable),
+        ];
+        let requeue: Vec<OutboundControl> = delivered
+            .into_iter()
+            .filter(|(item, status)| should_requeue_notice(item.kind, status))
+            .map(|(item, _)| item)
+            .collect();
+        engine.requeue_pending_rebase(requeue);
+
+        let pending = engine.take_pending_rebase();
+        assert_eq!(pending.len(), 1, "only the transient failure is retried");
+        assert_eq!(
+            pending[0].signed.nonce, 2,
+            "the rejected rebase is not re-added to pending_rebase"
+        );
     }
 
     /// **A3**: a `RebasePull` reply is verified against the local parent link

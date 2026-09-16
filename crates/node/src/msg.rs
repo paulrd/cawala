@@ -2888,6 +2888,7 @@ mod tests {
             parent: parent.map(|(id, slot)| ParentLink {
                 parent_id: id.to_string(),
                 slot,
+                generation: 0,
             }),
             children: children
                 .into_iter()
@@ -2898,6 +2899,7 @@ mod tests {
                     date_joined: 0,
                 })
                 .collect(),
+            address_epoch: 0,
         }
     }
 
@@ -2947,6 +2949,7 @@ mod tests {
             address: None,
             parent: None,
             children: Vec::new(),
+            address_epoch: 0,
         };
         assert!(matches!(
             RoutableSnapshot::from_record(&rec),

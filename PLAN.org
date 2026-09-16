@@ -669,6 +669,38 @@
        data-dir or blob impact. Verified: node lib 206, `routed_control` 15,
        `exit_rebase` 8, `netting_harness` 17, workspace tests, clippy and the
        wasm32 check all green.
+     - Rebase promptness + generation ordering (DONE): a node that joins with a
+       subtree is now rebased **immediately** - `handle_join_approved` pushes a
+       `Rebase` to its children right after the record/peers/pending mutations
+       have persisted (a no-op when it has none, and no notice is sent for a
+       mutation that did not commit) - instead of waiting for the ~30 s healing
+       `RebasePull`. `RebaseNotice.generation` is now a real, enforced ordering
+       token derived from a node-local monotonic `NodeRecord.address_epoch`
+       (bumped exactly once, in the single `RecordStore::set_address_value`, and
+       only when the stored asserted address value actually changes) and sent on
+       every outgoing notice; the receiver keeps a per-link high-water mark in
+       `ParentLink.generation`, and `handle_rebase` ignores `<` (audited
+       `rebase-stale-ignored`), treats `==` as idempotent when the address matches
+       and `Rejected(BadRequest)` when it disagrees (audited `rebase-conflict`),
+       and applies `>` advancing the mark. A deterministically rejected `Rebase`
+       notice is now **terminal** (`should_requeue_notice`), so a rolled-back
+       parent no longer redials a refusing child every 5 s; `Unreachable`/
+       `TimedOut` stay retryable. A parent whose persisted epoch regresses (a
+       restored or rolled-back record) can only *degrade push promptness*: the
+       generation-agnostic healing pull still applies the parent's current
+       address and re-propagates, so any stall is bounded to one probe interval
+       (pinned by `rolled_back_parent_stalls_child_until_pull_heals`). A browser
+       leaf, which has no healing pull, enforces the same rules with an
+       **in-memory** guard - deliberately not persisted, since that would force a
+       `LOCAL_STATE_VERSION` bump and discard every existing user blob.
+       Compatibility: `node.json` gains only two `#[serde(default)]` fields
+       (`address_epoch`, `parent.generation`), so old files load unchanged; no
+       `CONTROL_FORMAT_VERSION`, `RebaseNotice`, `NodeSnapshot`/`ControlReply` or
+       `LOCAL_STATE_VERSION` change, and no reply/DTO change. Residual: a stale
+       browser notice arriving only *after* a reload is theoretically possible and
+       is corrected by the parent's next push. Verified: node lib 214,
+       `exit_rebase` 11, client 86, workspace tests, clippy and the wasm32 check
+       all green.
 
 * Top Risks
   1. Iroh WASM maturity -> M0 spike before any other work.
