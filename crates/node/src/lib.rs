@@ -18,6 +18,7 @@ pub use proto::{ALPN, PingPong};
 pub mod admin_cli;
 pub mod admin_store;
 pub mod audit;
+pub mod claim_bundle;
 pub mod control;
 pub mod control_store;
 pub mod identity;

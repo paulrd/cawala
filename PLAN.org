@@ -592,12 +592,51 @@
        `netting_harness` (15), `seen_restart` (3), ledger 223, client 82, plus
        workspace clippy and the wasm32 check; web `npm test` (29) + `npm run
        build`. Deferred to v2: whole-subtree rejoin (`Rebase` prefix-swap with
-       per-node consent and a persisted generation), foster-parent recovery
-       (non-response claim + `Recover` + registry cleanup), `EdgeClose`, moved
+       per-node consent and a persisted generation), `EdgeClose`, moved
        pointers, signed topology/registry distribution, per-peer control version
        negotiation, a netting `--primary-root` selector, an optional `OctAddr`
        depth cap, and hoisting the per-request control-plane reload into
        `receive_routed_at`.
+     - Foster-parent recovery (DECIDED: cut) + stranded-claim evidence bundle
+       (DONE): automated recovery was **cut by owner decision**. Rationale: exit
+       is already unconditional and works against an unreachable parent, and
+       re-attachment already happens through an out-of-band `Invite`; the
+       proposed non-response claim is unverifiable and adds no capability, and a
+       timeout heuristic misreads the real cases (the parent kicked the node, the
+       relationship soured, the parent's services degraded) while inviting a
+       "declare my parent dead to dodge a live parent" narrative. Reconnection is
+       therefore **leave (if needed) + invitation** - no grace clock, no health
+       store, no `Recover` variant. What shipped instead is an out-of-band
+       **stranded-claim evidence bundle** for a prospective new parent's
+       *discretionary* `prefund`/`fund`: `crates/control/src/claim.rs`
+       (`STRANDED_CLAIM_VERSION` 1, domain `cawala-control/stranded-claim/v1`)
+       defines a signed dated `StrandedClaim` plus
+       `StrandedClaimBundle { version, child, child_operator, child_ledger,
+       claim, edge, commitment, parent_balance, parent_proof, chain }` and
+       `verify_bundle` (commitment under the child's ledger key; optional
+       genesis-anchored or suffix chain continuity; a
+       `merkle::verify_state_inclusion` proof of the `Parent` balance against the
+       committed `state_root`, verified whenever a proof is present; negative
+       balances and a >300 s future `issued_at` rejected). No wire change:
+       `CONTROL_FORMAT_VERSION` stays 4. Node CLI `control claim-export
+       [--from <node-id>] [--out <file>]` (commits before proving and
+       self-verifies before writing), `control claim-review <file>` (1 MiB cap;
+       prints an explicit "not proven" block - the amount is self-attested, the
+       head may not be the presenter's latest, the edge row is unverified
+       context, nothing compels payment), and informational `control
+       parent-status` (a one-shot probe: no persistence, no gating); export and
+       review are audited. Browser: a passive `cawala.recovery.v1` tracker behind
+       `parentStatus()` (instrumented on the existing balance poll, best-effort,
+       cannot affect the balance flow) and an informational "Parent unreachable"
+       notice with a "re-join via invitation" action; no `LOCAL_STATE_VERSION`
+       change. Residual (unchanged): a re-attached child with a non-zero `Parent`
+       balance still shows a hard `MirrorMismatch::UnbackedClaim` until the new
+       parent funds it to match - the bundle is what makes that decision informed
+       - and v2 `EdgeClose`/`ENTRY_FORMAT_VERSION` 4 remains the clean-settlement
+       path. Verified: `claim.rs` 24 unit tests (frozen field-order golden and
+       real Merkle state-inclusion proofs), `crates/node/tests/claim_bundle.rs`
+       (11), web `parentLiveness` (12), workspace tests, clippy, the wasm32
+       check, web `npm test` (41) and `npm run build`.
 
 * Top Risks
   1. Iroh WASM maturity -> M0 spike before any other work.

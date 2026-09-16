@@ -19,8 +19,9 @@ use cawala_node::msg::{
 };
 use cawala_node::{
     ControlNode, LedgerService, MsgConfig, RoutableSnapshot, SettlementManager, admin_cli,
-    build_envelope, identity, ledger_commitments, ledger_keys, ledger_service, ledger_store,
-    netting_harness, record, send_envelope, spawn_control_only, spawn_with_secret_key,
+    build_envelope, claim_bundle, identity, ledger_commitments, ledger_keys, ledger_service,
+    ledger_store, netting_harness, record, send_envelope, spawn_control_only,
+    spawn_with_secret_key,
 };
 use cawala_topology::OctAddr;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -216,6 +217,36 @@ enum ControlCommand {
     /// exit (re-root at `0` + re-base the children) succeeds even if the parent
     /// is unreachable.
     Exit,
+    /// Export this node's self-attested stranded-claim evidence bundle as JSON.
+    ///
+    /// The bundle is **out-of-band review evidence** for a prospective foster
+    /// parent's operator: it is never authority, never sent on the wire, and
+    /// never gates anything. The node's own operator key signs the claim; the
+    /// ledger's `Parent` balance is bound to the committed head by a Merkle
+    /// state proof.
+    ClaimExport {
+        /// The parent this node detached from, named in the claim and used to
+        /// carry the failed edge's registry row (when present).
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        from: Option<String>,
+        /// Write the bundle JSON to this file instead of stdout.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
+    /// Verify a stranded-claim evidence bundle file and print the review.
+    ///
+    /// Prints the presenter, the detached-from, the state-proof-checked
+    /// self-attested `Parent` balance, and the reviewer's exposure guidance
+    /// (including what is explicitly *not* proven). Verification failure is a
+    /// non-zero exit; the outcome is always audited.
+    ClaimReview {
+        /// The bundle JSON file to verify (capped at 1 MiB).
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Informational only: one-shot liveness probe of this node's recorded
+    /// parent, with no gating and no new persisted state.
+    ParentStatus,
     /// Manage this node's admin grants (operator-signed delegations).
     Admin {
         #[command(subcommand)]
@@ -1613,6 +1644,131 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
                 engine.record().children.len()
             );
         }
+        ControlCommand::ClaimExport { from, out } => {
+            let now = now_unix_seconds();
+            let from_id = from.map(NodeId::from);
+            let outcome =
+                claim_bundle::export_bundle(data_dir, &node_id, &operator, from_id.as_ref(), now)
+                    .map_err(|err| anyhow::anyhow!("{err:#}"))?;
+            let json = serde_json::to_string_pretty(&outcome.bundle)?;
+            match &out {
+                Some(path) => {
+                    std::fs::write(path, format!("{json}\n")).map_err(|err| {
+                        anyhow::anyhow!("failed to write {}: {err}", path.display())
+                    })?;
+                    println!("wrote claim bundle to {}", path.display());
+                    println!("{}", claim_bundle::export_summary(&outcome));
+                }
+                None => {
+                    println!("{json}");
+                    eprintln!("{}", claim_bundle::export_summary(&outcome));
+                }
+            }
+            cawala_node::audit::append(
+                data_dir,
+                serde_json::json!({
+                    "event": "claim-export",
+                    "node": node_id,
+                    "from": from_id.as_ref().map(|id| id.to_string()),
+                    "parent_balance": outcome.verified.parent_balance,
+                    "height": outcome.verified.commitment_height,
+                    "committed": outcome.committed,
+                    "chain_included": outcome.chain_included,
+                    "chain_total": outcome.chain_total,
+                    "out": out.as_ref().map(|path| path.display().to_string()),
+                }),
+            );
+        }
+        ControlCommand::ClaimReview { file } => {
+            let now = now_unix_seconds();
+            match claim_bundle::review_bundle_file(&file, now) {
+                Ok(verified) => {
+                    println!("verified: true");
+                    println!("presenter: {}", verified.child);
+                    match &verified.detached_from {
+                        Some(parent) => println!("detached_from: {parent}"),
+                        None => println!("detached_from: none"),
+                    }
+                    println!("issued_at: {}", verified.issued_at);
+                    println!(
+                        "state-proof-checked attested Parent balance: {}",
+                        verified.parent_balance
+                    );
+                    println!("commitment_height: {}", verified.commitment_height);
+                    println!("{}", claim_bundle::review_guidance(&verified));
+                    cawala_node::audit::append(
+                        data_dir,
+                        serde_json::json!({
+                            "event": "claim-review",
+                            "node": node_id,
+                            "file": file.display().to_string(),
+                            "outcome": "verified",
+                            "presenter": verified.child,
+                            "parent_balance": verified.parent_balance,
+                            "height": verified.commitment_height,
+                        }),
+                    );
+                }
+                Err(err) => {
+                    cawala_node::audit::append(
+                        data_dir,
+                        serde_json::json!({
+                            "event": "claim-review",
+                            "node": node_id,
+                            "file": file.display().to_string(),
+                            "outcome": "rejected",
+                            "detail": format!("{err:#}"),
+                        }),
+                    );
+                    return Err(err);
+                }
+            }
+        }
+        ControlCommand::ParentStatus => {
+            let store = record::RecordStore::open(data_dir, &node_id)?;
+            let attachment = claim_bundle::attachment_state(store.record());
+            let parent = store
+                .record()
+                .parent
+                .as_ref()
+                .map(|link| link.parent_id.clone());
+            match &parent {
+                None => {
+                    println!("parent: none");
+                    println!("reachable: unknown (no parent recorded)");
+                }
+                Some(parent_id) => {
+                    let engine = ControlNode::open(data_dir, &node_id, operator.clone())?;
+                    let control = Arc::new(Mutex::new(engine));
+                    let router = spawn_with_secret_key(secret_key.clone()).await?;
+                    let reachability = claim_bundle::probe_parent(
+                        router.endpoint(),
+                        &control,
+                        Duration::from_secs(PARENT_PROBE_TIMEOUT_SECONDS),
+                        now_unix_seconds(),
+                    )
+                    .await?;
+                    router
+                        .shutdown()
+                        .await
+                        .map_err(|err| anyhow::anyhow!("router shutdown: {err}"))?;
+                    println!("parent: {parent_id}");
+                    match reachability {
+                        claim_bundle::ParentReachability::Reachable => {
+                            println!("reachable: true");
+                        }
+                        claim_bundle::ParentReachability::Unreachable(detail) => {
+                            println!("reachable: false");
+                            eprintln!("note: parent probe failed: {detail}");
+                        }
+                        claim_bundle::ParentReachability::NoParent => {
+                            println!("reachable: unknown (no parent recorded)");
+                        }
+                    }
+                }
+            }
+            println!("attachment: {}", attachment.label());
+        }
         ControlCommand::Admin { command } => {
             admin_command(data_dir, &node_id, &operator, command)?;
         }
@@ -1827,6 +1983,9 @@ const JOIN_TTL_SECONDS: u64 = 3600;
 
 /// Per-request direct-control deadline.
 const CONTROL_TIMEOUT_SECONDS: u64 = 15;
+
+/// Short deadline for the informational `parent-status` liveness probe.
+const PARENT_PROBE_TIMEOUT_SECONDS: u64 = 5;
 
 /// Parse a `ID=ADDR` next-hop hint.
 ///

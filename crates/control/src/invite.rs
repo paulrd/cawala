@@ -279,7 +279,10 @@ fn percent_encode(value: &str) -> String {
 const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
 /// Decode exactly 64 hex characters into the 32-byte operator key.
-fn parse_operator_hex(raw: &str) -> Option<OperatorPubKey> {
+///
+/// Shared with [`crate::claim`], which relies on the node-id == operator-key
+/// identity to bind a bundle's `child` to its `child_operator`.
+pub(crate) fn parse_operator_hex(raw: &str) -> Option<OperatorPubKey> {
     let bytes = decode_hex_32(raw)?;
     OperatorPubKey::from_bytes(&bytes).ok()
 }

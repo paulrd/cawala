@@ -35,6 +35,7 @@ import {
 import { clientState, ledgerState } from './stores.svelte.js';
 import * as idb from './identityBundle.js';
 import * as adminKeys from './adminKeys.js';
+import * as parentLiveness from './parentLiveness.js';
 
 // ── Internal state ────────────────────────────────────────────
 
@@ -1485,13 +1486,43 @@ export async function requestBalance() {
   }
   if (!_clientNode) return null;
   try {
-    return await _clientNode.request_balance();
+    const ack = await _clientNode.request_balance();
+    // A returned ack (`delivered`/`duplicate`/`rejected`) means the parent
+    // answered, so this existing 20 s balance poll doubles as the parent
+    // liveness probe. A thrown error is a transport failure (dial/timeout/no
+    // route). Recording is best-effort and never gates the balance flow.
+    parentLiveness.recordParentProbe(_parentNodeId(), true);
+    return ack;
   } catch (err) {
+    parentLiveness.recordParentProbe(_parentNodeId(), false);
     const message = _errorMessage(err);
     _warnOnce('balance-request', '[api] request_balance failed', err);
     ledgerState.error = message;
     return null;
   }
+}
+
+// ── Parent liveness (passive, informational only) ─────────────
+
+/**
+ * Passive parent-liveness status for the informational UI notice.
+ *
+ * This is a **read-only, informational** signal with no authority and no
+ * gating: it is derived from the existing parent-facing balance poll (see
+ * `requestBalance`) and the `cawala.recovery.v1` localStorage tracker. The
+ * recovery *action* stays out of the API layer — the UI reuses `leave()` and
+ * the join flow.
+ *
+ * `reachable` is true when the last probe succeeded (or none has failed yet);
+ * `unreachableSince` is the first-failure timestamp while failing, else null.
+ * The returned object has exactly the frozen keys
+ * `{ parent, reachable, lastOkAt, unreachableSince, consecutiveFailures }`.
+ *
+ * @returns {{ parent: string|null, reachable: boolean, lastOkAt: number|null, unreachableSince: number|null, consecutiveFailures: number }}
+ */
+export function parentStatus() {
+  const parent = _useMock || !_clientNode ? null : _parentNodeId();
+  return parentLiveness.getParentStatus(parent);
 }
 
 /**

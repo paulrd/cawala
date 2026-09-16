@@ -16,6 +16,7 @@
     getReceiveUri,
     leave,
     getLastControlEvent,
+    parentStatus,
   } from '../../lib/api.js';
   import { ORDER_REJECT, ORDER_STATUS, ORDER_STATUS_LABELS, ORDER_STATUS_DESCRIPTIONS, CONTROL_EVENT, ROUTES } from '../../lib/constants.js';
   import { truncateMiddle, timeAgo, formatTime, copyToClipboard } from '../../lib/utils.js';
@@ -305,6 +306,79 @@
     leaveConfirmOpen = false;
   }
 
+  // ── Parent status (M5: informational unreachable notice) ──
+  //
+  // Threshold: show the notice only after 2+ consecutive failures so a
+  // single transient ping blip does not nag. Two in a row suggests a
+  // real problem rather than a momentary network hiccup.
+  const PARENT_UNREACHABLE_THRESHOLD = 2;
+
+  let _parentStatusData = $state(null);
+  let _parentStatusPoller = $state(null);
+
+  function _readParentStatus() {
+    if (typeof parentStatus !== 'function') return null;
+    try {
+      return parentStatus();
+    } catch {
+      return null;
+    }
+  }
+
+  function _startParentStatusPoller() {
+    _stopParentStatusPoller();
+    const update = () => { _parentStatusData = _readParentStatus(); };
+    update();
+    _parentStatusPoller = setInterval(update, 5000);
+  }
+
+  function _stopParentStatusPoller() {
+    if (_parentStatusPoller) {
+      clearInterval(_parentStatusPoller);
+      _parentStatusPoller = null;
+    }
+  }
+
+  let parentUnreachable = $derived(
+    isLive &&
+    _parentStatusData != null &&
+    _parentStatusData.parent != null &&
+    !_parentStatusData.reachable &&
+    _parentStatusData.consecutiveFailures >= PARENT_UNREACHABLE_THRESHOLD &&
+    _parentStatusData.unreachableSince != null
+  );
+
+  function _formatDuration(ms) {
+    const sec = Math.floor(ms / 1000);
+    if (sec < 60) return 'less than a minute';
+    const min = Math.floor(sec / 60);
+    if (min < 60) return `about ${min} minute${min === 1 ? '' : 's'}`;
+    const hr = Math.floor(min / 60);
+    if (hr < 24) return `about ${hr} hour${hr === 1 ? '' : 's'}`;
+    const day = Math.floor(hr / 24);
+    return `about ${day} day${day === 1 ? '' : 's'}`;
+  }
+
+  let unreachableDuration = $derived(
+    parentUnreachable && _parentStatusData?.unreachableSince
+      ? _formatDuration(Date.now() - _parentStatusData.unreachableSince)
+      : ''
+  );
+
+  /**
+   * "Re-join via invitation" affordance.
+   * If still attached, guide the user to the existing leave action (the
+   * shipped Leave-network confirm dialog) and then to the join flow.
+   * If already detached, link straight to the join flow.
+   */
+  function handleRejoin() {
+    if (isJoined && !hasLeft) {
+      handleLeave();
+    } else {
+      navigate(ROUTES.JOIN_FLOW);
+    }
+  }
+
   // ── Mock transaction history ──────────────────────────────
   let mockTransactions = $state([
     { id: 1, type: 'transfer', to: '0.3.2', amount: 150, timestamp: new Date(Date.now() - 3600000).toISOString() },
@@ -323,9 +397,11 @@
 
   onMount(() => {
     _startDetachedPoller();
+    _startParentStatusPoller();
     return () => {
       _stopSendPoller();
       _stopDetachedPoller();
+      _stopParentStatusPoller();
       if (_parseDebounce) clearTimeout(_parseDebounce);
     };
   });
@@ -769,6 +845,30 @@
       </div>
     {/if}
   </Card>
+  <!-- ── Parent Unreachable Notice ──────────────────────── -->
+  {#if parentUnreachable}
+    <Card title="Parent unreachable" variant="warn">
+      <div class="parent-unreachable-notice">
+        <p class="text-sm">
+          Your parent node has been unreachable for {unreachableDuration}.
+        </p>
+        <p class="text-sm muted">
+          This may be temporary, or the relationship may have ended. Nothing happens automatically.
+        </p>
+        <p class="text-sm muted">
+          You can leave this network and re-join another one using an invitation from a node operator. Any balance you hold with your parent stays on their books. Whether a new parent chooses to recognise it is entirely their decision, made with their operator. Nothing happens automatically.
+        </p>
+        <button
+          type="button"
+          class="btn btn--ghost"
+          onclick={handleRejoin}
+        >
+          Re-join via invitation
+        </button>
+      </div>
+    </Card>
+  {/if}
+
   <!-- ── Leave Network Card ─────────────────────────────── -->
   {#if isLive}
     {#if isJoined && !hasLeft}
@@ -1239,5 +1339,13 @@
     font-weight: 700;
     font-size: 11px;
     margin-top: 1px;
+  }
+
+  /* Parent unreachable notice */
+  .parent-unreachable-notice {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+    line-height: var(--leading-normal);
   }
 </style>

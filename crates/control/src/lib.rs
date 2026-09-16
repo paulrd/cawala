@@ -40,6 +40,7 @@
 pub const MAX_CONTROL_FRAME: u32 = 64 * 1024;
 
 pub mod admin;
+pub mod claim;
 pub mod invite;
 pub mod reply;
 pub mod request;
@@ -53,6 +54,10 @@ pub use admin::{
 };
 pub use cawala_ledger::{NodeId, OperatorPubKey, OperatorSecretKey, Signature};
 pub use cawala_topology::{ChildKind, OctAddr};
+pub use claim::{
+    ClaimError, STRANDED_CLAIM_CONTEXT, STRANDED_CLAIM_VERSION, SignedStrandedClaim, StateProof,
+    StrandedClaim, StrandedClaimBundle, VerifiedClaim,
+};
 pub use invite::{INVITE_SCHEME, Invite, InviteError};
 pub use reply::{
     AdminApproved, AdminPendingJoin, AdminRejected, AdminSnapshot, CONTROL_ALPN,
