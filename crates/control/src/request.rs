@@ -203,16 +203,20 @@ pub struct DetachChild {
     pub child: NodeId,
 }
 
-/// Re-parent a child within its current region.
+/// Re-parent a child **within its current parent** (v1: re-slotting only).
 ///
-/// The request only states the desired target; the node applies the
-/// downward-only and cycle rules and rejects moves the sender is not allowed
-/// to request.
+/// The request states the desired target, but v1 supports only re-slotting a
+/// direct child under the parent that already holds it: the receiving node
+/// rejects any `new_parent` other than itself, and its authority gate rejects a
+/// sender that is not this node's operator or senior child. Moving a subtree to
+/// a *different* parent (the old parent releases it, the new parent approves,
+/// and the subtree's addresses are rebased) is not implemented.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoveChild {
     /// The child to move.
     pub child: NodeId,
-    /// The new parent: this node or a descendant (node enforces downward-only).
+    /// The new parent: v1 requires this node itself (re-slot under the same
+    /// parent); a descendant or an external parent is rejected.
     pub new_parent: NodeId,
     /// New slot (`0..=7`), or `None` for the node to pick.
     pub slot: Option<u8>,

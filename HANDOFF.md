@@ -38,10 +38,15 @@ how to verify, and conventions**. Detail lives elsewhere:
   Reconnection is **leave (if needed) + invitation**; the shipped stranded-claim
   bundle is out-of-band review evidence only, never authority and never on the
   wire.
-- **v2 deferred**: whole-subtree rejoin (`Rebase` prefix-swap with per-node
-  consent and a persisted generation), `EdgeClose` for clean edge settlement
+- **v2 deferred**: `EdgeClose` for clean edge settlement
   (`ENTRY_FORMAT_VERSION` 4), moved-pointers, signed topology/registry
-  distribution, per-peer control version negotiation.
+  distribution, per-peer control version negotiation. Note: a node **with or
+  without children can already join any network by invitation** — `Join`
+  rewrites the joiner's own address immediately and its descendants converge via
+  the periodic healing `RebasePull` (each node is renamed only by its own direct
+  parent, which then re-pushes to its children). The only sharpening left is
+  pushing `Rebase` downward immediately at join plus a persisted per-edge
+  `generation` for repeated renames; neither is needed for the capability.
 - **Carried-prefix Phase 2** (deferred, `SETTLE_PAYLOAD_VERSION` 3): per-hop
   `PeerKeys` + a relayer-signed `HopCertV1` and echoed intermediate
   `EntryProofV1`s so the origin keyed-verifies the LCA hop. Accountability, not

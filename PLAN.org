@@ -591,12 +591,19 @@
        Verified: `crates/node/tests/exit_rebase.rs` (7), `routed_control` (13),
        `netting_harness` (15), `seen_restart` (3), ledger 223, client 82, plus
        workspace clippy and the wasm32 check; web `npm test` (29) + `npm run
-       build`. Deferred to v2: whole-subtree rejoin (`Rebase` prefix-swap with
-       per-node consent and a persisted generation), `EdgeClose`, moved
-       pointers, signed topology/registry distribution, per-peer control version
-       negotiation, a netting `--primary-root` selector, an optional `OctAddr`
-       depth cap, and hoisting the per-request control-plane reload into
-       `receive_routed_at`.
+        build`. Deferred to v2: `EdgeClose`, moved pointers, signed
+        topology/registry distribution, per-peer control version negotiation,
+        and an optional `OctAddr` depth cap. Note on "subtree rejoin": a node
+        **with or without children can already join any network by invitation** -
+        `Join` rewrites the joiner's own address immediately and its descendants
+        converge through the periodic healing `RebasePull` (each node is renamed
+        only by its own direct parent, and applying a rename re-pushes to its
+        children), so the subtree follows within a probe interval (~30 s per
+        level) and heals after downtime. Descendants cannot veto; their opt-out is
+        to exit and become their own island. The only sharpening left is
+        promptness (push `Rebase` downward at `JoinApproved` instead of waiting
+        for the pull) plus a persisted per-edge `generation` so repeated renames
+        of the same edge can be ordered - neither is needed for the capability.
      - Foster-parent recovery (DECIDED: cut) + stranded-claim evidence bundle
        (DONE): automated recovery was **cut by owner decision**. Rationale: exit
        is already unconditional and works against an unreachable parent, and
