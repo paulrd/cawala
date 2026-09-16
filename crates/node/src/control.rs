@@ -140,6 +140,24 @@ pub struct OutboundControl {
     pub kind: OutboundKind,
 }
 
+/// How an existing peer row relates to a freshly approved/re-created one.
+///
+/// Split out from the old `Option<bool>` so a ledger-only change can be
+/// reconciled (updated) rather than mistaken for a conflict: the operator key
+/// is the identity/authority, the ledger key is the node's own settlement key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerState {
+    /// No row exists for the node.
+    Absent,
+    /// The retained row is byte-identical to the expected one.
+    Identical,
+    /// The retained row has the same operator and role but a different ledger
+    /// key; the stored row is updated to the expected key.
+    LedgerChanged,
+    /// The retained row conflicts on operator or role (identity/authority).
+    Conflict,
+}
+
 /// The local control engine: persisted links plus the judge of who may mutate
 /// them.
 ///
@@ -151,10 +169,12 @@ pub struct OutboundControl {
 ///
 /// The **control-plane** state — the node record (`node.json`) and the peer
 /// registry (`ledger_peers.json`) — is re-read from disk at the start of every
-/// [`ControlNode::receive_at`], so mutations made by a separate process (CLI
-/// `control exit`, `control admin approve`, node-to-node join approval) are
-/// observed without a restart. Both reloads warn and continue on failure: they
-/// describe topology/identity, not authority to refuse service on.
+/// [`ControlNode::receive_at`] **and** [`ControlNode::receive_routed_at`] (via
+/// [`ControlNode::refresh_control_plane`]), so mutations made by a separate
+/// process (CLI `control exit`, `control admin approve`, node-to-node join
+/// approval) are observed without a restart on both the direct and routed
+/// paths. Both reloads warn and continue on failure: they describe
+/// topology/identity, not authority to refuse service on.
 ///
 /// The pending-join store and the replay sidecar ([`SeenStore`]) are
 /// deliberately **not** reloaded per request: the former is this process's own
@@ -568,6 +588,51 @@ impl ControlNode {
         }
     }
 
+    /// Reload the **control-plane** state — the persisted node record
+    /// (`node.json`) and the peer registry (`ledger_peers.json`) — from disk.
+    ///
+    /// Called at the top of both [`ControlNode::receive_at`] and
+    /// [`ControlNode::receive_routed_at`], before any check that reads the
+    /// record or the registry, so a mutation made by a *separate process* (the
+    /// CLI rewriting `node.json`, or `control admin approve` registering a peer
+    /// row) is observed without a restart on the routed path as well as the
+    /// direct one.
+    ///
+    /// Both reloads are existence-guarded: a harness that never persisted a
+    /// record/peers has no file to reload and keeps its in-memory state. Both
+    /// warn and continue on failure: they describe topology/identity, not
+    /// authority to refuse service on.
+    fn refresh_control_plane(&mut self) {
+        // Full reload of the persisted record so a topology mutation made by a
+        // *separate process* is observed without a restart. The CLI `control
+        // exit` rewrites `node.json` directly (it does not go through this
+        // engine), so without this a live node would keep serving its stale
+        // parent/children and never run the healing path.
+        if self.data_dir.join(crate::record::NODE_RECORD_FILE).exists() {
+            match RecordStore::open(&self.data_dir, &self.node_id) {
+                Ok(record) => self.record = record,
+                Err(err) => {
+                    warn!(%err, "node record reload failed; using the in-memory record");
+                }
+            }
+        }
+        // Full reload so a peer row registered by a *separate process* is
+        // observed without a restart. A child operator registered by `control
+        // admin approve` / node-to-node join approval lives only on disk until
+        // now, and exit/healing frames from that child are verified against this
+        // registry (`verify_control` in `authorize`), so without this a live
+        // node would keep refusing an otherwise-valid `Exit`/`RebasePull` with
+        // `Unauthorized` until restart.
+        if self.data_dir.join(ledger_peers::PEERS_FILE).exists() {
+            match ledger_peers::load_peers(&self.data_dir) {
+                Ok(peers) => self.peers = peers,
+                Err(err) => {
+                    warn!(%err, "peer registry reload failed; using the in-memory registry");
+                }
+            }
+        }
+    }
+
     /// Handle one incoming request and produce its reply.
     ///
     /// Uses the system clock for join-expiry checks. Tests that need
@@ -587,8 +652,10 @@ impl ControlNode {
     /// 1. wire version is [`CONTROL_FORMAT_VERSION`];
     /// 2. the operator signature verifies under `signed.controller`;
     /// 3. `now <= expiry <= now + CONTROL_REQUEST_MAX_TTL_SECS`;
-    /// 4. the persisted node record is reloaded from disk (warn-and-continue);
-    /// 5. the peer registry is reloaded from disk (warn-and-continue);
+    /// 4. the persisted node record is reloaded from disk (warn-and-continue;
+    ///    see [`ControlNode::refresh_control_plane`]);
+    /// 5. the peer registry is reloaded from disk (warn-and-continue; same
+    ///    helper);
     /// 6. admin grants are reloaded from disk (fail closed to empty);
     /// 7. the `(origin, controller, nonce)` replay guard;
     /// 8. dispatch.
@@ -616,40 +683,7 @@ impl ControlNode {
         if signed.expiry > now.saturating_add(CONTROL_REQUEST_MAX_TTL_SECS) {
             return ControlReply::Rejected(RejectCode::BadRequest);
         }
-        // Full reload of the persisted record so a topology mutation made by a
-        // *separate process* is observed without a restart. The CLI `control
-        // exit` rewrites `node.json` directly (it does not go through this
-        // engine), so without this a live node would keep serving its stale
-        // parent/children and never run the healing path. Topology is not
-        // authority, so a failed reload warns and keeps the in-memory record
-        // rather than failing closed. A harness that never persisted a record
-        // has no file to reload and keeps its in-memory state.
-        if self.data_dir.join(crate::record::NODE_RECORD_FILE).exists() {
-            match RecordStore::open(&self.data_dir, &self.node_id) {
-                Ok(record) => self.record = record,
-                Err(err) => {
-                    warn!(%err, "node record reload failed; using the in-memory record");
-                }
-            }
-        }
-        // Full reload so a peer row registered by a *separate process* is
-        // observed without a restart. A child operator registered by `control
-        // admin approve` / node-to-node join approval lives only on disk until
-        // now, and exit/healing frames from that child are verified against this
-        // registry (`verify_control` in `authorize`), so without this a live
-        // node would keep refusing an otherwise-valid `Exit`/`RebasePull` with
-        // `Unauthorized` until restart. Like the record, the registry is not
-        // authority to refuse service on, so a failed reload warns and keeps the
-        // in-memory registry rather than failing closed. A harness that never
-        // persisted peers has no file to reload and keeps its in-memory state.
-        if self.data_dir.join(ledger_peers::PEERS_FILE).exists() {
-            match ledger_peers::load_peers(&self.data_dir) {
-                Ok(peers) => self.peers = peers,
-                Err(err) => {
-                    warn!(%err, "peer registry reload failed; using the in-memory registry");
-                }
-            }
-        }
+        self.refresh_control_plane();
         // Full reload so a grant/revoke performed by a separate operator CLI
         // process is observed without a restart. On any load failure, serve no
         // delegated authority (fail closed).
@@ -748,11 +782,14 @@ impl ControlNode {
     /// Checks here, in order:
     /// 1. [`RoutedControlV1::validate`] (version, bounded forwards, intent
     ///    version, per-forward request/origin coherence);
-    /// 2. `target.node`/`target.addr` name this node;
-    /// 3. the carried intent self-verifies and its expiry is inside the TTL cap;
-    /// 4. a forward exists, its `hop.node` is the authenticated `remote`, and
+    /// 2. the persisted node record and peer registry are reloaded from disk
+    ///    (warn-and-continue; see [`ControlNode::refresh_control_plane`]) so an
+    ///    externally rewritten `node.json` or `ledger_peers.json` is observed;
+    /// 3. `target.node`/`target.addr` name this node;
+    /// 4. the carried intent self-verifies and its expiry is inside the TTL cap;
+    /// 5. a forward exists, its `hop.node` is the authenticated `remote`, and
     ///    the destination's registry verifies it;
-    /// 5. class gate:
+    /// 6. class gate:
     ///    - `Join`/`JoinApproved`/`JoinRejected` are refused on the routed path;
     ///    - admin requests dispatch the **intent** (so the existing
     ///      `authorize_admin` grant store, replay, and TTL rules apply verbatim);
@@ -774,6 +811,12 @@ impl ControlNode {
         if routed.validate().is_err() {
             return ControlReply::Rejected(RejectCode::Unauthorized);
         }
+        // Observe a control-plane mutation made by a *separate process* before
+        // any record/registry-dependent check below (the `target.addr` match and
+        // `verify_forward`/`authorize`). Without this a routed request would be
+        // refused against stale state after a CLI rewrite of `node.json` or
+        // `ledger_peers.json`.
+        self.refresh_control_plane();
         if routed.target.node != self.node_id {
             return ControlReply::Rejected(RejectCode::Unauthorized);
         }
@@ -1002,8 +1045,18 @@ impl ControlNode {
     ///   (`PeerRegistry::insert` rejects duplicates);
     /// - a child the record **already lists** is already attached: its existing
     ///   slot/address are returned and it is not re-attached;
-    /// - a **conflicting** row (different operator/ledger/role) or a slot taken
-    ///   by a *different* child is still an error.
+    /// - a **ledger-only** change (same operator and role) updates the stored
+    ///   row's ledger key and audits `peer-ledger-updated`: the operator key is
+    ///   the identity/authority, while the ledger key is the child's own
+    ///   settlement key, and retaining a stale key would reject the child's
+    ///   future hops. This is sound because the pending [`JoinRequest`] was
+    ///   **self-signed by the child** (`signed.origin == join.node`,
+    ///   `signed.controller == join.operator`), so the child's own operator
+    ///   vouches for the new key — the reconciliation is unconditional here.
+    ///   (Contrast [`ControlNode::handle_create_child`], which is narrowed: a
+    ///   `CreateChild` is not signed by the peer whose row changes.)
+    /// - a **conflicting** row (different operator/role) or a slot taken by a
+    ///   *different* child is still an error.
     ///
     /// Requires this node to have an asserted [`NodeRecord::address`].
     pub fn approve_pending(
@@ -1034,15 +1087,17 @@ impl ControlNode {
             role,
         };
         // Reconcile the retained registry row before any mutation: an identical
-        // row must not be re-inserted, a genuine conflict is refused outright.
+        // row must not be re-inserted, a changed-operator/role row is refused
+        // outright, and a ledger-only change is applied later (after the child
+        // link is in place) by `reconcile_peer_row`.
         let peer_state = self.existing_peer_state(&peer);
-        if peer_state == Some(false) {
+        if peer_state == PeerState::Conflict {
             return Err(ControlError::Codec(format!(
-                "peer row for '{}' conflicts with the approved operator/ledger/role",
+                "peer row for '{}' conflicts with the approved operator/role",
                 request.node
             )));
         }
-        let peer_present = peer_state == Some(true);
+        let peer_present = peer_state == PeerState::Identical;
 
         // A child the record already lists is already approved; keep its
         // existing slot and never re-attach it.
@@ -1098,14 +1153,22 @@ impl ControlNode {
             return Err(ControlError::Codec(err.to_string()));
         }
 
+        // The retained row is reconciled unconditionally here: the pending
+        // `JoinRequest` was **self-signed by the child** (`signed.origin ==
+        // join.node`, `signed.controller == join.operator`), so the child's own
+        // operator vouches for the new ledger key. The audit attributes the
+        // rotation to that child.
         if !peer_present
-            && let Err(err) = self.peers.insert(peer)
+            && let Err(code) =
+                self.reconcile_peer_row(&peer, peer_state, request.node.as_str(), now)
         {
             if already_listed.is_none() {
                 let _ = self.record.detach_child(request.node.as_str());
             }
             self.pending.add_pending(request);
-            return Err(ControlError::Codec(err.to_string()));
+            return Err(ControlError::Codec(format!(
+                "peer row update failed: {code:?}"
+            )));
         }
 
         self.record
@@ -1374,7 +1437,7 @@ impl ControlNode {
             Some(existing)
                 if existing.operator == expected.operator && existing.role == expected.role =>
             {
-                self.replace_parent_ledger(&signed.origin, approval.parent_ledger)
+                self.replace_peer_ledger(&signed.origin, Some(approval.parent_ledger))
             }
             Some(_) => Err(RejectCode::Unauthorized),
             None => self
@@ -1386,40 +1449,104 @@ impl ControlNode {
 
     /// Classify the registry row for `expected`'s node.
     ///
-    /// Returns `None` when no row exists, `Some(true)` when the existing row is
-    /// byte-identical to `expected` (a re-approval: success, do **not**
-    /// re-insert — `PeerRegistry::insert` rejects a duplicate), and
-    /// `Some(false)` when a row exists but conflicts (a different
-    /// operator/ledger/role for the same node id).
+    /// The operator key is the identity/authority; the ledger key is the node's
+    /// own settlement key, which it controls. A retained row that differs only
+    /// in its ledger key is therefore reconciled ([`PeerState::LedgerChanged`])
+    /// rather than refused: retaining a stale key would reject the node's future
+    /// settlement hops. A changed operator or role is a genuine conflict
+    /// ([`PeerState::Conflict`]).
     ///
-    /// `Exit` deliberately retains the child's row, so "exit then change your
+    /// `Exit` deliberately retains the node's row, so "exit then change your
     /// mind" must treat the identical retained row as already registered rather
     /// than as a `DuplicateKey` conflict.
-    fn existing_peer_state(&self, expected: &PeerKeys) -> Option<bool> {
-        self.peers
-            .get(&expected.node_id)
-            .map(|existing| existing == expected)
+    fn existing_peer_state(&self, expected: &PeerKeys) -> PeerState {
+        match self.peers.get(&expected.node_id) {
+            None => PeerState::Absent,
+            Some(existing) if existing == expected => PeerState::Identical,
+            Some(existing)
+                if existing.operator == expected.operator && existing.role == expected.role =>
+            {
+                PeerState::LedgerChanged
+            }
+            Some(_) => PeerState::Conflict,
+        }
     }
 
-    /// Replace an existing parent row's ledger key, preserving its operator.
+    /// Apply the registry mutation implied by a re-approval/re-create.
+    ///
+    /// [`PeerState::Absent`] inserts the new row; [`PeerState::LedgerChanged`]
+    /// replaces the retained row's ledger key and appends the additive
+    /// `peer-ledger-updated` audit line naming `actor`; [`PeerState::Identical`]
+    /// is a no-op (`PeerRegistry::insert` rejects a duplicate).
+    /// [`PeerState::Conflict`] is refused — callers check it first, so it is
+    /// defensive here.
+    ///
+    /// The operator key is the identity/authority and the ledger key is the
+    /// child's own settlement key (which the child controls), so a
+    /// same-operator/same-role row whose ledger key changed is updated: a stale
+    /// key would reject the child's future hops. Whether that is sound depends
+    /// on *who* vouches for the new key, which is the caller's concern: see
+    /// [`ControlNode::approve_pending`] (the child's self-signed join) and
+    /// [`ControlNode::handle_create_child`] (self-operator only).
+    ///
+    /// # Operational consequences
+    ///
+    /// A rotation is not a local bookkeeping detail:
+    /// - the **old** ledger key's historical commitments and carried hops no
+    ///   longer resolve against the updated registry — there is one ledger row
+    ///   per node, so the new key replaces the old rather than supplementing it;
+    /// - the rotation is **network-wide**: peers that still hold the old row
+    ///   produce conflicting registry rows in a merged netting harness until
+    ///   they too observe the new key.
+    fn reconcile_peer_row(
+        &mut self,
+        peer: &PeerKeys,
+        state: PeerState,
+        actor: &str,
+        now: u64,
+    ) -> Result<(), RejectCode> {
+        match state {
+            PeerState::Identical => Ok(()),
+            PeerState::Conflict => Err(RejectCode::Unauthorized),
+            PeerState::Absent => self
+                .peers
+                .insert(peer.clone())
+                .map_err(|err| map_ledger_error(&err)),
+            PeerState::LedgerChanged => {
+                let old = self.peers.get(&peer.node_id).and_then(|row| row.ledger);
+                self.replace_peer_ledger(&peer.node_id, peer.ledger)?;
+                self.audit(serde_json::json!({
+                    "ts": now,
+                    "event": "peer-ledger-updated",
+                    "node": peer.node_id.to_string(),
+                    "actor": actor,
+                    "old_ledger": old.map(|key| key.to_string()),
+                    "new_ledger": peer.ledger.map(|key| key.to_string()),
+                }));
+                Ok(())
+            }
+        }
+    }
+
+    /// Replace an existing peer row's ledger key, preserving its operator.
     ///
     /// `PeerRegistry` exposes no in-place update or removal (and the ledger
     /// crate is out of scope here), so rebuild it from its canonical
     /// seq-of-rows serde form with the one key swapped. The rebuild is into a
     /// fresh registry, so a failure (e.g. a ledger-key collision) leaves
     /// `self.peers` untouched.
-    fn replace_parent_ledger(
+    fn replace_peer_ledger(
         &mut self,
-        parent: &NodeId,
-        ledger: LedgerPubKey,
+        node: &NodeId,
+        ledger: Option<LedgerPubKey>,
     ) -> Result<(), RejectCode> {
         let value = serde_json::to_value(&self.peers).map_err(|_| RejectCode::Internal)?;
         let rows =
             serde_json::from_value::<Vec<PeerKeys>>(value).map_err(|_| RejectCode::Internal)?;
         let mut rebuilt = PeerRegistry::new();
         for mut row in rows {
-            if &row.node_id == parent {
-                row.ledger = Some(ledger);
+            if &row.node_id == node {
+                row.ledger = ledger;
             }
             rebuilt.insert(row).map_err(|_| RejectCode::Unauthorized)?;
         }
@@ -1489,9 +1616,10 @@ impl ControlNode {
         create: &CreateChild,
         now: u64,
     ) -> ControlReply {
-        if let Err(code) = self.authorize(signed, now) {
-            return ControlReply::Rejected(code);
-        }
+        let authority = match self.authorize(signed, now) {
+            Ok(authority) => authority,
+            Err(code) => return ControlReply::Rejected(code),
+        };
         let role = match create.kind {
             ChildKind::Node => PeerRole::Node,
             ChildKind::User => PeerRole::User,
@@ -1503,12 +1631,21 @@ impl ControlNode {
             role,
         };
         // A retained identical row (a child that exited, or a replayed create)
-        // must not be re-inserted; a genuine conflict is refused.
+        // must not be re-inserted, a changed-operator/role row is refused, and a
+        // ledger-only change is applied by `reconcile_peer_row` — but **only**
+        // when this node's own operator drove the create. Unlike a re-attach
+        // join, a `CreateChild` is not signed by the peer whose row changes: a
+        // senior child (`Authority::Peer`) could otherwise substitute a
+        // sibling's/descendant's ledger key with one it controls. A senior-child
+        // create with a changed ledger therefore keeps the pre-reconciliation
+        // refusal (`Unauthorized`); new/identical rows are unchanged.
         let peer_state = self.existing_peer_state(&peer);
-        if peer_state == Some(false) {
+        if (peer_state == PeerState::LedgerChanged && authority != Authority::SelfOperator)
+            || peer_state == PeerState::Conflict
+        {
             return ControlReply::Rejected(RejectCode::Unauthorized);
         }
-        let peer_present = peer_state == Some(true);
+        let peer_present = peer_state == PeerState::Identical;
 
         // A child the record already lists is already created: idempotent
         // `Accepted`, no re-attach.
@@ -1520,8 +1657,13 @@ impl ControlNode {
             .any(|c| c.child_id == create.child.as_str());
         if already_listed {
             if !peer_present {
-                if let Err(err) = self.peers.insert(peer) {
-                    return ControlReply::Rejected(map_ledger_error(&err));
+                if let Err(code) = self.reconcile_peer_row(
+                    &peer,
+                    peer_state,
+                    signed.origin.as_str(),
+                    now,
+                ) {
+                    return ControlReply::Rejected(code);
                 }
                 if ledger_peers::save_peers(&self.data_dir, &self.peers).is_err() {
                     return ControlReply::Rejected(RejectCode::Internal);
@@ -1540,10 +1682,11 @@ impl ControlNode {
             return ControlReply::Rejected(map_record_error(&err));
         }
         if !peer_present
-            && let Err(err) = self.peers.insert(peer)
+            && let Err(code) =
+                self.reconcile_peer_row(&peer, peer_state, signed.origin.as_str(), now)
         {
             self.record = backup;
-            return ControlReply::Rejected(map_ledger_error(&err));
+            return ControlReply::Rejected(code);
         }
         if self.record.save().is_err()
             || ledger_peers::save_peers(&self.data_dir, &self.peers).is_err()
@@ -5077,6 +5220,233 @@ mod tests {
         assert!(
             engine.approve_pending("child", Some(3), 0, ledger(1)).is_err(),
             "a conflicting retained operator must error"
+        );
+    }
+
+    /// **Exit-rights follow-up**: a re-approval whose retained row has the same
+    /// operator and role but a *different ledger key* is accepted, the stored
+    /// row is updated, and an additive `peer-ledger-updated` audit line is
+    /// written. The child controls its own settlement ledger key, so a stale key
+    /// must not lock it out of re-attaching.
+    #[tokio::test]
+    async fn approve_pending_updates_changed_ledger_and_audits() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[("child", ChildKind::Node, 3, 1)],
+        );
+        // The retained row has the same operator/role but ledger seed 2.
+        let peers = [node_peer("child", &child_op, 2)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+
+        engine.pending.add_pending(JoinRequest {
+            node: NodeId::from("child"),
+            kind: ChildKind::Node,
+            operator: child_op.public(),
+            // The child regenerated its settlement key (seed 5).
+            ledger: Some(ledger(5)),
+            desired_slot: Some(3),
+            location_hint: None,
+            nonce: 1,
+            expiry: u64::MAX,
+        });
+
+        let approval = engine
+            .approve_pending("child", Some(3), 0, ledger(1))
+            .expect("a changed ledger key must be reconciled, not refused");
+        assert_eq!(approval.slot, 3);
+        assert_eq!(
+            engine
+                .peers()
+                .get(&NodeId::from("child"))
+                .and_then(|row| row.ledger),
+            Some(ledger(5)),
+            "the stored row must carry the child's new ledger key"
+        );
+        assert_eq!(engine.peers().len(), 1, "the retained row is not duplicated");
+
+        // The additive audit line names the node, the actor (the child whose
+        // self-signed join vouched for the new key) and both keys.
+        let audit = std::fs::read_to_string(dir.path().join(crate::audit::CONTROL_AUDIT_FILE))
+            .expect("audit log");
+        assert!(audit.contains("\"event\":\"peer-ledger-updated\""), "{audit}");
+        assert!(audit.contains("\"node\":\"child\""), "{audit}");
+        assert!(audit.contains("\"actor\":\"child\""), "{audit}");
+        assert!(
+            audit.contains(&format!("\"old_ledger\":\"{}\"", ledger(2))),
+            "{audit}"
+        );
+        assert!(
+            audit.contains(&format!("\"new_ledger\":\"{}\"", ledger(5))),
+            "{audit}"
+        );
+    }
+
+    /// **Exit-rights follow-up**: a retained row for the same operator but a
+    /// *different role* is still a genuine conflict.
+    #[tokio::test]
+    async fn approve_pending_conflicting_role_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[("child", ChildKind::Node, 3, 1)],
+        );
+        // The retained row is a `User` for the same operator.
+        let peers = [user_peer("child", &child_op)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+
+        engine.pending.add_pending(JoinRequest {
+            node: NodeId::from("child"),
+            kind: ChildKind::Node,
+            operator: child_op.public(),
+            ledger: Some(ledger(2)),
+            desired_slot: Some(3),
+            location_hint: None,
+            nonce: 1,
+            expiry: u64::MAX,
+        });
+
+        let err = engine
+            .approve_pending("child", Some(3), 0, ledger(1))
+            .expect_err("a changed role must be refused");
+        assert!(
+            err.to_string().contains("conflicts"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            engine
+                .peers()
+                .get(&NodeId::from("child"))
+                .map(|row| row.role),
+            Some(PeerRole::User),
+            "the retained row is untouched"
+        );
+    }
+
+    /// **Exit-rights follow-up (oracle review)**: a senior-child `CreateChild`
+    /// that changes an existing node's ledger key is refused. The request is not
+    /// signed by the peer whose row changes, so only this node's own operator
+    /// may rotate a ledger on the `CreateChild` path. No `peer-ledger-updated`
+    /// line is written.
+    #[tokio::test]
+    async fn create_child_senior_peer_cannot_rotate_a_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let senior_op = secret(3);
+        let victim_op = secret(4);
+        // `senior` (date_joined 1) outranks `victim` (2), so a create signed by
+        // `senior` is admitted by `authorize` as `Authority::Peer`.
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[
+                ("senior", ChildKind::Node, 0, 1),
+                ("victim", ChildKind::Node, 1, 2),
+            ],
+        );
+        let peers = [
+            node_peer("senior", &senior_op, 3),
+            node_peer("victim", &victim_op, 2),
+        ];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+
+        let create = CreateChild {
+            child: NodeId::from("victim"),
+            operator: victim_op.public(),
+            ledger: Some(ledger(5)),
+            kind: ChildKind::Node,
+            slot: Some(1),
+            date_joined: 2,
+        };
+        let signed = authorize_at("senior", &senior_op, 1, ControlRequest::CreateChild(create));
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized),
+            "a senior child must not substitute a sibling's ledger key"
+        );
+        assert_eq!(
+            engine
+                .peers()
+                .get(&NodeId::from("victim"))
+                .and_then(|row| row.ledger),
+            Some(ledger(2)),
+            "the retained row is untouched"
+        );
+
+        // `CreateChild` is not an admin request (so `audit_request` writes
+        // nothing) and the reconciliation never ran: no rotation line.
+        let audit = std::fs::read_to_string(dir.path().join(crate::audit::CONTROL_AUDIT_FILE))
+            .unwrap_or_default();
+        assert!(
+            !audit.contains("peer-ledger-updated"),
+            "unexpected audit: {audit}"
+        );
+    }
+
+    /// **Exit-rights follow-up (oracle review)**: this node's own operator may
+    /// still rotate an existing node's ledger key via `CreateChild`, and the
+    /// `peer-ledger-updated` audit names the operator as the actor.
+    #[tokio::test]
+    async fn create_child_self_operator_rotates_ledger_and_audits_actor() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let victim_op = secret(4);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[("victim", ChildKind::Node, 1, 2)],
+        );
+        let peers = [node_peer("victim", &victim_op, 2)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &peers);
+
+        let create = CreateChild {
+            child: NodeId::from("victim"),
+            operator: victim_op.public(),
+            ledger: Some(ledger(5)),
+            kind: ChildKind::Node,
+            slot: Some(1),
+            date_joined: 2,
+        };
+        let signed = authorize_at("parent", &parent_op, 1, ControlRequest::CreateChild(create));
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(
+            engine
+                .peers()
+                .get(&NodeId::from("victim"))
+                .and_then(|row| row.ledger),
+            Some(ledger(5)),
+            "the operator-driven rotation updates the row"
+        );
+
+        let audit = std::fs::read_to_string(dir.path().join(crate::audit::CONTROL_AUDIT_FILE))
+            .expect("audit log");
+        assert!(audit.contains("\"event\":\"peer-ledger-updated\""), "{audit}");
+        assert!(audit.contains("\"node\":\"victim\""), "{audit}");
+        assert!(audit.contains("\"actor\":\"parent\""), "{audit}");
+        assert!(
+            audit.contains(&format!("\"old_ledger\":\"{}\"", ledger(2))),
+            "{audit}"
+        );
+        assert!(
+            audit.contains(&format!("\"new_ledger\":\"{}\"", ledger(5))),
+            "{audit}"
         );
     }
 

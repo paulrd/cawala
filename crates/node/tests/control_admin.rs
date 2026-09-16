@@ -578,11 +578,14 @@ async fn expiry_window_is_enforced() {
     let parent_id = fixture.parent.endpoint.id().to_string();
     let now = now_unix_seconds();
 
+    // Margin, not a boundary: the engine compares an expiry against its own
+    // clock read, so a one-second tick between construction here and the read
+    // there must not flip either assertion (this test was a wall-clock flake).
     let expired = SignedControl::authorize(
         node(&parent_id),
         &fixture.admin_op,
         fresh_nonce(),
-        now.saturating_sub(1),
+        now.saturating_sub(60),
         ControlRequest::AdminQuery,
     )
     .unwrap();
@@ -595,7 +598,7 @@ async fn expiry_window_is_enforced() {
         node(&parent_id),
         &fixture.admin_op,
         fresh_nonce(),
-        now + CONTROL_REQUEST_MAX_TTL_SECS + 1,
+        now + CONTROL_REQUEST_MAX_TTL_SECS + 60,
         ControlRequest::AdminQuery,
     )
     .unwrap();

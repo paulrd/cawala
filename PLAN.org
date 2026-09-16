@@ -637,6 +637,31 @@
        real Merkle state-inclusion proofs), `crates/node/tests/claim_bundle.rs`
        (11), web `parentLiveness` (12), workspace tests, clippy, the wasm32
        check, web `npm test` (41) and `npm run build`.
+     - Exit-rights follow-ups (DONE): (a) the per-request control-plane refresh
+       (record `node.json` + peer `ledger_peers.json`, warn-and-continue) is
+       hoisted into a shared `refresh_control_plane` called by **both**
+       `receive_at` and `receive_routed_at` before every state-dependent check, so
+       a routed request no longer sees a stale record/registry after an external
+       CLI write. (b) Parent-side ledger rotation is reconciled on **re-attach**:
+       a same-operator/same-role row whose ledger key changed is accepted and
+       updated (anchor: the pending `JoinRequest` is self-signed by the child, so
+       that child's operator vouches for the new key) with an additive
+       `peer-ledger-updated` audit line carrying the actor. `handle_create_child`
+       is narrowed to `Authority::SelfOperator` only - a senior child attempting
+       the same rotation keeps the pre-batch `Unauthorized` refusal, because that
+       request is not signed by the peer whose row would change. Consequences
+       documented: after a rotation the old key's historical commitments/carried
+       hops no longer resolve against the one-ledger-per-node registry, and a
+       rotation is network-wide (peers still holding the old row produce
+       conflicting registry rows in a merged netting harness until they update).
+       (c) `ledger net` and `ledger verify-cascade` gained
+       `--primary-root <node-id>` (default: largest component, ties by root id;
+       ignored under `--topology`). (d) The optional `OctAddr` depth cap remains
+       deliberately deferred (decision 9: no hard depth cap; frames are already
+       bounded by `MAX_CONTROL_FRAME`). No version constants move and there is no
+       data-dir or blob impact. Verified: node lib 206, `routed_control` 15,
+       `exit_rebase` 8, `netting_harness` 17, workspace tests, clippy and the
+       wasm32 check all green.
 
 * Top Risks
   1. Iroh WASM maturity -> M0 spike before any other work.

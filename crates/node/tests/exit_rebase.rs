@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cawala_control::{
     CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest, DetachChild, JoinApproval,
-    JoinRequest, NodeId, OperatorSecretKey, RebaseNotice, SignedControl,
+    JoinRequest, NodeId, OperatorSecretKey, RebaseNotice, RejectCode, SignedControl,
 };
 use cawala_ledger::{LedgerPubKey, LedgerSecretKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::{AckStatus, Envelope, MSG_LEDGER_V1, RejectReason};
@@ -1055,3 +1055,116 @@ async fn stale_row_rejoin_of_unprocessed_exit_succeeds() {
         "no duplicate child entry"
     );
 }
+
+// ---------------------------------------------------------------------------
+// (E) Stale Rebase from a former parent after a re-home
+// ---------------------------------------------------------------------------
+
+/// A node that exited, re-rooted, and then re-joined a **new** parent must
+/// refuse an old parent's `Rebase` for its old prefix: authority is the current
+/// parent link, and a stale former parent cannot move the node back. The
+/// address is unchanged by the refusal.
+#[tokio::test]
+async fn stale_rebase_from_former_parent_is_refused_after_rehome() {
+    let world = World::new();
+    let (nodes, _addrs) = build(world.defs()).await;
+    let now = now_unix_seconds();
+
+    // A exits from P and becomes an independent root `0`.
+    let exit = {
+        let engine = nodes[&world.a_id].control.lock().await;
+        engine.sign_exit_request(now).expect("sign exit")
+    };
+    assert_eq!(
+        deliver(&nodes[&world.p_id].control, &exit).await,
+        ControlReply::Accepted
+    );
+    nodes[&world.a_id]
+        .control
+        .lock()
+        .await
+        .apply_exit(now)
+        .expect("apply exit");
+    wait_record(&nodes[&world.a_id].control, None, "0").await;
+
+    // A re-joins its former sibling B (now a root-`0.2` node) as a new parent.
+    let join = JoinRequest {
+        node: node(&world.a_id),
+        kind: ChildKind::Node,
+        operator: world.a_op.public(),
+        ledger: Some(ledger(1)),
+        desired_slot: Some(0),
+        location_hint: None,
+        nonce: fresh_nonce(),
+        expiry: now_unix_seconds() + CONTROL_REQUEST_TTL_SECS,
+    };
+    nodes[&world.a_id]
+        .control
+        .lock()
+        .await
+        .begin_outbound_join(join.clone(), node(&world.b_id), None)
+        .expect("record outbound join");
+    let signed_join = authorize(&world.a_id, &world.a_op, ControlRequest::Join(join));
+    assert_eq!(
+        send_direct(
+            &nodes[&world.a_id].endpoint,
+            &nodes[&world.b_id].addr,
+            &signed_join
+        )
+        .await,
+        ControlReply::Pending
+    );
+
+    // B approves A at slot 0; A installs parent B and address `0.2.0`.
+    let approval: JoinApproval = {
+        let mut engine = nodes[&world.b_id].control.lock().await;
+        engine
+            .approve_pending(&world.a_id, Some(0), now, ledger(2))
+            .expect("approve pending")
+    };
+    let signed_approval = authorize(
+        &world.b_id,
+        &world.b_op,
+        ControlRequest::JoinApproved(approval),
+    );
+    assert_eq!(
+        send_direct(
+            &nodes[&world.b_id].endpoint,
+            &nodes[&world.a_id].addr,
+            &signed_approval
+        )
+        .await,
+        ControlReply::Accepted
+    );
+    wait_record(&nodes[&world.a_id].control, Some(&world.b_id), "0.2.0").await;
+
+    // The old parent P signs a `Rebase` for A's *old* prefix (`0` -> `0.1`).
+    // A's current parent is B, so the origin check refuses it.
+    let stale = authorize(
+        &world.p_id,
+        &world.p_op,
+        ControlRequest::Rebase(RebaseNotice {
+            node: node(&world.a_id),
+            parent_address: "0".parse().unwrap(),
+            address: "0.1".parse().unwrap(),
+            generation: 2,
+        }),
+    );
+    assert_eq!(
+        deliver(&nodes[&world.a_id].control, &stale).await,
+        ControlReply::Rejected(RejectCode::Unauthorized)
+    );
+
+    // The refusal did not move A: still re-homed under B at `0.2.0`.
+    let record = nodes[&world.a_id].control.lock().await.record().clone();
+    assert_eq!(
+        record.parent.as_ref().map(|p| p.parent_id.as_str()),
+        Some(world.b_id.as_str())
+    );
+    assert_eq!(
+        record.address.as_ref().map(|a| a.to_string()).as_deref(),
+        Some("0.2.0"),
+        "a stale former parent must not change the address"
+    );
+}
+

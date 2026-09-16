@@ -390,6 +390,10 @@ enum LedgerCommand {
         /// Use a saved topology snapshot instead of deriving from records.
         #[arg(long, value_name = "FILE")]
         topology: Option<PathBuf>,
+        /// Designate the primary component by a member node id. Default: the
+        /// largest component, ties by root id. Ignored with `--topology`.
+        #[arg(long, value_name = "NODE_ID")]
+        primary_root: Option<String>,
         /// Emit the report as JSON.
         #[arg(long)]
         json: bool,
@@ -411,6 +415,10 @@ enum LedgerCommand {
         /// Select an order from `--orders` by its `hash` hex.
         #[arg(long, value_name = "HEX", requires = "orders")]
         order_hash: Option<String>,
+        /// Designate the primary component by a member node id. Default: the
+        /// largest component, ties by root id.
+        #[arg(long, value_name = "NODE_ID")]
+        primary_root: Option<String>,
         /// Emit the result as JSON.
         #[arg(long)]
         json: bool,
@@ -839,12 +847,17 @@ fn ledger(data_dir: &std::path::Path, command: LedgerCommand) -> Result<()> {
             peer,
             orders,
             topology,
+            primary_root,
             json,
             strict,
         } => {
             let peers = resolve_peers(data_dir, peer);
-            let inputs = match netting_harness::load(&peers, orders.as_deref(), topology.as_deref())
-            {
+            let inputs = match netting_harness::load(
+                &peers,
+                orders.as_deref(),
+                topology.as_deref(),
+                primary_root.as_deref(),
+            ) {
                 Ok(inputs) => inputs,
                 Err(err) => fail(2, format!("{err:#}")),
             };
@@ -873,10 +886,16 @@ fn ledger(data_dir: &std::path::Path, command: LedgerCommand) -> Result<()> {
             order,
             orders,
             order_hash,
+            primary_root,
             json,
         } => {
             let peers = resolve_peers(data_dir, peer);
-            let inputs = match netting_harness::load(&peers, orders.as_deref(), None) {
+            let inputs = match netting_harness::load(
+                &peers,
+                orders.as_deref(),
+                None,
+                primary_root.as_deref(),
+            ) {
                 Ok(inputs) => inputs,
                 Err(err) => fail(2, format!("{err:#}")),
             };

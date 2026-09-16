@@ -1232,3 +1232,207 @@ async fn routed_topology_dispatches_last_hop_control_not_intent() {
         "the root must dispatch the senior predecessor's control, not the user intent"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Control-plane freshness on the routed path (part A)
+// ---------------------------------------------------------------------------
+
+/// A routed request must observe a `node.json` rewritten by a *separate
+/// process*. The destination's in-memory engine is built from a stale record
+/// (root `0`); an external rewrite to a parented `0.1` must be picked up by
+/// `receive_routed_at` before its `target.addr` check, so the same routed frame
+/// that was refused against the stale state is then served.
+#[tokio::test]
+async fn routed_observes_externally_rewritten_node_record() {
+    let dest_secret = SecretKey::generate();
+    let dest_id = dest_secret.public().to_string();
+    let dest_op = operator(&dest_secret);
+    let hop_secret = SecretKey::generate();
+    let hop_id = hop_secret.public().to_string();
+    let hop_op = operator(&hop_secret);
+    let remote = EndpointId::from(hop_secret.public());
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut record = RecordStore::open(dir.path(), &dest_id).unwrap();
+    record.set_address("0".parse().unwrap()).unwrap();
+    record.save().unwrap();
+
+    // The hop is known *in memory*; no `ledger_peers.json` exists, so the
+    // registry reload is skipped and only the record is externally changed.
+    let mut peers = PeerRegistry::new();
+    peers.insert(node_row(&hop_id, &hop_op, 9)).unwrap();
+    let mut engine = ControlNode::new(
+        dir.path().to_path_buf(),
+        &dest_id,
+        dest_op.clone(),
+        record,
+        peers,
+        ControlStore::open(dir.path()).unwrap(),
+        AdminStore::empty(),
+    );
+
+    let target = PeerRef {
+        addr: "0.1".parse().unwrap(),
+        node: dest_id.clone(),
+    };
+    let requester = PeerRef {
+        addr: "0".parse().unwrap(),
+        node: hop_id.clone(),
+    };
+    let intent = SignedControl::authorize(
+        node(&dest_id),
+        &dest_op,
+        fresh_nonce(),
+        now_unix_seconds() + CONTROL_REQUEST_TTL_SECS,
+        ControlRequest::Query,
+    )
+    .unwrap();
+    let forward = SignedControl::authorize(
+        node(&hop_id),
+        &hop_op,
+        fresh_nonce(),
+        now_unix_seconds() + CONTROL_REQUEST_TTL_SECS,
+        ControlRequest::Query,
+    )
+    .unwrap();
+    let request = routed(
+        target,
+        requester,
+        intent,
+        None,
+        vec![RoutedForward::new(
+            PeerRef {
+                addr: "0".parse().unwrap(),
+                node: hop_id.clone(),
+            },
+            forward,
+        )],
+    );
+
+    // Stale: the in-memory record still says `0`, so `target.addr == 0.1` fails
+    // before the forward/registry checks.
+    assert_eq!(
+        engine
+            .receive_routed_at(remote, request.clone(), now_unix_seconds())
+            .await,
+        ControlReply::Rejected(RejectCode::Unauthorized)
+    );
+
+    // A separate process re-parents and re-addresses the node on disk. The
+    // address must be cleared before the parent link (a root address is invalid
+    // under a parent).
+    let mut external = RecordStore::open(dir.path(), &dest_id).unwrap();
+    external.unset_address().unwrap();
+    external.set_parent("external-parent", 1).unwrap();
+    external.set_address("0.1".parse().unwrap()).unwrap();
+    external.save().unwrap();
+
+    assert!(
+        matches!(
+            engine
+                .receive_routed_at(remote, request, now_unix_seconds())
+                .await,
+            ControlReply::Snapshot(_)
+        ),
+        "the externally rewritten record must be observed before the address check"
+    );
+    assert_eq!(
+        engine.record().address.as_ref().map(ToString::to_string),
+        Some("0.1".to_string()),
+        "the engine must adopt the on-disk record"
+    );
+}
+
+/// A routed request must observe a `ledger_peers.json` row written by a
+/// *separate process*. A routed topology request from a senior child is refused
+/// while the destination's in-memory registry is empty; once the child's row is
+/// written to disk the forward verifies and the request is dispatched.
+#[tokio::test]
+async fn routed_observes_externally_written_peer_row() {
+    let dest_secret = SecretKey::generate();
+    let dest_id = dest_secret.public().to_string();
+    let dest_op = operator(&dest_secret);
+    let child_secret = SecretKey::generate();
+    let child_id = child_secret.public().to_string();
+    let child_op = operator(&child_secret);
+    let remote = EndpointId::from(child_secret.public());
+
+    let dir = tempfile::tempdir().unwrap();
+    // The destination lists the child as its only (so senior) node child.
+    let mut record = RecordStore::open(dir.path(), &dest_id).unwrap();
+    record.set_address("0".parse().unwrap()).unwrap();
+    record
+        .attach_child(&child_id, ChildKind::Node, Some(0), 1)
+        .unwrap();
+    record.save().unwrap();
+
+    // Empty in-memory registry and no `ledger_peers.json` on disk.
+    let mut engine = ControlNode::new(
+        dir.path().to_path_buf(),
+        &dest_id,
+        dest_op.clone(),
+        record,
+        PeerRegistry::new(),
+        ControlStore::open(dir.path()).unwrap(),
+        AdminStore::empty(),
+    );
+
+    let query = || {
+        SignedControl::authorize(
+            node(&child_id),
+            &child_op,
+            fresh_nonce(),
+            now_unix_seconds() + CONTROL_REQUEST_TTL_SECS,
+            ControlRequest::Query,
+        )
+        .unwrap()
+    };
+    let make = |intent: SignedControl| {
+        routed(
+            PeerRef {
+                addr: "0".parse().unwrap(),
+                node: dest_id.clone(),
+            },
+            PeerRef {
+                addr: "0.0".parse().unwrap(),
+                node: child_id.clone(),
+            },
+            intent.clone(),
+            None,
+            vec![RoutedForward::new(
+                PeerRef {
+                    addr: "0.0".parse().unwrap(),
+                    node: child_id.clone(),
+                },
+                intent,
+            )],
+        )
+    };
+
+    // Without the row, `verify_forward` refuses the routed frame.
+    assert_eq!(
+        engine
+            .receive_routed_at(remote, make(query()), now_unix_seconds())
+            .await,
+        ControlReply::Rejected(RejectCode::Unauthorized)
+    );
+
+    // A separate process registers the child's operator/ledger row.
+    let mut external = PeerRegistry::new();
+    external.insert(node_row(&child_id, &child_op, 4)).unwrap();
+    cawala_node::save_peers(dir.path(), &external).unwrap();
+
+    assert!(
+        matches!(
+            engine
+                .receive_routed_at(remote, make(query()), now_unix_seconds())
+                .await,
+            ControlReply::Snapshot(_)
+        ),
+        "the externally written peer row must let the routed frame verify"
+    );
+    assert!(
+        engine.peers().get(&node(&child_id)).is_some(),
+        "the engine must adopt the on-disk registry"
+    );
+}

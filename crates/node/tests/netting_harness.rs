@@ -408,7 +408,7 @@ impl Benches {
 
     fn load_raw(&self, orders: &[PaymentOrder]) -> anyhow::Result<HarnessInputs> {
         let path = self.orders_path(orders);
-        netting_harness::load(&self.peer_dirs(), Some(path.to_str().unwrap()), None)
+        netting_harness::load(&self.peer_dirs(), Some(path.to_str().unwrap()), None, None)
     }
 
     fn load(&self, orders: &[PaymentOrder]) -> HarnessInputs {
@@ -654,7 +654,7 @@ fn conflicting_registry_rows_across_peers_are_a_hard_load_error() {
     let p1 = make_peer_at(&d1, "same-node", "0", None, &[]);
     let p2 = make_peer_at(&d2, "same-node", "0", None, &[]);
 
-    let err = netting_harness::load(&[p1.dir.clone(), p2.dir.clone()], None, None).unwrap_err();
+    let err = netting_harness::load(&[p1.dir.clone(), p2.dir.clone()], None, None, None).unwrap_err();
     assert!(
         format!("{err:#}").contains("conflicting registry rows"),
         "unexpected error: {err:#}"
@@ -809,7 +809,7 @@ fn islands_both_rooted_at_zero_load_and_audit_independently() {
     });
 
     let peers = vec![r.dir.clone(), a.dir.clone(), x.dir.clone(), y.dir.clone()];
-    let inputs = netting_harness::load(&peers, None, None).unwrap();
+    let inputs = netting_harness::load(&peers, None, None, None).unwrap();
     assert_eq!(inputs.components.len(), 3, "primary + two islands");
     assert_eq!(inputs.topology.root_id(), "R");
     assert_eq!(inputs.components[1].topology.root_id(), "X");
@@ -838,6 +838,58 @@ fn islands_both_rooted_at_zero_load_and_audit_independently() {
         .notes
         .iter()
         .any(|note| note.contains("topology components: 3")));
+}
+
+/// `load`'s `primary_root` selector: designating a **smaller** component as
+/// primary reorders the partition so the report labels it `primary`, and an
+/// unknown designated id is a clear load error.
+#[test]
+fn designated_primary_root_relabels_components() {
+    let root = tempfile::tempdir().unwrap();
+    let r = make_peer_at(
+        &root.path().join("r"),
+        "R",
+        "0",
+        None,
+        &[("A", ChildKind::Node, 1)],
+    );
+    let a = make_peer_at(
+        &root.path().join("a"),
+        "A",
+        "0.1",
+        Some(("R", 1)),
+        &[],
+    );
+    let x = make_peer_at(&root.path().join("x"), "X", "0", None, &[]);
+    let peers = vec![r.dir.clone(), a.dir.clone(), x.dir.clone()];
+
+    // Default: the larger R/A component leads.
+    let default = netting_harness::load(&peers, None, None, None).unwrap();
+    let report = netting_harness::report(&default);
+    assert_eq!(report.components[0].root, "R");
+    assert!(report.components[0].primary);
+    assert_eq!(report.components[1].root, "X");
+    assert!(!report.components[1].primary);
+
+    // Designating the smaller island promotes it to primary.
+    let designated = netting_harness::load(&peers, None, None, Some("X")).unwrap();
+    let report = netting_harness::report(&designated);
+    assert_eq!(report.components[0].root, "X");
+    assert!(report.components[0].primary);
+    assert_eq!(report.components[1].root, "R");
+    assert!(!report.components[1].primary);
+    assert!(
+        report.notes.iter().any(|note| note.contains("primary root X")),
+        "notes: {:?}",
+        report.notes
+    );
+
+    // An id that names no peer record is a clear error.
+    let err = netting_harness::load(&peers, None, None, Some("nope")).unwrap_err();
+    assert!(
+        err.to_string().contains("designated primary root 'nope'"),
+        "unexpected error: {err:#}"
+    );
 }
 
 /// A stale parent-side `children` row (the old parent still lists an exited
@@ -871,7 +923,7 @@ fn stale_parent_child_row_is_ignored_with_stale_child_link() {
     );
 
     let peers = vec![r.dir.clone(), a.dir.clone(), x.dir.clone()];
-    let inputs = netting_harness::load(&peers, None, None).unwrap();
+    let inputs = netting_harness::load(&peers, None, None, None).unwrap();
     assert_eq!(inputs.components.len(), 2, "primary R/A + island X");
     assert_eq!(inputs.topology.root_id(), "R");
     assert_eq!(inputs.components[1].topology.root_id(), "X");
@@ -943,7 +995,7 @@ fn cross_component_order_is_an_advisory_route_invalid() {
     std::fs::write(&path, serde_json::to_string(&order).unwrap()).unwrap();
 
     let peers = vec![r.dir.clone(), a.dir.clone(), x.dir.clone()];
-    let inputs = netting_harness::load(&peers, Some(path.to_str().unwrap()), None).unwrap();
+    let inputs = netting_harness::load(&peers, Some(path.to_str().unwrap()), None, None).unwrap();
     let report = netting_harness::report(&inputs);
     assert!(
         report.findings.is_empty(),
@@ -984,7 +1036,7 @@ fn reattached_stranded_pair_surfaces_exactly_once() {
     });
 
     let peers = vec![r.dir.clone(), a.dir.clone()];
-    let inputs = netting_harness::load(&peers, None, None).unwrap();
+    let inputs = netting_harness::load(&peers, None, None, None).unwrap();
     let report = netting_harness::report(&inputs);
     let mismatches: Vec<&Finding> = report
         .findings
@@ -1038,7 +1090,7 @@ fn exit_advisories_do_not_suppress_nets() {
         y.dir.clone(),
     ];
     let path = b.orders_path(std::slice::from_ref(&order));
-    let inputs = netting_harness::load(&peers, Some(path.to_str().unwrap()), None).unwrap();
+    let inputs = netting_harness::load(&peers, Some(path.to_str().unwrap()), None, None).unwrap();
     let report = netting_harness::report(&inputs);
 
     assert!(
@@ -1120,7 +1172,7 @@ fn reattach_with_stranded_parent_blocks_netting_on_new_edge() {
         new_parent.dir.clone(),
         x.dir.clone(),
     ];
-    let inputs = netting_harness::load(&peers, None, None).unwrap();
+    let inputs = netting_harness::load(&peers, None, None, None).unwrap();
     let report = netting_harness::report(&inputs);
 
     // The new edge N -> X is a hard UnbackedClaim.
@@ -1178,3 +1230,97 @@ fn reattach_with_stranded_parent_blocks_netting_on_new_edge() {
     assert!(!report.findings.is_empty());
     assert!(report.nets.is_empty());
 }
+
+// ── 13. Mixed components plus a hard finding ──────────────────────────────
+
+/// An island (advisory `Detached`) and a genuine hard finding (a mirror
+/// mismatch) coexist: both buckets are reported, `nets` is suppressed by the
+/// hard finding, and the default CLI exit is 1. The island-only baseline (same
+/// fixture, before the tamper) still collapses `nets` and exits 0, pinning that
+/// the hard finding — not the island — is what blocks reconciliation.
+#[test]
+fn mixed_island_and_hard_finding_report_both_and_block_netting() {
+    let mut b = Benches::new();
+    b.fund_setup(1000);
+    let order = order(1);
+    b.apply(&order);
+
+    // An independent island Y, plus a stale parent-side row for it on R.
+    let y = make_peer_at(
+        &b.root.path().join("y"),
+        "Y",
+        "0",
+        None,
+        &[("uY", ChildKind::User, 0)],
+    );
+    let mut r_store = record::RecordStore::open(&b.r.dir, &b.r.node_id).unwrap();
+    r_store
+        .attach_child("Y", ChildKind::Node, Some(0), 0)
+        .unwrap();
+    r_store.save().unwrap();
+
+    let peers = vec![
+        b.r.dir.clone(),
+        b.a.dir.clone(),
+        b.b.dir.clone(),
+        y.dir.clone(),
+    ];
+    let path = b.orders_path(std::slice::from_ref(&order));
+
+    // Baseline: advisory island only, no hard finding -> nets collapse, exit 0.
+    let clean = netting_harness::load(&peers, Some(path.to_str().unwrap()), None, None).unwrap();
+    let clean = netting_harness::report(&clean);
+    assert!(
+        clean.findings.is_empty(),
+        "island-only must have no hard finding: {:?}",
+        clean.findings
+    );
+    assert!(clean
+        .advisories
+        .iter()
+        .any(|f| matches!(f, Finding::Detached { root, .. } if root == &n("Y"))));
+    assert!(
+        !clean.nets.is_empty(),
+        "an island alone must not suppress nets"
+    );
+
+    // A genuine hard finding: A descends 50 more to uA without R extending
+    // Child(A), so the R -> A edge no longer mirrors.
+    let aid = b.a.id();
+    let akey = b.a.key.clone();
+    descend(b.set.get_mut(&aid).unwrap(), &akey, &n("uA"), 50);
+    b.persist_all();
+
+    let inputs = netting_harness::load(&peers, Some(path.to_str().unwrap()), None, None).unwrap();
+    let report = netting_harness::report(&inputs);
+
+    // Both buckets are populated and split correctly.
+    assert!(
+        report.findings.iter().any(|f| matches!(
+            f,
+            Finding::MirrorMismatch { edge, .. }
+                if edge.parent == b.r.id() && edge.child == b.a.id()
+        )),
+        "expected the hard R -> A mirror mismatch: {:?}",
+        report.findings
+    );
+    assert!(
+        report.advisories.iter().any(
+            |f| matches!(f, Finding::Detached { root, .. } if root == &n("Y"))
+        ),
+        "the island must stay advisory: {:?}",
+        report.advisories
+    );
+    assert!(report.advisories.iter().any(
+        |f| matches!(f, Finding::StaleChildLink { parent, child } if parent == &b.r.id() && child == &n("Y"))
+    ));
+    assert!(report.advisories.iter().all(|f| f.is_advisory()));
+
+    // The hard finding suppresses netting and drives the default exit code.
+    assert!(
+        report.nets.is_empty(),
+        "a hard finding must suppress nets even alongside an advisory island"
+    );
+    assert!(!report.findings.is_empty(), "the default CLI exits 1");
+}
+

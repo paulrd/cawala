@@ -9,7 +9,9 @@
 //! - the **topology** from each dir's `node.json` (parent/child links), or a
 //!   saved [`Topology`] snapshot for historical re-slotting. A network that has
 //!   split through exit is assembled as **one [`Topology`] per weakly connected
-//!   component**, primary first (see [`build_topology_partition`]);
+//!   component**, primary first (see [`build_topology_partition`]). The primary
+//!   component defaults to the largest (ties by root id), or is designated
+//!   explicitly by a member node id (the harness commands' `--primary-root`);
 //! - the **peer registry** from each dir's self row plus every
 //!   `ledger_peers.json` row, rejecting any conflict;
 //! - the **ledgers** by replaying each `entries.log` into an in-memory
@@ -137,7 +139,11 @@ pub struct HarnessReport {
 /// `orders_source` is an optional operator-supplied order source: a file path
 /// or `-` for stdin, holding either a JSON array of orders or one JSON order
 /// per line. `topology_file` optionally overrides the topology with a saved
-/// snapshot.
+/// snapshot (in which case `primary_root` is unused).
+///
+/// `primary_root` optionally designates the primary topology component by
+/// naming any member node id; when `None` the largest component is primary
+/// (ties by root id). It is ignored when `topology_file` supplies the topology.
 ///
 /// Every peer dir is validated and held under a shared ledger lock for the
 /// duration of the load (released before returning).
@@ -145,6 +151,7 @@ pub fn load(
     peer_dirs: &[PathBuf],
     orders_source: Option<&str>,
     topology_file: Option<&Path>,
+    primary_root: Option<&str>,
 ) -> Result<HarnessInputs> {
     if peer_dirs.is_empty() {
         bail!("no peer data dirs supplied");
@@ -179,7 +186,7 @@ pub fn load(
             Vec::new(),
         ),
         None => {
-            let partition = build_topology_partition(&records, None)?;
+            let partition = build_topology_partition(&records, primary_root)?;
             (partition.components, partition.findings)
         }
     };
@@ -984,6 +991,82 @@ mod tests {
         assert!(build_topology(std::slice::from_ref(&dangling)).is_err());
     }
 
+    /// A designated primary root may promote a **smaller** component, and the
+    /// partition order (which `report` turns into `primary`/island labelling)
+    /// follows it. An id that names no record is a clear error.
+    #[test]
+    fn designated_primary_root_promotes_a_smaller_component() {
+        let three_node = |child_a: &str, child_b: &str| {
+            let children = vec![
+                record::ChildEntry {
+                    child_id: child_a.to_string(),
+                    kind: ChildKind::Node,
+                    slot: 0,
+                    date_joined: 0,
+                },
+                record::ChildEntry {
+                    child_id: child_b.to_string(),
+                    kind: ChildKind::Node,
+                    slot: 1,
+                    date_joined: 0,
+                },
+            ];
+            vec![
+                record::NodeRecord {
+                    node_id: "root".to_string(),
+                    address: Some("0".parse().unwrap()),
+                    parent: None,
+                    children,
+                },
+                record::NodeRecord {
+                    node_id: child_a.to_string(),
+                    address: Some("0.0".parse().unwrap()),
+                    parent: Some(record::ParentLink {
+                        parent_id: "root".to_string(),
+                        slot: 0,
+                    }),
+                    children: vec![],
+                },
+                record::NodeRecord {
+                    node_id: child_b.to_string(),
+                    address: Some("0.1".parse().unwrap()),
+                    parent: Some(record::ParentLink {
+                        parent_id: "root".to_string(),
+                        slot: 1,
+                    }),
+                    children: vec![],
+                },
+            ]
+        };
+        let island = record::NodeRecord {
+            node_id: "island".to_string(),
+            address: Some("0".parse().unwrap()),
+            parent: None,
+            children: vec![],
+        };
+        let mut records = three_node("a", "b");
+        records.push(island);
+
+        // Default: the largest component is primary.
+        let default = build_topology_partition(&records, None).unwrap();
+        assert_eq!(default.components[0].topology.root_id(), "root");
+        assert_eq!(default.components[0].topology.node_count(), 3);
+        assert_eq!(default.components[1].topology.root_id(), "island");
+
+        // Naming the smaller island promotes it to position 0.
+        let designated = build_topology_partition(&records, Some("island")).unwrap();
+        assert_eq!(designated.components[0].topology.root_id(), "island");
+        assert_eq!(designated.components[0].topology.node_count(), 1);
+        assert_eq!(designated.components[1].topology.root_id(), "root");
+
+        // An unknown (or absent) id is a hard error.
+        let err = build_topology_partition(&records, Some("nope")).unwrap_err();
+        assert!(
+            err.to_string().contains("designated primary root 'nope'"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn merge_peer_rejects_conflict_and_dedups_identical() {
         let op = OperatorPubKey::from_bytes(&[1u8; 32]).unwrap();
@@ -1144,7 +1227,7 @@ mod tests {
         leaf_svc.commit().unwrap();
 
         let peers = vec![root_dir.path().to_path_buf(), leaf_dir.path().to_path_buf()];
-        let inputs = load(&peers, None, None).unwrap();
+        let inputs = load(&peers, None, None, None).unwrap();
         assert_eq!(inputs.topology.root_id(), root_id);
         assert_eq!(inputs.topology.node_count(), 3, "root, leaf, user-a");
         assert_eq!(inputs.ledgers.node_ids().count(), 2);
@@ -1199,7 +1282,7 @@ mod tests {
         bytes.extend_from_slice(&frame);
         std::fs::write(&log_path, bytes).unwrap();
 
-        let err = load(&[dir.path().to_path_buf()], None, None).unwrap_err();
+        let err = load(&[dir.path().to_path_buf()], None, None, None).unwrap_err();
         assert!(err.to_string().contains("commitment chain"), "unexpected: {err}");
     }
 }
