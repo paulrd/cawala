@@ -35,3 +35,6 @@ web-time = "1.1"
 # Native tests build ledger fixtures whose `OpenAccount` body needs the
 # topology `ChildKind`; not part of the wasm dependency graph.
 cawala-topology = { path = "../topology" }
+# Test-only tokio features (macros + rt for `#[tokio::test]`); never compiled
+# for wasm builds of this crate.
+tokio = { version = "1.43.0", default-features = false, features = ["macros", "rt"] }

@@ -47,8 +47,9 @@ pub mod ledger_state;
 pub mod state;
 
 use crate::control::{
-    ControlHandler, JOIN_TTL_SECONDS, SharedControl, exchange_admin, exchange_control,
-    invite_endpoint_addr,
+    ControlHandler, JOIN_TTL_SECONDS, ROUTED_REPLY_TIMEOUT_SECS, SharedControl,
+    build_routed_control, exchange_admin, exchange_control, invite_endpoint_addr,
+    routed_request_envelope, should_try_routed, sign_admin_request, verify_routed_reply_bytes,
 };
 use crate::dto::{
     AdminActionDto, AdminSnapshotDto, ControlEventDto, JoinOutcome, JoinStatus, LedgerEventDto,
@@ -198,6 +199,20 @@ enum ParentRule {
     Required(Option<String>),
 }
 
+/// Result of queueing one accepted envelope for delivery.
+///
+/// A dedicated enum keeps the oversized [`Envelope`] out of the error variant
+/// (clippy's `result_large_err`); the variants map one-to-one onto
+/// [`TrySendError`].
+enum DeliveryOutcome {
+    /// Queued successfully.
+    Delivered,
+    /// The target queue is full; report `Busy`.
+    Full,
+    /// The target queue is closed; report `Internal`.
+    Closed,
+}
+
 /// Server side of the `cawala/msg/0` protocol for a browser leaf.
 ///
 /// Mirrors the native `cawala-node` `MsgHandler`'s receive-origin behavior:
@@ -209,6 +224,14 @@ pub struct MsgHandler {
     self_node: String,
     seen: Mutex<SeenSet>,
     sink: mpsc::Sender<Envelope>,
+    /// Dedicated delivery queue for `MSG_CONTROL_V1` envelopes.
+    ///
+    /// A control client owns this queue's receiver and awaits correlated
+    /// routed replies on it, so routed replies never mix into the general
+    /// [`ClientNode::try_recv_envelope`] drain that JS reads. `None` for a
+    /// fixed-address leaf, which cannot originate routed control and so keeps
+    /// delivering every message type to `sink`.
+    control: Option<mpsc::Sender<Envelope>>,
 }
 
 impl std::fmt::Debug for MsgHandler {
@@ -223,28 +246,39 @@ impl std::fmt::Debug for MsgHandler {
 impl MsgHandler {
     /// Build a handler for the leaf at the fixed `self_addr`/`self_node`,
     /// delivering accepted envelopes to `sink`.
+    ///
+    /// A fixed-address leaf has no control identity and cannot originate a
+    /// routed request, so it has no control-reply queue: every delivered
+    /// envelope (including any `MSG_CONTROL_V1`) goes to `sink`, preserving the
+    /// pre-split behavior.
     pub fn new(self_addr: OctAddr, self_node: String, sink: mpsc::Sender<Envelope>) -> Self {
         MsgHandler {
             source: AddressSource::Fixed(self_addr),
             self_node,
             seen: Mutex::new(SeenSet::new(SeenConfig::default())),
             sink,
+            control: None,
         }
     }
 
     /// Build a handler whose asserted address and accepted parent are read live
     /// from `shared`, for a control client that learns its address only after
     /// `JoinApproved`.
+    ///
+    /// `control_sink` receives `MSG_CONTROL_V1` envelopes (routed replies);
+    /// everything else goes to `sink`.
     pub(crate) fn for_shared(
         shared: Arc<SharedControl>,
         self_node: String,
         sink: mpsc::Sender<Envelope>,
+        control_sink: mpsc::Sender<Envelope>,
     ) -> Self {
         MsgHandler {
             source: AddressSource::Shared(shared),
             self_node,
             seen: Mutex::new(SeenSet::new(SeenConfig::default())),
             sink,
+            control: Some(control_sink),
         }
     }
 
@@ -333,10 +367,25 @@ impl MsgHandler {
 
         // 7. A control leaf only accepts envelopes originated by the parent it
         //    joined; the routing leaf is the sole legitimate sender.
-        match self.parent_rule() {
-            ParentRule::Unrestricted => {}
-            ParentRule::Required(Some(parent)) if env.src.node == parent => {}
-            ParentRule::Required(_) => return rejected(msg_id, RejectReason::NotNeighbor),
+        //
+        //    `MSG_CONTROL_V1` is the one exemption: a routed control reply
+        //    travels back down the tree from the target node, so its `src` is
+        //    an ancestor of this leaf, not the joined parent. Accepting it from
+        //    any non-parent origin is safe because (a) the payload is an
+        //    end-to-end operator-signed `SignedRoutedReply` under a signing
+        //    domain that can never be replayed as a control request or an admin
+        //    grant, and (b) the waiter correlates it by `reply_to` against a
+        //    request this leaf just sent and verifies the responder key before
+        //    surfacing it. An unsolicited control envelope therefore cannot
+        //    change any state; it is simply dropped by the waiter. Every other
+        //    check below (dst == self, hop-chain shape, self-not-in-chain,
+        //    last-hop == authenticated remote) still applies unchanged.
+        if env.msg_type != cawala_msg::MSG_CONTROL_V1 {
+            match self.parent_rule() {
+                ParentRule::Unrestricted => {}
+                ParentRule::Required(Some(parent)) if env.src.node == parent => {}
+                ParentRule::Required(_) => return rejected(msg_id, RejectReason::NotNeighbor),
+            }
         }
 
         // 8. Replay: remember (origin, msg_id) and never deliver a duplicate.
@@ -355,19 +404,38 @@ impl MsgHandler {
             };
         }
 
-        match self.sink.try_send(env) {
-            Ok(()) => Ack {
+        match self.deliver(env) {
+            DeliveryOutcome::Delivered => Ack {
                 msg_id,
                 status: AckStatus::Delivered,
             },
-            Err(TrySendError::Full(_)) => {
+            DeliveryOutcome::Full => {
                 self.unobserve(&origin, msg_id);
                 rejected(msg_id, RejectReason::Busy)
             }
-            Err(TrySendError::Closed(_)) => {
+            DeliveryOutcome::Closed => {
                 self.unobserve(&origin, msg_id);
                 rejected(msg_id, RejectReason::Internal)
             }
+        }
+    }
+
+    /// Queue one accepted envelope on its delivery channel.
+    ///
+    /// `MSG_CONTROL_V1` goes to the dedicated control queue when one exists,
+    /// so routed replies do not pollute the JS envelope/ledger drain;
+    /// everything else (and every message on a fixed-address leaf) goes to the
+    /// general sink.
+    fn deliver(&self, env: Envelope) -> DeliveryOutcome {
+        let channel = if env.msg_type == cawala_msg::MSG_CONTROL_V1 {
+            self.control.as_ref().unwrap_or(&self.sink)
+        } else {
+            &self.sink
+        };
+        match channel.try_send(env) {
+            Ok(()) => DeliveryOutcome::Delivered,
+            Err(TrySendError::Full(_)) => DeliveryOutcome::Full,
+            Err(TrySendError::Closed(_)) => DeliveryOutcome::Closed,
         }
     }
 
@@ -477,6 +545,13 @@ pub struct ClientNode {
     router: Router,
     address: Option<String>,
     rx: Option<tokio::sync::Mutex<mpsc::Receiver<Envelope>>>,
+    /// Receiver for `MSG_CONTROL_V1` envelopes split out by [`MsgHandler`].
+    ///
+    /// Held here (not in [`SharedControl`]) so the async routed request can
+    /// await a correlated reply without stealing ledger envelopes via
+    /// [`ClientNode::try_recv_envelope`]. `None` for clients with no control
+    /// identity.
+    control_rx: Option<tokio::sync::Mutex<mpsc::Receiver<Envelope>>>,
     control: Arc<SharedControl>,
     ledger: Mutex<LedgerStateV1>,
 }
@@ -503,6 +578,7 @@ impl ClientNode {
             router,
             address: None,
             rx: None,
+            control_rx: None,
             control,
             ledger: Mutex::new(LedgerStateV1::new()),
         })
@@ -533,6 +609,7 @@ impl ClientNode {
             router,
             address: Some(self_addr),
             rx: Some(tokio::sync::Mutex::new(rx)),
+            control_rx: None,
             control,
             ledger: Mutex::new(LedgerStateV1::new()),
         })
@@ -571,18 +648,23 @@ impl ClientNode {
         // rather than growing without limit. The handler reads the assigned
         // address live from `control`, which is empty until `JoinApproved`.
         let (sink, rx) = mpsc::channel(32);
+        // Routed control replies are split onto their own queue so the JS
+        // envelope/ledger drain ([`ClientNode::try_recv_envelope`]) sees only
+        // application traffic.
+        let (control_sink, control_rx) = mpsc::channel(32);
         let router = Router::builder(endpoint)
             .accept(proto::ALPN, PingHandler)
             .accept(CONTROL_ALPN, ControlHandler::new(Arc::clone(&control)))
             .accept(
                 cawala_msg::ALPN,
-                MsgHandler::for_shared(Arc::clone(&control), self_node, sink),
+                MsgHandler::for_shared(Arc::clone(&control), self_node, sink, control_sink),
             )
             .spawn();
         Ok(ClientNode {
             router,
             address: None,
             rx: Some(tokio::sync::Mutex::new(rx)),
+            control_rx: Some(tokio::sync::Mutex::new(control_rx)),
             control,
             ledger: Mutex::new(LedgerStateV1::new()),
         })
@@ -769,17 +851,19 @@ impl ClientNode {
 
     /// Query `node`'s admin snapshot (its topology plus pending joins).
     ///
-    /// `node` is the target's endpoint id. Requires a configured admin key and
-    /// dials the node directly over `cawala/control/0`.
-    pub async fn admin_query(&self, node: String) -> Result<AdminSnapshotDto, JsError> {
-        let (target, admin) = self.admin_context(&node)?;
-        let reply = exchange_admin(
-            self.router.endpoint(),
-            target,
-            &admin,
-            ControlRequest::AdminQuery,
-        )
-        .await?;
+    /// `node` is the target's endpoint id. Requires a configured admin key.
+    /// When `node_addr` is `None` the node is dialed directly over
+    /// `cawala/control/0`; when it is `Some`, a failed direct dial (transport
+    /// error only) is retried over the routed tree using `node_addr` as the
+    /// target's asserted address.
+    pub async fn admin_query(
+        &self,
+        node: String,
+        node_addr: Option<String>,
+    ) -> Result<AdminSnapshotDto, JsError> {
+        let reply = self
+            .admin_exchange(&node, ControlRequest::AdminQuery, node_addr)
+            .await?;
         match reply {
             ControlReply::AdminSnapshot(snapshot) => Ok(AdminSnapshotDto::from_snapshot(&snapshot)),
             ControlReply::Rejected(code) => Err(admin_rejected(code)),
@@ -788,16 +872,19 @@ impl ClientNode {
     }
 
     /// Approve `child`'s pending join at `node`, optionally assigning `slot`.
+    ///
+    /// `node_addr` optionally names `node`'s asserted address for the routed
+    /// fallback; see [`ClientNode::admin_query`].
     pub async fn admin_approve_join(
         &self,
         node: String,
         child: String,
         slot: Option<u8>,
+        node_addr: Option<String>,
     ) -> Result<AdminActionDto, JsError> {
-        let (target, admin) = self.admin_context(&node)?;
         let child = parse_child(&child)?;
         let request = ControlRequest::AdminApproveJoin(AdminJoinApprove { child, slot });
-        let reply = exchange_admin(self.router.endpoint(), target, &admin, request).await?;
+        let reply = self.admin_exchange(&node, request, node_addr).await?;
         match reply {
             ControlReply::AdminApproved(approved) => Ok(AdminActionDto::from_approved(&approved)),
             ControlReply::AdminRejected(rejected) => Ok(AdminActionDto::from_rejected(&rejected)),
@@ -807,16 +894,19 @@ impl ClientNode {
     }
 
     /// Reject `child`'s pending join at `node`, optionally carrying `reason`.
+    ///
+    /// `node_addr` optionally names `node`'s asserted address for the routed
+    /// fallback; see [`ClientNode::admin_query`].
     pub async fn admin_reject_join(
         &self,
         node: String,
         child: String,
         reason: Option<String>,
+        node_addr: Option<String>,
     ) -> Result<AdminActionDto, JsError> {
-        let (target, admin) = self.admin_context(&node)?;
         let child = parse_child(&child)?;
         let request = ControlRequest::AdminRejectJoin(AdminJoinReject { child, reason });
-        let reply = exchange_admin(self.router.endpoint(), target, &admin, request).await?;
+        let reply = self.admin_exchange(&node, request, node_addr).await?;
         match reply {
             ControlReply::AdminApproved(approved) => Ok(AdminActionDto::from_approved(&approved)),
             ControlReply::AdminRejected(rejected) => Ok(AdminActionDto::from_rejected(&rejected)),
@@ -826,21 +916,178 @@ impl ClientNode {
     }
 
     /// Re-send `child`'s most recent stored decision from `node`.
+    ///
+    /// `node_addr` optionally names `node`'s asserted address for the routed
+    /// fallback; see [`ClientNode::admin_query`].
     pub async fn admin_redeliver_join(
         &self,
         node: String,
         child: String,
+        node_addr: Option<String>,
     ) -> Result<AdminActionDto, JsError> {
-        let (target, admin) = self.admin_context(&node)?;
         let child = parse_child(&child)?;
         let request = ControlRequest::AdminRedeliverJoin(AdminRedeliverJoin { child });
-        let reply = exchange_admin(self.router.endpoint(), target, &admin, request).await?;
+        let reply = self.admin_exchange(&node, request, node_addr).await?;
         match reply {
             ControlReply::AdminApproved(approved) => Ok(AdminActionDto::from_approved(&approved)),
             ControlReply::AdminRejected(rejected) => Ok(AdminActionDto::from_rejected(&rejected)),
             ControlReply::Rejected(code) => Err(admin_rejected(code)),
             _ => Err(unexpected_admin_reply("an admin redelivery")),
         }
+    }
+
+    /// Run one admin request: direct first, routed fallback only on a
+    /// **transport** failure.
+    ///
+    /// With `node_addr == None` this is exactly the old direct exchange,
+    /// including its error. With `Some`, a failed direct dial (dial error,
+    /// timeout, no route) is retried over the routed tree; a delivered
+    /// `Rejected(..)` reply means the node answered and is never retried.
+    async fn admin_exchange(
+        &self,
+        node: &str,
+        request: ControlRequest,
+        node_addr: Option<String>,
+    ) -> Result<ControlReply, JsError> {
+        let (target, admin) = self.admin_context(node)?;
+        let direct = exchange_admin(self.router.endpoint(), target, &admin, request.clone()).await;
+
+        if !should_try_routed(&direct) {
+            return direct;
+        }
+        let Some(raw_addr) = node_addr else {
+            // No target address supplied: preserve the exact direct error and
+            // never fall back.
+            return direct;
+        };
+        let target_addr: OctAddr = raw_addr.parse().map_err(to_js_err)?;
+        // The routed intent is signed exactly like the direct request: origin
+        // is the target (the destination engine requires `origin == self`) and
+        // the controller is the delegated admin key. The per-hop forward is
+        // signed separately with this browser's operator key.
+        let intent = sign_admin_request(target, &admin, request)?;
+        self.exchange_routed_control(target, target_addr, intent)
+            .await
+    }
+
+    /// Send `intent` to `target` over the routing tree and await its verified
+    /// reply.
+    ///
+    /// The browser must be joined (an assigned address and parent). The
+    /// request is framed as a `MSG_CONTROL_V1` envelope addressed to
+    /// `target.addr` and dialed to the parent; the reply arrives later through
+    /// the `cawala/msg/0` accept loop on the split control queue. A reply is
+    /// accepted only if it decodes as a
+    /// [`SignedRoutedReply`](cawala_control::SignedRoutedReply), correlates by
+    /// `reply_to`, echoes this client as `requester`, names `target` as
+    /// `responder`, and verifies under the target node's operator key. A
+    /// non-matching control envelope is dropped: one outstanding routed request
+    /// per client is the intended usage, and an uncorrelated reply cannot be
+    /// trusted. The control-receiver mutex is held for the whole wait, so
+    /// concurrent routed requests on one client are serialized.
+    async fn exchange_routed_control(
+        &self,
+        target: EndpointId,
+        target_addr: OctAddr,
+        intent: SignedControl,
+    ) -> Result<ControlReply, JsError> {
+        let operator = self
+            .control
+            .operator
+            .clone()
+            .ok_or_else(|| JsError::new("client has no control identity; use spawn_control"))?;
+        let (self_addr, parent) = self.joined_context()?;
+        let requester = PeerRef {
+            addr: self_addr,
+            node: self.control.node_id().to_string(),
+        };
+        let target_ref = PeerRef {
+            addr: target_addr,
+            node: target.to_string(),
+        };
+
+        let mut forward_nonce = [0u8; 8];
+        getrandom::fill(&mut forward_nonce).map_err(to_js_err)?;
+        let mut id_bytes = [0u8; MsgId::LEN];
+        getrandom::fill(&mut id_bytes).map_err(to_js_err)?;
+        let mut nonce_bytes = [0u8; 8];
+        getrandom::fill(&mut nonce_bytes).map_err(to_js_err)?;
+
+        let routed = build_routed_control(
+            target_ref.clone(),
+            requester.clone(),
+            intent,
+            &operator,
+            u64::from_le_bytes(forward_nonce),
+            now_unix_seconds().saturating_add(CONTROL_REQUEST_TTL_SECS),
+        )
+        .map_err(to_js_err)?;
+        // `to_bytes` rejects a payload over `MAX_CONTROL_FRAME` before framing.
+        let payload = routed.to_bytes().map_err(to_js_err)?;
+        let env = routed_request_envelope(
+            &requester,
+            &target_ref,
+            MsgId::from_bytes(id_bytes),
+            u64::from_le_bytes(nonce_bytes),
+            payload,
+        );
+
+        let next_hop: EndpointId = parent.node_id.as_str().parse().map_err(to_js_err)?;
+        let ack = self.exchange_ack(next_hop, &env).await?;
+        match ack.status {
+            AckStatus::Delivered | AckStatus::Duplicate => {}
+            AckStatus::Rejected(_) => {
+                return Err(JsError::new(&format!(
+                    "routed control request refused by the parent relay: {}",
+                    ack.status_str()
+                )));
+            }
+        }
+
+        let control_rx = self.control_rx.as_ref().ok_or_else(|| {
+            JsError::new("client has no routed-control channel; use spawn_control")
+        })?;
+        // Serialize concurrent routed waits on one client.
+        let mut rx = control_rx.lock().await;
+        let request_msg_id = env.msg_id;
+
+        let wait_for_reply = async {
+            loop {
+                let received = rx
+                    .recv()
+                    .await
+                    .ok_or_else(|| JsError::new("control reply channel closed"))?;
+                if received.msg_type != cawala_msg::MSG_CONTROL_V1 {
+                    continue;
+                }
+                // Cheap correlation first; drop anything that is not our reply
+                // (including malformed and unrelated control traffic).
+                let Ok(decoded) = cawala_control::SignedRoutedReply::from_bytes(&received.payload)
+                else {
+                    tracing::debug!("dropping malformed routed control envelope");
+                    continue;
+                };
+                if decoded.reply.reply_to != request_msg_id {
+                    tracing::debug!("dropping unrelated routed control envelope");
+                    continue;
+                }
+                let verified = verify_routed_reply_bytes(
+                    &received.payload,
+                    request_msg_id,
+                    &target_ref,
+                    &requester,
+                )
+                .map_err(to_js_err)?;
+                return Ok::<ControlReply, JsError>(verified.reply.reply);
+            }
+        };
+
+        n0_future::time::timeout(
+            n0_future::time::Duration::from_secs(ROUTED_REPLY_TIMEOUT_SECS),
+            wait_for_reply,
+        )
+        .await
+        .map_err(|_| JsError::new("routed control request timed out"))?
     }
 
     /// Require a configured admin key and parse the target node id.
@@ -1530,4 +1777,140 @@ fn unexpected_admin_reply(what: &str) -> JsError {
 
 pub(crate) fn to_js_err(err: impl std::fmt::Display) -> JsError {
     JsError::new(&err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cawala_msg::Hop;
+
+    fn peer(addr: &str, node: &str) -> PeerRef {
+        PeerRef {
+            addr: addr.parse().expect("sample address parses"),
+            node: node.to_string(),
+        }
+    }
+
+    /// A joined control leaf at `self_addr` under `parent`, with its split
+    /// envelope and control-reply queues.
+    fn joined_handler(
+        self_addr: &str,
+        parent_node: &str,
+    ) -> (
+        MsgHandler,
+        mpsc::Receiver<Envelope>,
+        mpsc::Receiver<Envelope>,
+    ) {
+        let self_node = "browser-leaf".to_string();
+        let shared = Arc::new(SharedControl::new(
+            self_node.clone(),
+            Some(OperatorSecretKey::from_bytes([1u8; 32])),
+        ));
+        {
+            let mut state = shared.lock_state();
+            state.record.address = Some(self_addr.parse().expect("sample address parses"));
+            state.record.parent = Some(ParentLink {
+                node_id: NodeId::from(parent_node.to_string()),
+                slot: 2,
+            });
+        }
+        let (sink, rx) = mpsc::channel(4);
+        let (control_sink, control_rx) = mpsc::channel(4);
+        (
+            MsgHandler::for_shared(shared, self_node, sink, control_sink),
+            rx,
+            control_rx,
+        )
+    }
+
+    /// An envelope descending from a non-parent ancestor `ancestor` to the
+    /// leaf, with a valid hop chain whose last hop is the authenticated parent.
+    fn ancestor_envelope(
+        ancestor: &PeerRef,
+        self_addr: &str,
+        parent: &PeerRef,
+        msg_type: u16,
+        msg_id: MsgId,
+    ) -> Envelope {
+        let mut env = Envelope::new(
+            ancestor.clone(),
+            self_addr.parse().expect("sample address parses"),
+            msg_id,
+            msg_type,
+            7,
+            Vec::new(),
+        );
+        // One recorded hop consumed one TTL (see `cawala_msg` forwarding).
+        env.ttl = 1;
+        env.hop_chain.push(Hop {
+            addr: parent.addr.clone(),
+            node: parent.node.clone(),
+        });
+        env
+    }
+
+    #[tokio::test]
+    async fn control_envelope_from_non_parent_ancestor_reaches_control_queue() {
+        // The parent must be a real endpoint id so it can authenticate as the
+        // QUIC remote.
+        let parent_op = OperatorSecretKey::from_bytes([2u8; 32]);
+        let parent_node = parent_op.public().to_string();
+        let ancestor_node = OperatorSecretKey::from_bytes([3u8; 32])
+            .public()
+            .to_string();
+        let (handler, mut sink_rx, mut control_rx) = joined_handler("0.2.3", &parent_node);
+        let parent = peer("0.2", &parent_node);
+        let ancestor = peer("0", &ancestor_node);
+        let remote: EndpointId = parent_node.parse().expect("endpoint id parses");
+
+        let env = ancestor_envelope(
+            &ancestor,
+            "0.2.3",
+            &parent,
+            cawala_msg::MSG_CONTROL_V1,
+            MsgId([0x5a; 16]),
+        );
+        let ack = handler.handle(remote, env).await;
+
+        assert_eq!(ack.status, AckStatus::Delivered);
+        let delivered = control_rx
+            .try_recv()
+            .expect("control envelope reaches the control queue");
+        assert_eq!(delivered.msg_type, cawala_msg::MSG_CONTROL_V1);
+        assert_eq!(delivered.src.node, ancestor_node);
+        assert!(
+            sink_rx.try_recv().is_err(),
+            "control replies must not mix into the general sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_control_envelope_from_non_parent_ancestor_is_rejected() {
+        let parent_op = OperatorSecretKey::from_bytes([2u8; 32]);
+        let parent_node = parent_op.public().to_string();
+        let ancestor_node = OperatorSecretKey::from_bytes([4u8; 32])
+            .public()
+            .to_string();
+        let (handler, mut sink_rx, mut control_rx) = joined_handler("0.2.3", &parent_node);
+        let parent = peer("0.2", &parent_node);
+        let ancestor = peer("0", &ancestor_node);
+        let remote: EndpointId = parent_node.parse().expect("endpoint id parses");
+
+        let env = ancestor_envelope(
+            &ancestor,
+            "0.2.3",
+            &parent,
+            MSG_LEDGER_V1,
+            MsgId([0x5b; 16]),
+        );
+        let ack = handler.handle(remote, env).await;
+
+        assert_eq!(
+            ack.status,
+            AckStatus::Rejected(RejectReason::NotNeighbor),
+            "the parent rule still applies to non-control traffic"
+        );
+        assert!(sink_rx.try_recv().is_err());
+        assert!(control_rx.try_recv().is_err());
+    }
 }

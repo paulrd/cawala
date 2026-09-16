@@ -331,6 +331,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "cawala-ledger",
+ "cawala-msg",
  "cawala-topology",
  "postcard",
  "serde",

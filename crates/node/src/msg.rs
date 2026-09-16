@@ -34,16 +34,19 @@ use cawala_ledger::{
     AuthRef, Hash, HopRole, LedgerPubKey, NodeId, PaymentOrder, PeerKeys, PeerRegistry, PeerRole,
     SignedEntry, classify_hop, hop_postings,
 };
+use cawala_control::{ControlReply, RejectCode, RoutedControlV1, SignedRoutedReply};
 use cawala_msg::{
-    Ack, AckStatus, Envelope, EntryProofV1, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
-    MSG_LEDGER_V1, MSG_SETTLE_V1, MessageType, MsgError, MsgId, Neighbor, NeighborKind,
-    OrderRejectV1, OrderResultV1, OrderResultV2, OrderResultV3, OrderStatusV1, PeerRef, RejectReason,
-    Routable,
+    Ack, AckStatus, Envelope, EntryProofV1, Hop, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
+    MSG_CONTROL_V1, MSG_LEDGER_V1, MSG_SETTLE_V1, MessageType, MsgError, MsgId, Neighbor,
+    NeighborKind, OrderRejectV1, OrderResultV1, OrderResultV2, OrderResultV3, OrderStatusV1, PeerRef,
+    RejectReason, Routable,
     RouteDecision, RouteError, Seen, SeenConfig, SeenSet, SettleForwardV1, SettleHopV1,
     SettleOutcomeV2, SettlePayloadV2, SettleRejectV1, SettleResultV2, SettlementStatusV2,
     ValueNoticeV1, VersionedLedgerPayload, decode_versioned,
 };
 use cawala_topology::ChildKind;
+
+use crate::control::{ControlNode, deliver_outbound_decisions};
 
 use crate::ledger_service::{ApplyOutcome, HopOutcome, LedgerService};
 use crate::orders;
@@ -335,6 +338,13 @@ pub struct MsgHandler {
     config: MsgConfig,
     seen: Mutex<SeenSet>,
     sink: tokio::sync::mpsc::Sender<Envelope>,
+    /// Shared control engine, set only when messaging is co-hosted with control
+    /// (see [`spawn_control_node_live_on`](crate::control::spawn_control_node_live_on)).
+    ///
+    /// The plain [`spawn_msg_node`]/[`spawn_msg_node_on`] paths leave this
+    /// `None`, so they cannot authenticate or re-sign routed control and reject
+    /// `MSG_CONTROL_V1` outright.
+    control: Option<Arc<tokio::sync::Mutex<ControlNode>>>,
 }
 
 impl MsgHandler {
@@ -359,6 +369,31 @@ impl MsgHandler {
         config: MsgConfig,
         sink: tokio::sync::mpsc::Sender<Envelope>,
     ) -> Self {
+        Self::build(endpoint, source, config, sink, None)
+    }
+
+    /// Like [`MsgHandler::with_source`], but sharing the node's control engine so
+    /// the handler can authenticate and re-sign `MSG_CONTROL_V1` forwards.
+    ///
+    /// Only the combined control+msg spawn uses this; the plain msg spawn paths
+    /// leave the engine unset.
+    pub(crate) fn with_source_and_control(
+        endpoint: Endpoint,
+        source: NeighborSource,
+        config: MsgConfig,
+        sink: tokio::sync::mpsc::Sender<Envelope>,
+        control: Arc<tokio::sync::Mutex<ControlNode>>,
+    ) -> Self {
+        Self::build(endpoint, source, config, sink, Some(control))
+    }
+
+    fn build(
+        endpoint: Endpoint,
+        source: NeighborSource,
+        config: MsgConfig,
+        sink: tokio::sync::mpsc::Sender<Envelope>,
+        control: Option<Arc<tokio::sync::Mutex<ControlNode>>>,
+    ) -> Self {
         let seen = Mutex::new(SeenSet::new(config.seen));
         MsgHandler {
             endpoint,
@@ -366,6 +401,7 @@ impl MsgHandler {
             config,
             seen,
             sink,
+            control,
         }
     }
 
@@ -413,6 +449,89 @@ impl MsgHandler {
             guard.unobserve(origin, msg_id);
         }
         Ack { msg_id, status }
+    }
+
+    /// Prepare a `MSG_CONTROL_V1` envelope for the next hop.
+    ///
+    /// Both routed payloads declare their version as the first field and share
+    /// the value `1`, so direction cannot be inferred from the route; it is
+    /// decided by a **full decode plus envelope coherence**:
+    ///
+    /// - a [`RoutedControlV1`] whose `target`/`requester` match the envelope is a
+    ///   request: its forward vector must mirror the hop chain 1:1, its
+    ///   predecessor must verify against this hop's registry, and this hop's own
+    ///   forward is appended (freshly signed) before re-encoding;
+    /// - a [`SignedRoutedReply`] whose `responder` matches `env.src` is a reply
+    ///   and is passed through unchanged;
+    /// - anything else is refused.
+    ///
+    /// The control lock is taken only for the synchronous verify/sign and
+    /// released before the caller forwards; it is never held across
+    /// [`forward_once`].
+    async fn prepare_control_forward(&self, env: &mut Envelope) -> Result<(), RejectReason> {
+        // Bound the payload before any decode work.
+        if env.payload.len() > cawala_control::MAX_CONTROL_FRAME as usize {
+            return Err(RejectReason::BadPayload);
+        }
+        let Some(control) = self.control.as_ref() else {
+            // Messaging without a co-hosted control engine cannot route control.
+            return Err(RejectReason::NoRoute);
+        };
+
+        if let Ok(mut routed) = RoutedControlV1::from_bytes(&env.payload)
+            && routed.target.addr == env.dst
+            && routed.requester.node == env.src.node
+            && routed.requester.addr == env.src.addr
+        {
+            // Fail fast on inner coherence (version, bound, per-forward
+            // request/origin equality) instead of trusting the destination to
+            // catch it: a relay must not sign its own forward onto a malformed
+            // payload.
+            if routed.validate().is_err() {
+                return Err(RejectReason::BadPayload);
+            }
+            // `forwards` is the signature vector parallel to the transport hop
+            // chain: exactly one per hop, in path order.
+            if routed.forwards.len() != env.hop_chain.len() {
+                return Err(RejectReason::BadPayload);
+            }
+            for (index, forward) in routed.forwards.iter().enumerate() {
+                if !same_hop(&forward.hop, &env.hop_chain[index]) {
+                    return Err(RejectReason::BadPayload);
+                }
+            }
+            // Relays drop an expired intent rather than carrying it further.
+            if routed.intent.expiry < unix_now() {
+                return Err(RejectReason::TtlExpired);
+            }
+            // Verify the immediate predecessor and append this hop's forward.
+            // The lock is dropped at the end of this block.
+            let own = {
+                let engine = control.lock().await;
+                let Some(last) = routed.forwards.last() else {
+                    return Err(RejectReason::BadPayload);
+                };
+                engine
+                    .verify_forward(last)
+                    .map_err(|_| RejectReason::BadPayload)?;
+                engine
+                    .sign_forward(&routed.intent.request)
+                    .map_err(|_| RejectReason::BadPayload)?
+            };
+            routed.forwards.push(own);
+            env.payload = routed
+                .to_bytes()
+                .map_err(|_| RejectReason::BadPayload)?;
+            return Ok(());
+        }
+
+        if let Ok(reply) = SignedRoutedReply::from_bytes(&env.payload)
+            && reply.reply.responder.node == env.src.node
+        {
+            return Ok(());
+        }
+
+        Err(RejectReason::NoRoute)
     }
 
     /// Full receive decision for one envelope.
@@ -503,6 +622,13 @@ impl MsgHandler {
                     AckStatus::Rejected(RejectReason::TtlExpired)
                 } else {
                     let next_node = next.node.clone();
+                    // Routed control is re-signed per hop before the hop chain
+                    // changes, so a refused payload leaves the envelope intact.
+                    if env.msg_type == MSG_CONTROL_V1
+                        && let Err(reason) = self.prepare_control_forward(&mut env).await
+                    {
+                        return self.settle(&origin, msg_id, AckStatus::Rejected(reason));
+                    }
                     if cawala_msg::append_hop(&mut env, this).is_err() {
                         AckStatus::Rejected(RejectReason::BadHopChain)
                     } else {
@@ -1497,6 +1623,142 @@ pub async fn dispatch_settle_envelope(
                 .await;
         }
     }
+}
+
+/// Process one locally delivered `MSG_CONTROL_V1` envelope addressed to this
+/// node as the routed target.
+///
+/// The transport has authenticated only the final hop, so this function
+/// enforces the envelope-level coherence the routed wrapper cannot see: the
+/// request names this envelope's destination and source, and its forward vector
+/// mirrors the hop chain 1:1. The wrapper's authority rules then run inside
+/// [`ControlNode::receive_routed_at`].
+///
+/// The reply is a fresh descending `MSG_CONTROL_V1` envelope signed by this
+/// node's operator; an already-decoded `SignedRoutedReply` (a reply addressed to
+/// this node as its own requester) is ignored. Any admin decision queued by the
+/// engine is reverse-dialed, and its outcome patched into the reply's
+/// `delivery` field, before the reply is signed.
+pub async fn dispatch_control_envelope(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    control: &Arc<tokio::sync::Mutex<ControlNode>>,
+    env: Envelope,
+) {
+    let routed = match RoutedControlV1::from_bytes(&env.payload) {
+        Ok(routed) => routed,
+        Err(err) => {
+            tracing::warn!(
+                msg_id = %env.msg_id.to_hex(),
+                %err,
+                "malformed MSG_CONTROL_V1 payload at destination; skipping"
+            );
+            return;
+        }
+    };
+    // The authenticated last hop; the msg layer proved it is the QUIC remote and
+    // a direct neighbor, so it is the authority this node binds to.
+    let Some(hop) = env.hop_chain.last() else {
+        return;
+    };
+    let Ok(remote) = hop.node.parse::<EndpointId>() else {
+        return;
+    };
+
+    // Envelope coherence. A request that fails any of these is answered with an
+    // `Unauthorized` reply rather than silently dropped, so the requester can
+    // distinguish a refusal from a lost message.
+    let coherent = routed.target.addr == env.dst
+        && routed.requester == env.src
+        && routed.forwards.len() == env.hop_chain.len()
+        && routed
+            .forwards
+            .iter()
+            .zip(env.hop_chain.iter())
+            .all(|(forward, hop)| same_hop(&forward.hop, hop));
+    if !coherent {
+        tracing::warn!(
+            msg_id = %env.msg_id.to_hex(),
+            "MSG_CONTROL_V1 request failed envelope coherence; refusing"
+        );
+        send_control_reply(
+            endpoint,
+            source,
+            config,
+            control,
+            &env,
+            routed.requester,
+            ControlReply::Rejected(RejectCode::Unauthorized),
+        )
+        .await;
+        return;
+    }
+
+    let requester = routed.requester.clone();
+    let (mut reply, outbound, data_dir) = {
+        let mut engine = control.lock().await;
+        let reply = engine.receive_routed(remote, routed).await;
+        let outbound = engine.take_outbound();
+        let data_dir = engine.data_dir().to_path_buf();
+        (reply, outbound, data_dir)
+    };
+    // Reverse-dial any queued join decision, patch `delivery`, then sign the
+    // reply. The engine lock is not held across the dials.
+    deliver_outbound_decisions(endpoint, &data_dir, outbound, &mut reply).await;
+    tracing::info!(%remote, "routed control reply");
+
+    send_control_reply(endpoint, source, config, control, &env, requester, reply).await;
+}
+
+/// Sign `reply` as this node and send it back down to `requester` as a fresh
+/// `MSG_CONTROL_V1` envelope.
+///
+/// `reply_to` correlates with the request envelope's `msg_id`; the msg layer has
+/// no reply channel, so the requester matches it by that id.
+async fn send_control_reply(
+    endpoint: &Endpoint,
+    source: &NeighborSource,
+    config: &MsgConfig,
+    control: &Arc<tokio::sync::Mutex<ControlNode>>,
+    request: &Envelope,
+    requester: PeerRef,
+    reply: ControlReply,
+) {
+    let signed = {
+        let engine = control.lock().await;
+        match engine.sign_routed_reply(request.msg_id, requester.clone(), reply) {
+            Ok(signed) => signed,
+            Err(err) => {
+                tracing::warn!(%err, "cannot sign routed control reply");
+                return;
+            }
+        }
+    };
+    let bytes = match signed.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(%err, "cannot encode routed control reply");
+            return;
+        }
+    };
+    let snapshot = source.snapshot();
+    let src = snapshot.routable.this.clone();
+    let outgoing = match build_envelope(&src, requester.addr, MSG_CONTROL_V1, bytes, config.ttl) {
+        Ok(outgoing) => outgoing,
+        Err(err) => {
+            tracing::warn!(%err, "cannot build routed control reply envelope");
+            return;
+        }
+    };
+    if let Err(err) = send_envelope(endpoint, &snapshot, &outgoing, config.hop_timeout).await {
+        tracing::warn!(%err, "routed control reply could not be sent");
+    }
+}
+
+/// Whether a routed [`PeerRef`] names the same hop as an envelope [`Hop`].
+fn same_hop(peer: &PeerRef, hop: &Hop) -> bool {
+    peer.addr == hop.addr && peer.node == hop.node
 }
 
 /// Handle a settlement `Result` at the origin: emit the browser's `OrderResult`.

@@ -9,10 +9,11 @@ use cawala_control::{
     SetAddress, SignedControl,
 };
 use cawala_ledger::{AccountRef, Amount, LedgerPubKey, commitment_hash, verify_chain};
-use cawala_msg::{MSG_LEDGER_V1, MSG_SETTLE_V1};
+use cawala_msg::{MSG_CONTROL_V1, MSG_LEDGER_V1, MSG_SETTLE_V1};
 use cawala_node::control::spawn_control_node_live;
 use cawala_node::msg::{
-    NeighborSource, dispatch_ledger_envelope, dispatch_settle_envelope, sweep_settlements,
+    NeighborSource, dispatch_control_envelope, dispatch_ledger_envelope, dispatch_settle_envelope,
+    sweep_settlements,
 };
 use cawala_node::{
     ControlNode, LedgerService, MsgConfig, RoutableSnapshot, SettlementManager, admin_cli,
@@ -472,6 +473,9 @@ async fn run(data_dir: PathBuf) -> Result<()> {
         let manager = Arc::new(Mutex::new(SettlementManager::new()));
 
         // Must stay alive for the accept loop; dropped at process exit.
+        // Clone the control handle first: `spawn_control_node_live` takes
+        // ownership, but the drain loop still needs it for routed control.
+        let dispatch_control = Arc::clone(&control);
         let (router, mut received) =
             spawn_control_node_live(secret_key, source.clone(), config.clone(), control).await?;
         let endpoint = router.endpoint().clone();
@@ -521,6 +525,16 @@ async fn run(data_dir: PathBuf) -> Result<()> {
                             &dispatch_manager,
                             &dispatch_dir,
                             &dispatch_node,
+                            env,
+                        )
+                        .await;
+                    }
+                    MSG_CONTROL_V1 => {
+                        dispatch_control_envelope(
+                            &endpoint,
+                            &dispatch_source,
+                            &dispatch_config,
+                            &dispatch_control,
                             env,
                         )
                         .await;

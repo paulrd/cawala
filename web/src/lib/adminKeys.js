@@ -8,7 +8,11 @@
  *
  * Storage key `cawala.admin.v1`, shape:
  *   { v: 1, entries: [ { nodeId, adminSeedHex, adminPubHex, scope: 'admin',
- *                        grantedAt, expiresAt, label } ] }
+ *                        grantedAt, expiresAt, label, nodeAddr } ] }
+ *
+ * `nodeAddr` (dotted octal, e.g. "0.1.2") is the target node's asserted address
+ * used for tree-routed admin calls. It is additive: entries stored before it
+ * existed read back as `nodeAddr: null`.
  *
  * Every public accessor except `adminSeedBytes()` returns seed-free views, so
  * accidental logging/serialization can never leak K_admin. Pure ESM, no DOM
@@ -25,6 +29,13 @@ const HEX64_MESSAGE = {
   adminSeedHex: 'adminSeedHex must be exactly 64 hex characters',
   adminPubHex: 'adminPubHex must be exactly 64 hex characters',
 };
+
+// Dotted octal nodal address: one digit per level, each 0..=7. Accepts "0" and
+// "0.1.2"; rejects empty, leading/trailing dots ("0.", ".0"), and non-octal
+// digits ("8", "00").
+const NODE_ADDR = /^[0-7](?:\.[0-7])*$/;
+export const nodeAddrMessage =
+  'nodeAddr must be a dotted octal address such as "0" or "0.1.2" (each level 0-7)';
 
 /**
  * Resolve a localStorage-like object, or null when storage is unavailable
@@ -66,6 +77,27 @@ function _requireHex64(value, message) {
 }
 
 /**
+ * Whether `value` is a valid dotted octal nodal address (or absent).
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isValidNodeAddr(value) {
+  return value == null || (typeof value === 'string' && NODE_ADDR.test(value));
+}
+
+/**
+ * Validate and normalize an optional nodal address. `null`/`undefined` yield
+ * `null`; anything else must be a dotted octal address.
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+function _requireNodeAddr(value) {
+  if (value == null) return null;
+  if (!isValidNodeAddr(value)) throw new Error(nodeAddrMessage);
+  return value;
+}
+
+/**
  * @param {string} hex
  * @returns {Uint8Array}
  */
@@ -89,6 +121,7 @@ function _publicEntry(record) {
     grantedAt: record.grantedAt,
     expiresAt: record.expiresAt,
     label: record.label,
+    nodeAddr: record.nodeAddr ?? null,
   };
 }
 
@@ -116,6 +149,8 @@ function _normalizeStored(entry) {
     grantedAt,
     expiresAt,
     label: typeof entry.label === 'string' ? entry.label : null,
+    // Additive field: pre-existing rows without a valid `nodeAddr` read as null.
+    nodeAddr: isValidNodeAddr(entry.nodeAddr) ? (entry.nodeAddr ?? null) : null,
   };
 }
 
@@ -178,7 +213,7 @@ function _writeRecords(records) {
 /**
  * All stored admin entries as seed-free objects. Malformed/unavailable storage
  * yields `[]`; never throws.
- * @returns {Array<{ nodeId: string, adminPubHex: string, scope: 'admin', grantedAt: number, expiresAt: number, label: string|null }>}
+ * @returns {Array<{ nodeId: string, adminPubHex: string, scope: 'admin', grantedAt: number, expiresAt: number, label: string|null, nodeAddr: string|null }>}
  */
 export function loadAdminEntries() {
   return _readRecords().map(_publicEntry);
@@ -187,7 +222,7 @@ export function loadAdminEntries() {
 /**
  * UI-facing list of admin nodes with an `active` flag. Never returns the seed.
  * @param {number} [now] epoch millis
- * @returns {Array<{ nodeId: string, adminPubHex: string, scope: 'admin', grantedAt: number, expiresAt: number, label: string|null, active: boolean }>}
+ * @returns {Array<{ nodeId: string, adminPubHex: string, scope: 'admin', grantedAt: number, expiresAt: number, label: string|null, nodeAddr: string|null, active: boolean }>}
  */
 export function listAdminNodes(now = Date.now()) {
   return _readRecords().map((record) => ({
@@ -197,6 +232,7 @@ export function listAdminNodes(now = Date.now()) {
     grantedAt: record.grantedAt,
     expiresAt: record.expiresAt,
     label: record.label,
+    nodeAddr: record.nodeAddr ?? null,
     active: record.expiresAt > now,
   }));
 }
@@ -247,6 +283,7 @@ export function adminSeedBytes(nodeId) {
  * @param {number} [input.grantedAt] epoch millis (defaults to now)
  * @param {number} [input.expiresAt] epoch millis (defaults to grantedAt + 7d)
  * @param {string|null} [input.label]
+ * @param {string|null} [input.nodeAddr] dotted octal target address, or null
  * @returns {object} the seed-free stored entry
  */
 export function addAdminEntry({
@@ -256,10 +293,12 @@ export function addAdminEntry({
   grantedAt,
   expiresAt,
   label = null,
+  nodeAddr = null,
 } = {}) {
   const normalizedNodeId = _requireHex64(nodeId, HEX64_MESSAGE.nodeId);
   const normalizedSeed = _requireHex64(adminSeedHex, HEX64_MESSAGE.adminSeedHex);
   const normalizedPub = _requireHex64(adminPubHex, HEX64_MESSAGE.adminPubHex);
+  const normalizedNodeAddr = _requireNodeAddr(nodeAddr);
 
   const now = Date.now();
   const granted = grantedAt == null ? now : Number(grantedAt);
@@ -276,6 +315,7 @@ export function addAdminEntry({
     grantedAt: granted,
     expiresAt: expires,
     label: typeof label === 'string' ? label : null,
+    nodeAddr: normalizedNodeAddr,
   };
 
   const records = _readRecords().filter((entry) => entry.nodeId !== normalizedNodeId);

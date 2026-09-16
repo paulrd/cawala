@@ -183,6 +183,14 @@
           <div class="live-header-left">
             <span class="text-sm muted">Administering:</span>
             <EndpointId id={activeGrant.nodeId} />
+            {#if activeGrant.nodeAddr}
+              <span class="text-xs muted header-address">
+                <code>{activeGrant.nodeAddr}</code>
+              </span>
+              <Badge variant="ok" label="Tree-routed" />
+            {:else}
+              <Badge variant="muted" label="Direct only" />
+            {/if}
           </div>
           <button
             type="button"
@@ -382,6 +390,11 @@
     display: flex;
     align-items: center;
     gap: var(--sp-2);
+    flex-wrap: wrap;
+  }
+  .header-address {
+    display: inline-flex;
+    align-items: center;
   }
   .btn--sm {
     padding: var(--sp-1) var(--sp-2);

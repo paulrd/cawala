@@ -1667,12 +1667,18 @@ export class AdminUnavailableError extends Error {
  * key is returned (nothing is persisted).
  *
  * @param {string} nodeId Target parent node id (64 hex).
- * @param {{ expirySeconds?: number|null, label?: string|null }} [opts]
- * @returns {Promise<{ nodeId: string, adminPubHex: string }>}
+ * @param {{ expirySeconds?: number|null, label?: string|null, nodeAddr?: string|null }} [opts]
+ * @returns {Promise<{ nodeId: string, adminPubHex: string, nodeAddr: string|null }>}
  */
-export async function configureAdminNode(nodeId, { expirySeconds = null, label = null } = {}) {
+export async function configureAdminNode(
+  nodeId,
+  { expirySeconds = null, label = null, nodeAddr = null } = {},
+) {
   if (typeof nodeId !== 'string' || !/^[0-9a-fA-F]{64}$/.test(nodeId)) {
     throw new Error('nodeId must be exactly 64 hex characters');
+  }
+  if (!adminKeys.isValidNodeAddr(nodeAddr)) {
+    throw new Error(adminKeys.nodeAddrMessage);
   }
 
   const now = Date.now();
@@ -1685,7 +1691,7 @@ export async function configureAdminNode(nodeId, { expirySeconds = null, label =
   if (_useMock) {
     await mockDelay(200);
     const adminPubHex = _randomHex32();
-    return { nodeId: nodeId.toLowerCase(), adminPubHex };
+    return { nodeId: nodeId.toLowerCase(), adminPubHex, nodeAddr: nodeAddr ?? null };
   }
 
   const node = _requireNode();
@@ -1707,9 +1713,10 @@ export async function configureAdminNode(nodeId, { expirySeconds = null, label =
     grantedAt: now,
     expiresAt,
     label,
+    nodeAddr,
   });
 
-  return { nodeId: nodeId.toLowerCase(), adminPubHex };
+  return { nodeId: nodeId.toLowerCase(), adminPubHex, nodeAddr: nodeAddr ?? null };
 }
 
 /**
@@ -1731,7 +1738,7 @@ export function removeAdminNode(nodeId) {
 
 /**
  * Admin nodes for UI display (seed-free).
- * @returns {Array<{ nodeId: string, adminPubHex: string, scope: 'admin', grantedAt: number, expiresAt: number, label: string|null, active: boolean }>}
+ * @returns {Array<{ nodeId: string, adminPubHex: string, scope: 'admin', grantedAt: number, expiresAt: number, label: string|null, nodeAddr: string|null, active: boolean }>}
  */
 export function getAdminNodes() {
   return adminKeys.listAdminNodes();
@@ -1812,7 +1819,12 @@ export async function approveJoin(childEndpointId, slot = null) {
   if (!active) throw new AdminUnavailableError('approve');
 
   const node = _requireNode();
-  const dto = await node.admin_approve_join(active.nodeId, childEndpointId, slot);
+  const dto = await node.admin_approve_join(
+    active.nodeId,
+    childEndpointId,
+    slot,
+    active.nodeAddr ?? null,
+  );
   try {
     return {
       status: 'approved',
@@ -1843,7 +1855,12 @@ export async function rejectJoin(childEndpointId, reason = null) {
   if (!active) throw new AdminUnavailableError('reject');
 
   const node = _requireNode();
-  const dto = await node.admin_reject_join(active.nodeId, childEndpointId, reason);
+  const dto = await node.admin_reject_join(
+    active.nodeId,
+    childEndpointId,
+    reason,
+    active.nodeAddr ?? null,
+  );
   try {
     return { status: 'rejected', delivery: dto.delivery };
   } finally {
@@ -1866,7 +1883,7 @@ export async function redeliverJoin(childEndpointId) {
   if (!active) throw new AdminUnavailableError('redeliver');
 
   const node = _requireNode();
-  const dto = await node.admin_redeliver_join(active.nodeId, childEndpointId);
+  const dto = await node.admin_redeliver_join(active.nodeId, childEndpointId, active.nodeAddr ?? null);
   try {
     return { status: 'redelivered', delivery: dto.delivery };
   } finally {
@@ -2197,7 +2214,7 @@ export async function getJoinRequests() {
 
   let snapshot;
   try {
-    snapshot = await _requireNode().admin_query(active.nodeId);
+    snapshot = await _requireNode().admin_query(active.nodeId, active.nodeAddr ?? null);
   } catch (err) {
     _warnOnce('admin-query', '[api] admin_query failed', err);
     return [];

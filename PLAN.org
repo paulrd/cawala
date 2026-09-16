@@ -481,17 +481,46 @@
        `npx vite build`, and a live N0 `web/scripts/smoke-admin.mjs`
        (grant -> query -> approve delivered -> applicant joined -> revoke ->
        unauthorized).
-     - Routed control (deferred, composes with the above): `MSG_CONTROL_V1`
-       (already reserved, `crates/msg/src/envelope.rs`) carries control over
-       envelopes, hop-by-hop up the tree via `next_step`/`route` (ascend
-       supported). Authority is the **structural per-hop (H1)** model: each
-       intermediary re-signs with its own senior-child authority and the
-       destination authorizes its immediate child; the human's end-to-end intent
-       travels for audit but is advisory. `AdminGrant` is the portable
-       delegation primitive to carry; routing adds a `Routed` wrapper and swaps
-       transport without changing the admin DTO surface. Rejected alternatives:
-       holding the node operator seed in the browser; collapsing user/leaf
-       identity.
+     - Routed control (increment 2, DONE): `MSG_CONTROL_V1` (reserved at
+       `crates/msg/src/envelope.rs`) now carries `RoutedControlV1` (frozen
+       postcard, `ROUTED_CONTROL_VERSION` 1, new `crates/control/src/routed.rs`)
+       hop-by-hop along the tree; `crates/msg` itself is unchanged. The wrapper
+       holds the advisory end-to-end `SignedControl` intent, an optional carried
+       `AdminGrant` (audit evidence only - a carried-but-unstored grant never
+       authorizes), and one `RoutedForward` (hop ref + that hop's own
+       `SignedControl` over the same request) per transmitting hop. Authority is
+       the **structural per-hop (H1)** model: every transmitter re-signs the same
+       request with its own operator key, each receiver `verify_control`s its
+       predecessor against its own registry, and the destination dispatches the
+       **intent** for admin/self-operator classes (the intent origin is already
+       the destination, so `authorize_admin` and every handler apply verbatim) or
+       the **last hop's** control for topology (senior node child; `User`
+       children excluded); `Join`/join decisions are refused on the routed path.
+       Relays disambiguate request vs reply by full decode plus envelope
+       coherence (both share leading byte 1) and drop expired intents. Replies
+       are node-operator-signed `SignedRoutedReply`s correlated by `reply_to` =
+       request `msg_id` and descend to the requester; the browser verifies them
+       against the target node id (the node-id == operator-key invariant) and
+       never surfaces an unverified reply. An additive `event:"routed"` audit
+       line records requester/forwarder/hops/kind/outcome. No
+       `CONTROL_FORMAT_VERSION` bump, no new `ControlRequest` variant, and the
+       direct `cawala/control/0` path is byte-identical. Web: admin entries carry
+       an optional octal `nodeAddr`; when set, admin calls try direct first and
+       fall back to routed on a transport error. Verified by the hermetic
+       `crates/node/tests/routed_control.rs` (13 cases over the real
+       `cawala/msg/0` transport: admin query/approve + delivery, revoke wins,
+       target/requester mismatch, expiry/replay, forged predecessor, senior vs
+       non-senior topology, join refusal, oversize pre-decode, reply-through-relay
+       disambiguation, forward-count mismatch), 21 `routed.rs` unit tests, 7
+       browser host tests, `web npm test` (29) and `npm run build`. Deferred:
+       non-senior topology over route (needs authority threaded through the
+       handlers); non-ancestor targets (need address discovery or
+       `AdminGrant.node_addr`); signed topology/registry distribution (the only
+       true prevention); CLI routed admin; direct-dial replies; automatic
+       redeliver orchestration; more than one outstanding routed request per
+       browser client; control-reply reflection rate limiting. Rejected
+       alternatives: holding the node operator seed in the browser; collapsing
+       user/leaf identity.
      - Companion gap (DONE): `JoinRejected` now requires the invite-pinned
        parent operator on both applicants (native `handle_join_rejected` and
        wasm `LocalState1::on_join_rejected`), mirroring `JoinApproved`; a spoofed

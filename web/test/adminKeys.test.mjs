@@ -47,8 +47,16 @@ function reset() {
   memory.clear();
 }
 
-function entry(nodeId, seedHex, pubHex, { grantedAt, expiresAt, label = null } = {}) {
-  return { nodeId, adminSeedHex: seedHex, adminPubHex: pubHex, grantedAt, expiresAt, label };
+function entry(nodeId, seedHex, pubHex, { grantedAt, expiresAt, label = null, nodeAddr = null } = {}) {
+  return {
+    nodeId,
+    adminSeedHex: seedHex,
+    adminPubHex: pubHex,
+    grantedAt,
+    expiresAt,
+    label,
+    nodeAddr,
+  };
 }
 
 function hexToBytes(hex) {
@@ -73,6 +81,7 @@ test('add/load round-trip (seed-free view)', () => {
     grantedAt: now,
     expiresAt: now + 1000,
     label: 'parent A',
+    nodeAddr: null,
   });
 
   const loaded = loadAdminEntries();
@@ -191,6 +200,142 @@ test('listAdminNodes never includes the seed', () => {
   assert.equal(serialized.includes(SEED_A), false);
   assert.equal(serialized.includes('adminSeedHex'), false);
   assert.equal(serialized.includes(PUB_A), true);
+});
+
+test('nodeAddr round-trips through addAdminEntry/listAdminNodes', () => {
+  reset();
+  const now = 1_700_000_000_000;
+  const stored = addAdminEntry(
+    entry(NODE_A, SEED_A, PUB_A, { grantedAt: now, expiresAt: now + 1000, nodeAddr: '0.1.2' }),
+  );
+  assert.equal(stored.nodeAddr, '0.1.2');
+
+  const listed = listAdminNodes(now);
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].nodeAddr, '0.1.2');
+  assert.equal(findAdminNode(NODE_A).nodeAddr, '0.1.2');
+  assert.equal(JSON.stringify(listed).includes(SEED_A), false);
+
+  // A bare root address is valid too.
+  addAdminEntry(
+    entry(NODE_B, SEED_B, PUB_B, { grantedAt: now, expiresAt: now + 1000, nodeAddr: '0' }),
+  );
+  assert.equal(findAdminNode(NODE_B).nodeAddr, '0');
+});
+
+test('invalid nodeAddr values are rejected', () => {
+  reset();
+  const now = 1_700_000_000_000;
+  const base = { grantedAt: now, expiresAt: now + 1000 };
+  const invalid = [
+    '',
+    '.',
+    '0.',
+    '.0',
+    '0..1',
+    '8',
+    '08',
+    '0.8',
+    'a.b',
+    '0.1.a',
+    ' 0.1',
+    '0.1 ',
+  ];
+  for (const nodeAddr of invalid) {
+    assert.throws(
+      () => addAdminEntry(entry(NODE_A, SEED_A, PUB_A, { ...base, nodeAddr })),
+      /nodeAddr must be a dotted octal address/,
+      `expected ${JSON.stringify(nodeAddr)} to be rejected`,
+    );
+  }
+
+  // Valid multi-level addresses do not throw.
+  for (const nodeAddr of ['0', '7', '0.1.2', '7.7.7.7.7.7.7.7']) {
+    addAdminEntry(entry(NODE_A, SEED_A, PUB_A, { ...base, nodeAddr }));
+  }
+});
+
+test('pre-existing stored entries without nodeAddr read back as null', () => {
+  reset();
+  const now = 1_700_000_000_000;
+  // Simulate a v1 record written before nodeAddr existed (no key at all).
+  memory.setItem(
+    ADMIN_KEY,
+    JSON.stringify({
+      v: 1,
+      entries: [
+        {
+          nodeId: NODE_A,
+          adminSeedHex: SEED_A,
+          adminPubHex: PUB_A,
+          scope: 'admin',
+          grantedAt: now,
+          expiresAt: now + 1000,
+          label: 'legacy',
+        },
+      ],
+    }),
+  );
+
+  const loaded = loadAdminEntries();
+  assert.equal(loaded.length, 1);
+  assert.equal(loaded[0].nodeAddr, null);
+  assert.equal(listAdminNodes(now)[0].nodeAddr, null);
+  assert.equal(findAdminNode(NODE_A).nodeAddr, null);
+  assert.equal(activeAdminNode(now).nodeAddr, null);
+  assert.equal(Buffer.from(adminSeedBytes(NODE_A)).toString('hex'), SEED_A);
+});
+
+test('a malformed stored nodeAddr normalizes to null without dropping the entry', () => {
+  reset();
+  const now = 1_700_000_000_000;
+  memory.setItem(
+    ADMIN_KEY,
+    JSON.stringify({
+      v: 1,
+      entries: [
+        entry(NODE_A, SEED_A, PUB_A, {
+          grantedAt: now,
+          expiresAt: now + 1000,
+          nodeAddr: '8.8.8',
+        }),
+      ],
+    }),
+  );
+
+  const loaded = loadAdminEntries();
+  assert.equal(loaded.length, 1);
+  assert.equal(loaded[0].nodeAddr, null);
+});
+
+test('getAdminNodes-equivalent public surface never exposes seed material', () => {
+  reset();
+  const now = 1_700_000_000_000;
+  addAdminEntry(
+    entry(NODE_A, SEED_A, PUB_A, {
+      grantedAt: now,
+      expiresAt: now + 1000,
+      label: 'parent A',
+      nodeAddr: '0.1.2',
+    }),
+  );
+
+  // `api.getAdminNodes()` is a thin wrapper over `listAdminNodes()`; assert the
+  // exact seed-free shape it forwards to the UI.
+  const listed = listAdminNodes(now);
+  const serialized = JSON.stringify(listed);
+  assert.equal(serialized.includes(SEED_A), false);
+  assert.equal(serialized.includes('adminSeedHex'), false);
+  assert.deepEqual(Object.keys(listed[0]).sort(), [
+    'active',
+    'adminPubHex',
+    'expiresAt',
+    'grantedAt',
+    'label',
+    'nodeAddr',
+    'nodeId',
+    'scope',
+  ]);
 });
 
 test('adminSeedBytes returns the exact 32 bytes', () => {

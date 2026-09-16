@@ -19,6 +19,7 @@
     removeAdminNode,
   } from '../../lib/api.js';
   import { copyToClipboard } from '../../lib/utils.js';
+  import { isValidNodeAddr } from '../../lib/adminKeys.js';
 
   let caps = $derived(getCapabilities());
   let mock = $derived(isMockMode());
@@ -134,9 +135,19 @@
   let configureNodeId = $state('');
   let configureLabel = $state('');
   let configureDays = $state(7);
+  let configureNodeAddr = $state('');
   let configureResult = $state(null); // { nodeId, adminPubHex } | null
   let removeConfirmOpen = $state(false);
   let removeTarget = $state(null); // nodeId string
+
+  let configureNodeAddrValid = $derived(
+    configureNodeAddr === '' || isValidNodeAddr(configureNodeAddr),
+  );
+  let configureNodeAddrHint = $derived(
+    configureNodeAddr && !configureNodeAddrValid
+      ? 'Enter a dotted octal address such as 0 or 0.3.1 (one digit 0-7 per level).'
+      : null,
+  );
 
   async function loadAdminNodes() {
     if (mock) return;
@@ -158,6 +169,7 @@
   let configureReady = $derived(
     validateNodeId(configureNodeId) &&
     configureDays > 0 &&
+    configureNodeAddrValid &&
     !adminBusy,
   );
 
@@ -166,9 +178,11 @@
     adminBusy = true;
     try {
       const expirySeconds = Math.round(configureDays * 24 * 60 * 60);
+      const nodeAddr = configureNodeAddr.trim() || null;
       const result = await configureAdminNode(configureNodeId, {
         expirySeconds,
         label: configureLabel.trim() || null,
+        nodeAddr,
       });
       configureResult = result;
       showToast('Admin key generated. Copy the public key and ask the operator to grant it.', 'ok');
@@ -510,6 +524,22 @@
               disabled={adminBusy}
             />
           </div>
+          <div class="field">
+            <label class="field-label" for="admin-node-addr">Target address (optional)</label>
+            <input
+              id="admin-node-addr"
+              type="text"
+              class="field-input field-input--mono"
+              placeholder="e.g. 0.3.1"
+              bind:value={configureNodeAddr}
+              disabled={adminBusy}
+            />
+            {#if configureNodeAddrHint}
+              <span class="field-hint field-hint--danger">{configureNodeAddrHint}</span>
+            {:else}
+              <span class="field-hint">Octal tree address of the administered node. When set, admin calls can reach the node hop-by-hop through the routing tree if a direct connection is not available.</span>
+            {/if}
+          </div>
           <button
             type="button"
             class="btn btn--primary"
@@ -571,10 +601,20 @@
                     {#if node.label}
                       <Badge variant="info" label={node.label} />
                     {/if}
+                    {#if node.nodeAddr}
+                      <Badge variant="ok" label="Tree-routed" />
+                    {:else}
+                      <Badge variant="muted" label="Direct only" />
+                    {/if}
                   </div>
                   <span class="text-xs muted">
                     Granted: {formatTs(node.grantedAt)} | Expires: {formatTs(node.expiresAt)}
                   </span>
+                  {#if node.nodeAddr}
+                    <span class="text-xs muted">
+                      Address: <code>{node.nodeAddr}</code>
+                    </span>
+                  {/if}
                 </div>
                 <button
                   type="button"

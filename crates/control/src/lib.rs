@@ -43,6 +43,7 @@ pub mod admin;
 pub mod invite;
 pub mod reply;
 pub mod request;
+pub mod routed;
 pub mod senior;
 pub mod sign;
 
@@ -62,6 +63,10 @@ pub use request::{
     AdminJoinApprove, AdminJoinReject, AdminRedeliverJoin, ControlRequest, CreateChild,
     DetachChild, JoinApproval, JoinRejection, JoinRequest, MAX_LOCATION_HINT_LEN, MAX_NODE_ID_LEN,
     MAX_REASON_LEN, MoveChild, SetAddress, is_admin_request,
+};
+pub use routed::{
+    MAX_ROUTED_FORWARDS, ROUTED_CONTROL_VERSION, ROUTED_REPLY_CONTEXT, ROUTED_REPLY_VERSION,
+    RoutedControlV1, RoutedError, RoutedForward, RoutedReplyV1, SignedRoutedReply,
 };
 pub use senior::senior_child;
 pub use sign::{

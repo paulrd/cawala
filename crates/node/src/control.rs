@@ -33,11 +33,12 @@ use cawala_control::{
     CONTROL_FORMAT_VERSION, CONTROL_REQUEST_MAX_TTL_SECS, CONTROL_REQUEST_TTL_SECS, ChildKind,
     ChildSnapshot, ControlError, ControlReply, ControlRequest, CreateChild, DeliveryStatus,
     DetachChild, Invite, JoinApproval, JoinRejection, JoinRequest, MAX_CONTROL_FRAME, MoveChild,
-    NodeId, NodeSnapshot, OperatorPubKey, OperatorSecretKey, ParentSnapshot, RejectCode,
-    SetAddress, SignedAdminGrant, SignedControl, is_admin_request, senior_child, verify_control,
+    NodeId, NodeSnapshot, OperatorPubKey, OperatorSecretKey, ParentSnapshot, ROUTED_REPLY_VERSION,
+    RejectCode, RoutedControlV1, RoutedForward, RoutedReplyV1, SetAddress, SignedAdminGrant,
+    SignedControl, SignedRoutedReply, is_admin_request, senior_child, verify_control,
 };
 use cawala_ledger::{LedgerPubKey, PeerKeys, PeerRegistry, PeerRole};
-use cawala_msg::{MsgId, Seen, SeenConfig, SeenSet};
+use cawala_msg::{MsgId, PeerRef, Seen, SeenConfig, SeenSet};
 
 use crate::admin_store::AdminStore;
 use crate::control_store::ControlStore;
@@ -410,6 +411,244 @@ impl ControlNode {
         };
         self.audit_request(&signed, &reply, now);
         reply
+    }
+
+    /// Handle one routed control request, using the system clock.
+    ///
+    /// See [`ControlNode::receive_routed_at`]. The envelope-level coherence
+    /// checks (`requester == env.src`, `forwards.len() == hop_chain.len()`,
+    /// per-index hop match) are enforced by the caller
+    /// (`dispatch_control_envelope`) because they need the transport envelope;
+    /// everything that is a property of the routed payload plus `remote` is
+    /// enforced here.
+    pub async fn receive_routed(
+        &mut self,
+        remote: EndpointId,
+        routed: RoutedControlV1,
+    ) -> ControlReply {
+        self.receive_routed_at(remote, routed, now_unix_seconds()).await
+    }
+
+    /// Handle one routed control request reaching this node as its destination.
+    ///
+    /// The transport has already checked the envelope: the hop chain is a
+    /// plausible path, this node is the destination, the chain's last hop is the
+    /// authenticated QUIC `remote` and a direct neighbor, and `(src, msg_id)` is
+    /// not a replay. `remote` is the authenticated final hop, so it — not any
+    /// unauthenticated `RoutedForward.hop` — is authority.
+    ///
+    /// Checks here, in order:
+    /// 1. [`RoutedControlV1::validate`] (version, bounded forwards, intent
+    ///    version, per-forward request/origin coherence);
+    /// 2. `target.node`/`target.addr` name this node;
+    /// 3. the carried intent self-verifies and its expiry is inside the TTL cap;
+    /// 4. a forward exists, its `hop.node` is the authenticated `remote`, and
+    ///    the destination's registry verifies it;
+    /// 5. class gate:
+    ///    - `Join`/`JoinApproved`/`JoinRejected` are refused on the routed path;
+    ///    - admin requests dispatch the **intent** (so the existing
+    ///      `authorize_admin` grant store, replay, and TTL rules apply verbatim);
+    ///    - a self-operator intent dispatches the intent;
+    ///    - topology requests dispatch the **last hop's** signed control, and
+    ///      only when it is this node's senior node child (`Authority::Peer`).
+    ///
+    /// A carried [`SignedAdminGrant`] is verified for audit only: it must verify
+    /// under this node's operator, be scoped to this node, and name the intent
+    /// controller, but it never authorizes on its own — the
+    /// [`AdminStore`](crate::admin_store::AdminStore) is the authority, so a
+    /// revoke wins over a still-valid carried grant.
+    pub async fn receive_routed_at(
+        &mut self,
+        remote: EndpointId,
+        routed: RoutedControlV1,
+        now: u64,
+    ) -> ControlReply {
+        if routed.validate().is_err() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        if routed.target.node != self.node_id {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        if self.record.record().address.as_ref() != Some(&routed.target.addr) {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        if routed.intent.verify_signature().is_err() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        if now > routed.intent.expiry {
+            return ControlReply::Rejected(RejectCode::Expired);
+        }
+        if routed.intent.expiry > now.saturating_add(CONTROL_REQUEST_MAX_TTL_SECS) {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+
+        // The predecessor is authority; `RoutedForward.hop` alone never is.
+        let Some(last) = routed.forwards.last() else {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        };
+        if last.hop.node != remote.to_string() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        if self.verify_forward(last).is_err() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+
+        // Join traffic is direct-only: a routed `Join`/`JoinApproved`/
+        // `JoinRejected` is never accepted, whatever its signatures say.
+        if matches!(
+            &routed.intent.request,
+            ControlRequest::Join(_)
+                | ControlRequest::JoinApproved(_)
+                | ControlRequest::JoinRejected(_)
+        ) {
+            self.audit(serde_json::json!({
+                "ts": now,
+                "event": "routed-refused",
+                "kind": routed.intent.request.kind(),
+                "origin": routed.intent.origin.to_string(),
+                "requester": routed.requester.node,
+                "forwarder": last.hop.node,
+                "hops": routed.forwards.len(),
+                "routed": true,
+            }));
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+
+        // Routing context recorded on every dispatched routed request. `last` is
+        // the authenticated predecessor (the msg layer bound it to the QUIC
+        // remote); this is accountability evidence, never authority.
+        let requester = routed.requester.node.clone();
+        let forwarder = last.hop.node.clone();
+        let hops = routed.forwards.len();
+        let kind = routed.intent.request.kind();
+
+        // Admin class: dispatch the end-to-end intent; its origin is already
+        // this node, so the untouched `authorize_admin` path (store + replay +
+        // TTL) decides.
+        if is_admin_request(&routed.intent.request) {
+            if let Some(grant) = &routed.grant {
+                let well_formed = grant.grant.validate().is_ok()
+                    && grant.verify(&self.operator.public()).is_ok()
+                    && grant.grant.node.as_str() == self.node_id
+                    && grant.grant.admin == routed.intent.controller;
+                if !well_formed {
+                    return ControlReply::Rejected(RejectCode::Unauthorized);
+                }
+                // Evidence, not authority: record when the store does not back
+                // the carried grant, then let `authorize_admin` refuse it.
+                if self
+                    .admins
+                    .active_scope(&routed.intent.controller, now)
+                    .is_none()
+                {
+                    self.audit(serde_json::json!({
+                        "ts": now,
+                        "event": "grant_store_missing",
+                        "admin": routed.intent.controller.to_string(),
+                        "node": self.node_id,
+                        "requester": routed.requester.node,
+                        "forwarder": last.hop.node,
+                        "hops": routed.forwards.len(),
+                        "routed": true,
+                    }));
+                }
+            }
+            let reply = self.receive_at(remote, routed.intent, now).await;
+            self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
+            return reply;
+        }
+
+        // Self-operator class: the intent is addressed to this node and signed
+        // by this node's own operator key.
+        if routed.intent.origin.as_str() == self.node_id
+            && routed.intent.controller == self.operator.public()
+        {
+            let reply = self.receive_at(remote, routed.intent, now).await;
+            self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
+            return reply;
+        }
+
+        // Topology class: only the immediate predecessor's own signed control
+        // is dispatched, and only if it is this node's senior node child.
+        match self.authorize(&last.signed, now) {
+            Ok(Authority::Peer) => {}
+            _ => return ControlReply::Rejected(RejectCode::Unauthorized),
+        }
+        let last_signed = last.signed.clone();
+        let reply = self.receive_at(remote, last_signed, now).await;
+        self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
+        reply
+    }
+
+    /// Re-sign `request` as this node's own per-hop routed forward.
+    ///
+    /// The returned forward's `hop` is this node's record address and id, and
+    /// its `signed` control's origin is this node, so structural coherence
+    /// (`hop.node == signed.origin`) holds by construction. A node with no
+    /// asserted address cannot forward routed control.
+    pub fn sign_forward(&self, request: &ControlRequest) -> Result<RoutedForward, ControlError> {
+        let address = self.record.record().address.clone().ok_or_else(|| {
+            ControlError::Codec(
+                "cannot sign a routed forward without an asserted address".to_string(),
+            )
+        })?;
+        let signed = SignedControl::authorize(
+            NodeId::from(self.node_id.clone()),
+            &self.operator,
+            fresh_nonce(),
+            now_unix_seconds().saturating_add(CONTROL_REQUEST_TTL_SECS),
+            request.clone(),
+        )?;
+        Ok(RoutedForward::new(
+            PeerRef {
+                addr: address,
+                node: self.node_id.clone(),
+            },
+            signed,
+        ))
+    }
+
+    /// Verify one per-hop forward against this node's registry.
+    ///
+    /// `verify_control` binds the forward's `origin` to the operator key the
+    /// registry knows (the stronger form of the `hop.node == origin` string
+    /// check, which is also enforced structurally). A forward whose hop and
+    /// signed origin disagree is refused.
+    pub fn verify_forward(&self, forward: &RoutedForward) -> Result<(), RejectCode> {
+        verify_control(&forward.signed, &self.peers).map_err(|err| map_control_error(&err))?;
+        if forward.hop.node != forward.signed.origin.as_str() {
+            return Err(RejectCode::Unauthorized);
+        }
+        Ok(())
+    }
+
+    /// Build and sign a routed reply as this node.
+    ///
+    /// The responder is this node's id and record address; the signature is the
+    /// routed-reply domain ([`ROUTED_REPLY_CONTEXT`](cawala_control::ROUTED_REPLY_CONTEXT))
+    /// under this node's operator key. A node with no asserted address cannot
+    /// answer routed control.
+    pub fn sign_routed_reply(
+        &self,
+        reply_to: MsgId,
+        requester: PeerRef,
+        reply: ControlReply,
+    ) -> Result<SignedRoutedReply, ControlError> {
+        let address = self.record.record().address.clone().ok_or_else(|| {
+            ControlError::Codec("cannot sign a routed reply without an asserted address".to_string())
+        })?;
+        let routed = RoutedReplyV1 {
+            version: ROUTED_REPLY_VERSION,
+            reply_to,
+            requester,
+            responder: PeerRef {
+                addr: address,
+                node: self.node_id.clone(),
+            },
+            reply,
+        };
+        SignedRoutedReply::authorize(routed, &self.operator)
+            .map_err(|err| ControlError::Codec(err.to_string()))
     }
 
     /// Applicant side: queue the outbound join so a later `JoinApproved` /
@@ -1266,6 +1505,34 @@ impl ControlNode {
         }));
     }
 
+    /// Audit a routed dispatch with its routing context.
+    ///
+    /// Additive and backward compatible with existing `control_audit.jsonl`
+    /// consumers: the only new keys are `routed`, `requester`, `forwarder`, and
+    /// `hops`. `requester`/`forwarder` are public node ids already carried in
+    /// the envelope; no secrets or payloads are logged. The admin surface keeps
+    /// its own [`ControlNode::audit_request`] line alongside this one.
+    fn audit_routed(
+        &self,
+        now: u64,
+        kind: &str,
+        reply: &ControlReply,
+        requester: &str,
+        forwarder: &str,
+        hops: usize,
+    ) {
+        self.audit(serde_json::json!({
+            "ts": now,
+            "event": "routed",
+            "kind": kind,
+            "outcome": reply_outcome(reply),
+            "routed": true,
+            "requester": requester,
+            "forwarder": forwarder,
+            "hops": hops,
+        }));
+    }
+
     /// Build the direct dial target for an [`Invite`], applying its optional
     /// `relay`/`ip` transport hints.
     ///
@@ -1382,29 +1649,7 @@ impl ProtocolHandler for ControlHandler {
 
         // Deliver decisions owned by this node and patch the reply with the
         // applicant's view. Never hold the engine mutex across `send_direct`.
-        let mut last_status = None;
-        for item in outbound {
-            let status = match item.target.as_str().parse::<EndpointId>() {
-                Ok(target) => delivery_status(
-                    ControlNode::send_direct(
-                        &self.endpoint,
-                        target,
-                        &item.signed,
-                        DELIVERY_TIMEOUT,
-                    )
-                    .await,
-                ),
-                Err(err) => {
-                    warn!(child = %item.target, %err, "invalid applicant endpoint id");
-                    DeliveryStatus::Unreachable
-                }
-            };
-            audit_delivery(&data_dir, &item.target, item.kind, &status);
-            last_status = Some(status);
-        }
-        if let Some(status) = last_status {
-            patch_delivery(&mut reply, status);
-        }
+        deliver_outbound_decisions(&self.endpoint, &data_dir, outbound, &mut reply).await;
         info!(%remote, kind = signed_kind(&reply), "control reply");
 
         proto::write_framed(&mut send, &reply).await?;
@@ -1492,7 +1737,13 @@ pub fn spawn_control_node_live_on(
     node: Arc<Mutex<ControlNode>>,
 ) -> (Router, tokio::sync::mpsc::Receiver<cawala_msg::Envelope>) {
     let (sink, receiver) = tokio::sync::mpsc::channel(SINK_CAPACITY);
-    let handler = MsgHandler::with_source(endpoint.clone(), source, config, sink);
+    let handler = MsgHandler::with_source_and_control(
+        endpoint.clone(),
+        source,
+        config,
+        sink,
+        Arc::clone(&node),
+    );
     let control = ControlHandler::new(node, endpoint.clone());
     let router = Router::builder(endpoint)
         .accept(proto::ALPN, crate::PingHandler)
@@ -1574,6 +1825,38 @@ fn delivery_status(result: Result<ControlReply, ControlError>) -> DeliveryStatus
             DeliveryStatus::TimedOut
         }
         Err(_) => DeliveryStatus::Unreachable,
+    }
+}
+
+/// Reverse-dial each queued outbound decision and patch `reply` with the last
+/// applicant's delivery outcome.
+///
+/// Shared by the direct [`ControlHandler`] and the routed destination path so
+/// `AdminApproved.delivery`/`AdminRejected.delivery` stay correct whichever
+/// transport carried the request. The caller must have dropped the engine lock
+/// (this awaits `send_direct`).
+pub(crate) async fn deliver_outbound_decisions(
+    endpoint: &Endpoint,
+    data_dir: &Path,
+    outbound: Vec<OutboundControl>,
+    reply: &mut ControlReply,
+) {
+    let mut last_status = None;
+    for item in outbound {
+        let status = match item.target.as_str().parse::<EndpointId>() {
+            Ok(target) => delivery_status(
+                ControlNode::send_direct(endpoint, target, &item.signed, DELIVERY_TIMEOUT).await,
+            ),
+            Err(err) => {
+                warn!(child = %item.target, %err, "invalid applicant endpoint id");
+                DeliveryStatus::Unreachable
+            }
+        };
+        audit_delivery(data_dir, &item.target, item.kind, &status);
+        last_status = Some(status);
+    }
+    if let Some(status) = last_status {
+        patch_delivery(reply, status);
     }
 }
 
