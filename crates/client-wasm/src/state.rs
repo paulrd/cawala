@@ -267,8 +267,10 @@ impl LocalStateV1 {
     /// payload. A rejection for a different parent is refused (`Denied`); when
     /// the join pinned an operator key (an invite), the signer must match it,
     /// else the rejection is denied and the outbound join is **retained** (a
-    /// spoofed rejection must not cancel a real join). A rejection with no
-    /// matching outbound join is a no-op (`None`).
+    /// spoofed rejection must not cancel a real join). A stale rejection whose
+    /// nonce does not match the outstanding request is likewise denied and the
+    /// outbound join is retained. A rejection with no matching outbound join is
+    /// a no-op (`None`).
     pub fn on_join_rejected(
         &mut self,
         rejection: &JoinRejection,
@@ -283,6 +285,20 @@ impl LocalStateV1 {
         }
         if let Some(expected) = &outbound.pinned_operator
             && controller != expected
+        {
+            return Transition::Denied(RejectCode::Unauthorized);
+        }
+        // Staleness check, mirroring `on_join_approved`: only a rejection whose
+        // nonce answers the outstanding request may consume it, so a replayed
+        // rejection cannot cancel a later re-join. A `0` nonce on either side is
+        // treated as a wildcard (documented residual): the parent's CLI
+        // `control reject` legitimately sends `0` when it has no pending row, so
+        // an unpinned TOFU join can still be cancelled by a zero-nonce
+        // rejection. Closing that fully requires making the CLI require a
+        // pending row; out of scope here.
+        if outbound.request.nonce != 0
+            && rejection.nonce != 0
+            && rejection.nonce != outbound.request.nonce
         {
             return Transition::Denied(RejectCode::Unauthorized);
         }
@@ -597,6 +613,48 @@ mod tests {
         assert_eq!(transition.reply(), ControlReply::Accepted);
         assert!(state.outbound.is_none());
         assert_eq!(state.status_label(), "rejected");
+    }
+
+    #[test]
+    fn stale_rejection_nonce_is_denied() {
+        let (mut state, request) = pending(None);
+        // A later re-join to the same parent uses a fresh nonce.
+        let mut newer = request.clone();
+        newer.nonce = 99;
+        state.set_outbound(newer, node("parent"), None, 6);
+
+        // The old rejection (nonce 7) no longer answers the outstanding request.
+        let stale = JoinRejection {
+            child: node("me"),
+            reason: "stale".to_string(),
+            nonce: request.nonce,
+        };
+        let transition = state.on_join_rejected(&stale, &node("parent"), &operator(9).public());
+        assert_eq!(transition, Transition::Denied(RejectCode::Unauthorized));
+        assert!(state.outbound.is_some(), "the current outbound is retained");
+        assert!(state.last_rejection.is_none());
+    }
+
+    #[test]
+    fn zero_rejection_nonce_is_accepted_residual() {
+        // Documented residual: a `0` rejection nonce is a wildcard and still
+        // cancels the outbound join. This is legitimate for the parent's CLI
+        // `control reject` when it has no pending row; an unpinned TOFU join can
+        // therefore still be cancelled by a zero-nonce rejection.
+        let (mut state, _) = pending(None);
+        let rejection = JoinRejection {
+            child: node("me"),
+            reason: "cli cancel".to_string(),
+            nonce: 0,
+        };
+        let transition = state.on_join_rejected(&rejection, &node("parent"), &operator(9).public());
+        assert_eq!(transition.reply(), ControlReply::Accepted);
+        assert!(state.outbound.is_none());
+        assert_eq!(state.status_label(), "rejected");
+        assert_eq!(
+            state.last_rejection.as_ref().unwrap().reason.as_deref(),
+            Some("cli cancel")
+        );
     }
 
     #[test]

@@ -38,13 +38,14 @@ use cawala_control::{
     SignedControl, SignedRoutedReply, is_admin_request, senior_child, verify_control,
 };
 use cawala_ledger::{LedgerPubKey, PeerKeys, PeerRegistry, PeerRole};
-use cawala_msg::{MsgId, PeerRef, Seen, SeenConfig, SeenSet};
+use cawala_msg::{MsgId, PeerRef, Seen, SeenConfig};
 
 use crate::admin_store::AdminStore;
 use crate::control_store::ControlStore;
 use crate::ledger_peers;
 use crate::msg::{MSG_ALPN, MsgConfig, MsgHandler, NeighborSource, RoutableSnapshot};
 use crate::record::{NodeRecord, RecordError, RecordStore};
+use crate::seen_store::SeenStore;
 
 /// Default sink capacity for locally delivered envelopes when control is
 /// co-hosted with messaging.
@@ -145,11 +146,19 @@ pub struct ControlNode {
     /// Most-recent operator-signed decision per child, for redelivery.
     decisions: VecDeque<SignedControl>,
     /// Per-node replay guard keyed `origin:controller`, id = request nonce.
-    seen: SeenSet,
+    /// Persisted across restarts via [`SeenStore`].
+    seen: SeenStore,
 }
 
 impl ControlNode {
     /// Build an engine from already-open stores.
+    ///
+    /// This constructor is for harnesses/tests and does **not** load persisted
+    /// replay marks: it starts with an empty guard even when `data_dir` already
+    /// holds a `control_seen.json`, and the first accepted request will
+    /// overwrite that file with the marks seen since construction. Production
+    /// nodes must use [`ControlNode::open`], which re-seeds the guard from
+    /// disk.
     pub fn new(
         data_dir: impl Into<PathBuf>,
         node_id: impl Into<String>,
@@ -169,7 +178,7 @@ impl ControlNode {
             admins,
             outbound: VecDeque::new(),
             decisions: VecDeque::new(),
-            seen: SeenSet::new(CONTROL_SEEN_CONFIG),
+            seen: SeenStore::empty(CONTROL_SEEN_CONFIG),
         }
     }
 
@@ -192,6 +201,7 @@ impl ControlNode {
             ControlStore::open(&data_dir).map_err(|err| ControlError::Codec(err.to_string()))?;
         let admins = AdminStore::load(&data_dir, node_id, &operator.public())
             .map_err(|err| ControlError::Codec(err.to_string()))?;
+        let seen = SeenStore::open(&data_dir, CONTROL_SEEN_CONFIG, now_unix_seconds());
         Ok(ControlNode {
             data_dir,
             node_id: node_id.to_string(),
@@ -202,7 +212,7 @@ impl ControlNode {
             admins,
             outbound: VecDeque::new(),
             decisions: VecDeque::new(),
-            seen: SeenSet::new(CONTROL_SEEN_CONFIG),
+            seen,
         })
     }
 
@@ -380,10 +390,31 @@ impl ControlNode {
         // Replay guard: per (origin, controller), keyed by the request nonce.
         // Control requests are terminal, so a marked nonce is never unobserved.
         let seen_origin = format!("{}:{}", signed.origin, signed.controller);
-        if self.seen.observe(&seen_origin, nonce_msg_id(signed.nonce)) == Seen::Duplicate {
-            let reply = ControlReply::Rejected(RejectCode::Replay);
-            self.audit_request(&signed, &reply, now);
-            return reply;
+        match self
+            .seen
+            .observe(&seen_origin, nonce_msg_id(signed.nonce), signed.expiry)
+        {
+            Seen::Duplicate => {
+                let reply = ControlReply::Rejected(RejectCode::Replay);
+                self.audit_request(&signed, &reply, now);
+                return reply;
+            }
+            Seen::Fresh => {
+                // Persist the mark *before* dispatch so a crash cannot reopen
+                // the window for an already-applied request. Fail closed: if
+                // the mark is not durable, the request is not applied. The mark
+                // stays set even if dispatch later rejects, matching the
+                // terminal semantics of the in-memory guard.
+                if let Err(err) = self.seen.save(&self.data_dir, now) {
+                    warn!(
+                        %err,
+                        "control replay mark could not be persisted; refusing request"
+                    );
+                    let reply = ControlReply::Rejected(RejectCode::Internal);
+                    self.audit_request(&signed, &reply, now);
+                    return reply;
+                }
+            }
         }
         let reply = match &signed.request {
             ControlRequest::Join(join) => self.handle_join(&signed, join, now),
@@ -1043,6 +1074,25 @@ impl ControlNode {
                 // old trust-on-first-use behavior, as with approvals.
                 if let Some(expected) = outbound.pinned_operator
                     && signed.controller != expected
+                {
+                    return ControlReply::Rejected(RejectCode::Unauthorized);
+                }
+                // The rejection must answer the *current* outbound request. A
+                // non-zero rejection nonce that does not echo the outstanding
+                // request's nonce is stale (or aimed at a different join) and
+                // must not cancel this one; the outbound join is retained,
+                // mirroring the pinned-mismatch behavior above.
+                //
+                // Residual: a rejection carrying nonce `0` is still accepted,
+                // because the CLI `control reject` legitimately sends `0` when
+                // the parent has no pending row (`main.rs` `.unwrap_or(0)`).
+                // An unpinned (trust-on-first-use) join can therefore still be
+                // cancelled by a zero-nonce rejection; closing that fully means
+                // requiring a pending row in the CLI, which is out of scope
+                // here.
+                if outbound.request.nonce != 0
+                    && rejection.nonce != 0
+                    && rejection.nonce != outbound.request.nonce
                 {
                     return ControlReply::Rejected(RejectCode::Unauthorized);
                 }
@@ -2402,6 +2452,80 @@ mod tests {
             engine.pending().outbound().is_some(),
             "the current outbound join is retained for a matching approval"
         );
+    }
+
+    /// **F**: a rejection whose non-zero nonce does not echo the outstanding
+    /// request must not cancel the in-flight join; a matching nonce is
+    /// accepted and clears it. Mirrors `stale_approval_nonce_is_rejected_without_change`.
+    #[tokio::test]
+    async fn stale_rejection_nonce_is_rejected_without_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = OperatorSecretKey::from_bytes([3u8; 32]);
+        let (mut engine, request) = outbound_applicant(dir.path(), None);
+        let remote = EndpointId::from(SecretKey::generate().public());
+
+        // A rejection for a different (non-zero) request nonce is refused
+        // before any mutation; the current outbound join is retained.
+        let stale = JoinRejection {
+            child: NodeId::from("me"),
+            reason: "stale".to_string(),
+            nonce: request.nonce + 100,
+        };
+        let signed = authorize_at("parent", &parent_op, 1, ControlRequest::JoinRejected(stale));
+        assert_eq!(
+            engine.receive_at(remote, signed, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+        assert!(
+            engine.pending().outbound().is_some(),
+            "the current outbound join is retained for a matching rejection"
+        );
+
+        // The rejection that echoes the outstanding nonce is accepted.
+        let matching = JoinRejection {
+            child: NodeId::from("me"),
+            reason: "matched".to_string(),
+            nonce: request.nonce,
+        };
+        let signed = authorize_at(
+            "parent",
+            &parent_op,
+            2,
+            ControlRequest::JoinRejected(matching),
+        );
+        assert_eq!(
+            engine.receive_at(remote, signed, 0).await,
+            ControlReply::Accepted
+        );
+        assert!(engine.pending().outbound().is_none());
+    }
+
+    /// Documented residual: a `0` rejection nonce is still accepted. The CLI
+    /// `control reject` sends `0` when the parent has no pending row
+    /// (`main.rs`), so treating it as stale would break that path. Closing this
+    /// fully requires the CLI to require a pending row (out of scope).
+    #[tokio::test]
+    async fn zero_rejection_nonce_is_still_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = OperatorSecretKey::from_bytes([3u8; 32]);
+        let (mut engine, _request) = outbound_applicant(dir.path(), None);
+        let remote = EndpointId::from(SecretKey::generate().public());
+        let rejection = JoinRejection {
+            child: NodeId::from("me"),
+            reason: "cli".to_string(),
+            nonce: 0,
+        };
+        let signed = authorize_at(
+            "parent",
+            &parent_op,
+            1,
+            ControlRequest::JoinRejected(rejection),
+        );
+        assert_eq!(
+            engine.receive_at(remote, signed, 0).await,
+            ControlReply::Accepted
+        );
+        assert!(engine.pending().outbound().is_none());
     }
 
     /// A pre-existing row for the parent node id with a **different operator**

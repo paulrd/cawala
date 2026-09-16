@@ -175,6 +175,9 @@ impl ControlHandler {
     }
 
     /// Consume a parent's rejection of our outbound join.
+    ///
+    /// Matching (parent, pinned signer, and nonce staleness) is enforced by
+    /// [`crate::state::LocalStateV1::on_join_rejected`], which is authoritative.
     fn handle_join_rejected(
         &self,
         signed: &SignedControl,

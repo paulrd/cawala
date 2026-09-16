@@ -523,10 +523,34 @@
        user/leaf identity.
      - Companion gap (DONE): `JoinRejected` now requires the invite-pinned
        parent operator on both applicants (native `handle_join_rejected` and
-       wasm `LocalState1::on_join_rejected`), mirroring `JoinApproved`; a spoofed
-       self-signed rejection can no longer cancel an in-flight join (the outbound
-       join is left intact on mismatch). Deferred: a `rejection.nonce` staleness
-       check (edge case when the parent has no pending row, so its nonce is 0).
+       wasm `on_join_rejected`), mirroring `JoinApproved`; a spoofed self-signed
+       rejection can no longer cancel an in-flight join (the outbound join is
+       left intact on mismatch). The deferred `rejection.nonce` staleness check
+       is now in place on both paths: a mismatched non-zero nonce (the parent
+       echoes the request nonce; `handle_admin_reject_join` uses the pending
+       row's) is denied `Unauthorized` with the outbound retained. Residual
+       (documented): a `0` rejection nonce is a wildcard because the CLI
+       `control reject` sends `0` when the parent has no pending row, so an
+       unpinned TOFU join can still be cancelled by a zero-nonce rejection;
+       closing it fully means requiring a pending row in the CLI.
+     - Control replay-guard durability (DONE): the guard behind `receive_at`'s
+       `(origin, controller, nonce)` check is no longer in-memory only.
+       `crates/node/src/seen_store.rs` pairs the `msg::SeenSet` with an ordered,
+       capped sidecar persisted to `<data-dir>/control_seen.json` (version 1;
+       temp file + `sync_all` + rename) and re-observed on `ControlNode::open`.
+       `receive_at` persists a `Seen::Fresh` mark **before** dispatch and returns
+       `Rejected(Internal)` if the mark cannot be made durable (fail closed), so a
+       restart no longer reopens the <=120 s delegated-admin replay window.
+       Verified by `seen_store` unit tests and `crates/node/tests/seen_restart.rs`
+       (restart replay is `Replay`, a corrupt sidecar does not block `open`, a
+       failed persist is `Rejected(Internal)` with no dispatch). Documented
+       residuals: the sidecar's cross-origin eviction is insertion-order LRU
+       while `SeenSet` evicts by `last_touch`, so under cap pressure a still-valid
+       in-memory mark can be absent after a restart; durability is scoped to a
+       process restart (the parent dir is not fsynced, so power loss is
+       best-effort); pruning uses the wall clock. Advisories (not done):
+       parent-dir fsync, corrupt-sidecar observability, write coalescing for the
+       per-`Fresh` rewrite, cap-only eviction.
 
 * Top Risks
   1. Iroh WASM maturity -> M0 spike before any other work.

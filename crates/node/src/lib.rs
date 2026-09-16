@@ -30,6 +30,7 @@ pub mod msg;
 pub mod netting_harness;
 pub mod orders;
 pub mod record;
+pub mod seen_store;
 pub mod settlement;
 
 pub use admin_cli::{AdminCliError, AdminListEntry, GrantOutcome};
