@@ -2380,9 +2380,14 @@ impl ControlNode {
 
     /// Admin: re-send the stored decision for `child`, if one is retained.
     ///
-    /// The stored frame is reused as-is (fresh top-level nonce not needed: the
-    /// applicant matches it by the echoed `JoinRequest.nonce`). If nothing is
-    /// stored, reply [`RejectCode::NotFound`].
+    /// The retained inner [`ControlRequest`] is **re-signed** with a fresh
+    /// top-level nonce and fresh expiry via [`Self::sign_decision`] rather than
+    /// reusing the stored frame: the original frame may already be past its TTL
+    /// (and, in a mixed fleet, would carry a stale version). The inner request is
+    /// reproduced unchanged, so the echoed `JoinRequest.nonce` the applicant
+    /// matches is unchanged. The new frame replaces the stored decision so
+    /// subsequent redeliveries build on the latest. If nothing is stored, reply
+    /// [`RejectCode::NotFound`].
     fn handle_admin_redeliver_join(
         &mut self,
         signed: &SignedControl,
@@ -2398,16 +2403,20 @@ impl ControlNode {
         let Some(stored) = self.stored_decision(&redeliver.child).cloned() else {
             return ControlReply::Rejected(RejectCode::NotFound);
         };
-        // Clone the request out so the decision's fields can be read without
-        // holding a borrow of `stored` while it is moved into the outbound
-        // queue.
+        // Reproduce the retained inner request exactly (the applicant matches
+        // the decision by the echoed `JoinRequest.nonce`) and re-sign it with a
+        // fresh nonce/expiry.
         let request = stored.request.clone();
+        let Ok(re_signed) = self.sign_decision(request.clone(), now) else {
+            return ControlReply::Rejected(RejectCode::Internal);
+        };
+        self.store_decision(re_signed.clone());
         match &request {
             ControlRequest::JoinApproved(approval) => {
                 let child = approval.child.clone();
                 self.outbound.push_back(OutboundControl {
                     target: child.clone(),
-                    signed: stored,
+                    signed: re_signed,
                     kind: OutboundKind::Approved,
                 });
                 ControlReply::AdminApproved(AdminApproved {
@@ -2421,7 +2430,7 @@ impl ControlNode {
                 let child = rejection.child.clone();
                 self.outbound.push_back(OutboundControl {
                     target: child.clone(),
-                    signed: stored,
+                    signed: re_signed,
                     kind: OutboundKind::Rejected,
                 });
                 ControlReply::AdminRejected(AdminRejected {
@@ -3987,8 +3996,14 @@ mod tests {
         ));
         let first = engine.take_outbound();
         assert_eq!(first.len(), 1);
+        let first_nonce = first[0].signed.nonce;
+        let first_request = first[0].signed.request.clone();
 
-        // Redelivery re-queues the stored frame unchanged.
+        // Redelivery **re-signs** the retained inner request with a fresh nonce
+        // and fresh expiry rather than reusing the stored frame: at a `now` past
+        // the first frame's TTL the redelivered frame is valid again. The echoed
+        // `JoinRequest.nonce` (inside the unchanged inner request) is what the
+        // applicant matches.
         let redeliver = authorize_at(
             "parent",
             &operator,
@@ -3998,12 +4013,26 @@ mod tests {
             }),
         );
         assert!(matches!(
-            engine.receive_at(remote, redeliver, 0).await,
+            engine.receive_at(remote, redeliver, 250).await,
             ControlReply::AdminApproved(_)
         ));
         let second = engine.take_outbound();
         assert_eq!(second.len(), 1);
-        assert_eq!(second[0].signed, first[0].signed, "the frame is reused");
+        assert_eq!(
+            second[0].signed.request, first_request,
+            "the inner request (and its echoed JoinRequest.nonce) is unchanged"
+        );
+        assert_ne!(
+            second[0].signed.nonce, first_nonce,
+            "the frame is re-signed, not reused"
+        );
+        assert_eq!(
+            second[0].signed.expiry,
+            250 + CONTROL_REQUEST_TTL_SECS,
+            "the redelivered frame carries a fresh expiry"
+        );
+        assert!(second[0].signed.expiry > first[0].signed.expiry);
+        assert_eq!(second[0].signed.verify_signature(), Ok(()));
 
         // Nothing stored for an unknown child.
         let unknown = authorize_at(

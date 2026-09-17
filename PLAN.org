@@ -794,6 +794,32 @@
         moved-pointers decision - retry with fresh addresses discovered out of
         band); and a `User` (browser-leaf) child's re-slot is out of scope in v1
         and refused.
+      - Control version negotiation (assessed, deferred) + admin-redelivery
+        re-sign (DONE): per-peer `CONTROL_FORMAT_VERSION` negotiation was
+        assessed at a design gate and **not built**. Rationale: there is one
+        codebase and the wasm bundle is rebuilt in lockstep, so no mixed-version
+        fleet exists today; the full design (a per-peer version cache,
+        learn-on-inbound, `min()`-version minting at every site, one `BadVersion`
+        retry, and a routed intent-version cap) is real but not justified now,
+        and full routed negotiation is unsound without a wire change.
+        `CONTROL_FORMAT_VERSION` stays 4, so control remains effectively lockstep
+        for node->child and routed frames. Accepted residual: **v4-only control
+        features** (`Exit`, `DetachNotice`, `Rebase`, `RebasePull`, and
+        `MoveChild`, whose healing `Rebase` is v4-only) cannot reach a known-v3
+        peer; without a per-peer version record (out of scope) such a child
+        cannot be detected or refused, so those operations degrade/fail silently
+        across a version boundary. Independently, the present-day
+        **admin-redelivery** bug is fixed: `handle_admin_redeliver_join` now
+        re-signs the retained inner request with a fresh top-level nonce and
+        expiry via `sign_decision` (previously it pushed the stored frame
+        verbatim, delivering an **expired** frame after the original TTL - and a
+        stale version in a mixed fleet), reproduces the inner request unchanged so
+        the applicant still matches the echoed `JoinRequest.nonce`, and stores the
+        new frame so later redeliveries build on the latest. No
+        `CONTROL_FORMAT_VERSION` bump. Verified: `cawala-node --lib` (the
+        redelivery test asserts a differing nonce, a fresh expiry, an identical
+        inner request, and a valid signature), workspace tests, clippy, and the
+        wasm32 check.
 
 * Top Risks
   1. Iroh WASM maturity -> M0 spike before any other work.

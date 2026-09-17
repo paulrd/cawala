@@ -60,7 +60,19 @@ how to verify, and conventions**. Detail lives elsewhere:
   (consistent with the rejected moved-pointers decision — retry with fresh
   addresses discovered out of band), and a `User` (browser-leaf) child's
   re-slot is out of scope in v1 and refused.
-- **v2 deferred**: per-peer control version negotiation only. **Signed
+- **Control version negotiation** (assessed, deferred — not built): there is one
+  codebase and the wasm bundle is rebuilt in lockstep, so no mixed-version fleet
+  exists today; the full design (a per-peer version cache, learn-on-inbound,
+  `min()`-version minting at every site, one `BadVersion` retry, and a routed
+  intent-version cap) is real but not justified now, and full routed negotiation
+  is unsound without a wire change. `CONTROL_FORMAT_VERSION` stays 4, so control
+  remains effectively lockstep for node→child and routed frames. Accepted
+  residual: **v4-only control features** (`Exit`, `DetachNotice`, `Rebase`,
+  `RebasePull`, and `MoveChild`, whose healing `Rebase` is v4-only) cannot reach
+  a known-v3 peer, and without a per-peer version record such a child cannot be
+  detected or refused, so those operations degrade/fail silently across a
+  version boundary. The independent present-day admin-redelivery bug is fixed
+  (fresh nonce/expiry re-sign; see Hard breaks). **Signed
   topology/registry distribution is rejected** (PLAN.org decision 10): the live
   network topology is the source of truth, so there is no distributed signed
   snapshot to cache/refresh/revoke, and fabricated hops stay detectable rather
@@ -136,10 +148,13 @@ how to verify, and conventions**. Detail lives elsewhere:
 - Hard breaks — recreate `node-data` and rebuild the wasm bundle when they
   change: **control format 4**, ledger (entry/signed) format 4, node on-disk
   ledger meta format 3, settlement payload 3, browser ledger payload 3. Control
-  v4 dual-accepts v3 **inbound only**; minted frames
-  are v4, so mixed-version control is effectively lockstep for node→child and
-  routed frames (per-peer negotiation is a v2 item). Settlement v3 rejects v2
-  inbound, so node↔node settlement is lockstep (same precedent as v1→v2).
+  v4 dual-accepts v3 **inbound only**; minted frames are v4, so mixed-version
+  control is effectively lockstep for node→child and routed frames (per-peer
+  negotiation was assessed and deferred — see above; `MoveChild`/`Rebase`/`Exit`
+  are v4-only and cannot reach a v3 peer). Admin redelivery now re-signs the
+  retained request with a fresh nonce/expiry instead of re-sending the stored
+  (possibly expired) frame. Settlement v3 rejects v2 inbound, so node↔node
+  settlement is lockstep (same precedent as v1→v2).
 - `web/src/wasm/` is gitignored; run `npm run build:wasm` after any
   `crates/client-wasm` change or the JS/wasm arity can desync.
 - Control-plane local state under `<data-dir>`: `control_seen.json` (durable
