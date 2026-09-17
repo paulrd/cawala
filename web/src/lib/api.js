@@ -511,12 +511,16 @@ function _stopControlPoller() {
  * Drain all queued control events into `_lastControlEvent`, copying each DTO to
  * a plain object and freeing it. Kinds are `accepted`, `rejected`, and
  * `detached`; a `detached` event also clears the mirrored join address.
- * Persists state when anything was drained.
+ * On `accepted`/`detached` the wasm ledger was re-pinned/cleared synchronously:
+ * persist the ledger blob before the state blob, resync the reactive ledger
+ * store, and drop any stale `ledger_key_mismatch` error. Persists state when
+ * anything was drained.
  */
 function _drainControlEvents() {
   if (_useMock || !_clientNode) return;
   let drained = false;
   let accepted = false;
+  let parentChanged = false;
   try {
     for (;;) {
       const ev = _clientNode.try_recv_control_event();
@@ -529,11 +533,15 @@ function _drainControlEvents() {
         dateJoined: ev.date_joined ?? null,
         reason: ev.reason ?? null,
       };
-      if (_lastControlEvent.kind === CONTROL_EVENT.ACCEPTED) accepted = true;
+      if (_lastControlEvent.kind === CONTROL_EVENT.ACCEPTED) {
+        accepted = true;
+        parentChanged = true;
+      }
       if (_lastControlEvent.kind === CONTROL_EVENT.DETACHED) {
         // The wasm state is parentless now; clear the mirrored address so the
         // UI drops out of the joined view ("Left network") immediately.
         clientState.address = null;
+        parentChanged = true;
       }
       ev.free?.();
       drained = true;
@@ -541,6 +549,14 @@ function _drainControlEvents() {
   } catch (err) {
     _warnOnce('control-drain', '[api] control event drain failed', err);
     return;
+  }
+  if (parentChanged) {
+    // The parent-scoped ledger binding changed in wasm: a prior mismatch no
+    // longer describes the current leaf. Persist the ledger blob before the
+    // state blob so a reload cannot restore the stale pin.
+    ledgerState.error = null;
+    _persistLedgerState();
+    _syncLedgerStoreFromStatus();
   }
   if (drained) _persistState();
   // A fresh approval means an address now exists: verify its balance.
@@ -2000,8 +2016,12 @@ export async function leave() {
       delivery: outcome.delivery ?? null,
     };
     // The local wasm state is now parentless: mirror and persist immediately
-    // (the poller would also pick this up on its next tick).
+    // (the poller would also pick this up on its next tick). The wasm `leave()`
+    // cleared the parent-scoped ledger binding, so persist the ledger blob
+    // before the state blob and resync the reactive store.
     _syncJoinStateIntoStore();
+    _persistLedgerState();
+    _syncLedgerStoreFromStatus();
     _persistState();
     return result;
   } finally {

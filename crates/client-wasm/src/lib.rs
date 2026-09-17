@@ -554,7 +554,12 @@ pub struct ClientNode {
     /// identity.
     control_rx: Option<tokio::sync::Mutex<mpsc::Receiver<Envelope>>>,
     control: Arc<SharedControl>,
-    ledger: Mutex<LedgerStateV1>,
+    /// The leaf ledger state.
+    ///
+    /// Shared with the inbound [`ControlHandler`] so a verified `JoinApproval`
+    /// can re-pin the parent ledger synchronously, before any balance request
+    /// races the stale pin.
+    ledger: Arc<Mutex<LedgerStateV1>>,
 }
 
 #[wasm_bindgen]
@@ -581,7 +586,7 @@ impl ClientNode {
             rx: None,
             control_rx: None,
             control,
-            ledger: Mutex::new(LedgerStateV1::new()),
+            ledger: Arc::new(Mutex::new(LedgerStateV1::new())),
         })
     }
 
@@ -612,7 +617,7 @@ impl ClientNode {
             rx: Some(tokio::sync::Mutex::new(rx)),
             control_rx: None,
             control,
-            ledger: Mutex::new(LedgerStateV1::new()),
+            ledger: Arc::new(Mutex::new(LedgerStateV1::new())),
         })
     }
 
@@ -653,9 +658,15 @@ impl ClientNode {
         // envelope/ledger drain ([`ClientNode::try_recv_envelope`]) sees only
         // application traffic.
         let (control_sink, control_rx) = mpsc::channel(32);
+        // Shared with the control handler so a verified `JoinApproval` can
+        // re-pin the parent ledger synchronously.
+        let ledger: Arc<Mutex<LedgerStateV1>> = Arc::new(Mutex::new(LedgerStateV1::new()));
         let router = Router::builder(endpoint)
             .accept(proto::ALPN, PingHandler)
-            .accept(CONTROL_ALPN, ControlHandler::new(Arc::clone(&control)))
+            .accept(
+                CONTROL_ALPN,
+                ControlHandler::new(Arc::clone(&control), Arc::clone(&ledger)),
+            )
             .accept(
                 cawala_msg::ALPN,
                 MsgHandler::for_shared(Arc::clone(&control), self_node, sink, control_sink),
@@ -667,7 +678,7 @@ impl ClientNode {
             rx: Some(tokio::sync::Mutex::new(rx)),
             control_rx: Some(tokio::sync::Mutex::new(control_rx)),
             control,
-            ledger: Mutex::new(LedgerStateV1::new()),
+            ledger,
         })
     }
 
@@ -880,6 +891,13 @@ impl ClientNode {
         // answered), so a failed parent cannot trap the user.
         let transition = self.control.lock_state().apply_detach();
         if matches!(transition, Transition::Detached) {
+            // The balance claim belongs to the leaf we just left: drop the pin
+            // and parent-scoped balance/pending before surfacing the event, so a
+            // subsequent store sync cannot resurrect it.
+            self.ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear_parent_binding();
             self.control
                 .push_event(ControlEventDto::detached(&parent.node_id));
         }

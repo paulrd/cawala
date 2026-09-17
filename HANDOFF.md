@@ -29,6 +29,20 @@ how to verify, and conventions**. Detail lives elsewhere:
   stranded-claim evidence bundle (automated foster recovery was **cut** by
   decision), and the exit-rights follow-ups. See `PLAN.org` M4/M5 for the
   authoritative description of each.
+- Browser re-attach stale ledger pin (DONE): a browser re-attached to a new
+  parent re-pins its leaf ledger key from the authenticated
+  `JoinApproval.parent_ledger` synchronously in the control handler (before the
+  accepted event, so the balance request cannot race the stale pin) and clears
+  the parent-scoped balance/pending; `DetachNotice`/`leave` clear the binding.
+  The web layer persists the ledger blob before the join-state blob on
+  `accepted`/`detached` and drops a stale `ledger_key_mismatch`. No version bump
+  (`JoinApproval.parent_ledger` already existed). Residuals: a pre-fix persisted
+  blob/identity bundle may already hold an inconsistent (state=B, pin=A) pair and
+  stay wedged - heal is leave + re-join; a same-parent ledger-key rotation
+  without re-approval still hard-rejects until a re-join (the browser has no
+  authenticated rotation channel); persistence is best-effort, so a failed
+  ledger-blob write with a succeeding join-state write can still leave that
+  inconsistent pair (low probability).
 
 ## Next (recorded backlog)
 - **`OctAddr` depth cap** — deliberately not done (PLAN decision 9: no hard depth
@@ -175,5 +189,7 @@ how to verify, and conventions**. Detail lives elsewhere:
 - A peer **ledger-key rotation** is reconciled only on re-attach (the child's
   self-signed join vouches for the new key) or by the node's own operator on
   `CreateChild`; it is network-wide, and the old key's historical
-  commitments/hops stop resolving against the updated registry.
+  commitments/hops stop resolving against the updated registry. The browser now
+  re-pins on re-attach too (see the browser re-attach entry above); a browser
+  same-parent rotation without re-approval still hard-rejects until a re-join.
 - Only commit when explicitly asked.

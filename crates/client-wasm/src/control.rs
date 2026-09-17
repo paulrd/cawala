@@ -23,6 +23,7 @@ use iroh::{EndpointAddr, EndpointId, TransportAddr};
 use tracing::info;
 
 use crate::dto::ControlEventDto;
+use crate::ledger_state::LedgerStateV1;
 use crate::state::{LocalStateV1, Transition};
 use crate::{now_unix_seconds, to_js_err};
 
@@ -156,6 +157,12 @@ impl SharedControl {
 /// self-admin `Query`. All mutations of the local state happen here.
 pub(crate) struct ControlHandler {
     shared: Arc<SharedControl>,
+    /// The leaf ledger state, shared with [`crate::ClientNode`].
+    ///
+    /// A verified `JoinApproval` re-pins the parent ledger key here
+    /// synchronously (before the accepted event), so the browser never issues a
+    /// balance request under a former parent's pin.
+    ledger: Arc<Mutex<LedgerStateV1>>,
 }
 
 impl std::fmt::Debug for ControlHandler {
@@ -167,9 +174,16 @@ impl std::fmt::Debug for ControlHandler {
 }
 
 impl ControlHandler {
-    /// Wrap shared state.
-    pub(crate) fn new(shared: Arc<SharedControl>) -> Self {
-        ControlHandler { shared }
+    /// Wrap shared state and the shared ledger handle.
+    pub(crate) fn new(shared: Arc<SharedControl>, ledger: Arc<Mutex<LedgerStateV1>>) -> Self {
+        ControlHandler { shared, ledger }
+    }
+
+    /// Lock the shared ledger state, recovering from poisoning.
+    fn lock_ledger(&self) -> MutexGuard<'_, LedgerStateV1> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Dispatch exactly one signed request, synchronously.
@@ -311,7 +325,9 @@ impl ControlHandler {
         }
         let transition = self.shared.lock_state().apply_detach();
         if matches!(transition, Transition::Detached) {
-            // The parent is gone: drop the ordering guard with it.
+            // The parent is gone: drop the ordering guard and the parent-scoped
+            // ledger binding (pin + balance + pending) before the event.
+            self.lock_ledger().clear_parent_binding();
             self.shared.reset_rebase_guard();
             self.shared
                 .push_event(ControlEventDto::detached(&parent.node_id));
@@ -335,6 +351,10 @@ impl ControlHandler {
             &signed.controller,
         );
         if matches!(transition, Transition::Approved) {
+            // Re-pin to the authenticated new parent's ledger key *before* the
+            // accepted event (and before `reset_rebase_guard`), so the balance
+            // request the event triggers verifies under the new leaf's key.
+            self.lock_ledger().rebind_parent(approval.parent_ledger);
             // A fresh link has no known generation: reset the ordering guard.
             self.shared.reset_rebase_guard();
             self.shared
@@ -665,10 +685,75 @@ fn reply_kind(reply: &ControlReply) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cawala_control::{ROUTED_REPLY_VERSION, RoutedReplyV1};
+    use cawala_control::{JoinRequest, ROUTED_REPLY_VERSION, RoutedReplyV1};
+    use cawala_ledger::{
+        Entry, EntryBody, Ledger, LedgerSecretKey, MemLog, SignedCommitment, SignedEntry,
+        attest_balance, build_commitment, entry_hash,
+    };
+    use cawala_msg::BalanceReceiptV1;
+    use cawala_topology::ChildKind;
 
     fn operator(seed: u8) -> OperatorSecretKey {
         OperatorSecretKey::from_bytes([seed; 32])
+    }
+
+    /// An isolated ledger handle for a handler that does not inspect it.
+    fn test_ledger() -> Arc<Mutex<LedgerStateV1>> {
+        Arc::new(Mutex::new(LedgerStateV1::new()))
+    }
+
+    fn ledger_key(seed: u8) -> LedgerSecretKey {
+        LedgerSecretKey::from_bytes([seed; 32])
+    }
+
+    /// A root ledger that opens one account per `accounts`, mirroring the
+    /// fixture in `crate::ledger_state`'s tests.
+    fn ledger_with_accounts(key: &LedgerSecretKey, accounts: &[NodeId]) -> Ledger<MemLog> {
+        let mut ledger = Ledger::new_root(key.public());
+        let mut prev = cawala_ledger::Hash::ZERO;
+        for (seq, child) in accounts.iter().enumerate() {
+            let entry = Entry {
+                ledger_id: key.public(),
+                seq: seq as u64,
+                height: seq as u64,
+                prev_hash: prev,
+                issued_at: seq as u64,
+                body: EntryBody::OpenAccount {
+                    child: child.clone(),
+                    kind: ChildKind::Node,
+                },
+                postings: vec![],
+                auth: None,
+            };
+            let signed = SignedEntry::sign(entry, key).unwrap();
+            prev = entry_hash(&signed.entry).unwrap();
+            ledger.append(signed).unwrap();
+        }
+        ledger
+    }
+
+    /// A cryptographically valid balance receipt for `child` under `key`.
+    fn receipt_for(key: &LedgerSecretKey, parent: &NodeId, child: &NodeId) -> BalanceReceiptV1 {
+        // The child must be an opened account for `attest_balance` to resolve.
+        let ledger = ledger_with_accounts(
+            key,
+            &[child.clone(), NodeId::from("n0"), NodeId::from("n2")],
+        );
+        let commitment = SignedCommitment::sign(
+            build_commitment(&ledger, cawala_ledger::Hash::ZERO, 1).unwrap(),
+            key,
+        )
+        .unwrap();
+        let attestation = attest_balance(&ledger, parent, child).unwrap();
+        BalanceReceiptV1 {
+            reply_to: None,
+            query_id: None,
+            ledger_pubkey: key.public(),
+            attestation,
+            commitment,
+            history: vec![],
+            notice: None,
+        }
     }
 
     fn peer(addr: &str, node: &str) -> PeerRef {
@@ -906,7 +991,7 @@ mod tests {
     #[test]
     fn rebase_from_recorded_parent_updates_address_in_place() {
         let (shared, parent_op, parent_id) = joined_browser();
-        let handler = ControlHandler::new(Arc::clone(&shared));
+        let handler = ControlHandler::new(Arc::clone(&shared), test_ledger());
         let signed = signed_by(
             &parent_id,
             &parent_op,
@@ -929,7 +1014,7 @@ mod tests {
     #[test]
     fn rebase_to_current_address_is_an_idempotent_accept() {
         let (shared, parent_op, parent_id) = joined_browser();
-        let handler = ControlHandler::new(Arc::clone(&shared));
+        let handler = ControlHandler::new(Arc::clone(&shared), test_ledger());
         let signed = signed_by(
             &parent_id,
             &parent_op,
@@ -946,7 +1031,7 @@ mod tests {
     #[test]
     fn rebase_with_wrong_derivation_is_bad_request() {
         let (shared, parent_op, parent_id) = joined_browser();
-        let handler = ControlHandler::new(Arc::clone(&shared));
+        let handler = ControlHandler::new(Arc::clone(&shared), test_ledger());
         // The slot is 3, so `0.4.4` is not `0.4.child(3)`.
         let signed = signed_by(
             &parent_id,
@@ -967,7 +1052,7 @@ mod tests {
     #[test]
     fn rebase_claiming_parent_origin_under_attacker_key_is_rejected() {
         let (shared, _parent_op, parent_id) = joined_browser();
-        let handler = ControlHandler::new(Arc::clone(&shared));
+        let handler = ControlHandler::new(Arc::clone(&shared), test_ledger());
         let attacker = operator(9);
         // `origin` claims the parent node id, but the frame is signed by the
         // attacker's operator key; the origin/controller binding must fail.
@@ -990,7 +1075,7 @@ mod tests {
     #[test]
     fn rebase_from_a_stale_or_sibling_parent_is_rejected() {
         let (shared, _parent_op, _parent_id) = joined_browser();
-        let handler = ControlHandler::new(Arc::clone(&shared));
+        let handler = ControlHandler::new(Arc::clone(&shared), test_ledger());
         // A different node (a former parent or a sibling) signs a plausible
         // re-base: the origin does not match the recorded parent.
         let other = operator(3);
@@ -1017,7 +1102,7 @@ mod tests {
     #[test]
     fn rebase_lower_generation_is_ignored() {
         let (shared, parent_op, parent_id) = joined_browser();
-        let handler = ControlHandler::new(Arc::clone(&shared));
+        let handler = ControlHandler::new(Arc::clone(&shared), test_ledger());
 
         let newer = signed_by(
             &parent_id,
@@ -1048,7 +1133,7 @@ mod tests {
     #[test]
     fn rebase_equal_generation_different_address_is_refused() {
         let (shared, parent_op, parent_id) = joined_browser();
-        let handler = ControlHandler::new(Arc::clone(&shared));
+        let handler = ControlHandler::new(Arc::clone(&shared), test_ledger());
 
         let applied = signed_by(
             &parent_id,
@@ -1089,7 +1174,7 @@ mod tests {
     #[test]
     fn rebase_higher_generation_applies() {
         let (shared, parent_op, parent_id) = joined_browser();
-        let handler = ControlHandler::new(Arc::clone(&shared));
+        let handler = ControlHandler::new(Arc::clone(&shared), test_ledger());
 
         let first = signed_by(
             &parent_id,
@@ -1119,7 +1204,7 @@ mod tests {
     #[test]
     fn rebase_guard_resets_on_parent_change() {
         let (shared, parent_op, parent_id) = joined_browser();
-        let handler = ControlHandler::new(Arc::clone(&shared));
+        let handler = ControlHandler::new(Arc::clone(&shared), test_ledger());
 
         // Apply a high generation from the first parent.
         let high = signed_by(
@@ -1156,7 +1241,7 @@ mod tests {
     #[test]
     fn detach_notice_from_recorded_parent_clears_parent_and_address() {
         let (shared, parent_op, parent_id) = joined_browser();
-        let handler = ControlHandler::new(Arc::clone(&shared));
+        let handler = ControlHandler::new(Arc::clone(&shared), test_ledger());
         let signed = signed_by(
             &parent_id,
             &parent_op,
@@ -1181,7 +1266,7 @@ mod tests {
     #[test]
     fn detach_notice_from_a_wrong_origin_is_rejected_and_state_retained() {
         let (shared, _parent_op, _parent_id) = joined_browser();
-        let handler = ControlHandler::new(Arc::clone(&shared));
+        let handler = ControlHandler::new(Arc::clone(&shared), test_ledger());
         let other = operator(3);
         let signed = signed_by(
             &NodeId::from(other.public().to_string()),
@@ -1199,5 +1284,234 @@ mod tests {
         assert!(state.record.parent.is_some());
         assert!(state.record.address.is_some());
         assert!(shared.lock_events().is_empty());
+    }
+
+    // ── ledger re-pin on re-attach / detach ─────────────────────────
+
+    /// A browser joined to parent A with an A-scoped ledger (pin, balance,
+    /// pending order, activity, leaf pin) and an outstanding join to parent B.
+    struct ReattachFixture {
+        shared: Arc<SharedControl>,
+        ledger: Arc<Mutex<LedgerStateV1>>,
+        parent_b_op: OperatorSecretKey,
+        browser_id: String,
+        parent_b_id: NodeId,
+        pin_a: LedgerSecretKey,
+        pin_b: LedgerSecretKey,
+    }
+
+    fn reattach_fixture() -> ReattachFixture {
+        let browser_op = operator(1);
+        let parent_a_op = operator(2);
+        let parent_b_op = operator(3);
+        let browser_id = browser_op.public().to_string();
+        let parent_a_id = NodeId::from(parent_a_op.public().to_string());
+        let parent_b_id = NodeId::from(parent_b_op.public().to_string());
+        let pin_a = ledger_key(11);
+        let pin_b = ledger_key(12);
+
+        let shared = Arc::new(SharedControl::new(
+            browser_id.clone(),
+            Some(browser_op.clone()),
+        ));
+        {
+            let mut state = shared.lock_state();
+            state.record.address = Some("0.2.3".parse().expect("address parses"));
+            state.record.parent = Some(crate::state::ParentLink {
+                node_id: parent_a_id,
+                slot: 3,
+            });
+            let request = JoinRequest {
+                node: NodeId::from(browser_id.clone()),
+                kind: ChildKind::User,
+                operator: browser_op.public(),
+                ledger: None,
+                desired_slot: None,
+                location_hint: None,
+                nonce: 42,
+                expiry: u64::MAX,
+            };
+            request.validate().expect("join request validates");
+            state.set_outbound(request, parent_b_id.clone(), None, 0);
+        }
+
+        let ledger = Arc::new(Mutex::new(LedgerStateV1::new()));
+        {
+            let mut l = ledger.lock().unwrap();
+            l.pinned_ledger = Some(pin_a.public());
+            l.balance = Some(crate::ledger_state::VerifiedBalanceV1 {
+                amount: 7,
+                height: 1,
+                state_root: cawala_ledger::Hash::ZERO,
+            });
+            let order = crate::ledger_state::build_payment_order(
+                NodeId::from(browser_id.clone()),
+                NodeId::from("0.9.1"),
+                5,
+                1,
+                u64::MAX,
+            );
+            let auth = order.authorize(&browser_op).expect("order authorises");
+            l.push_pending(order, auth, 1);
+            l.record_activity(crate::ledger_state::ActivityEntryV1 {
+                entry_seq: 1,
+                entry_hash: cawala_ledger::Hash::from_bytes([0xaa; 32]),
+                payment_id: cawala_ledger::Hash::ZERO,
+                from: NodeId::from("0.1.1"),
+                to: NodeId::from("0.9.1"),
+                amount: 5,
+                role: cawala_ledger::HopRole::Direct,
+                issued_at: 0,
+            });
+            l.pin_leaf_key(NodeId::from("0.9"), ledger_key(5).public());
+        }
+
+        ReattachFixture {
+            shared,
+            ledger,
+            parent_b_op,
+            browser_id,
+            parent_b_id,
+            pin_a,
+            pin_b,
+        }
+    }
+
+    /// Drive a valid approval from parent B for the fixture's outstanding join.
+    fn approve_from_b(f: &ReattachFixture, approval: cawala_control::JoinApproval) -> ControlReply {
+        let handler = ControlHandler::new(Arc::clone(&f.shared), Arc::clone(&f.ledger));
+        let signed = signed_by(
+            &f.parent_b_id,
+            &f.parent_b_op,
+            ControlRequest::JoinApproved(approval),
+        );
+        handler.handle(&signed)
+    }
+
+    fn approval_from_b(
+        f: &ReattachFixture,
+        parent_ledger: cawala_ledger::LedgerPubKey,
+    ) -> cawala_control::JoinApproval {
+        cawala_control::JoinApproval {
+            child: NodeId::from(f.browser_id.clone()),
+            child_operator: operator(1).public(),
+            child_ledger: None,
+            kind: ChildKind::User,
+            slot: 3,
+            address: "0.3.3".parse().expect("address parses"),
+            date_joined: 0,
+            nonce: 42,
+            parent_ledger,
+        }
+    }
+
+    /// The load-bearing regression: re-attaching to a new parent re-pins the
+    /// ledger to the authenticated `parent_ledger` and clears the old parent's
+    /// balance/pending (retaining display-only + leaf-scoped state), and the new
+    /// leaf's receipt then verifies.
+    #[test]
+    fn join_approved_from_new_parent_rebinds_ledger_and_receipt_verifies() {
+        let f = reattach_fixture();
+        assert_eq!(
+            approve_from_b(&f, approval_from_b(&f, f.pin_b.public())),
+            ControlReply::Accepted
+        );
+
+        {
+            let l = f.ledger.lock().unwrap();
+            assert_eq!(l.pinned_ledger, Some(f.pin_b.public()));
+            assert!(l.balance.is_none(), "old parent's balance is cleared");
+            assert!(l.pending.is_empty(), "old parent's pending is cleared");
+            assert_eq!(l.activity.len(), 1, "display-only activity is retained");
+            assert_eq!(l.pinned_leaf_keys.len(), 1, "leaf pins are retained");
+        }
+        {
+            let events = f.shared.lock_events();
+            let event = events.front().expect("accepted event is queued");
+            assert_eq!(event.kind(), "accepted");
+        }
+
+        // The re-pinned key accepts the new leaf's balance receipt through the
+        // same path `apply_balance_receipt_event` uses.
+        let receipt = receipt_for(
+            &f.pin_b,
+            &f.parent_b_id,
+            &NodeId::from(f.browser_id.clone()),
+        );
+        let installed = crate::ledger_state::apply_balance_receipt(
+            &mut f.ledger.lock().unwrap(),
+            &receipt,
+            &f.browser_id,
+            &f.parent_b_id,
+        )
+        .expect("B-keyed receipt verifies after the re-pin");
+        assert_eq!(installed.amount, 0);
+        assert!(f.ledger.lock().unwrap().balance.is_some());
+    }
+
+    /// A stale (wrong-nonce) approval must not touch the ledger binding.
+    #[test]
+    fn stale_join_approval_does_not_touch_ledger() {
+        let f = reattach_fixture();
+        let mut approval = approval_from_b(&f, f.pin_b.public());
+        approval.nonce = 99;
+        assert_eq!(
+            approve_from_b(&f, approval),
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+        let l = f.ledger.lock().unwrap();
+        assert_eq!(l.pinned_ledger, Some(f.pin_a.public()));
+        assert!(l.balance.is_some());
+        assert_eq!(l.pending.len(), 1);
+    }
+
+    /// A `DetachNotice` from a wrong origin must not clear the binding.
+    #[test]
+    fn detach_notice_from_wrong_origin_does_not_touch_ledger() {
+        let f = reattach_fixture();
+        let handler = ControlHandler::new(Arc::clone(&f.shared), Arc::clone(&f.ledger));
+        let other = operator(9);
+        let signed = signed_by(
+            &NodeId::from(other.public().to_string()),
+            &other,
+            ControlRequest::DetachNotice(DetachNotice {
+                node: NodeId::from(f.browser_id.clone()),
+            }),
+        );
+        assert_eq!(
+            handler.handle(&signed),
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+        let l = f.ledger.lock().unwrap();
+        assert_eq!(l.pinned_ledger, Some(f.pin_a.public()));
+        assert!(l.balance.is_some());
+    }
+
+    /// A `DetachNotice` from the recorded parent clears the parent-scoped
+    /// ledger binding before the detached event.
+    #[test]
+    fn detach_notice_from_recorded_parent_clears_parent_binding() {
+        let f = reattach_fixture();
+        let handler = ControlHandler::new(Arc::clone(&f.shared), Arc::clone(&f.ledger));
+        let parent_a_op = operator(2);
+        let parent_a_id = NodeId::from(parent_a_op.public().to_string());
+        let signed = signed_by(
+            &parent_a_id,
+            &parent_a_op,
+            ControlRequest::DetachNotice(DetachNotice {
+                node: NodeId::from(f.browser_id.clone()),
+            }),
+        );
+        assert_eq!(handler.handle(&signed), ControlReply::Accepted);
+        let l = f.ledger.lock().unwrap();
+        assert!(l.pinned_ledger.is_none());
+        assert!(l.balance.is_none());
+        assert!(l.pending.is_empty());
+        drop(l);
+        let events = f.shared.lock_events();
+        assert_eq!(
+            events.front().expect("detached event queued").kind(),
+            "detached"
+        );
     }
 }

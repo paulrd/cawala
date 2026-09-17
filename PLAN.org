@@ -422,6 +422,28 @@
         deduped with live events, and the Activity page renders settlement status
         truthfully (applied/duplicate proven; partial/indeterminate/unverified
         warn; rejected danger). Local blob bump only - not a wire break.
+      - Browser re-attach stale ledger pin (DONE): a browser re-attached to a new
+        parent now re-pins its leaf ledger key from the authenticated
+        `JoinApproval.parent_ledger` synchronously inside the control handler
+        (before `reset_rebase_guard()` and before the accepted event, so the
+        balance request the event triggers cannot race a stale pin), replacing
+        the former parent's TOFU pin; the parent-scoped validated balance and
+        in-flight `pending` are cleared (display-only `activity`/`settlements`
+        and leaf-scoped `pinned_leaf_keys` are retained). `DetachNotice` and
+        local `leave()` clear the binding before their detached event, and the
+        web layer persists the ledger blob before the join-state blob on
+        `accepted`/`detached` (clearing a stale `ledger_key_mismatch`). No
+        version bump - `JoinApproval.parent_ledger` already existed, and
+        `verify_receipt`'s `None`-TOFU fallback is unchanged (a same-parent
+        ledger-key mismatch still hard-rejects). Residuals: a pre-fix persisted
+        blob or identity bundle may already hold an inconsistent (state=B,
+        pin=A) pair and stay wedged - heal is leave + re-join; a same-parent
+        ledger-key rotation without re-approval still hard-rejects until a
+        re-join (the browser has no authenticated rotation channel); and
+        persistence is best-effort, so a failed ledger-blob write with a
+        succeeding join-state write can still leave that inconsistent pair
+        (low probability: the larger ledger blob fails first against a
+        near-full quota).
       - Still owed: no global supply anchor by design; manual prefund liquidity (an
         underfunded LCA parent yields a `Partial`: payer debited, payee not
         credited); control format 4 / settlement payload 3 / browser ledger

@@ -9,9 +9,11 @@
 //! # Trust model
 //!
 //! A [`BalanceReceiptV1`] is only trusted after
-//! [`verify_balance_attestation`] accepts it under a pinned ledger key. The
-//! first verified receipt is **trust-on-first-use** pinned
-//! ([`LedgerStateV1::pinned_ledger`]); every later receipt must be signed by
+//! [`verify_balance_attestation`] accepts it under a pinned ledger key. The pin
+//! is installed from the authenticated `JoinApproval.parent_ledger` on join, and
+//! cleared when the parent changes (detach/leave); when no pin is present, the
+//! first verified receipt is **trust-on-first-use** pinned as a fallback
+//! ([`LedgerStateV1::pinned_ledger`]). Every later receipt must be signed by
 //! that same ledger or it is rejected without touching any state. v1 does not
 //! attempt to chain `prev_commitment_hash`; each receipt stands alone against
 //! the pinned key.
@@ -230,7 +232,9 @@ pub fn settlement_state_reason(state: &SettlementStateV1) -> Option<&str> {
 pub struct LedgerStateV1 {
     /// [`LEDGER_STATE_VERSION`].
     pub version: u8,
-    /// The ledger key pinned by the first verified receipt, if any.
+    /// The current parent leaf's ledger key: installed from the authenticated
+    /// `JoinApproval.parent_ledger` on join (or the first verified receipt as a
+    /// trust-on-first-use fallback), and cleared when the parent changes.
     pub pinned_ledger: Option<LedgerPubKey>,
     /// The last cryptographically verified balance, if any.
     pub balance: Option<VerifiedBalanceV1>,
@@ -492,6 +496,36 @@ impl LedgerStateV1 {
             .iter()
             .find(|(id, _)| id == node_id)
             .map(|(_, key)| *key)
+    }
+
+    /// Re-pin the parent ledger key to a newly approved parent and drop the
+    /// parent-scoped state.
+    ///
+    /// Called when a verified `JoinApproval` names the new parent's
+    /// `parent_ledger`: the pin then tracks the authenticated current parent
+    /// (mirroring the native `replace_peer_ledger`), so a stale TOFU pin from a
+    /// former parent cannot reject the new leaf's balance receipt. The verified
+    /// balance and any in-flight orders were scoped to the old parent's leaf and
+    /// are cleared.
+    ///
+    /// `activity`/`settlements` (display-only) and `pinned_leaf_keys`
+    /// (leaf-scoped, not parent-scoped) are retained.
+    pub fn rebind_parent(&mut self, ledger: LedgerPubKey) {
+        self.pinned_ledger = Some(ledger);
+        self.balance = None;
+        self.pending.clear();
+    }
+
+    /// Clear the parent-scoped binding: the pinned parent ledger key, the
+    /// verified balance, and any in-flight orders.
+    ///
+    /// Called on detach/leave, when the leaf no longer has a parent and its
+    /// balance claim belongs to a leaf it has left. `activity`/`settlements`
+    /// and `pinned_leaf_keys` are retained.
+    pub fn clear_parent_binding(&mut self) {
+        self.pinned_ledger = None;
+        self.balance = None;
+        self.pending.clear();
     }
 
     /// Remove and return the pending order whose hash equals `order_hash`.
@@ -1604,6 +1638,70 @@ mod tests {
         assert!(verify_receipt(&mut state, &receipt, "n1", &parent).is_err());
         assert_eq!(state.pinned_ledger, Some(pinned.public()));
         assert_eq!(state.balance.as_ref().unwrap().amount, 5);
+    }
+
+    #[test]
+    fn rebind_parent_replaces_pin_and_clears_parent_scoped_state() {
+        let old_pin = ledger(1);
+        let new_parent = ledger(2);
+        let order_key = ledger(3);
+        let mut state = LedgerStateV1::new();
+        state.pinned_ledger = Some(old_pin.public());
+        state.balance = Some(VerifiedBalanceV1 {
+            amount: 5,
+            height: 1,
+            state_root: Hash::ZERO,
+        });
+        push_pending(&mut state, &order_key, pending_order(1));
+        state.record_activity(activity_from_notice(&notice(1, 0xaa)));
+        state.record_settlement(
+            Hash::from_bytes([0x33; 32]),
+            SettlementStateV1::Applied,
+            Some(5),
+            Some(node("n2")),
+            Some(7),
+        );
+        state.pin_leaf_key(node("leaf"), ledger(5).public());
+
+        state.rebind_parent(new_parent.public());
+
+        assert_eq!(state.pinned_ledger, Some(new_parent.public()));
+        assert!(state.balance.is_none(), "balance is parent-scoped");
+        assert!(state.pending.is_empty(), "pending is parent-scoped");
+        // Display-only and leaf-scoped state is retained.
+        assert_eq!(state.activity.len(), 1);
+        assert_eq!(state.settlements.len(), 1);
+        assert_eq!(
+            state.pinned_leaf_key(&node("leaf")),
+            Some(ledger(5).public())
+        );
+    }
+
+    #[test]
+    fn clear_parent_binding_clears_pin_balance_and_pending() {
+        let pin = ledger(1);
+        let order_key = ledger(3);
+        let mut state = LedgerStateV1::new();
+        state.pinned_ledger = Some(pin.public());
+        state.balance = Some(VerifiedBalanceV1 {
+            amount: 5,
+            height: 1,
+            state_root: Hash::ZERO,
+        });
+        push_pending(&mut state, &order_key, pending_order(1));
+        state.record_activity(activity_from_notice(&notice(1, 0xaa)));
+        state.pin_leaf_key(node("leaf"), ledger(5).public());
+
+        state.clear_parent_binding();
+
+        assert!(state.pinned_ledger.is_none());
+        assert!(state.balance.is_none());
+        assert!(state.pending.is_empty());
+        assert_eq!(state.activity.len(), 1);
+        assert_eq!(
+            state.pinned_leaf_key(&node("leaf")),
+            Some(ledger(5).public())
+        );
     }
 
     #[test]
