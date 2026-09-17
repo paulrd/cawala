@@ -8,7 +8,7 @@ use cawala_control::{
     Invite, JoinRejection, JoinRequest, MoveChild, NodeId, OperatorPubKey, OperatorSecretKey,
     SetAddress, SignedControl,
 };
-use cawala_ledger::{AccountRef, Amount, LedgerPubKey, commitment_hash, verify_chain};
+use cawala_ledger::{AccountRef, Amount, EntryBody, LedgerPubKey, commitment_hash, verify_chain};
 use cawala_msg::{MSG_CONTROL_V1, MSG_LEDGER_V1, MSG_SETTLE_V1};
 use cawala_node::control::{
     pull_rebase_from_parent, spawn_control_node_live, sweep_pending_rebase,
@@ -183,7 +183,10 @@ enum ControlCommand {
         child: String,
     },
     /// Ask a directly-controlled neighbor to re-slot one of its direct
-    /// children (v1 is downward-only within the same node).
+    /// children (v1: a **node** child under the same parent; a `User`
+    /// browser-leaf child is rejected). The child is re-based onto its new
+    /// address by the parent's `Rebase` push, and heals by pull if it was
+    /// offline.
     MoveChild {
         /// The controlled neighbor's `EndpointId`.
         #[arg(long, value_name = "ENDPOINT_ID")]
@@ -358,6 +361,18 @@ enum LedgerCommand {
         /// `user` (the default) or `node`.
         #[arg(long, value_name = "KIND")]
         kind: Option<String>,
+    },
+    /// Write off this node's entire `Parent` balance to settle a severed edge.
+    ///
+    /// Run after `control exit` (a node with a parent link must detach first).
+    /// The close forfeits the **whole** pooled `Parent` balance — possibly
+    /// another former parent's claim and any extension a new parent already
+    /// made — and is irreversible, so do it **before** a new parent prefunds.
+    EdgeClose {
+        /// Optional, non-authoritative audit context: the node this close is
+        /// settling with (e.g. the old parent's `EndpointId`).
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        from: Option<String>,
     },
     /// Append one chained commitment at the current ledger head.
     Commit,
@@ -792,6 +807,45 @@ fn ledger(data_dir: &std::path::Path, command: LedgerCommand) -> Result<()> {
                     .parent_balance()
                     .unwrap_or(Amount::ZERO)
             );
+        }
+        LedgerCommand::EdgeClose { from } => {
+            let mut service = LedgerService::open(data_dir, &node_id)?;
+            let operator = OperatorSecretKey::from_bytes(secret_key.to_bytes());
+            let nonce = getrandom::u64().map_err(|err| anyhow::anyhow!("getrandom: {err}"))?;
+            let now = now_unix_seconds();
+            let from_id = from.map(NodeId::from);
+            match service.edge_close(&operator, nonce, now, from_id.as_ref())? {
+                Some((seq, hash)) => {
+                    // The amount actually written off is the appended body's,
+                    // which may be newer than any balance read before the call.
+                    let body = service.entry_at(seq)?.entry.body;
+                    let written_off = match body {
+                        EntryBody::EdgeClose { amount } => amount,
+                        _ => anyhow::bail!("the appended edge-close entry had an unexpected body"),
+                    };
+                    println!("edge-closed: wrote off {written_off} from the Parent account");
+                    println!("entry_seq: {seq}");
+                    println!("entry_hash: {hash}");
+                    println!(
+                        "parent_balance: {}",
+                        service
+                            .ledger()
+                            .balances()
+                            .parent_balance()
+                            .unwrap_or(Amount::ZERO)
+                    );
+                    eprintln!(
+                        "warning: this wrote off the ENTIRE pooled Parent balance ({written_off}); \
+                         it is irreversible and may include another former parent's claim and any \
+                         extension a new parent already made. Close BEFORE a new parent prefunds. \
+                         Sequence: `control exit` -> `ledger edge-close` -> re-attach; a node that \
+                         already re-attached with a stranded claim must `control exit` again first."
+                    );
+                }
+                None => {
+                    println!("Parent balance is already zero; nothing to close.");
+                }
+            }
         }
         LedgerCommand::Commit => {
             let mut service = LedgerService::open(data_dir, &node_id)?;
@@ -1601,11 +1655,11 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
                 );
             };
             // Operational rule (accepted residual): a clean re-attach needs a
-            // zero `Parent` balance. The severed edge stays a stranded claim, so
-            // re-attaching with a non-zero `Parent` surfaces as a hard
-            // `UnbackedClaim` on the new parent's books (no `EdgeClose` until
-            // v2). Warn only: exit is a right and must still succeed, and an
-            // unreadable ledger must not block it either.
+            // zero `Parent` balance, otherwise the stranded claim surfaces as a
+            // hard `UnbackedClaim` on the new parent's books. `ledger edge-close`
+            // writes the whole stranded balance off. Warn only: exit is a right
+            // and must still succeed, and an unreadable ledger must not block it
+            // either.
             if let Ok(service) = LedgerService::open(data_dir, &node_id)
                 && let Some(balance) = service.ledger().balances().parent_balance()
                 && balance > Amount::ZERO
@@ -1613,7 +1667,11 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
                 eprintln!(
                     "warning: Parent account balance is {balance}; a clean re-attach needs a \
                      zero Parent balance, otherwise the stranded claim surfaces as a hard \
-                     UnbackedClaim on the new parent's books. The exit still succeeds."
+                     UnbackedClaim on the new parent's books. Run `ledger edge-close` to write \
+                     off the ENTIRE pooled Parent balance (irreversible; it may include another \
+                     former parent's claim and any extension a new parent already made), and do \
+                     so BEFORE a new parent prefunds. Sequence: `control exit` -> \
+                     `ledger edge-close` -> re-attach. The exit still succeeds."
                 );
             }
             // Best-effort: tell the parent to drop this link. An unreachable

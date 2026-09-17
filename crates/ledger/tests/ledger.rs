@@ -100,9 +100,10 @@ impl Chain {
 
     fn build(&self, body: EntryBody, postings: Vec<Posting>) -> SignedEntry {
         let auth = match &body {
-            EntryBody::Transfer { .. } | EntryBody::Issue { .. } | EntryBody::Burn { .. } => {
-                Some(auth(self.seq))
-            }
+            EntryBody::Transfer { .. }
+            | EntryBody::Issue { .. }
+            | EntryBody::Burn { .. }
+            | EntryBody::EdgeClose { .. } => Some(auth(self.seq)),
             _ => None,
         };
         self.build_with_auth(body, postings, auth)

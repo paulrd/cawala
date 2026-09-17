@@ -7,8 +7,9 @@
 //! an entry.
 //!
 //! The operator signature is over the domain-separated request **hash** (not
-//! the raw bytes), and the transfer/issue/burn contexts differ, so an
-//! authorisation produced for one kind can never validate another.
+//! the raw bytes), and the transfer/issue/burn/prefund/edge-close contexts
+//! differ, so an authorisation produced for one kind can never validate
+//! another.
 //!
 //! # Replay
 //!
@@ -35,6 +36,8 @@ pub const ISSUE_CONTEXT: &str = "cawala-ledger/issue-request/v1";
 pub const BURN_CONTEXT: &str = "cawala-ledger/burn-request/v1";
 /// BLAKE3 derive-key context for [`PrefundRequest::hash`].
 pub const PREFUND_CONTEXT: &str = "cawala-ledger/prefund-request/v1";
+/// BLAKE3 derive-key context for [`EdgeCloseRequest::hash`].
+pub const EDGE_CLOSE_CONTEXT: &str = "cawala-ledger/edge-close-request/v1";
 
 fn encode_node_id(out: &mut Vec<u8>, id: &NodeId) {
     let bytes = id.as_str().as_bytes();
@@ -263,6 +266,63 @@ impl PrefundRequest {
         let mut out = Vec::new();
         self.encode_into(&mut out);
         derive_order_hash(PREFUND_CONTEXT, &out)
+    }
+
+    /// Authorise this request with an operator key, producing an [`AuthRef`].
+    ///
+    /// The signature is over [`Self::hash`]'s bytes, so it cannot be replayed
+    /// as a different order kind.
+    pub fn authorize(&self, operator: &OperatorSecretKey) -> Result<AuthRef, LedgerError> {
+        let request_hash = self.hash();
+        Ok(AuthRef {
+            operator: operator.public(),
+            nonce: self.nonce,
+            order_hash: request_hash,
+            signature: operator.sign(request_hash.as_bytes()),
+        })
+    }
+}
+
+/// An operator-signed request to write off the node's `Parent` asset.
+///
+/// The body is a generic `Parent` write-off ([`EntryBody::EdgeClose`]); the
+/// service composes a full edge close by requesting the current `Parent`
+/// balance. Like a burn this is a node-level op: the entry must be signed by
+/// the ledger of `request.node`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeCloseRequest {
+    /// The node whose operator authorises the write-off.
+    pub node: NodeId,
+    /// Amount to write off the `Parent` asset.
+    pub amount: Amount,
+    /// Operator replay nonce, carried into `AuthRef::nonce`. This is a
+    /// standalone write-off, not a cascade; the service does not enforce replay.
+    pub nonce: u64,
+    /// Unix-style expiry; valid while `now <= expiry`.
+    pub expiry: u64,
+}
+
+impl EdgeCloseRequest {
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        encode_node_id(out, &self.node);
+        out.extend_from_slice(&self.amount.get().to_le_bytes());
+        out.extend_from_slice(&self.nonce.to_le_bytes());
+        out.extend_from_slice(&self.expiry.to_le_bytes());
+    }
+
+    /// The canonical request bytes (the preimage of [`Self::hash`]).
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, LedgerError> {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        Ok(out)
+    }
+
+    /// The domain-separated request hash
+    /// (`cawala-ledger/edge-close-request/v1`).
+    pub fn hash(&self) -> Hash {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        derive_order_hash(EDGE_CLOSE_CONTEXT, &out)
     }
 
     /// Authorise this request with an operator key, producing an [`AuthRef`].
@@ -579,6 +639,62 @@ pub fn verify_burn(
     if child != &request.account {
         return Err(LedgerError::InvalidEntryShape);
     }
+    if *amount != request.amount {
+        return Err(LedgerError::InvalidEntryShape);
+    }
+
+    auth.operator.verify(order_hash.as_bytes(), &auth.signature)
+}
+
+/// Verify that a signed edge-close entry carries a valid authorisation for
+/// `request`.
+///
+/// Edge closes keep the strict node-level binding (like a burn): the entry must
+/// be signed by the ledger of `request.node`. Requires:
+/// [`Entry::check_conservation`] passes; the entry verifies under a registered
+/// ledger key and that signer is `request.node` (else
+/// [`LedgerError::LedgerMismatch`]); the body is
+/// `EdgeClose { amount }`; `auth` is present and its operator matches the
+/// signer's; `order_hash`/`nonce` match the request; the request is unexpired;
+/// the body amount matches; and the operator signature verifies over
+/// `request.hash()`'s bytes under `auth.operator`.
+///
+/// # Replay
+///
+/// No replay enforcement. This is a standalone write-off, not a cascade, so the
+/// replay unit is `request.hash()`; a caller that needs idempotence must track
+/// it (the service treats an already-zero `Parent` balance as the no-op).
+pub fn verify_edge_close(
+    signed: &SignedEntry,
+    request: &EdgeCloseRequest,
+    registry: &PeerRegistry,
+    now: u64,
+) -> Result<(), LedgerError> {
+    // Reject a malformed entry before trusting any operator material.
+    signed.entry.check_conservation()?;
+    let signer = registry.verify_entry(signed)?;
+    if signer.node_id != request.node {
+        return Err(LedgerError::LedgerMismatch);
+    }
+
+    let EntryBody::EdgeClose { amount } = &signed.entry.body else {
+        return Err(LedgerError::InvalidEntryShape);
+    };
+    let auth = signed
+        .entry
+        .auth
+        .as_ref()
+        .ok_or(LedgerError::MissingAuthorization)?;
+    if auth.operator != signer.operator {
+        return Err(LedgerError::Unauthorized);
+    }
+
+    let order_hash = request.hash();
+    if auth.order_hash != order_hash || auth.nonce != request.nonce {
+        return Err(LedgerError::OrderMismatch);
+    }
+    require_no_expiry(request.expiry, now)?;
+
     if *amount != request.amount {
         return Err(LedgerError::InvalidEntryShape);
     }
@@ -1650,6 +1766,200 @@ mod tests {
             verify_burn(&signed, &request, &registry, 50),
             Err(LedgerError::LedgerMismatch)
         );
+    }
+
+    fn edge_close_request() -> EdgeCloseRequest {
+        EdgeCloseRequest {
+            node: child("alice"),
+            amount: Amount::new(25),
+            nonce: 9,
+            expiry: 200,
+        }
+    }
+
+    fn edge_close_entry(
+        ledger_key: &LedgerSecretKey,
+        amount: Amount,
+        auth: Option<AuthRef>,
+        postings: Vec<Posting>,
+    ) -> SignedEntry {
+        // A canonical entry unless the caller supplies a malformed set.
+        let postings = if postings.is_empty() {
+            vec![posting(AccountRef::Parent, -(amount.get() as i64))]
+        } else {
+            postings
+        };
+        let entry = Entry {
+            ledger_id: ledger_key.public(),
+            seq: 0,
+            height: 0,
+            prev_hash: Hash::ZERO,
+            issued_at: 0,
+            body: EntryBody::EdgeClose { amount },
+            postings,
+            auth,
+        };
+        SignedEntry::sign(entry, ledger_key).unwrap()
+    }
+
+    #[test]
+    fn authorize_edge_close_round_trips() {
+        let op = operator(1);
+        let request = edge_close_request();
+        let auth = request.authorize(&op).unwrap();
+        assert_eq!(auth.operator, op.public());
+        assert_eq!(auth.nonce, request.nonce);
+        assert_eq!(auth.order_hash, request.hash());
+        assert_eq!(
+            auth.operator
+                .verify(request.hash().as_bytes(), &auth.signature),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn valid_edge_close_is_accepted() {
+        let op = operator(1);
+        let ledger_key = ledger(11);
+        let registry = registry_with(&[("alice", &op, &ledger_key)]);
+        let request = edge_close_request();
+        let auth = request.authorize(&op).unwrap();
+        let signed = edge_close_entry(&ledger_key, request.amount, Some(auth), vec![]);
+        assert_eq!(verify_edge_close(&signed, &request, &registry, 50), Ok(()));
+    }
+
+    #[test]
+    fn edge_close_rejects_wrong_signer_and_operator() {
+        let op = operator(1);
+        let other = operator(2);
+        let ledger_key = ledger(11);
+        let request = edge_close_request();
+        let auth = request.authorize(&op).unwrap();
+        let signed = edge_close_entry(&ledger_key, request.amount, Some(auth.clone()), vec![]);
+
+        // Unregistered signer: the ledger key is not in the registry.
+        let empty = PeerRegistry::new();
+        assert_eq!(
+            verify_edge_close(&signed, &request, &empty, 50),
+            Err(LedgerError::Unauthorized)
+        );
+
+        // Signed by bob's ledger while alice authorises.
+        let bob = operator(2);
+        let registry = registry_with(&[("alice", &op, &ledger(11)), ("bob", &bob, &ledger(22))]);
+        let signed = edge_close_entry(&ledger(22), request.amount, Some(auth.clone()), vec![]);
+        assert_eq!(
+            verify_edge_close(&signed, &request, &registry, 50),
+            Err(LedgerError::LedgerMismatch)
+        );
+
+        // Wrong registered operator for the signer node.
+        let registry = registry_with(&[("alice", &other, &ledger_key)]);
+        let signed = edge_close_entry(&ledger_key, request.amount, Some(auth), vec![]);
+        assert_eq!(
+            verify_edge_close(&signed, &request, &registry, 50),
+            Err(LedgerError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn edge_close_rejects_expired_amount_nonce_and_missing_auth() {
+        let op = operator(1);
+        let ledger_key = ledger(11);
+        let registry = registry_with(&[("alice", &op, &ledger_key)]);
+        let request = edge_close_request();
+
+        // Expired.
+        let auth = request.authorize(&op).unwrap();
+        let signed = edge_close_entry(&ledger_key, request.amount, Some(auth), vec![]);
+        assert_eq!(
+            verify_edge_close(&signed, &request, &registry, request.expiry + 1),
+            Err(LedgerError::OrderExpired)
+        );
+
+        // Amount mismatch.
+        let auth = request.authorize(&op).unwrap();
+        let signed = edge_close_entry(&ledger_key, Amount::new(26), Some(auth), vec![]);
+        assert_eq!(
+            verify_edge_close(&signed, &request, &registry, 50),
+            Err(LedgerError::InvalidEntryShape)
+        );
+
+        // Nonce mismatch.
+        let mut auth = request.authorize(&op).unwrap();
+        auth.nonce += 1;
+        let signed = edge_close_entry(&ledger_key, request.amount, Some(auth), vec![]);
+        assert_eq!(
+            verify_edge_close(&signed, &request, &registry, 50),
+            Err(LedgerError::OrderMismatch)
+        );
+
+        // Missing auth.
+        let signed = edge_close_entry(&ledger_key, request.amount, None, vec![]);
+        assert_eq!(
+            verify_edge_close(&signed, &request, &registry, 50),
+            Err(LedgerError::MissingAuthorization)
+        );
+    }
+
+    #[test]
+    fn edge_close_rejects_malformed_posting_shape() {
+        let op = operator(1);
+        let ledger_key = ledger(11);
+        let registry = registry_with(&[("alice", &op, &ledger_key)]);
+        let request = edge_close_request();
+        let auth = request.authorize(&op).unwrap();
+
+        // A child leg (and a multi-leg set) fails conservation before auth.
+        for postings in [
+            vec![child_posting("a", -25)],
+            vec![
+                posting(AccountRef::Parent, -25),
+                child_posting("a", -25),
+            ],
+            vec![posting(AccountRef::Parent, 25)],
+        ] {
+            let signed = edge_close_entry(&ledger_key, request.amount, Some(auth.clone()), postings);
+            assert_eq!(
+                verify_edge_close(&signed, &request, &registry, 50),
+                Err(LedgerError::InvalidEntryShape)
+            );
+        }
+    }
+
+    #[test]
+    fn edge_close_rejects_wrong_body_kind() {
+        // A valid `Burn` entry carrying an auth for the edge-close request must
+        // not validate as an edge close.
+        let op = operator(1);
+        let ledger_key = ledger(11);
+        let registry = registry_with(&[("alice", &op, &ledger_key)]);
+        let request = edge_close_request();
+        let auth = request.authorize(&op).unwrap();
+        let signed = burn_entry(&ledger_key, "a", request.amount, Some(auth));
+        assert_eq!(
+            verify_edge_close(&signed, &request, &registry, 50),
+            Err(LedgerError::InvalidEntryShape)
+        );
+    }
+
+    #[test]
+    fn edge_close_hash_is_domain_separated_from_burn() {
+        // Identical field values must not collide across request kinds.
+        let edge = EdgeCloseRequest {
+            node: child("alice"),
+            amount: Amount::new(25),
+            nonce: 9,
+            expiry: 200,
+        };
+        let burn = BurnRequest {
+            node: child("alice"),
+            account: child("a"),
+            amount: Amount::new(25),
+            nonce: 9,
+            expiry: 200,
+        };
+        assert_ne!(edge.hash(), burn.hash());
     }
 
     #[test]

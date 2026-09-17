@@ -31,7 +31,9 @@ use cawala_ledger::{
     SignedEntry, build_commitment, commitment_hash, execute_plan, plan_transfer, verify_chain,
 };
 use cawala_node::netting_harness::{self, HarnessInputs};
-use cawala_node::{identity, ledger_commitments, ledger_keys, ledger_peers, ledger_store, record};
+use cawala_node::{
+    LedgerService, identity, ledger_commitments, ledger_keys, ledger_peers, ledger_store, record,
+};
 use cawala_topology::{ChildKind, Topology};
 
 /// The payer's registered operator (uA).
@@ -230,6 +232,16 @@ fn seed_peer(
     build(&mut ledger, &peer.key);
     persist(peer, &ledger);
     commit_peer(peer, &ledger, ts);
+}
+
+/// Attach `peer` under `parent` at slot 1 / address `0.1`, clearing any root
+/// address first so the record never sits in the illegal parent+root state.
+fn reattach_under(peer: &Peer, parent: &str) {
+    let mut store = record::RecordStore::open(&peer.dir, &peer.node_id).unwrap();
+    store.unset_address().unwrap();
+    store.set_parent(parent, 1).unwrap();
+    store.set_address("0.1".parse().unwrap()).unwrap();
+    store.save().unwrap();
 }
 
 /// Rewrite `commitments.log` verbatim (no validation), so a broken chain can be
@@ -1130,8 +1142,10 @@ fn exit_advisories_do_not_suppress_nets() {
 /// and is never a `MirrorMismatch`.
 ///
 /// This is the operational rule "exit with zero `Parent` for a clean
-/// re-attach": until v2 `EdgeClose`, a non-zero stranded claim blocks netting
-/// on the new network.
+/// re-attach": a non-zero stranded claim blocks netting on the new network
+/// until the child writes it off. The sibling
+/// `edge_close_clears_the_stranded_claim_and_restores_netting` test
+/// demonstrates the post-close path.
 #[test]
 fn reattach_with_stranded_parent_blocks_netting_on_new_edge() {
     let root = tempfile::tempdir().unwrap();
@@ -1229,6 +1243,119 @@ fn reattach_with_stranded_parent_blocks_netting_on_new_edge() {
     // Exit 1 and no netting: a hard finding always blocks.
     assert!(!report.findings.is_empty());
     assert!(report.nets.is_empty());
+}
+
+/// `ledger edge-close` clears the stranded claim so a re-attached child does
+/// not dirty the new edge. Pre-close the hard `UnbackedClaim` suppresses nets
+/// (including a healthy component's real flow); after the child detaches, closes
+/// its whole `Parent` balance, and re-attaches, the merge has no hard finding and
+/// the healthy component's net collapses again.
+#[test]
+fn edge_close_clears_the_stranded_claim_and_restores_netting() {
+    // Primary healthy network with a real flow, so `nets` is observably
+    // suppressed pre-close and restored post-close.
+    let mut b = Benches::new();
+    b.fund_setup(1000);
+    let order = order(1);
+    b.apply(&order);
+
+    // N is the new parent; P is the old parent holding a stale row for X. X has
+    // a 100 Parent claim and is re-attached under N.
+    let new_parent = make_peer_at(
+        &b.root.path().join("n"),
+        "N",
+        "0",
+        None,
+        &[("X", ChildKind::Node, 1)],
+    );
+    let old_parent = make_peer_at(
+        &b.root.path().join("p"),
+        "P",
+        "0",
+        None,
+        &[("X", ChildKind::Node, 1)],
+    );
+    let x = make_peer_at(
+        &b.root.path().join("x"),
+        "X",
+        "0",
+        None,
+        &[("uX", ChildKind::User, 0)],
+    );
+    seed_peer(&x, 1, |ledger, key| {
+        open(ledger, key, &n("uX"), ChildKind::User);
+        descend(ledger, key, &n("uX"), 100);
+    });
+    reattach_under(&x, "N");
+
+    let peers = vec![
+        b.r.dir.clone(),
+        b.a.dir.clone(),
+        b.b.dir.clone(),
+        new_parent.dir.clone(),
+        old_parent.dir.clone(),
+        x.dir.clone(),
+    ];
+    let path = b.orders_path(std::slice::from_ref(&order));
+
+    // (a) Pre-close regression: the stranded claim is a hard `UnbackedClaim` on
+    // the new edge and suppresses the primary's nets.
+    let inputs = netting_harness::load(&peers, Some(path.to_str().unwrap()), None, None).unwrap();
+    let report = netting_harness::report(&inputs);
+    assert!(
+        report.findings.iter().any(|f| matches!(
+            f,
+            Finding::MirrorMismatch { edge, direction: MirrorDirection::UnbackedClaim, .. }
+                if edge.parent == n("N") && edge.child == n("X")
+        )),
+        "pre-close stranded claim must be a hard UnbackedClaim: {:?}",
+        report.findings
+    );
+    assert!(
+        report.nets.is_empty(),
+        "the hard stranded claim must suppress nets"
+    );
+
+    // Exit again (`control exit`): detach X so the service will close.
+    {
+        let mut store = record::RecordStore::open(&x.dir, &x.node_id).unwrap();
+        store.rebase_to_root().unwrap();
+        store.save().unwrap();
+    }
+    let secret = identity::load_or_create_secret_key(&x.dir).unwrap();
+    let operator = OperatorSecretKey::from_bytes(secret.to_bytes());
+    let mut service = LedgerService::open(&x.dir, &x.node_id).unwrap();
+    let closed = service
+        .edge_close(&operator, 1, 2_000, Some(&n("P")))
+        .unwrap();
+    assert!(closed.is_some(), "a stranded Parent balance must close");
+    assert_eq!(
+        service.ledger().balances().parent_balance(),
+        Some(Amount::ZERO)
+    );
+    drop(service);
+
+    // Re-attach under N.
+    reattach_under(&x, "N");
+
+    // (b) Post-close: no hard finding and the healthy component's net returns.
+    let inputs = netting_harness::load(&peers, Some(path.to_str().unwrap()), None, None).unwrap();
+    let report = netting_harness::report(&inputs);
+    assert!(
+        report.findings.is_empty(),
+        "post-close must be clean, got hard findings: {:?}",
+        report.findings
+    );
+    assert_eq!(
+        report.nets,
+        vec![NetTransfer {
+            parent: b.r.id(),
+            from: b.a.id(),
+            to: b.b.id(),
+            amount: Amount::new(100),
+        }],
+        "the healthy component's net must not be suppressed after the close"
+    );
 }
 
 // ── 13. Mixed components plus a hard finding ──────────────────────────────

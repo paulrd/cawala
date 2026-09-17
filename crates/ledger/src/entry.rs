@@ -20,8 +20,9 @@ use crate::keys::{LedgerId, LedgerPubKey, LedgerSecretKey, OperatorPubKey, Signa
 /// Version prefix of [`Entry::canonical_bytes`]. Bump on any format change.
 ///
 /// v3 removed the `Equity` account and made `Issue`/`Burn` child-only boundary
-/// operations (`account: AccountRef` -> `child: NodeId`).
-pub const ENTRY_FORMAT_VERSION: u8 = 3;
+/// operations (`account: AccountRef` -> `child: NodeId`). v4 appends
+/// `EntryBody::EdgeClose { amount }`, a `Parent`-only boundary write-off.
+pub const ENTRY_FORMAT_VERSION: u8 = 4;
 
 /// The position of a transfer hop within the LCA settlement cascade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -118,18 +119,31 @@ pub enum EntryBody {
         /// The operator's authorisation signature.
         operator_sig: Signature,
     },
+    /// Write off the node's universal `Parent` asset to settle a severed edge:
+    /// `{Parent:−amount}`.
+    ///
+    /// A **boundary parent** operation: exempt from the balance equation and
+    /// lowering the node's derived equity `Parent − ΣChild` (a deliberate
+    /// write-off borne by this node's operator). It cannot overdraw the current
+    /// `Parent` balance. The ledger is generic — any `amount ≤ balance` is a
+    /// valid write-off; composing an exact close is the caller's job.
+    EdgeClose {
+        /// The amount written off (must be `> 0`).
+        amount: Amount,
+    },
 }
 
 impl EntryBody {
     /// The posting rule this body must obey (a pure function of the body).
     ///
-    /// `Issue`/`Burn` are child-only boundary operations, exempt from the
-    /// balance equation; every other body is balanced. This is deliberately
-    /// **body-keyed, not rootness-keyed**, so it is deterministic under dynamic
-    /// attach/detach.
+    /// `Issue`/`Burn` are child-only boundary operations and `EdgeClose` is a
+    /// parent-only boundary operation, all exempt from the balance equation;
+    /// every other body is balanced. This is deliberately **body-keyed, not
+    /// rootness-keyed**, so it is deterministic under dynamic attach/detach.
     pub(crate) fn posting_rule(&self) -> PostingRule {
         match self {
             EntryBody::Issue { .. } | EntryBody::Burn { .. } => PostingRule::Boundary,
+            EntryBody::EdgeClose { .. } => PostingRule::BoundaryParent,
             _ => PostingRule::Balanced,
         }
     }
@@ -157,7 +171,7 @@ pub struct Entry {
     pub body: EntryBody,
     /// The balance movements this entry applies.
     pub postings: Vec<Posting>,
-    /// Operator authorisation (required for transfer/issue/burn).
+    /// Operator authorisation (required for transfer/issue/burn/edge-close).
     pub auth: Option<AuthRef>,
 }
 
@@ -166,7 +180,10 @@ impl Entry {
     pub fn requires_auth(&self) -> bool {
         matches!(
             &self.body,
-            EntryBody::Transfer { .. } | EntryBody::Issue { .. } | EntryBody::Burn { .. }
+            EntryBody::Transfer { .. }
+                | EntryBody::Issue { .. }
+                | EntryBody::Burn { .. }
+                | EntryBody::EdgeClose { .. }
         )
     }
 
@@ -175,12 +192,15 @@ impl Entry {
     ///
     /// The rule is a pure function of the body ([`EntryBody::posting_rule`]) and
     /// is enforced through the shared [`check_posting_rule`] helper, so
-    /// append-time validation, [`Balances::apply`], and
-    /// [`Balances::apply_boundary`] cannot drift:
+    /// append-time validation, [`Balances::apply`],
+    /// [`Balances::apply_boundary`], and [`Balances::apply_parent_boundary`]
+    /// cannot drift:
     ///
     /// - `Transfer` / `OpenAccount`: **balanced**, `ΔParent == ΔΣChild`.
     /// - `Issue` / `Burn`: **boundary**, exactly one `Child` leg, exempt from
     ///   the balance equation.
+    /// - `EdgeClose`: **boundary parent**, exactly one `Parent` leg, exempt from
+    ///   the balance equation (a deliberate equity write-off).
     ///
     /// The body/postings binding is then checked:
     ///
@@ -193,6 +213,7 @@ impl Entry {
     ///   `[{Child(child):+amount}]`.
     /// - `Burn { child, amount }`: `amount > 0`, exactly
     ///   `[{Child(child):−amount}]`.
+    /// - `EdgeClose { amount }`: `amount > 0`, exactly `[{Parent:−amount}]`.
     /// - `OpenAccount`: postings must be empty (opening is a pure account
     ///   creation; the zero balance is materialized by [`crate::log::Ledger::append`]).
     /// - `RotateLedgerKey`: [`LedgerError::Unsupported`] in Phase A.
@@ -203,7 +224,7 @@ impl Entry {
     /// different payment id; `netting` selects by `auth.order_hash`, so the two
     /// must agree.
     ///
-    /// Transfer/issue/burn require [`Entry::auth`] to be `Some`.
+    /// Transfer/issue/burn/edge-close require [`Entry::auth`] to be `Some`.
     pub fn check_conservation(&self) -> Result<(), LedgerError> {
         if matches!(&self.body, EntryBody::RotateLedgerKey { .. }) {
             return Err(LedgerError::Unsupported);
@@ -304,6 +325,19 @@ impl Entry {
                         .get(&AccountRef::Child(child.clone()))
                         .copied()
                         == Some(-amount)
+                {
+                    Ok(())
+                } else {
+                    Err(LedgerError::InvalidEntryShape)
+                }
+            }
+            EntryBody::EdgeClose { amount } => {
+                let amount = amount.get() as i128;
+                if amount == 0 {
+                    return Err(LedgerError::InvalidEntryShape);
+                }
+                if deltas.len() == 1
+                    && deltas.get(&AccountRef::Parent).copied() == Some(-amount)
                 {
                     Ok(())
                 } else {
@@ -582,6 +616,95 @@ mod tests {
     }
 
     #[test]
+    fn edge_close_canonical_shape_conserves() {
+        let entry = Entry {
+            auth: Some(auth()),
+            ..base(
+                EntryBody::EdgeClose {
+                    amount: Amount::new(40),
+                },
+                vec![posting(AccountRef::Parent, -40)],
+            )
+        };
+        assert_eq!(entry.check_conservation(), Ok(()));
+    }
+
+    #[test]
+    fn edge_close_rejects_non_parent_only_shapes() {
+        // A child leg is rejected.
+        let child_leg = Entry {
+            auth: Some(auth()),
+            ..base(
+                EntryBody::EdgeClose {
+                    amount: Amount::new(40),
+                },
+                vec![child_posting("a", -40)],
+            )
+        };
+        assert_eq!(
+            child_leg.check_conservation(),
+            Err(LedgerError::InvalidEntryShape)
+        );
+
+        // A `+amount` Parent leg is rejected (write-offs are negative).
+        let positive = Entry {
+            auth: Some(auth()),
+            ..base(
+                EntryBody::EdgeClose {
+                    amount: Amount::new(40),
+                },
+                vec![posting(AccountRef::Parent, 40)],
+            )
+        };
+        assert_eq!(
+            positive.check_conservation(),
+            Err(LedgerError::InvalidEntryShape)
+        );
+
+        // A multi-leg set is rejected.
+        let multi_leg = Entry {
+            auth: Some(auth()),
+            ..base(
+                EntryBody::EdgeClose {
+                    amount: Amount::new(40),
+                },
+                vec![
+                    posting(AccountRef::Parent, -40),
+                    child_posting("a", -40),
+                ],
+            )
+        };
+        assert_eq!(
+            multi_leg.check_conservation(),
+            Err(LedgerError::InvalidEntryShape)
+        );
+
+        // A zero amount is rejected.
+        let zero = Entry {
+            auth: Some(auth()),
+            ..base(EntryBody::EdgeClose { amount: Amount::ZERO }, vec![])
+        };
+        assert_eq!(
+            zero.check_conservation(),
+            Err(LedgerError::InvalidEntryShape)
+        );
+    }
+
+    #[test]
+    fn edge_close_requires_auth() {
+        let entry = base(
+            EntryBody::EdgeClose {
+                amount: Amount::new(40),
+            },
+            vec![posting(AccountRef::Parent, -40)],
+        );
+        assert_eq!(
+            entry.check_conservation(),
+            Err(LedgerError::MissingAuthorization)
+        );
+    }
+
+    #[test]
     fn issue_rejects_non_child_only_shapes() {
         // A `Parent` leg is not allowed on a boundary op.
         let parent_leg = Entry {
@@ -856,6 +979,14 @@ mod tests {
                     None,
                 ),
             ),
+            (
+                "edge_close",
+                golden_entry(
+                    EntryBody::EdgeClose { amount },
+                    vec![posting(AccountRef::Parent, -7)],
+                    Some(golden_auth()),
+                ),
+            ),
         ]
     }
 
@@ -869,18 +1000,20 @@ mod tests {
             "issue" => GOLDEN_ISSUE,
             "burn" => GOLDEN_BURN,
             "rotate_ledger_key" => GOLDEN_ROTATE,
+            "edge_close" => GOLDEN_EDGE_CLOSE,
             other => panic!("unknown golden case {other}"),
         }
     }
 
-    const GOLDEN_OPEN_ACCOUNT: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d209000161000000";
-    const GOLDEN_TRANSFER_ASCEND: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d209012222222222222222222222222222222222222222222222222222222222222222070002000d0101610d0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
-    const GOLDEN_TRANSFER_LCA: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d2090122222222222222222222222222222222222222222222222222222222222222220701020101610d0101620e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
-    const GOLDEN_TRANSFER_DESCEND: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d209012222222222222222222222222222222222222222222222222222222222222222070202000e0101610e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
-    const GOLDEN_TRANSFER_DIRECT: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d2090122222222222222222222222222222222222222222222222222222222222222220703020101610d0101620e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
-    const GOLDEN_ISSUE: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d20902016107010101610e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
-    const GOLDEN_BURN: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d20903016107010101610d0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
-    const GOLDEN_ROTATE: &str = "03d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d20904c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242647ee6334067ec8141217bfe87e83ea3a89dbc91b2f615c993275bae5eeab0557e12f5f62257a1eef97ba76f68d2cf83379ebc7c2f0071998f9539d523cd1a090000";
+    const GOLDEN_OPEN_ACCOUNT: &str = "04d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d209000161000000";
+    const GOLDEN_TRANSFER_ASCEND: &str = "04d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d209012222222222222222222222222222222222222222222222222222222222222222070002000d0101610d0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
+    const GOLDEN_TRANSFER_LCA: &str = "04d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d2090122222222222222222222222222222222222222222222222222222222222222220701020101610d0101620e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
+    const GOLDEN_TRANSFER_DESCEND: &str = "04d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d209012222222222222222222222222222222222222222222222222222222222222222070202000e0101610e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
+    const GOLDEN_TRANSFER_DIRECT: &str = "04d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d2090122222222222222222222222222222222222222222222222222222222222222220703020101610d0101620e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
+    const GOLDEN_ISSUE: &str = "04d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d20902016107010101610e0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
+    const GOLDEN_BURN: &str = "04d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d20903016107010101610d0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
+    const GOLDEN_ROTATE: &str = "04d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d20904c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242647ee6334067ec8141217bfe87e83ea3a89dbc91b2f615c993275bae5eeab0557e12f5f62257a1eef97ba76f68d2cf83379ebc7c2f0071998f9539d523cd1a090000";
+    const GOLDEN_EDGE_CLOSE: &str = "04d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873701012222222222222222222222222222222222222222222222222222222222222222d209050701000d0117cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
     const AUTH_REF_GOLDEN: &str = "17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0544444444444444444444444444444444444444444444444444444444444444444ef0de24d928dfa8740dcc7e9f7012b52d0d51026858a05447c7ce0bcdfa47f072cdfd611cd4eb96dbdf103aa3cad2a3c9f259810b5705501518f6bebf739101";
 
     fn to_hex(bytes: &[u8]) -> String {

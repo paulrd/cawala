@@ -832,6 +832,58 @@ fn forged_operator_cascade_is_not_silently_dropped() {
     assert!(report.nets.is_empty());
 }
 
+/// `EdgeClose` is a `Parent` boundary op, not a `Transfer`, so the
+/// `EntryBody::Transfer`-filtered route/replay audit must ignore it even when
+/// it carries the order's authorisation hash.
+#[test]
+fn verify_cascade_ignores_edge_close_entries() {
+    let mut fx = Fixture::new();
+    let order = order("uA", "uB", 100, 1);
+    let auth = order.authorize(&op(11)).unwrap();
+    let plan = plan_transfer(&fx.topo, &order, &auth, &fx.set, 42).unwrap();
+    execute_plan(&plan, &mut fx.set, &fx.keys, &fx.registry, 50).unwrap();
+
+    // An `EdgeClose` on a parented ledger whose `auth.order_hash` equals the
+    // order hash. If the audit did not filter to `Transfer`, this would be
+    // selected as an extra hop and rejected by `verify_transfer`.
+    let l_a_key = fx.keys[&n("L_A")].clone();
+    let edge_auth = AuthRef {
+        operator: op(11).public(),
+        nonce: order.nonce,
+        order_hash: order.hash(),
+        signature: op(11).sign(order.hash().as_bytes()),
+    };
+    append(
+        fx.set.get_mut(&n("L_A")).unwrap(),
+        &l_a_key,
+        EntryBody::EdgeClose {
+            amount: Amount::new(10),
+        },
+        vec![p(AccountRef::Parent, -10)],
+        Some(edge_auth),
+    );
+
+    let cascade = verify_cascade(&fx.topo, &order, &fx.set, &fx.registry).unwrap();
+    assert_eq!(cascade.len(), 5, "the EdgeClose entry must not be a hop");
+
+    let report = net(
+        &fx.topo,
+        &fx.set,
+        &fx.registry,
+        std::slice::from_ref(&order),
+        &BTreeMap::new(),
+    );
+    assert!(
+        !report.findings.iter().any(|f| matches!(
+            f,
+            Finding::RouteInvalid { payment_id, .. } | Finding::Replay { payment_id, .. }
+                if *payment_id == order.hash()
+        )),
+        "an EdgeClose must not be a route/replay finding, got {:?}",
+        report.findings
+    );
+}
+
 #[test]
 fn gapped_commitment_chain_is_reported_invalid() {
     let fx = Fixture::new();
@@ -1040,6 +1092,107 @@ fn local_issue_yields_no_finding() {
         report.findings
     );
     assert!(report.nets.is_empty());
+}
+
+/// Accepted residual: a still-attached child can hard-dirty its `(parent, child)`
+/// mirror with an `EdgeClose` (or, equivalently, the pre-existing
+/// `Issue` + `Ascend` path): the parent still holds `Child(A) = 100` while the
+/// child's `Parent` asset has been reduced, so the edge reads as an
+/// `UnmirroredExtension`. Neither path is a `Transfer`, so `append` accepts both
+/// without any route/order verification. The capability already existed; mining
+/// both end states proves `EdgeClose` adds legibility, not a new capability.
+#[test]
+fn attached_unilateral_write_off_is_an_unmirrored_extension() {
+    // R -> A mirror: R holds Child(A) = 100 and A holds Parent = 100 (descended
+    // to its user uA).
+    fn fixture() -> (Topology, LedgerSet, LedgerSecretKey) {
+        let mut topo = Topology::new_root("R");
+        topo.add_node("A", ChildKind::Node).unwrap();
+        topo.add_node("uA", ChildKind::User).unwrap();
+        topo.attach("R", "A", Some(0)).unwrap();
+        topo.attach("A", "uA", Some(0)).unwrap();
+
+        let r_key = k(101);
+        let a_key = k(102);
+        let mut set = LedgerSet::new();
+        set.insert(n("R"), Ledger::new_root(r_key.public())).unwrap();
+        set.insert(n("A"), Ledger::new_non_root(a_key.public()))
+            .unwrap();
+
+        open(set.get_mut(&n("R")).unwrap(), &r_key, "A", ChildKind::Node);
+        issue(set.get_mut(&n("R")).unwrap(), &r_key, "A", 100);
+        open(
+            set.get_mut(&n("A")).unwrap(),
+            &a_key,
+            "uA",
+            ChildKind::User,
+        );
+        descend(set.get_mut(&n("A")).unwrap(), &a_key, "uA", 100);
+        (topo, set, a_key)
+    }
+
+    fn mismatch(report: &cawala_ledger::NettingReport) -> Option<(Amount, Amount, MirrorDirection)> {
+        report.findings.iter().find_map(|f| match f {
+            Finding::MirrorMismatch {
+                edge,
+                parent_view,
+                child_view,
+                direction,
+            } if edge.parent == n("R") && edge.child == n("A") => {
+                Some((*parent_view, *child_view, *direction))
+            }
+            _ => None,
+        })
+    }
+
+    // An `EdgeClose` write-off on the still-attached child.
+    let (topo, mut set, a_key) = fixture();
+    append(
+        set.get_mut(&n("A")).unwrap(),
+        &a_key,
+        EntryBody::EdgeClose {
+            amount: Amount::new(40),
+        },
+        vec![p(AccountRef::Parent, -40)],
+        Some(dummy_auth()),
+    );
+    let report = net(&topo, &set, &PeerRegistry::new(), &[], &BTreeMap::new());
+    assert_eq!(
+        mismatch(&report),
+        Some((
+            Amount::new(100),
+            Amount::new(60),
+            MirrorDirection::UnmirroredExtension,
+        )),
+        "EdgeClose write-off: {:?}",
+        report.findings
+    );
+
+    // The same end state via the pre-existing `Issue` + `Ascend` path.
+    let (topo, mut set, a_key) = fixture();
+    issue(set.get_mut(&n("A")).unwrap(), &a_key, "uA", 40);
+    append(
+        set.get_mut(&n("A")).unwrap(),
+        &a_key,
+        EntryBody::Transfer {
+            payment_id: Hash::ZERO,
+            amount: Amount::new(40),
+            role: HopRole::Ascend,
+        },
+        vec![p(AccountRef::Parent, -40), p(ca("uA"), -40)],
+        Some(dummy_auth()),
+    );
+    let report = net(&topo, &set, &PeerRegistry::new(), &[], &BTreeMap::new());
+    assert_eq!(
+        mismatch(&report),
+        Some((
+            Amount::new(100),
+            Amount::new(60),
+            MirrorDirection::UnmirroredExtension,
+        )),
+        "Issue+Ascend: {:?}",
+        report.findings
+    );
 }
 
 /// `entry_hop_accounts` is exported and enforces the role-canonical posting

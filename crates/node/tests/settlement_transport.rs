@@ -26,8 +26,8 @@ use cawala_ledger::{
 };
 use cawala_msg::{
     AckStatus, Envelope, EntryProofV1, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
-    MSG_LEDGER_V1, MSG_SETTLE_V1, OrderRejectV1, OrderResultV3, OrderV2, PeerRef, SettleForwardV1,
-    SettleHopV1, SettleOutcomeV2, SettlePayloadV2, SettleResultV2, SettlementStatusV2,
+    MSG_LEDGER_V1, MSG_SETTLE_V1, OrderRejectV1, OrderResultV3, OrderV2, PeerRef, SettleForwardV3,
+    SettleHopV3, SettleOutcomeV3, SettlePayloadV3, SettleResultV3, SettlementStatusV2,
     VersionedLedgerPayload, append_hop, decode_versioned,
 };
 use cawala_node::LedgerService;
@@ -639,6 +639,19 @@ async fn cross_subtree_settlement_success() {
         assert_eq!(journal[0].hash(), order.hash());
     }
 
+    // The honest LCA echoed its hop with an inclusion proof, and the origin's
+    // accountability audit must accept it (the outcome is not degraded).
+    {
+        let mgr = h.a.manager.lock().await;
+        let terminal = mgr
+            .terminal(&order.hash())
+            .expect("the accepted outcome is recorded");
+        assert!(
+            !terminal.degraded,
+            "the honest path must not degrade the intermediate audit"
+        );
+    }
+
     for router in h.routers.drain(..) {
         router.shutdown().await.unwrap();
     }
@@ -867,7 +880,7 @@ fn posting(account: AccountRef, delta: i64) -> Posting {
 }
 
 /// A fabricated (but shape-valid) hop entry signed by an attacker key.
-fn fabricated_hop(signer_addr: &str, order: &PaymentOrder, role: HopRole, seed: u8) -> SettleHopV1 {
+fn fabricated_hop(signer_addr: &str, order: &PaymentOrder, role: HopRole, seed: u8) -> SettleHopV3 {
     let key = LedgerSecretKey::from_bytes([seed; 32]);
     let operator = OperatorSecretKey::from_bytes([seed; 32]);
     let auth = order.authorize(&operator).unwrap();
@@ -900,9 +913,12 @@ fn fabricated_hop(signer_addr: &str, order: &PaymentOrder, role: HopRole, seed: 
         postings,
         auth: Some(auth),
     };
-    SettleHopV1 {
+    SettleHopV3 {
         signer_addr: signer_addr.parse().expect("valid octal address"),
         entry: SignedEntry::sign(entry, &key).unwrap(),
+        // These fabricated hops exercise the next-hop checks, not origin proof
+        // verification.
+        proof: None,
     }
 }
 
@@ -911,9 +927,9 @@ fn forged_forward(
     order: &PaymentOrder,
     payer_addr: &str,
     payee_addr: &str,
-    hops: Vec<SettleHopV1>,
-) -> SettleForwardV1 {
-    SettleForwardV1 {
+    hops: Vec<SettleHopV3>,
+) -> SettleForwardV3 {
+    SettleForwardV3 {
         order: order.clone(),
         auth: order.authorize(&attacker.operator).unwrap(),
         payer_key: PeerKeys {
@@ -934,11 +950,11 @@ async fn send_forged(
     order: &PaymentOrder,
     payer_addr: &str,
     payee_addr: &str,
-    hops: Vec<SettleHopV1>,
+    hops: Vec<SettleHopV3>,
     dst: &str,
 ) {
     let forward = forged_forward(attacker, order, payer_addr, payee_addr, hops);
-    let bytes = SettlePayloadV2::Forward(forward).to_bytes().unwrap();
+    let bytes = SettlePayloadV3::Forward(forward).to_bytes().unwrap();
     let env = build_envelope(
         &attacker.snapshot.routable.this,
         dst.parse().expect("valid octal address"),
@@ -1099,7 +1115,7 @@ async fn relayed_tampered_lca_hop_is_rejected_at_terminal() {
         fabricated_hop("0", &order, HopRole::Lca, 77),
     ];
     let forward = forged_forward(&h.ua, &order, "0.1.3", "0.2.4", hops);
-    let bytes = SettlePayloadV2::Forward(forward).to_bytes().unwrap();
+    let bytes = SettlePayloadV3::Forward(forward).to_bytes().unwrap();
 
     // Relay it as if it had travelled A -> P -> B: the envelope's origin is the
     // payer leaf, its chain carries the payer hop then the LCA hop, and it is
@@ -1149,7 +1165,7 @@ async fn relayed_tampered_lca_hop_is_rejected_at_terminal() {
 // browser's result as `Indeterminate` and must not be recorded as a terminal.
 // The attacker is the LCA `P` (a direct neighbor of `A`), which spoofs
 // `env.src.addr` to the payee leaf `0.2` and injects a forged
-// `SettleResultV2::Applied`.
+// `SettleResultV3::Applied`.
 //
 // Residual (reported, not patched — tests-only scope): the origin has no
 // registry row binding the sibling leaf's node id to its ledger key, so it
@@ -1238,7 +1254,7 @@ fn proof_coords(proof: &EntryProofV1) -> (u64, Hash) {
 /// Send a crafted settlement `Result` to the origin `A` from its parent `P`,
 /// spoofing the envelope origin to the payee leaf (`0.2`) and appending `P` so
 /// `A` authenticates it as the last hop of the chain.
-async fn send_forged_result(h: &Harness, result: SettleResultV2) {
+async fn send_forged_result(h: &Harness, result: SettleResultV3) {
     let b_ref = PeerRef {
         addr: "0.2".parse().expect("valid octal address"),
         node: h.b.node_id.clone(),
@@ -1247,7 +1263,7 @@ async fn send_forged_result(h: &Harness, result: SettleResultV2) {
         addr: "0".parse().expect("valid octal address"),
         node: h.p.node_id.clone(),
     };
-    let payload = SettlePayloadV2::Result(result).to_bytes().unwrap();
+    let payload = SettlePayloadV3::Result(result).to_bytes().unwrap();
     // One TTL unit is consumed by the appended hop (the envelope's
     // `hop_chain.len() + ttl <= MAX_HOPS + 1` invariant).
     let mut env = build_envelope(
@@ -1325,12 +1341,13 @@ async fn forged_applied_from_lca_is_rejected() {
     let (seq, hash) = proof_coords(&proof);
     send_forged_result(
         &h,
-        SettleResultV2 {
+        SettleResultV3 {
             payment_id: order.hash(),
-            outcome: SettleOutcomeV2::Applied {
+            outcome: SettleOutcomeV3::Applied {
                 terminal_seq: seq,
                 terminal_hash: hash,
                 proof,
+                intermediates: vec![],
             },
         },
     )
@@ -1354,12 +1371,13 @@ async fn wrong_signer_key_is_rejected() {
     let (seq, hash) = proof_coords(&proof);
     send_forged_result(
         &h,
-        SettleResultV2 {
+        SettleResultV3 {
             payment_id: order.hash(),
-            outcome: SettleOutcomeV2::Applied {
+            outcome: SettleOutcomeV3::Applied {
                 terminal_seq: seq,
                 terminal_hash: hash,
                 proof,
+                intermediates: vec![],
             },
         },
     )
@@ -1382,12 +1400,13 @@ async fn tampered_terminal_coordinates_are_rejected() {
     let (seq, _) = proof_coords(&proof);
     send_forged_result(
         &h,
-        SettleResultV2 {
+        SettleResultV3 {
             payment_id: order.hash(),
-            outcome: SettleOutcomeV2::Applied {
+            outcome: SettleOutcomeV3::Applied {
                 terminal_seq: seq,
                 terminal_hash: Hash::ZERO,
                 proof,
+                intermediates: vec![],
             },
         },
     )
@@ -1403,12 +1422,13 @@ async fn tampered_terminal_coordinates_are_rejected() {
     let bad_seq = proof.entry.entry.seq + 7;
     send_forged_result(
         &h,
-        SettleResultV2 {
+        SettleResultV3 {
             payment_id: order.hash(),
-            outcome: SettleOutcomeV2::Applied {
+            outcome: SettleOutcomeV3::Applied {
                 terminal_seq: bad_seq,
                 terminal_hash: hash,
                 proof,
+                intermediates: vec![],
             },
         },
     )
@@ -1432,12 +1452,13 @@ async fn tampered_inclusion_is_rejected() {
     let (seq, hash) = proof_coords(&proof);
     send_forged_result(
         &h,
-        SettleResultV2 {
+        SettleResultV3 {
             payment_id: order.hash(),
-            outcome: SettleOutcomeV2::Applied {
+            outcome: SettleOutcomeV3::Applied {
                 terminal_seq: seq,
                 terminal_hash: hash,
                 proof,
+                intermediates: vec![],
             },
         },
     )
@@ -1453,12 +1474,13 @@ async fn tampered_inclusion_is_rejected() {
     let (seq, hash) = proof_coords(&proof);
     send_forged_result(
         &h,
-        SettleResultV2 {
+        SettleResultV3 {
             payment_id: order.hash(),
-            outcome: SettleOutcomeV2::Applied {
+            outcome: SettleOutcomeV3::Applied {
                 terminal_seq: seq,
                 terminal_hash: hash,
                 proof,
+                intermediates: vec![],
             },
         },
     )
@@ -1484,12 +1506,13 @@ async fn oversized_inclusion_proof_is_rejected() {
     let (seq, hash) = proof_coords(&proof);
     send_forged_result(
         &h,
-        SettleResultV2 {
+        SettleResultV3 {
             payment_id: order.hash(),
-            outcome: SettleOutcomeV2::Applied {
+            outcome: SettleOutcomeV3::Applied {
                 terminal_seq: seq,
                 terminal_hash: hash,
                 proof,
+                intermediates: vec![],
             },
         },
     )
@@ -1497,6 +1520,84 @@ async fn oversized_inclusion_proof_is_rejected() {
 
     let result = recv_order_result(&mut h.ua.sink).await;
     assert_rejected_as_indeterminate(&h, &result).await;
+    shutdown_harness(h).await;
+}
+
+/// **P2/M2 end-to-end**: a *verified* `Applied` whose echoed intermediate fails
+/// the origin's accountability audit must still resolve as `Applied` for the
+/// browser — the terminal proof remains the funds-correctness gate — while the
+/// origin records the terminal `degraded` and writes the
+/// `settle-intermediate-degraded` audit line.
+///
+/// The intermediate here is an `Lca` hop naming the LCA address whose fabricated
+/// entry carries no inclusion proof, so it fails the
+/// `intermediate_proof_missing` check before the M1 account check. (The harness
+/// does not expose the real LCA secret, so the M1 misposting case is covered by
+/// the `msg.rs` unit tests instead.)
+#[tokio::test]
+async fn degraded_intermediate_still_applies_and_is_audited() {
+    let (mut h, order) = setup_pending(110).await;
+    let leaf_key = LedgerSecretKey::from_bytes([0x61; 32]);
+    let proof = forged_terminal_proof(&order, &leaf_key, &h.b.node_id, &order.to);
+    assert!(
+        proof.validate().is_ok(),
+        "the terminal forgery is structurally self-consistent and credits the payee"
+    );
+    let (seq, hash) = proof_coords(&proof);
+
+    let intermediate = fabricated_hop("0", &order, HopRole::Lca, 0x62);
+    assert!(
+        intermediate.proof.is_none(),
+        "the fabricated intermediate carries no proof"
+    );
+
+    send_forged_result(
+        &h,
+        SettleResultV3 {
+            payment_id: order.hash(),
+            outcome: SettleOutcomeV3::Applied {
+                terminal_seq: seq,
+                terminal_hash: hash,
+                proof,
+                intermediates: vec![intermediate],
+            },
+        },
+    )
+    .await;
+
+    let result = recv_order_result(&mut h.ua.sink).await;
+    assert!(
+        matches!(result.status, SettlementStatusV2::Applied { .. }),
+        "a degraded intermediate must not deny the verified Applied, got {:?}",
+        result.status
+    );
+    assert!(
+        result.proof.is_some(),
+        "the verified terminal proof is still forwarded to the browser"
+    );
+
+    {
+        let mgr = h.a.manager.lock().await;
+        let terminal = mgr
+            .terminal(&order.hash())
+            .expect("the accepted outcome is recorded");
+        assert!(
+            terminal.degraded,
+            "the audit failure must be recorded as degraded"
+        );
+    }
+
+    let audit_path = h
+        .a
+        ._dir
+        .path()
+        .join(cawala_node::audit::CONTROL_AUDIT_FILE);
+    let audit = std::fs::read_to_string(&audit_path).expect("the degraded audit line is written");
+    assert!(
+        audit.contains("settle-intermediate-degraded"),
+        "audit log: {audit}"
+    );
+
     shutdown_harness(h).await;
 }
 
@@ -1529,12 +1630,13 @@ async fn replaying_the_terminal_result_is_idempotent() {
     // pending settlement for this payment id, so it must be a silent no-op.
     send_forged_result(
         &h,
-        SettleResultV2 {
+        SettleResultV3 {
             payment_id: order.hash(),
-            outcome: SettleOutcomeV2::Applied {
+            outcome: SettleOutcomeV3::Applied {
                 terminal_seq,
                 terminal_hash,
                 proof: proof.clone(),
+                intermediates: vec![],
             },
         },
     )
@@ -1578,7 +1680,7 @@ fn fabricated_hop_with_postings(
     role: HopRole,
     key: &LedgerSecretKey,
     postings: Vec<Posting>,
-) -> SettleHopV1 {
+) -> SettleHopV3 {
     let auth = order
         .authorize(&OperatorSecretKey::from_bytes([1u8; 32]))
         .unwrap();
@@ -1596,18 +1698,19 @@ fn fabricated_hop_with_postings(
         postings,
         auth: Some(auth),
     };
-    SettleHopV1 {
+    SettleHopV3 {
         signer_addr: signer_addr.parse().expect("valid octal address"),
         entry: SignedEntry::sign(entry, key).unwrap(),
+        proof: None,
     }
 }
 
 /// Relay a forged forward to the terminal `B` as if it had travelled A -> P -> B
 /// (sent by `P` so the terminal authenticates the preceding signer over QUIC),
 /// then wait for the terminal's drain to process it.
-async fn relay_to_terminal(h: &Harness, order: &PaymentOrder, hops: Vec<SettleHopV1>) {
+async fn relay_to_terminal(h: &Harness, order: &PaymentOrder, hops: Vec<SettleHopV3>) {
     let forward = forged_forward(&h.ua, order, "0.1.3", "0.2.4", hops);
-    let bytes = SettlePayloadV2::Forward(forward).to_bytes().unwrap();
+    let bytes = SettlePayloadV3::Forward(forward).to_bytes().unwrap();
     let a_ref = PeerRef {
         addr: "0.1".parse().unwrap(),
         node: h.a.node_id.clone(),

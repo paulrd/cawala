@@ -51,14 +51,19 @@ pub struct NodeRecord {
     pub parent: Option<ParentLink>,
     #[serde(default)]
     pub children: Vec<ChildEntry>,
-    /// This node's own monotonic address epoch.
+    /// This node's own monotonic **subtree routing epoch**.
     ///
     /// Bumped whenever the stored asserted address value changes (join,
-    /// re-base apply, exit-to-root, detach-notice). It is carried as the
-    /// `generation` of every outgoing [`cawala_control::RebaseNotice`] so a
-    /// child can order notices from this parent. Local bookkeeping only: it is
-    /// never asserted or derived from peers, and `#[serde(default)]` lets an
-    /// older `node.json` (written before this field existed) load unchanged.
+    /// re-base apply, exit-to-root, detach-notice) **or** one of this node's
+    /// direct children is re-slotted ([`RecordStore::move_child_slot`]: the
+    /// child's whole subtree moves to a new address, so every queued notice
+    /// must order above the earlier ones). It is carried as the `generation` of
+    /// every outgoing [`cawala_control::RebaseNotice`] so a child can order
+    /// notices from this parent. Local bookkeeping only: it is never asserted or
+    /// derived from peers, and `#[serde(default)]` lets an older `node.json`
+    /// (written before this field existed) load unchanged. The field name and
+    /// its JSON key are frozen: renaming would silently reset the epoch on load
+    /// and permanently strand descendants.
     #[serde(default)]
     pub address_epoch: u64,
 }
@@ -260,12 +265,50 @@ impl RecordStore {
         }
     }
 
+    /// Apply a parent-driven re-base atomically: set the asserted address, the
+    /// parent slot it descends through, and the parent-generation high-water
+    /// mark in one validated mutation.
+    ///
+    /// This atomicity is mandatory. Applying address and slot individually
+    /// cannot work: the intermediate state violates [`NodeRecord::validate`]'s
+    /// `address.slot() == parent.slot` invariant, and the individual setters do
+    /// not roll back, so a rejected half-apply would corrupt the in-memory
+    /// record. Here the candidate is validated before it replaces the store.
+    ///
+    /// The address change goes through [`RecordStore::set_address_value`], so
+    /// the subtree routing epoch bumps exactly when the address actually changes
+    /// (and a receiver then re-propagates with the bumped epoch). The
+    /// generation mark is monotonic via [`RecordStore::set_parent_generation`].
+    pub fn apply_rebase(
+        &mut self,
+        address: OctAddr,
+        slot: u8,
+        generation: u64,
+    ) -> Result<(), RecordError> {
+        let mut candidate = RecordStore {
+            data_dir: self.data_dir.clone(),
+            record: self.record.clone(),
+        };
+        candidate.set_address_value(Some(address));
+        if let Some(parent) = candidate.record.parent.as_mut() {
+            parent.slot = slot;
+        }
+        candidate.set_parent_generation(generation);
+        candidate.record.validate()?;
+        self.record = candidate.record;
+        Ok(())
+    }
+
     /// Set the stored asserted address, bumping
     /// [`NodeRecord::address_epoch`] exactly when the value actually changes.
     ///
-    /// This is the single site the epoch advances: every address mutation
-    /// (`set_address`, `unset_address`, `unset_parent`, `rebase_to_root`) goes
-    /// through it, so each stored-value change bumps the epoch exactly once.
+    /// This is the **own-address** bump site: every own-address mutation
+    /// (`set_address`, `unset_address`, `unset_parent`, `rebase_to_root`, and
+    /// `apply_rebase`) goes through it, so each stored-value change bumps the
+    /// epoch exactly once. The other advance site is
+    /// [`RecordStore::move_child_slot`], which bumps explicitly when a direct
+    /// child's slot (and therefore its subtree's address) actually changes; the
+    /// epoch is a *subtree routing* epoch, not an own-address-only one.
     fn set_address_value(&mut self, address: Option<OctAddr>) {
         if self.record.address != address {
             self.record.address = address;
@@ -351,6 +394,50 @@ impl RecordStore {
         self.record.children.remove(idx);
         self.record.validate()?;
         Ok(())
+    }
+
+    /// Re-slot a direct child in a single validated mutation, preserving its
+    /// kind and `date_joined` (slot/address is geography, not seniority).
+    ///
+    /// The subtree routing epoch ([`NodeRecord::address_epoch`]) is bumped
+    /// **exactly when the effective slot actually changes**: a same-slot move is
+    /// an idempotent no-op that returns `Ok(None)` and bumps nothing. Returns
+    /// the previous slot on a real move.
+    ///
+    /// Atomic: the candidate is validated before it replaces the store, so a
+    /// failed move (occupied slot, out-of-range slot, unknown child) leaves the
+    /// in-memory record untouched.
+    pub fn move_child_slot(
+        &mut self,
+        child_id: &str,
+        slot: u8,
+    ) -> Result<Option<u8>, RecordError> {
+        let Some((kind, old_slot, date_joined)) = self
+            .record
+            .children
+            .iter()
+            .find(|child| child.child_id == child_id)
+            .map(|child| (child.kind, child.slot, child.date_joined))
+        else {
+            return Err(RecordError::ChildNotFound(child_id.to_string()));
+        };
+        if old_slot == slot {
+            return Ok(None);
+        }
+        // Mutate a clone through the ordinary link setters (which validate), so
+        // a rejected move never touches the live record.
+        let mut candidate = RecordStore {
+            data_dir: self.data_dir.clone(),
+            record: self.record.clone(),
+        };
+        candidate.detach_child(child_id)?;
+        candidate.attach_child(child_id, kind, Some(slot), date_joined)?;
+        // A re-slot moves the child's whole subtree onto a new address, so the
+        // epoch advances even though this node's own address is unchanged.
+        candidate.record.address_epoch = candidate.record.address_epoch.saturating_add(1);
+        candidate.record.validate()?;
+        self.record = candidate.record;
+        Ok(Some(old_slot))
     }
 
     /// Set this node's parent link.
@@ -847,6 +934,92 @@ mod tests {
         // unset_parent keeps a root address and does not bump.
         store.unset_parent().unwrap();
         assert_eq!(store.address_epoch(), 4);
+    }
+
+    #[test]
+    fn move_child_slot_bumps_epoch_once_and_reports_old_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(dir.path());
+        store
+            .attach_child("c1", ChildKind::Node, Some(0), JOINED)
+            .unwrap();
+        store
+            .attach_child("c2", ChildKind::User, Some(1), JOINED)
+            .unwrap();
+        let before = store.address_epoch();
+
+        // A real re-slot: exactly one bump, the old slot is reported, and the
+        // kind/date_joined survive.
+        assert_eq!(store.move_child_slot("c1", 4), Ok(Some(0)));
+        assert_eq!(store.address_epoch(), before + 1);
+        let c1 = store
+            .record()
+            .children
+            .iter()
+            .find(|c| c.child_id == "c1")
+            .unwrap();
+        assert_eq!(c1.slot, 4);
+        assert_eq!(c1.kind, ChildKind::Node);
+        assert_eq!(c1.date_joined, JOINED);
+        store.record().validate().unwrap();
+
+        // A same-slot move is an idempotent no-op: no bump, no change.
+        assert_eq!(store.move_child_slot("c1", 4), Ok(None));
+        assert_eq!(store.address_epoch(), before + 1);
+
+        // Errors do not mutate: unknown child and occupied slot.
+        assert_eq!(
+            store.move_child_slot("nope", 0),
+            Err(RecordError::ChildNotFound("nope".into()))
+        );
+        assert_eq!(
+            store.move_child_slot("c1", 1),
+            Err(RecordError::SlotTaken(1))
+        );
+        assert_eq!(store.address_epoch(), before + 1);
+        let c1 = store
+            .record()
+            .children
+            .iter()
+            .find(|c| c.child_id == "c1")
+            .unwrap();
+        assert_eq!(c1.slot, 4, "a failed move must not mutate the record");
+        store.record().validate().unwrap();
+    }
+
+    #[test]
+    fn apply_rebase_is_atomic_and_rejects_invalid_combination() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(dir.path());
+        store.set_parent("parent-x", 2).unwrap();
+        store.set_address("0.5.2".parse().unwrap()).unwrap();
+        store
+            .attach_child("c1", ChildKind::Node, Some(0), JOINED)
+            .unwrap();
+        let epoch_before = store.address_epoch();
+
+        // A valid re-slot: address, parent slot, and the generation mark move
+        // together, bumping the epoch once (the stored address changed).
+        store.apply_rebase("0.5.4".parse().unwrap(), 4, 7).unwrap();
+        assert_eq!(store.record().address, Some("0.5.4".parse().unwrap()));
+        assert_eq!(store.record().parent.as_ref().unwrap().slot, 4);
+        assert_eq!(store.parent_generation(), 7);
+        assert_eq!(store.address_epoch(), epoch_before + 1);
+        store.record().validate().unwrap();
+
+        // An invalid combination (address slot disagrees with the requested
+        // parent slot) is refused **without** mutating the store.
+        let after = store.record().clone();
+        let epoch_after = store.address_epoch();
+        assert_eq!(
+            store.apply_rebase("0.5.5".parse().unwrap(), 4, 9),
+            Err(RecordError::AddressSlotMismatch {
+                address_slot: Some(5),
+                parent_slot: 4,
+            })
+        );
+        assert_eq!(store.record(), &after);
+        assert_eq!(store.address_epoch(), epoch_after);
     }
 
     #[test]

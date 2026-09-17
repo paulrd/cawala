@@ -6,8 +6,10 @@
 //! 2. **fund** a user (an explicit operator act,
 //!    [`LedgerService::fund`]), and
 //! 3. **verify and apply** a same-leaf [`cawala_ledger::PaymentOrder`]
-//!    ([`LedgerService::apply_order`]), and
-//! 4. attest a user's balance ([`LedgerService::balance_receipt`]).
+//!    ([`LedgerService::apply_order`]),
+//! 4. attest a user's balance ([`LedgerService::balance_receipt`]), and
+//! 5. **close a severed edge** by writing off the whole `Parent` balance
+//!    ([`LedgerService::edge_close`]).
 //!
 //! # State
 //!
@@ -22,6 +24,8 @@
 //! replay guard are therefore **not** authoritative: every mutation
 //! ([`ensure_account_open`](LedgerService::ensure_account_open),
 //! [`fund`](LedgerService::fund),
+//! [`prefund`](LedgerService::prefund),
+//! [`edge_close`](LedgerService::edge_close),
 //! [`apply_order`](LedgerService::apply_order)) and every read that must
 //! reflect the log ([`balance_receipt`](LedgerService::balance_receipt))
 //! re-reads and replays the whole log first (via the private
@@ -61,11 +65,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 
 use cawala_ledger::{
-    AccountRef, Amount, AuthRef, BalanceAttestation, Entry, EntryBody, Hash, HopRole, IssueRequest,
-    Ledger, LedgerError, LedgerPubKey, LedgerSecretKey, NodeId, OperatorPubKey, OperatorSecretKey,
-    PaymentOrder, PeerKeys, PeerRegistry, PeerRole, Posting, PrefundRequest, SignedAmount,
-    SignedCommitment, SignedEntry, attest_balance, build_commitment, commitment_hash, entry_hash,
-    entry_inclusion_proof, hop_postings, verify_issue, verify_prefund, verify_transfer,
+    AccountRef, Amount, AuthRef, BalanceAttestation, EdgeCloseRequest, Entry, EntryBody, Hash,
+    HopRole, IssueRequest, Ledger, LedgerError, LedgerPubKey, LedgerSecretKey, NodeId,
+    OperatorPubKey, OperatorSecretKey, PaymentOrder, PeerKeys, PeerRegistry, PeerRole, Posting,
+    PrefundRequest, SignedAmount, SignedCommitment, SignedEntry, attest_balance, build_commitment,
+    commitment_hash, entry_hash, entry_inclusion_proof, hop_postings, verify_edge_close,
+    verify_issue, verify_prefund, verify_transfer,
 };
 use cawala_msg::{
     BalanceReceiptV1, EntryProofV1, MAX_RECEIPT_HISTORY, MsgId, OctAddr, OrderRejectV1,
@@ -197,6 +202,7 @@ impl LedgerService {
     /// safe while the caller holds the per-transaction lock. Every public
     /// mutator ([`ensure_account_open`](Self::ensure_account_open),
     /// [`fund`](Self::fund), [`prefund`](Self::prefund),
+    /// [`edge_close`](Self::edge_close),
     /// [`apply_order`](Self::apply_order), [`apply_hop`](Self::apply_hop)) holds
     /// the exclusive lock across its whole refresh-and-append, and
     /// [`balance_receipt`](Self::balance_receipt) holds the shared lock across
@@ -552,6 +558,106 @@ impl LedgerService {
         self.ledger.append(signed)?;
         self.consumed.insert(request.hash(), (seq, hash));
         Ok((seq, hash))
+    }
+
+    /// Close a severed edge by writing off this node's whole `Parent` balance,
+    /// authorized by the node operator key.
+    ///
+    /// This is the operator half of the clean-exit primitive: after `control
+    /// exit` a node may still hold a stranded `Parent` claim from its former
+    /// parent. `EdgeClose` appends `{Parent:−balance}` so re-attaching does not
+    /// surface as a hard `UnbackedClaim` on the new parent's books.
+    ///
+    /// Ordering:
+    ///
+    /// 1. take the exclusive ledger lock and refresh from disk;
+    /// 2. read the current `Parent` balance;
+    /// 3. **zero ⇒ `Ok(None)` immediately** (idempotent, valid even while
+    ///    attached);
+    /// 4. non-zero while attached (`!is_root()`) is refused — run `control exit`
+    ///    first (the ledger itself is rootness-agnostic; this is service policy,
+    ///    mirroring [`prefund`](Self::prefund));
+    /// 5. authorize and sign an [`EdgeCloseRequest`] for the **exact** current
+    ///    balance, re-verify with [`verify_edge_close`], and append.
+    ///
+    /// # Pooled account
+    ///
+    /// `Parent` is one universal account, so this forfeits **everything** in it —
+    /// including another former parent's claim and any extension the current or
+    /// a new parent already made. Callers should close **before** a new parent
+    /// prefunds.
+    ///
+    /// `nonce` and `now` are caller-supplied; the request is valid while
+    /// `now <= expiry` (with `expiry = now + 3600`). `from` is optional,
+    /// non-authoritative audit context. Returns the appended entry's `(seq,
+    /// hash)`, or `None` when the `Parent` balance is already zero. An audit
+    /// line is appended best-effort and never fails the op.
+    pub fn edge_close(
+        &mut self,
+        operator: &OperatorSecretKey,
+        nonce: u64,
+        now: u64,
+        from: Option<&NodeId>,
+    ) -> Result<Option<(u64, Hash)>> {
+        let _lock = LedgerLock::acquire_exclusive(&self.data_dir)?;
+        self.refresh_from_disk()?;
+
+        let balance = self
+            .ledger
+            .balances()
+            .parent_balance()
+            .unwrap_or(Amount::ZERO);
+        if balance == Amount::ZERO {
+            return Ok(None);
+        }
+        if !self.is_root() {
+            bail!("this node is still attached (has a parent link); run `control exit` first");
+        }
+
+        let amount = balance;
+        let request = EdgeCloseRequest {
+            node: NodeId::from(self.node_id.clone()),
+            amount,
+            nonce,
+            expiry: now.saturating_add(3600),
+        };
+        let auth = request.authorize(operator)?;
+        let amount_i64 = i64::try_from(amount.get())
+            .context("Parent balance exceeds the ledger's signed range")?;
+
+        let seq = self.ledger.len() as u64;
+        let entry = Entry {
+            ledger_id: self.key.public(),
+            seq,
+            height: seq,
+            prev_hash: self.ledger.head_hash(),
+            issued_at: now,
+            body: EntryBody::EdgeClose { amount },
+            postings: vec![Posting {
+                account: AccountRef::Parent,
+                delta: SignedAmount::new(-amount_i64),
+            }],
+            auth: Some(auth),
+        };
+        let signed = SignedEntry::sign(entry, &self.key)?;
+        let registry = self.effective_registry()?;
+        verify_edge_close(&signed, &request, &registry, now)?;
+
+        let hash = entry_hash(&signed.entry)?;
+        self.ledger.append(signed)?;
+
+        // Best-effort: auditing must never fail the op.
+        crate::audit::append(
+            &self.data_dir,
+            serde_json::json!({
+                "event": "edge-close",
+                "amount": amount.get(),
+                "seq": seq,
+                "hash": hash.to_string(),
+                "from": from.map(NodeId::to_string),
+            }),
+        );
+        Ok(Some((seq, hash)))
     }
 
     /// Verify and apply a same-leaf `Direct` [`PaymentOrder`] from `sender`.

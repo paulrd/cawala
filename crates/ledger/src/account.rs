@@ -15,6 +15,8 @@
 //! - `Issue` / `Burn`: **boundary** operations on a single child liability
 //!   account, exempt from the balance equation. `Issue` is `{Child:+amount}` and
 //!   `Burn` is `{Child:−amount}`.
+//! - `EdgeClose`: a **boundary parent** operation writing off the universal
+//!   `Parent` asset, exempt from the balance equation: `{Parent:−amount}`.
 //!
 //! Only `Parent`/`Child` non-negativity is enforced everywhere, so locally
 //! issued value is spendable same-leaf but not cross-subtree unless the parent
@@ -230,6 +232,19 @@ impl Balances {
         self.apply_deltas(&deltas)
     }
 
+    /// Apply a **boundary parent** posting set atomically (`EdgeClose`).
+    ///
+    /// The set must be exactly one `Parent` leg with a nonzero delta (via the
+    /// shared [`check_posting_rule`]); it is exempt from the balance equation,
+    /// so it deliberately lowers the derived equity. Non-negativity is still
+    /// enforced, so a write-off cannot overdraw the `Parent` asset. On any error
+    /// `self` is left unchanged.
+    pub fn apply_parent_boundary(&mut self, postings: &[Posting]) -> Result<(), LedgerError> {
+        let deltas = aggregate_deltas(postings)?;
+        check_posting_rule(&deltas, PostingRule::BoundaryParent)?;
+        self.apply_deltas(&deltas)
+    }
+
     /// Apply aggregated deltas to a clone, committing only on full success.
     fn apply_deltas(&mut self, deltas: &BTreeMap<AccountRef, i128>) -> Result<(), LedgerError> {
         let mut next = self.clone();
@@ -270,20 +285,24 @@ impl Balances {
 ///
 /// `Transfer`/`OpenAccount` are **balanced** (`ΔParent == ΔΣChild`);
 /// `Issue`/`Burn` are **boundary** operations on a single child account and are
-/// exempt from the balance equation.
+/// exempt from the balance equation; `EdgeClose` is a **boundary parent**
+/// operation on the single universal `Parent` account and is likewise exempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PostingRule {
     /// `ΔParent == ΔΣChild`.
     Balanced,
     /// Exactly one `Child` leg (boundary `Issue`/`Burn`).
     Boundary,
+    /// Exactly one `Parent` leg (boundary `EdgeClose`).
+    BoundaryParent,
 }
 
 /// Enforce the shared per-entry posting rule against aggregated `deltas`.
 ///
 /// This is the single source of truth for the equation:
-/// [`crate::entry::Entry::check_conservation`], [`Balances::apply`], and
-/// [`Balances::apply_boundary`] all route through it so they cannot drift.
+/// [`crate::entry::Entry::check_conservation`], [`Balances::apply`],
+/// [`Balances::apply_boundary`], and [`Balances::apply_parent_boundary`] all
+/// route through it so they cannot drift.
 pub(crate) fn check_posting_rule(
     deltas: &BTreeMap<AccountRef, i128>,
     rule: PostingRule,
@@ -299,6 +318,15 @@ pub(crate) fn check_posting_rule(
             }
             match deltas.iter().next() {
                 Some((AccountRef::Child(_), delta)) if *delta != 0 => Ok(()),
+                _ => Err(LedgerError::InvalidEntryShape),
+            }
+        }
+        PostingRule::BoundaryParent => {
+            if deltas.len() != 1 {
+                return Err(LedgerError::InvalidEntryShape);
+            }
+            match deltas.iter().next() {
+                Some((AccountRef::Parent, delta)) if *delta != 0 => Ok(()),
                 _ => Err(LedgerError::InvalidEntryShape),
             }
         }
@@ -545,6 +573,47 @@ mod tests {
             empty.open_account(&child("b")).unwrap();
             empty
         });
+    }
+
+    #[test]
+    fn parent_boundary_accepts_exactly_one_negative_parent_leg() {
+        let mut b = Balances::new_non_root();
+        b.open_account(&child("a")).unwrap();
+        // Fund the Parent asset via a balanced Descend.
+        b.apply(&[posting(AccountRef::Parent, 10), child_posting("a", 10)])
+            .unwrap();
+
+        // Exactly `[{Parent: −m}]` is accepted and lowers equity.
+        b.apply_parent_boundary(&[posting(AccountRef::Parent, -4)])
+            .unwrap();
+        assert_eq!(b.parent_balance(), Some(Amount::new(6)));
+        assert_eq!(b.equity(), 6 - 10);
+    }
+
+    #[test]
+    fn parent_boundary_is_shape_strict() {
+        let mut b = Balances::new_non_root();
+        b.open_account(&child("a")).unwrap();
+        b.apply(&[posting(AccountRef::Parent, 10), child_posting("a", 10)])
+            .unwrap();
+        let before = b.clone();
+
+        // A child leg is not allowed on a parent boundary op.
+        assert_eq!(
+            b.apply_parent_boundary(&[posting(AccountRef::Parent, -5), child_posting("a", 5)]),
+            Err(LedgerError::InvalidEntryShape)
+        );
+        // A multi-leg (here child-only) set is rejected: exactly one leg.
+        assert_eq!(
+            b.apply_parent_boundary(&[child_posting("a", -1), child_posting("b", -1)]),
+            Err(LedgerError::InvalidEntryShape)
+        );
+        // A zero delta is rejected.
+        assert_eq!(
+            b.apply_parent_boundary(&[posting(AccountRef::Parent, 0)]),
+            Err(LedgerError::InvalidEntryShape)
+        );
+        assert_eq!(b, before, "failed parent boundary must not mutate balances");
     }
 
     #[test]

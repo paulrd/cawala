@@ -118,8 +118,13 @@
   - Defense against colluding parent + senior child.
   - Privacy from routing-path nodes.
   - Nodes are intentionally not zero-trust.
+  - Address/key identity binding is routing-based, not cryptographically distributed:
+    fabricated non-neighbor hops and address/key substitution are detectable (audit,
+    netting, carried-prefix Phase 2, `EdgeClose`) but not preventable - signed
+    topology/registry distribution is **rejected** (decision 10).
   - In-flight messages to just-moved addresses may fail during manual
-    topology rewires (v1; moved-pointers deferred with automatic splitting).
+    topology rewires (v1; moved pointers are **rejected** - retry with fresh
+    addresses discovered out of band; automatic splitting is deferred).
 ** Anonymity
   - Transmit only: addresses, NodeIds, amounts, coarse timestamps,
     commitments.
@@ -393,13 +398,22 @@
         once per distinct signer address (bounded). No wire change. Residual: a
         fabricated non-neighbor hop is still only structurally checked (no
         address<->key binding), which is evidence-integrity only in the depth-1
-        route. Phase 2 (deferred, `SETTLE_PAYLOAD_VERSION` 3): carry per-hop
-        `PeerKeys` plus a relayer-signed `HopCertV1` (operator key) and echo the
-        certs plus intermediate `EntryProofV1`s, so the origin keyed-verifies the
-        LCA hop against its persisted parent row and a provable substitution
-        resolves `Indeterminate` plus an audit record. This buys accountability
-        and detection, not prevention; a signed topology/registry distribution
-        (the only true prevention) is out of scope.
+        route. (Superseded by the next entry.)
+      - Carried-prefix Phase 2 (DONE): `SETTLE_PAYLOAD_VERSION` 3; `SettleHopV3`
+        carries an optional `EntryProofV1`; `Applied` echoes the intermediate hops
+        between origin and terminal; the origin binds the LCA hop's **posting
+        accounts** (debited child == its own node id, credited child == the
+        verified terminal signer's node id), verifies the entry under its own
+        persisted parent row and the hop's inclusion proof, and on any failure
+        records `degraded` + a `settle-intermediate-degraded` audit line while
+        still accepting the verified terminal `Applied` (the terminal proof
+        remains the funds-correctness gate). Residuals: a colluding LCA+terminal
+        can still fabricate a self-consistent cascade only when the terminal *is*
+        the compromised payee leaf (whose `Descend` must still credit the payee
+        user); a legit LCA ledger rotation makes the origin's persisted row stale
+        and degrades the audit until re-attach; the audit is forensic-only and
+        losing it on I/O failure does not change the funds outcome; the browser
+        wire (`OrderResultV3`) cannot distinguish degraded from clean `Applied`.
       - Reload activity reconstruction (DONE): the persisted browser ledger state
         (`LEDGER_STATE_VERSION` 4) records cross-leaf settlement outcomes with
         amount/counterparty/entry-seq and exposes them plus the value-notice
@@ -410,8 +424,9 @@
         warn; rejected danger). Local blob bump only - not a wire break.
       - Still owed: no global supply anchor by design; manual prefund liquidity (an
         underfunded LCA parent yields a `Partial`: payer debited, payee not
-        credited); control format 3 / settlement payload 2 / browser ledger
-        payload 3 are hard breaks.
+        credited); control format 4 / settlement payload 3 / browser ledger
+        payload 3 / ledger (entry) format 4 (node on-disk meta format 3) are hard
+        breaks.
   6. *M5 - Hardening*: exit rights, foster-parent recovery, compromise-path
      docs, audit tooling, governance/regulatory surface (Hawala exposure is
      real - community question, not code).
@@ -512,15 +527,15 @@
        target/requester mismatch, expiry/replay, forged predecessor, senior vs
        non-senior topology, join refusal, oversize pre-decode, reply-through-relay
        disambiguation, forward-count mismatch), 21 `routed.rs` unit tests, 7
-       browser host tests, `web npm test` (29) and `npm run build`. Deferred:
-       non-senior topology over route (needs authority threaded through the
-       handlers); non-ancestor targets (need address discovery or
-       `AdminGrant.node_addr`); signed topology/registry distribution (the only
-       true prevention); CLI routed admin; direct-dial replies; automatic
-       redeliver orchestration; more than one outstanding routed request per
-       browser client; control-reply reflection rate limiting. Rejected
-       alternatives: holding the node operator seed in the browser; collapsing
-       user/leaf identity.
+        browser host tests, `web npm test` (29) and `npm run build`. Deferred:
+        non-senior topology over route (needs authority threaded through the
+        handlers); non-ancestor targets (need address discovery or
+        `AdminGrant.node_addr`); CLI routed admin; direct-dial replies; automatic
+        redeliver orchestration; more than one outstanding routed request per
+        browser client; control-reply reflection rate limiting. Rejected
+        alternatives: holding the node operator seed in the browser; collapsing
+        user/leaf identity. Signed topology/registry distribution (previously
+        named the "only true prevention") is **rejected** - see decision 10.
      - Companion gap (DONE): `JoinRejected` now requires the invite-pinned
        parent operator on both applicants (native `handle_join_rejected` and
        wasm `on_join_rejected`), mirroring `JoinApproved`; a spoofed self-signed
@@ -567,12 +582,14 @@
        one validated `rebase_to_root()` (so an unreachable parent cannot trap the
        node), then push `Rebase` down the subtree; offline descendants heal via an
        in-memory pending-notice retry plus a startup/periodic `RebasePull`.
-       Stranded value is tolerated (no `ENTRY_FORMAT_VERSION` bump): the severed
-       edge pair remains, and the operational rule is "exit with a zero `Parent`
+       Stranded value is tolerated (this entry adds no `ENTRY_FORMAT_VERSION`
+       bump; the M5 `EdgeClose` entry below advances it to 4): the severed edge
+       pair remains, and the operational rule is "exit with a zero `Parent`
        balance for a clean re-attach" - otherwise the stranded claim surfaces as a
-       hard `MirrorMismatch::UnbackedClaim` on the new parent's books until v2
-       `EdgeClose` (CLI `control exit` warns on a non-zero balance and still
-       succeeds). Re-attach is idempotent for a former parent (its retained
+       hard `MirrorMismatch::UnbackedClaim` on the new parent's books until the
+       node writes it off with `ledger edge-close` (CLI `control exit` warns on a
+       non-zero balance and still succeeds). Re-attach is idempotent for a former
+       parent (its retained
        `PeerKeys` row no longer fails the approval) and for a stale row left by an
        unprocessed exit. `receive_at` re-reads `node.json` (record) and
        `ledger_peers.json` (peer registry) per request, warn-and-continue, so a
@@ -591,9 +608,15 @@
        Verified: `crates/node/tests/exit_rebase.rs` (7), `routed_control` (13),
        `netting_harness` (15), `seen_restart` (3), ledger 223, client 82, plus
        workspace clippy and the wasm32 check; web `npm test` (29) + `npm run
-        build`. Deferred to v2: `EdgeClose`, moved pointers, signed
-        topology/registry distribution, per-peer control version negotiation,
-        and an optional `OctAddr` depth cap. Note on "subtree rejoin": a node
+         build`. Deferred to v2: per-peer control version negotiation and an
+         optional `OctAddr` depth cap. Signed topology/registry distribution is
+         **rejected** (decision 10: the live topology is the source of truth).
+         Moved pointers are **rejected, not
+        deferred**: a changed topology is a material change in trust dynamics
+        (the parent-child relationship), so any in-flight transaction must fail
+        with an appropriate message and be re-tried with new source and/or
+        destination addresses, discovered **out of band** (no redirects, no
+        pointers, no silent re-addressing). Note on "subtree rejoin": a node
         **with or without children can already join any network by invitation** -
         `Join` rewrites the joiner's own address immediately and its descendants
         converge through the periodic healing `RebasePull` (each node is renamed
@@ -636,14 +659,59 @@
        `parentStatus()` (instrumented on the existing balance poll, best-effort,
        cannot affect the balance flow) and an informational "Parent unreachable"
        notice with a "re-join via invitation" action; no `LOCAL_STATE_VERSION`
-       change. Residual (unchanged): a re-attached child with a non-zero `Parent`
-       balance still shows a hard `MirrorMismatch::UnbackedClaim` until the new
-       parent funds it to match - the bundle is what makes that decision informed
-       - and v2 `EdgeClose`/`ENTRY_FORMAT_VERSION` 4 remains the clean-settlement
-       path. Verified: `claim.rs` 24 unit tests (frozen field-order golden and
-       real Merkle state-inclusion proofs), `crates/node/tests/claim_bundle.rs`
-       (11), web `parentLiveness` (12), workspace tests, clippy, the wasm32
-       check, web `npm test` (41) and `npm run build`.
+       change. Residual: a re-attached child with a non-zero `Parent` balance
+       still shows a hard `MirrorMismatch::UnbackedClaim` until the new parent
+       funds it to match or the child writes it off with `ledger edge-close` -
+       the bundle is what makes that decision informed (see the M5 `EdgeClose`
+       entry below). Verified: `claim.rs` 24 unit tests (frozen field-order
+       golden and real Merkle state-inclusion proofs),
+       `crates/node/tests/claim_bundle.rs` (11), web `parentLiveness` (12),
+       workspace tests, clippy, the wasm32 check, web `npm test` (41) and
+       `npm run build`.
+     - EdgeClose - clean edge settlement (DONE): `ENTRY_FORMAT_VERSION` 4 adds
+       `EntryBody::EdgeClose { amount }`, posting exactly `[{Parent: -amount}]`
+       as a **boundary-parent** write-off under a new crate-internal
+       `BoundaryParent` rule (`Boundary` stays child-only), authorized by
+       `EdgeCloseRequest`/`verify_edge_close` (BLAKE3 domain
+       `cawala-ledger/edge-close-request/v1`) and applied by
+       `LedgerService::edge_close` - a detached-only guard for a non-zero
+       balance (a zero balance is an `Ok(None)` no-op even while attached),
+       bailing "run `control exit` first" when still attached, an **exact**
+       full-balance close, and an appended `edge-close` audit line - driven by
+       the operator-only CLI `cawala-node ledger edge-close [--from <node-id>]`
+       (random nonce; writes the whole pooled `Parent` balance off). No new
+       wire/control variant: the parent side needs nothing new (`Burn { child }`
+       already exists), and the body is deliberately operationally generic. A
+       closed edge makes the child's `Parent` 0, so re-attach no longer surfaces
+       a hard `UnbackedClaim`. Accepted residuals: (1) an attached unilateral
+       write-off hard-dirties the (P,C) mirror
+       (`MirrorMismatch::UnmirroredExtension`, suppressing P's nets) - this is
+       **pre-existing**, not a new capability: a child could already do it with
+       `Issue` + `Ascend` (both paths pinned by
+       `attached_unilateral_write_off_is_an_unmirrored_extension`); audit policy
+       is unchanged and P's remedies are an honest detach by C, excluding C from
+       reconciliation, or a parent-side `Burn { child }` (no service/CLI path
+       yet - backlog), and detaching alone does not cure a hostile C that
+       ignores the notice; (2) the body is not edge-bound and `Parent` is one
+       pooled account, so a close forfeits everything in it (another former
+       parent's claim, any extension a new parent already made) - close
+       **before** a new parent prefunds, and a node that already re-attached
+       with a stranded claim must `control exit` again first; (3) no
+       ledger-level exactness and no per-request replay guard: any
+       `amount <= balance` is a valid write-off, the service always closes
+       fully, and idempotence is the zero no-op plus `InsufficientBalance`;
+       (4) hard break: entry format 4 + on-disk ledger meta format 3 invalidate
+       all entry hashes/signatures and commitment chains - recreate `node-data`,
+       rebuild the wasm bundle, and old browser bundles cannot verify v4 entry
+       proofs (the meta bump also replaced the stale-version message with a
+       version-generic "unsupported ledger format version {found} (expected
+       {expected})" error); (5) the former parent retains the stale `Child(C)`
+       liability (conservative for its equity, invisible after severance); no
+       supported burn path yet. Verified: `crates/ledger` 239 (golden vector +
+       `BoundaryParent` shape + `verify_edge_close` matrix + overdraw),
+       `crates/node/tests/edge_close.rs` (exact close/idempotence/attached
+       guard), the griefing pin, the pre-close -> post-close re-attach audit,
+       clippy and the wasm32 check.
      - Exit-rights follow-ups (DONE): (a) the per-request control-plane refresh
        (record `node.json` + peer `ledger_peers.json`, warn-and-continue) is
        hoisted into a shared `refresh_control_plane` called by **both**
@@ -700,7 +768,32 @@
        browser notice arriving only *after* a reload is theoretically possible and
        is corrected by the parent's next push. Verified: node lib 214,
        `exit_rebase` 11, client 86, workspace tests, clippy and the wasm32 check
-       all green.
+        all green.
+      - MoveChild re-slot rebase (DONE): a same-parent `MoveChild` (v1: node
+        child only) now persists the child's new slot atomically, bumps the
+        parent's subtree routing epoch, and queues exactly one targeted `Rebase`
+        for the moved child, which re-propagates to its own subtree; the child's
+        healing pull adopts the slot named by its entry in the parent's snapshot.
+        Both prior healing paths were broken - the push checked `address ==
+        parent_address.child(record.parent.slot)` against the child's own stale
+        slot, and the pull derived the same stale address - so a re-slot
+        stranded the child and its subtree permanently. `handle_rebase`'s rule is
+        now the direct-child structural check `address.parent() ==
+        Some(parent_address)` and the receiver **adopts** `address.slot()`;
+        `RecordStore::move_child_slot`/`apply_rebase` are atomic
+        (clone/validate/swap), and a `ChildKind::User` child is refused
+        (`BadRequest`) because a browser leaf has no healing pull. No wire/DTO/
+        format change: `CONTROL_FORMAT_VERSION` stays 4 and
+        `RebaseNotice`/`MoveChild` shapes are unchanged (the pull is deliberately
+        generation-agnostic, preserving the rolled-back-parent healing
+        guarantee). Verified: node lib 235 (record + control units),
+        `exit_rebase` (full suite incl. the new re-slot integration test),
+        workspace tests, clippy and the wasm32 check all green.
+        Residuals: the stale-address failure surface remains `NoRoute(NoSuchChild)`
+        with no dedicated stale-address signal (consistent with the rejected
+        moved-pointers decision - retry with fresh addresses discovered out of
+        band); and a `User` (browser-leaf) child's re-slot is out of scope in v1
+        and refused.
 
 * Top Risks
   1. Iroh WASM maturity -> M0 spike before any other work.
@@ -713,10 +806,10 @@
      senior-child admin accepted by decision 4; exit + audit are the checks).
   5. Control-key compromise cascading up via seniority -> scoped operator
      keys, documented compromise paths.
-  6. Address instability from manual rewires -> downward-only subdivision
-     (geography preserved by construction), admin link editing, location-DB
-     (hint) updates, accepted retries in v1 (moved-pointers deferred with
-     automatic splitting).
+   6. Address instability from manual rewires -> downward-only subdivision
+      (geography preserved by construction), admin link editing, location-DB
+      (hint) updates, accepted retries in v1 (moved pointers rejected, no
+      redirects; automatic splitting deferred).
   7. Scope creep (no DHTs/ZK/consensus) -> freeze v1: one credit message type,
      one ledger format, 8-entry routing tables.
 
@@ -738,8 +831,11 @@
   6. Frontend framework: Svelte (lightest, great PWA support).
   7. Relay: public N0 relays for development; self-hosted iroh-relay on a VPS
      before public launch.
-  8. Node splitting: automatic split algorithm + moved-pointers deferred to
-     post-v1. Splitting is a manual administrative operation - a node admin
+  8. Node splitting: automatic split algorithm deferred to post-v1; moved
+     pointers are **rejected** (a changed topology changes the parent-child
+     trust relationship, so an in-flight transaction must fail and be retried
+     with fresh addresses discovered out of band - no redirects). Splitting is
+     a manual administrative operation - a node admin
      can create new nodes and edit child/parent links of nodes they control
      (their own node, and via senior-child control, their parent). Splits are
      downward-only (subdivision): the full node stays the child of its own
@@ -753,3 +849,16 @@
   9. Tree depth: no hard cap on depth. Depth grows with subdivision; the only
      topology limits are the per-node 8-cap and geographic sense. Mitigate
      LCA concentration by proactively splitting hot levels (see risk 3).
+  10. Signed topology/registry distribution: **rejected**. The live network
+     topology is the source of truth: each node's authoritative parent/child
+     links (healed by `Rebase`/`RebasePull` and ordered by the subtree routing
+     epoch) already define routing and the address<->identity binding, so there
+     is no distributed snapshot to sign, cache, refresh, revoke, or reconcile,
+     and no equivocation surface to model. Distributing signed topology would add
+     complicated caching dynamics for a prevention benefit the threat model does
+     not require. Consequence: fabricated non-neighbor hops and address/key
+     substitution remain **detectable** (audit, netting, carried-prefix Phase 2,
+     `EdgeClose`) but not **prevented** - consistent with the accepted risks
+     ("nodes are intentionally not zero-trust"). This also removes the general
+     `NodeId -> current address` resolution moved-pointers would have relied on
+     (moved-pointers are rejected too - decision 8).

@@ -56,8 +56,8 @@ pub use route::{
     next_step, route, validate_hop_chain,
 };
 pub use settlement_payload::{
-    EntryProofV1, MAX_SETTLE_HOPS, SETTLE_PAYLOAD_VERSION, SettleForwardV1, SettleHopV1,
-    SettleOutcomeV2, SettlePayloadError, SettlePayloadV2, SettleRejectV1, SettleResultV2,
+    EntryProofV1, MAX_SETTLE_HOPS, SETTLE_PAYLOAD_VERSION, SettleForwardV3, SettleHopV3,
+    SettleOutcomeV3, SettlePayloadError, SettlePayloadV3, SettleRejectV1, SettleResultV3,
 };
 
 /// ALPN negotiated on every cawala/msg/0 connection.

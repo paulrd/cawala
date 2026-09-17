@@ -429,11 +429,17 @@ impl ControlNode {
     /// The reply is an **unsigned** [`ControlReply::Snapshot`] carried over
     /// direct control (the transport does not authenticate it), so nothing is
     /// applied until the snapshot is internally consistent *with this node's own
-    /// parent link*:
+    /// entry in it*:
     /// - `snapshot.node_id == record.parent.parent_id`;
-    /// - the snapshot's own address derives this node's expected address as
-    ///   `snapshot.address.child(record.parent.slot)`;
-    /// - the snapshot lists this node with exactly that derived address.
+    /// - `snapshot.address` is present;
+    /// - the snapshot lists this node, and that entry's `address` is exactly
+    ///   `snapshot.address.child(entry.slot)`.
+    ///
+    /// The entry's slot is therefore **adopted** (a same-parent re-slot the pull
+    /// missed) rather than compared against the stored one. The apply is
+    /// generation-agnostic: the stored parent-generation high-water mark is left
+    /// unchanged, so a parent whose persisted epoch regressed below this link's
+    /// mark can still heal this node.
     ///
     /// Returns `Ok(true)` when a different (verified) address was applied,
     /// `Ok(false)` when it was already current, and `Err` when the snapshot does
@@ -459,7 +465,6 @@ impl ControlNode {
                 "pull snapshot carries no address".to_string(),
             ));
         };
-        let expected = parent_address.child(parent.slot);
         let child = snapshot
             .children
             .iter()
@@ -467,20 +472,33 @@ impl ControlNode {
             .ok_or_else(|| {
                 ControlError::Codec("pull snapshot does not list this node".to_string())
             })?;
-        if child.address.as_ref() != Some(&expected) {
+        // `child()` debug-asserts the slot bound; a snapshot is untrusted, so
+        // refuse an out-of-range slot before deriving from it.
+        if child.slot > cawala_topology::MAX_SLOT {
             return Err(ControlError::Codec(format!(
-                "pull snapshot derives {} for this node, expected {expected}",
-                child
-                    .address
-                    .as_ref()
-                    .map_or_else(|| "none".to_string(), |address| address.to_string())
+                "pull snapshot lists slot {} out of range",
+                child.slot
             )));
         }
-        if self.record.record().address.as_ref() == Some(&expected) {
+        let Some(child_address) = child.address.clone() else {
+            return Err(ControlError::Codec(
+                "pull snapshot lists this node without an address".to_string(),
+            ));
+        };
+        let expected = parent_address.child(child.slot);
+        if child_address != expected {
+            return Err(ControlError::Codec(format!(
+                "pull snapshot derives {child_address} for this node, expected {expected}"
+            )));
+        }
+        if self.record.record().address.as_ref() == Some(&child_address) {
             return Ok(false);
         }
+        // Generation-agnostic: pass the current mark so `apply_rebase` cannot
+        // move it, preserving the rolled-back-parent healing guarantee.
+        let generation = self.record.parent_generation();
         self.record
-            .set_address(expected.clone())
+            .apply_rebase(child_address.clone(), child.slot, generation)
             .map_err(|err| ControlError::Codec(err.to_string()))?;
         self.record
             .save()
@@ -490,9 +508,9 @@ impl ControlNode {
             "event": "rebase-pull-applied",
             "node": self.node_id,
             "parent": parent.parent_id,
-            "address": expected.to_string(),
+            "address": child_address.to_string(),
         }));
-        self.propagate_rebase(&expected, now);
+        self.propagate_rebase(&child_address, now);
         Ok(true)
     }
 
@@ -1880,9 +1898,13 @@ impl ControlNode {
     ///
     /// The receiver is the child. Authority is the **current** direct parent's
     /// operator (`origin == record.parent.parent_id`, bound by
-    /// `verify_control`), and the topology rule `address ==
-    /// parent_address.child(record.parent.slot)` is enforced here (a pure
-    /// [`RebaseNotice::validate`] has no view of the parent link).
+    /// `verify_control`), and the topology rule `address.parent() ==
+    /// Some(parent_address)` is enforced here (a pure
+    /// [`RebaseNotice::validate`] has no view of the parent link). The notice's
+    /// `address` slot is then adopted as this node's parent-local slot: a
+    /// direct-child re-slot moves this node (and, by re-propagation, its
+    /// subtree) to the new slot, so the stored `parent.slot` and address move
+    /// together via [`RecordStore::apply_rebase`].
     ///
     /// # Ordering
     ///
@@ -1921,7 +1943,11 @@ impl ControlNode {
         if verify_control(signed, &self.peers).is_err() {
             return ControlReply::Rejected(RejectCode::Unauthorized);
         }
-        if notice.address != notice.parent_address.child(parent.slot) {
+        // Structural rule: the notice may only place this node as a **direct
+        // child** of the named parent address. The slot itself is whatever the
+        // notice names (a re-slot), so it is adopted below rather than compared
+        // against the stored one.
+        if notice.address.parent().as_ref() != Some(&notice.parent_address) {
             return ControlReply::Rejected(RejectCode::BadRequest);
         }
         // A lower generation is a notice from before the current prefix: ignore
@@ -1972,11 +1998,18 @@ impl ControlNode {
             }));
             return ControlReply::Rejected(RejectCode::BadRequest);
         }
-        // Strictly newer: apply, record the high-water mark, then propagate.
-        if let Err(err) = self.record.set_address(notice.address.clone()) {
+        // Strictly newer: apply address + parent slot + high-water mark in one
+        // validated mutation, then propagate.
+        if let Err(err) = self.record.apply_rebase(
+            notice.address.clone(),
+            notice
+                .address
+                .slot()
+                .expect("a direct child address has a slot"),
+            notice.generation,
+        ) {
             return ControlReply::Rejected(map_record_error(&err));
         }
-        self.record.set_parent_generation(notice.generation);
         if self.record.save().is_err() {
             return ControlReply::Rejected(RejectCode::Internal);
         }
@@ -1993,20 +2026,51 @@ impl ControlNode {
         ControlReply::Accepted
     }
 
-    /// Queue a `Rebase` notice for every child, deriving each child's new
+    /// Queue a single `Rebase` notice for one direct `child`, deriving its new
     /// address as `parent_address.child(slot)`.
     ///
-    /// Every notice carries **this node's own current
+    /// The notice carries **this node's own current
     /// [`RecordStore::address_epoch`]** as its `generation` (read here, never
-    /// passed in), so a child can order
-    /// notices from this parent: the epoch is bumped by the address mutation
-    /// that immediately precedes a propagation, so the notice names the epoch
-    /// the new prefix belongs to.
+    /// passed in), so the child can order notices from this parent: the epoch is
+    /// bumped by the address mutation (own-address change or direct-child
+    /// re-slot) that immediately precedes the propagation, so the notice names
+    /// the epoch the new prefix belongs to.
+    ///
+    /// Best-effort: a child that cannot be reached is retried by the P2 sweep
+    /// seam, never surfaced to the requester.
+    fn queue_rebase_notice(
+        &mut self,
+        child: NodeId,
+        slot: u8,
+        parent_address: &OctAddr,
+        now: u64,
+    ) {
+        let generation = self.record.address_epoch();
+        let notice = RebaseNotice {
+            node: child.clone(),
+            parent_address: parent_address.clone(),
+            address: parent_address.child(slot),
+            generation,
+        };
+        self.queue_notice(
+            &child,
+            OutboundKind::Rebase,
+            |node| {
+                ControlRequest::Rebase(RebaseNotice {
+                    node,
+                    ..notice.clone()
+                })
+            },
+            now,
+        );
+    }
+
+    /// Queue a `Rebase` notice for every child, deriving each child's new
+    /// address as `parent_address.child(slot)`.
     ///
     /// Best-effort: a child that cannot be reached is retried by the P2 sweep
     /// seam, never surfaced to the requester.
     fn propagate_rebase(&mut self, parent_address: &OctAddr, now: u64) {
-        let generation = self.record.address_epoch();
         let children: Vec<(NodeId, u8)> = self
             .record
             .record()
@@ -2015,18 +2079,7 @@ impl ControlNode {
             .map(|child| (NodeId::from(child.child_id.clone()), child.slot))
             .collect();
         for (child, slot) in children {
-            let notice = RebaseNotice {
-                node: child.clone(),
-                parent_address: parent_address.clone(),
-                address: parent_address.child(slot),
-                generation,
-            };
-            self.queue_notice(&child, OutboundKind::Rebase, |node| {
-                ControlRequest::Rebase(RebaseNotice {
-                    node,
-                    ..notice.clone()
-                })
-            }, now);
+            self.queue_rebase_notice(child, slot, parent_address, now);
         }
     }
 
@@ -2075,6 +2128,15 @@ impl ControlNode {
         ControlReply::Snapshot(self.snapshot())
     }
 
+    /// Parent side: re-slot one of this node's direct children **within this
+    /// node** (v1, node-child only).
+    ///
+    /// The child link is updated atomically and the node's subtree routing
+    /// epoch advances, then exactly one `Rebase` is queued for the moved child
+    /// (which re-propagates to its own subtree). A `ChildKind::User` child is
+    /// refused: a browser leaf has no healing pull, so re-slotting it would
+    /// strand it. A same-slot request is an idempotent `Accepted` no-op (no
+    /// epoch bump, no notice).
     fn handle_move_child(
         &mut self,
         signed: &SignedControl,
@@ -2088,31 +2150,68 @@ impl ControlNode {
         if move_child.new_parent.as_str() != self.node_id {
             return ControlReply::Rejected(RejectCode::BadRequest);
         }
-        let Some((kind, date_joined)) = self
+        // v1 is node-child only: a browser leaf is re-slotted by this same
+        // handler but has no healing pull, so it must be refused rather than
+        // silently stranded at a slot it cannot learn about.
+        let Some(kind) = self
             .record
             .record()
             .children
             .iter()
             .find(|child| child.child_id == move_child.child.as_str())
-            .map(|child| (child.kind, child.date_joined))
+            .map(|child| child.kind)
         else {
             return ControlReply::Rejected(RejectCode::NotFound);
         };
-        let backup = self.record.clone();
-        if let Err(err) = self.record.detach_child(move_child.child.as_str()) {
-            return ControlReply::Rejected(map_record_error(&err));
+        if kind != ChildKind::Node {
+            return ControlReply::Rejected(RejectCode::BadRequest);
         }
-        if let Err(err) = self.record.attach_child(
-            move_child.child.as_str(),
-            kind,
-            move_child.slot,
-            date_joined,
-        ) {
-            self.record = backup;
-            return ControlReply::Rejected(map_record_error(&err));
+        // `slot: None` keeps the old "lowest slot free for this child"
+        // semantics: the moved child's own slot counts as free, so a child
+        // already at the lowest available slot is a no-op.
+        let target_slot = {
+            let record = self.record.record();
+            match move_child.slot {
+                Some(slot) => Some(slot),
+                None => (0..=cawala_topology::MAX_SLOT).find(|slot| {
+                    !record.children.iter().any(|child| {
+                        child.slot == *slot && child.child_id != move_child.child.as_str()
+                    })
+                }),
+            }
+        };
+        let Some(target_slot) = target_slot else {
+            return ControlReply::Rejected(RejectCode::Internal);
+        };
+        // `move_child_slot` is atomic (clone/validate/swap), so a failure leaves
+        // the store untouched; the backup preserves the previous behaviour of
+        // restoring the record if a mutation ever leaves it partially applied.
+        let backup = self.record.clone();
+        match self.record.move_child_slot(move_child.child.as_str(), target_slot) {
+            Ok(None) => {
+                // Same effective slot: an idempotent no-op, so nothing changed
+                // and no notice is warranted.
+                return ControlReply::Accepted;
+            }
+            Ok(Some(_old_slot)) => {}
+            Err(err) => {
+                self.record = backup;
+                return ControlReply::Rejected(map_record_error(&err));
+            }
         }
         if self.record.save().is_err() {
             return ControlReply::Rejected(RejectCode::Internal);
+        }
+        // The re-slot bumped this node's subtree routing epoch, so the moved
+        // child must be re-based onto the new address; the child re-propagates
+        // to its own subtree. Exactly one notice, targeted at the moved child.
+        //
+        // A re-slot while this node has no address of its own cannot name the
+        // new prefix: skip the notice, matching `propagate_rebase`'s skip. The
+        // subtree is unroutable until this node has an address, at which point
+        // a later pull heals it.
+        if let Some(parent_address) = self.record.record().address.clone() {
+            self.queue_rebase_notice(move_child.child.clone(), target_slot, &parent_address, now);
         }
         ControlReply::Accepted
     }
@@ -4548,7 +4647,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebase_rejects_address_slot_mismatch_and_stale_former_parent() {
+    async fn rebase_rejects_non_direct_child_and_stale_former_parent() {
         let dir = tempfile::tempdir().unwrap();
         let child_op = secret(1);
         let parent_op = secret(2);
@@ -4562,13 +4661,22 @@ mod tests {
         let peers = [node_peer("parent", &parent_op, 3)];
         let mut engine = engine_with(dir.path(), "child", child_op.clone(), record, &peers);
 
-        // `parent_address.child(2)` is `0.5.2`, not `0.5.3`.
-        let mismatch = authorize_at("parent", &parent_op, 1, rebase_request("0.5.3", "0.5", 1));
+        // `0.5.2.3` is a *grandchild* of `0.5`, not a direct child: refused
+        // before any mutation.
+        let deeper = authorize_at("parent", &parent_op, 1, rebase_request("0.5.2.3", "0.5", 1));
         assert_eq!(
-            engine.receive_at(any_remote(), mismatch, 0).await,
+            engine.receive_at(any_remote(), deeper, 0).await,
+            ControlReply::Rejected(RejectCode::BadRequest)
+        );
+        // `0.7` is the same depth as the parent address `0.5`, so it is a
+        // sibling of the parent, not its child.
+        let sibling = authorize_at("parent", &parent_op, 2, rebase_request("0.7", "0.5", 1));
+        assert_eq!(
+            engine.receive_at(any_remote(), sibling, 0).await,
             ControlReply::Rejected(RejectCode::BadRequest)
         );
         assert_eq!(engine.record().address, Some("0.2".parse().unwrap()));
+        assert_eq!(engine.record().parent.as_ref().unwrap().slot, 2);
 
         // Current parent is `newparent`; `parent` is stale.
         let dir2 = tempfile::tempdir().unwrap();
@@ -4672,6 +4780,338 @@ mod tests {
             assert_eq!(notice.generation, epoch);
             assert_eq!(notice.parent_address, "0.5.2".parse().unwrap());
         }
+    }
+
+    /// A `Rebase` naming a **new slot** under the same parent (the `MoveChild`
+    /// push) is accepted and persists the new address, the adopted parent slot,
+    /// and the generation mark in one atomic apply.
+    #[tokio::test]
+    async fn rebase_applies_a_direct_child_slot_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_op = secret(1);
+        let parent_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "child",
+            Some("0.5.2"),
+            Some(("parent", 2)),
+            &[("c1", ChildKind::Node, 0, 1)],
+        );
+        let peers = [node_peer("parent", &parent_op, 3)];
+        let mut engine = engine_with(dir.path(), "child", child_op, record, &peers);
+
+        // Same parent address `0.5`, but the child moves from slot 2 to slot 4.
+        let signed = authorize_at("parent", &parent_op, 1, rebase_request("0.5.4", "0.5", 1));
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+        let record = engine.record().clone();
+        assert_eq!(record.address, Some("0.5.4".parse().unwrap()));
+        assert_eq!(
+            record.parent.as_ref().unwrap().slot, 4,
+            "the notice's slot is adopted"
+        );
+        assert_eq!(record.parent_generation(), 1);
+        // The child re-propagates from its new address with its own bumped epoch.
+        let outbound = engine.take_outbound();
+        assert_eq!(outbound.len(), 1);
+        let ControlRequest::Rebase(notice) = &outbound[0].signed.request else {
+            panic!("expected a Rebase frame");
+        };
+        assert_eq!(notice.address, "0.5.4.0".parse().unwrap());
+        assert_eq!(notice.generation, record.address_epoch());
+    }
+
+    #[tokio::test]
+    async fn move_child_reslots_and_queues_exactly_one_rebase() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[
+                ("moved", ChildKind::Node, 1, 10),
+                ("sibling", ChildKind::Node, 2, 20),
+            ],
+        );
+        let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &[]);
+        let epoch_before = engine.record().address_epoch();
+
+        let signed = authorize_at(
+            "parent",
+            &parent_op,
+            1,
+            ControlRequest::MoveChild(MoveChild {
+                child: NodeId::from("moved"),
+                new_parent: NodeId::from("parent"),
+                slot: Some(5),
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+
+        let record = engine.record().clone();
+        let moved = record
+            .children
+            .iter()
+            .find(|c| c.child_id == "moved")
+            .unwrap();
+        assert_eq!(moved.slot, 5);
+        let sibling = record
+            .children
+            .iter()
+            .find(|c| c.child_id == "sibling")
+            .unwrap();
+        assert_eq!(sibling.slot, 2, "a sibling is untouched");
+        assert_eq!(record.address_epoch(), epoch_before + 1);
+
+        let outbound = engine.take_outbound();
+        assert_eq!(outbound.len(), 1, "exactly one notice for the moved child");
+        assert_eq!(outbound[0].kind, OutboundKind::Rebase);
+        assert_eq!(outbound[0].target, NodeId::from("moved"));
+        let ControlRequest::Rebase(notice) = &outbound[0].signed.request else {
+            panic!("expected a Rebase frame");
+        };
+        assert_eq!(notice.node, NodeId::from("moved"));
+        assert_eq!(notice.parent_address, "0".parse().unwrap());
+        assert_eq!(notice.address, "0.5".parse().unwrap());
+        assert_eq!(notice.generation, record.address_epoch());
+    }
+
+    #[tokio::test]
+    async fn move_child_same_slot_is_accepted_without_a_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[("moved", ChildKind::Node, 5, 10)],
+        );
+        let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &[]);
+        let epoch_before = engine.record().address_epoch();
+
+        let signed = authorize_at(
+            "parent",
+            &parent_op,
+            1,
+            ControlRequest::MoveChild(MoveChild {
+                child: NodeId::from("moved"),
+                new_parent: NodeId::from("parent"),
+                slot: Some(5),
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(engine.record().address_epoch(), epoch_before);
+        assert!(
+            engine.take_outbound().is_empty(),
+            "a same-slot move needs no notice"
+        );
+    }
+
+    /// `slot: None` resolves to the lowest slot free for this child (its own
+    /// entry counts as free): with slot 0 taken and the child at slot 2, it
+    /// moves to the lowest free slot 1 and queues one targeted notice.
+    #[tokio::test]
+    async fn move_child_none_slot_picks_lowest_free_excluding_own_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[
+                ("moved", ChildKind::Node, 2, 10),
+                ("sibling", ChildKind::Node, 0, 20),
+            ],
+        );
+        let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &[]);
+        let epoch_before = engine.record().address_epoch();
+
+        let signed = authorize_at(
+            "parent",
+            &parent_op,
+            1,
+            ControlRequest::MoveChild(MoveChild {
+                child: NodeId::from("moved"),
+                new_parent: NodeId::from("parent"),
+                slot: None,
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+
+        let record = engine.record().clone();
+        let moved = record
+            .children
+            .iter()
+            .find(|c| c.child_id == "moved")
+            .unwrap();
+        assert_eq!(
+            moved.slot, 1,
+            "the lowest slot free for the moved child, excluding its own entry"
+        );
+        assert_eq!(record.address_epoch(), epoch_before + 1);
+        let outbound = engine.take_outbound();
+        assert_eq!(outbound.len(), 1, "exactly one notice for the moved child");
+        let ControlRequest::Rebase(notice) = &outbound[0].signed.request else {
+            panic!("expected a Rebase frame");
+        };
+        assert_eq!(notice.address, "0.1".parse().unwrap());
+    }
+
+    /// `slot: None` resolving to the moved child's **current** slot is an
+    /// idempotent `Accepted` no-op: no epoch bump and no queued notice.
+    #[tokio::test]
+    async fn move_child_none_slot_resolving_to_current_slot_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[
+                ("moved", ChildKind::Node, 2, 10),
+                ("sibling_a", ChildKind::Node, 0, 20),
+                ("sibling_b", ChildKind::Node, 1, 30),
+            ],
+        );
+        let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &[]);
+        let epoch_before = engine.record().address_epoch();
+
+        let signed = authorize_at(
+            "parent",
+            &parent_op,
+            1,
+            ControlRequest::MoveChild(MoveChild {
+                child: NodeId::from("moved"),
+                new_parent: NodeId::from("parent"),
+                slot: None,
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+        let moved = engine
+            .record()
+            .children
+            .iter()
+            .find(|c| c.child_id == "moved")
+            .unwrap();
+        assert_eq!(moved.slot, 2, "resolves to its current slot");
+        assert_eq!(engine.record().address_epoch(), epoch_before);
+        assert!(
+            engine.take_outbound().is_empty(),
+            "a same-slot move needs no notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_child_rejects_a_user_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[("leaf", ChildKind::User, 1, 10)],
+        );
+        let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &[]);
+
+        let signed = authorize_at(
+            "parent",
+            &parent_op,
+            1,
+            ControlRequest::MoveChild(MoveChild {
+                child: NodeId::from("leaf"),
+                new_parent: NodeId::from("parent"),
+                slot: Some(5),
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Rejected(RejectCode::BadRequest)
+        );
+        let leaf = engine
+            .record()
+            .children
+            .iter()
+            .find(|c| c.child_id == "leaf")
+            .unwrap();
+        assert_eq!(leaf.slot, 1, "a rejected move must not mutate the record");
+        assert!(engine.take_outbound().is_empty());
+    }
+
+    /// A pull snapshot may re-slot this node (a `MoveChild` push the node
+    /// missed): the entry's address/slot are adopted, the generation mark is
+    /// left alone, and the new prefix re-propagates.
+    #[test]
+    fn apply_pull_snapshot_applies_a_slot_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = record_store(
+            dir.path(),
+            "child",
+            Some("0.5.2"),
+            Some(("parent", 2)),
+            &[("c1", ChildKind::Node, 0, 1)],
+        );
+        let mut engine = engine_with(dir.path(), "child", secret(1), record, &[]);
+
+        let snapshot = NodeSnapshot {
+            node_id: NodeId::from("parent"),
+            address: Some("0.5".parse().unwrap()),
+            parent: None,
+            children: vec![ChildSnapshot {
+                child_id: NodeId::from("child"),
+                kind: ChildKind::Node,
+                slot: 4,
+                address: Some("0.5.4".parse().unwrap()),
+                date_joined: 1,
+            }],
+        };
+        assert_eq!(engine.apply_pull_snapshot(&snapshot, 0), Ok(true));
+        assert_eq!(engine.record().address, Some("0.5.4".parse().unwrap()));
+        assert_eq!(engine.record().parent.as_ref().unwrap().slot, 4);
+        // Generation-agnostic: the mark stays at its pre-pull value.
+        assert_eq!(engine.record().parent_generation(), 0);
+        let outbound = engine.take_outbound();
+        assert_eq!(outbound.len(), 1);
+        let ControlRequest::Rebase(notice) = &outbound[0].signed.request else {
+            panic!("expected a Rebase frame");
+        };
+        assert_eq!(notice.address, "0.5.4.0".parse().unwrap());
+
+        // An inconsistent snapshot (the entry address does not derive from the
+        // snapshot's own address + entry slot) is refused without mutation.
+        let inconsistent = NodeSnapshot {
+            node_id: NodeId::from("parent"),
+            address: Some("0.5".parse().unwrap()),
+            parent: None,
+            children: vec![ChildSnapshot {
+                child_id: NodeId::from("child"),
+                kind: ChildKind::Node,
+                slot: 6,
+                address: Some("0.5.4".parse().unwrap()),
+                date_joined: 1,
+            }],
+        };
+        assert!(engine.apply_pull_snapshot(&inconsistent, 0).is_err());
+        assert_eq!(engine.record().address, Some("0.5.4".parse().unwrap()));
     }
 
     /// A notice whose generation is below the stored high-water mark is a stale

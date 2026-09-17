@@ -211,6 +211,11 @@ pub struct DetachChild {
 /// sender that is not this node's operator or senior child. Moving a subtree to
 /// a *different* parent (the old parent releases it, the new parent approves,
 /// and the subtree's addresses are rebased) is not implemented.
+///
+/// v1 is further scoped to **node children only**: a [`ChildKind::User`]
+/// (browser leaf) is refused with `BadRequest`. A leaf has no healing pull, so
+/// a re-slot it could not learn about would strand it; the native node child is
+/// re-based by a targeted `Rebase` push (and can heal by pull).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoveChild {
     /// The child to move.
@@ -291,10 +296,14 @@ impl DetachNotice {
 /// A parent-signed re-base of a child's local address.
 ///
 /// The receiver is the child; `parent_address` is the sender's own (new)
-/// address and `address` is the child's new address, which must equal
-/// `parent_address.child(child.slot)` — a topology rule the receiver enforces
-/// against its own current parent link, so it is deliberately not checked in
-/// [`RebaseNotice::validate`] (which has no view of that link). Added in
+/// address and `address` is the child's new address. The topology rule is
+/// **`address` must be a direct child of `parent_address`** (i.e.
+/// `address.parent() == Some(parent_address)`): the receiver adopts
+/// `address.slot()` as its own new parent-local slot, so a same-parent re-slot
+/// (a new slot under the same parent prefix) is a legitimate re-base, not an
+/// error. This is enforced against the receiver's own current parent link, so
+/// it is deliberately not checked in [`RebaseNotice::validate`] (which has no
+/// view of that link). Added in
 /// [`CONTROL_FORMAT_VERSION`](crate::CONTROL_FORMAT_VERSION) 4 (variant 15).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebaseNotice {
@@ -304,21 +313,24 @@ pub struct RebaseNotice {
     pub parent_address: OctAddr,
     /// The child's new asserted address.
     pub address: OctAddr,
-    /// Epoch of this re-base (`>= 1`), carried for a future re-homing protocol.
+    /// Epoch of this re-base (`>= 1`), used to order notices from one parent.
     ///
-    /// v1 has a single generation and the node does **not** enforce ordering:
-    /// the receiver applies a notice whenever the derived address differs and
-    /// treats an equal address as an idempotent no-op. Out-of-order/epoch
-    /// handling is a v2 concern.
+    /// The receiver enforces ordering against its stored high-water mark (the
+    /// current parent link's `generation`): a **stale** notice (`<`) is ignored
+    /// (audited `rebase-stale-ignored`) so the parent stops retrying; an
+    /// **equal** generation is an idempotent no-op when the address already
+    /// matches, and otherwise `BadRequest` (audited `rebase-conflict`) — one
+    /// generation must not name two prefixes; a **newer** generation (`>`)
+    /// applies and advances the high-water mark.
     pub generation: u64,
 }
 
 impl RebaseNotice {
     /// Check the node-id length bound and that `generation >= 1`.
     ///
-    /// The `address == parent_address.child(slot)` derivation is a topology
-    /// check against the receiver's current parent link and is enforced by the
-    /// node, not here.
+    /// The topology rule — `address` must be a **direct child** of
+    /// `parent_address` (the receiver adopts its slot) — is checked against the
+    /// receiver's current parent link and is enforced by the node, not here.
     pub fn validate(&self) -> Result<(), ControlError> {
         validate_node_id("node", self.node.as_str())?;
         if self.generation < 1 {

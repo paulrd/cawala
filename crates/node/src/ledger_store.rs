@@ -42,7 +42,11 @@ pub const META_FILE: &str = "meta.json";
 /// removed (`Issue`/`Burn` are child-only boundary ops; equity is derived), and
 /// the signed entry format advanced to
 /// [`cawala_ledger::ENTRY_FORMAT_VERSION`] 3.
-pub const LEDGER_FORMAT_VERSION: u32 = 2;
+///
+/// v3: `EntryBody::EdgeClose` was appended and the signed entry format advanced
+/// to [`cawala_ledger::ENTRY_FORMAT_VERSION`] 4. Entry hashes/signatures changed,
+/// so a v2 (or older) log cannot be replayed and must be recreated.
+pub const LEDGER_FORMAT_VERSION: u32 = 3;
 
 /// Maximum accepted encoded frame size in bytes, mirroring `proto`'s bound.
 pub const MAX_ENTRY_FRAME_SIZE: u32 = proto::MAX_FRAME_SIZE;
@@ -176,16 +180,18 @@ pub fn load_meta(data_dir: &Path) -> Result<LedgerMeta> {
         .with_context(|| format!("{} is not a valid ledger meta file", path.display()))?;
     if meta.format_version != LEDGER_FORMAT_VERSION {
         if meta.format_version < LEDGER_FORMAT_VERSION {
-            // Older frames may post `Equity` legs, which no longer exist.
+            // The on-disk format (including the signed entry format) changed, so
+            // older frames cannot be replayed and the data dir must be recreated.
             bail!(
-                "{}: ledger format changed (Equity removed); recreate the data dir \
-                 (found format version {}, expected {LEDGER_FORMAT_VERSION})",
+                "{}: unsupported ledger format version {} (expected {LEDGER_FORMAT_VERSION}); \
+                 the on-disk ledger format changed, so recreate the data dir",
                 path.display(),
                 meta.format_version
             );
         }
         bail!(
-            "{}: unsupported ledger format version {} (expected {LEDGER_FORMAT_VERSION})",
+            "{}: ledger format version {} is newer than this binary supports \
+             (expected {LEDGER_FORMAT_VERSION}); upgrade the node or recreate the data dir",
             path.display(),
             meta.format_version
         );
@@ -654,14 +660,27 @@ mod tests {
     }
 
     #[test]
-    fn load_meta_rejects_older_format_with_a_clear_message() {
+    fn load_meta_accepts_the_current_format_version() {
         let dir = tempfile::tempdir().unwrap();
         let key = ledger_key();
-        // Simulate a v1 meta written before `Equity` was removed.
+        let meta = LedgerMeta {
+            format_version: LEDGER_FORMAT_VERSION,
+            node_id: NODE.to_string(),
+            ledger_id: key.public(),
+        };
+        save_meta(dir.path(), &meta).unwrap();
+        assert_eq!(load_meta(dir.path()).unwrap(), meta);
+    }
+
+    #[test]
+    fn load_meta_rejects_older_format_with_a_version_generic_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ledger_key();
+        // Simulate a v2 meta written before `EdgeClose` (entry format 4).
         save_meta(
             dir.path(),
             &LedgerMeta {
-                format_version: 1,
+                format_version: 2,
                 node_id: NODE.to_string(),
                 ledger_id: key.public(),
             },
@@ -671,10 +690,46 @@ mod tests {
         let err = load_meta(dir.path()).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("ledger format changed (Equity removed)"),
+            msg.contains(&format!(
+                "unsupported ledger format version 2 (expected {LEDGER_FORMAT_VERSION})"
+            )),
             "unexpected error: {msg}"
         );
-        assert!(msg.contains("recreate the data dir"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("the on-disk ledger format changed"),
+            "the message must be version-generic, not cite a specific change: {msg}"
+        );
+        assert!(!msg.contains("Equity removed"), "stale message: {msg}");
+        assert!(
+            msg.contains("recreate the data dir"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_meta_rejects_a_newer_format_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ledger_key();
+        save_meta(
+            dir.path(),
+            &LedgerMeta {
+                format_version: LEDGER_FORMAT_VERSION + 1,
+                node_id: NODE.to_string(),
+                ledger_id: key.public(),
+            },
+        )
+        .unwrap();
+
+        let err = load_meta(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer than this binary supports"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("expected {LEDGER_FORMAT_VERSION}")),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

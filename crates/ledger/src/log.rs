@@ -197,9 +197,11 @@ impl<L: LedgerLog> Ledger<L> {
     /// 5. `height == seq` (Phase A rule);
     /// 6. `prev_hash` matches the current head ([`Hash::ZERO`] at genesis);
     /// 7. the postings satisfy conservation and the canonical body shape
-    ///    ([`crate::entry::Entry::check_conservation`]);
+    ///    ([`crate::entry::Entry::check_conservation`]) — balanced for
+    ///    `Transfer`/`OpenAccount`, exactly one `Child` leg for `Issue`/`Burn`,
+    ///    exactly one `Parent` leg for `EdgeClose`;
     /// 8. applying the postings keeps every `Parent`/`Child` balance
-    ///    non-negative.
+    ///    non-negative (so an `EdgeClose` cannot overdraw `Parent`).
     ///
     /// On any failure the ledger is left completely unchanged.
     pub fn append(&mut self, signed: SignedEntry) -> Result<(), LedgerError> {
@@ -243,8 +245,8 @@ impl<L: LedgerLog> Ledger<L> {
         // Opening an account materializes its zero balance, so `accounts()` and
         // therefore `state_root` are independent of posting history. The body's
         // `posting_rule()` is the single source of truth for whether the set is
-        // balanced or a child-only boundary op, so a future boundary body cannot
-        // drift from `check_conservation`.
+        // balanced, a child-only boundary op, or a parent-only boundary op, so a
+        // future boundary body cannot drift from `check_conservation`.
         let mut next_balances = self.balances.clone();
         if let EntryBody::OpenAccount { child, .. } = &entry.body {
             next_balances.open_account(child)?;
@@ -252,6 +254,9 @@ impl<L: LedgerLog> Ledger<L> {
         match entry.body.posting_rule() {
             PostingRule::Balanced => next_balances.apply(&entry.postings)?,
             PostingRule::Boundary => next_balances.apply_boundary(&entry.postings)?,
+            PostingRule::BoundaryParent => {
+                next_balances.apply_parent_boundary(&entry.postings)?
+            }
         }
 
         let new_height = entry.height;
@@ -357,9 +362,10 @@ mod tests {
 
         fn build(&self, body: EntryBody, postings: Vec<Posting>) -> SignedEntry {
             let auth = match &body {
-                EntryBody::Transfer { .. } | EntryBody::Issue { .. } | EntryBody::Burn { .. } => {
-                    Some(auth(self.seq))
-                }
+                EntryBody::Transfer { .. }
+                | EntryBody::Issue { .. }
+                | EntryBody::Burn { .. }
+                | EntryBody::EdgeClose { .. } => Some(auth(self.seq)),
                 _ => None,
             };
             self.build_with_auth(body, postings, auth)
@@ -755,6 +761,88 @@ mod tests {
             Amount::new(60)
         );
         assert_eq!(h.ledger.balances().equity(), 40);
+    }
+
+    #[test]
+    fn edge_close_zeroes_parent_and_rejects_overdraw() {
+        let mut h = Harness::non_root();
+        h.commit_open("a").unwrap();
+        // Fund the Parent asset via a balanced Descend.
+        h.commit(
+            EntryBody::Transfer {
+                payment_id: Hash::ZERO,
+                amount: Amount::new(100),
+                role: HopRole::Descend,
+            },
+            vec![posting(AccountRef::Parent, 100), child_posting("a", 100)],
+        )
+        .unwrap();
+        assert_eq!(
+            h.ledger.balances().parent_balance(),
+            Some(Amount::new(100))
+        );
+
+        // Writing off more than the Parent balance is rejected atomically.
+        let before = h.ledger.balances().clone();
+        let len_before = h.ledger.len();
+        assert_eq!(
+            h.commit(
+                EntryBody::EdgeClose {
+                    amount: Amount::new(101),
+                },
+                vec![posting(AccountRef::Parent, -101)],
+            ),
+            Err(LedgerError::InsufficientBalance)
+        );
+        assert_eq!(h.ledger.balances(), &before);
+        assert_eq!(h.ledger.len(), len_before);
+
+        // A valid write-off zeroes the Parent asset.
+        h.commit(
+            EntryBody::EdgeClose {
+                amount: Amount::new(100),
+            },
+            vec![posting(AccountRef::Parent, -100)],
+        )
+        .unwrap();
+        assert_eq!(h.ledger.balances().parent_balance(), Some(Amount::ZERO));
+        assert_eq!(h.ledger.balances().child_balance(&child("a")), Amount::new(100));
+    }
+
+    /// The pre-existing griefing path: `append` does not run `verify_transfer`,
+    /// so a balanced `Ascend` hop signed by the node is accepted without any
+    /// order/route binding. `EdgeClose` adds legibility, not a new capability.
+    #[test]
+    fn balanced_ascend_is_accepted_without_verify_transfer() {
+        let mut h = Harness::non_root();
+        h.commit_open("a").unwrap();
+        h.commit_open("u").unwrap();
+        h.commit(
+            EntryBody::Transfer {
+                payment_id: Hash::ZERO,
+                amount: Amount::new(100),
+                role: HopRole::Descend,
+            },
+            vec![posting(AccountRef::Parent, 100), child_posting("a", 100)],
+        )
+        .unwrap();
+        h.commit_issue("u", 50).unwrap();
+
+        h.commit(
+            EntryBody::Transfer {
+                payment_id: Hash::ZERO,
+                amount: Amount::new(50),
+                role: HopRole::Ascend,
+            },
+            vec![posting(AccountRef::Parent, -50), child_posting("u", -50)],
+        )
+        .unwrap();
+
+        assert_eq!(h.ledger.balances().parent_balance(), Some(Amount::new(50)));
+        assert_eq!(
+            h.ledger.balances().child_balance(&child("u")),
+            Amount::ZERO
+        );
     }
 
     /// A distinct log backend proves `Ledger<L>` works through the trait.

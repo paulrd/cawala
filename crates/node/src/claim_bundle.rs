@@ -316,18 +316,22 @@ discretionary operator decision";
 /// The reviewer's exposure guidance for a verified bundle.
 ///
 /// This always appends the [`NOT_PROVEN`] block: the positive branch's
-/// "funding N to match" line is the only place in review that could be misread
-/// as a payable debt, so the block is stated for both a zero and a non-zero
-/// balance.
+/// "funding N to match" / "edge-close" lines are the only place in review that
+/// could be misread as a payable debt, so the block is stated for both a zero
+/// and a non-zero balance.
 pub fn review_guidance(verified: &VerifiedClaim) -> String {
     let exposure = if verified.parent_balance > 0 {
         format!(
-            "exposure: funding {} to match clears the hard UnbackedClaim on the new \
-             parent's books; not funding leaves the parent balance visible as a stranded claim",
+            "exposure: either fund {} to the child to match, or have the detached child run \
+             `ledger edge-close` to write off its stranded Parent claim (if the child is still \
+             attached it must run `control exit` first); the alternative to clearing the hard \
+             UnbackedClaim is leaving the parent balance visible as a stranded claim. A bundle \
+             exported after an edge-close is moot (the child's Parent balance is 0)",
             verified.parent_balance
         )
     } else {
-        "exposure: parent balance is zero; no prefund is needed to clear an UnbackedClaim"
+        "exposure: parent balance is zero; no prefund or `ledger edge-close` is needed to clear \
+         an UnbackedClaim"
             .to_string()
     };
     format!("{exposure}\n{NOT_PROVEN}")
@@ -477,13 +481,22 @@ mod tests {
             parent_balance: 42,
             commitment_height: 3,
         };
-        assert!(review_guidance(&positive).contains("funding 42 to match"));
+        let text = review_guidance(&positive);
+        assert!(text.contains("fund 42 to the child to match"), "{text}");
+        assert!(text.contains("`ledger edge-close`"), "{text}");
+        assert!(text.contains("detached child"), "{text}");
+        assert!(text.contains("`control exit` first"), "{text}");
+        assert!(text.contains("moot"), "{text}");
 
         let zero = VerifiedClaim {
             parent_balance: 0,
             ..positive
         };
-        assert!(review_guidance(&zero).contains("no prefund is needed"));
+        assert!(
+            review_guidance(&zero).contains("no prefund or `ledger edge-close` is needed"),
+            "{}",
+            review_guidance(&zero)
+        );
     }
 
     #[test]
@@ -500,7 +513,7 @@ mod tests {
         let text = review_guidance(&positive);
 
         // M1: the reviewer must see the four limits of the evidence, so the
-        // "funding N to match" line is never read as a payable debt.
+        // "fund N to match" / "edge-close" lines are never read as a payable debt.
         for phrase in [
             "not proven:",
             "self-attested",

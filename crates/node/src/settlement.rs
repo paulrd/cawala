@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, VecDeque};
 use cawala_ledger::{
     AccountRef, AuthRef, Hash, HopRole, NodeId, PaymentOrder, SignedEntry, classify_hop,
 };
-use cawala_msg::{EntryProofV1, MsgId, PeerRef, SettleOutcomeV2, SettleRejectV1};
+use cawala_msg::{EntryProofV1, MsgId, PeerRef, SettleOutcomeV3, SettleRejectV1};
 use cawala_topology::OctAddr;
 
 use crate::record::NodeRecord;
@@ -183,7 +183,16 @@ pub struct TerminalRecord {
     /// The payer's order.
     pub order: PaymentOrder,
     /// The terminal outcome.
-    pub outcome: SettleOutcomeV2,
+    pub outcome: SettleOutcomeV3,
+    /// Whether the verified `Applied` outcome's echoed intermediates failed the
+    /// origin's accountability check (a forensic degradation; the funds outcome
+    /// itself is unchanged and still `Applied`).
+    ///
+    /// Operator-visible via the `control_audit.jsonl`
+    /// `settle-intermediate-degraded` line (and a `tracing::warn!`); by design
+    /// there is **no** browser-wire signal, so an `OrderResultV3` cannot
+    /// distinguish a degraded from a clean `Applied`.
+    pub degraded: bool,
     /// The terminal leaf's signed `Descend` entry, when it applied. Retained for
     /// P5 verification (the result itself is advisory).
     pub terminal_entry: Option<SignedEntry>,
@@ -605,11 +614,13 @@ mod tests {
                 browser: pending(3, 100).browser,
                 browser_msg_id: MsgId([3; 16]),
                 order: pending(3, 100).order,
-                outcome: SettleOutcomeV2::Applied {
+                outcome: SettleOutcomeV3::Applied {
                     terminal_seq: 7,
                     terminal_hash: Hash::from_bytes([7u8; 32]),
                     proof: sample_entry_proof(),
+                    intermediates: vec![],
                 },
+                degraded: false,
                 terminal_entry: Some(sample_signed_entry()),
                 proof: Some(sample_entry_proof()),
             },
@@ -617,7 +628,7 @@ mod tests {
         assert_eq!(manager.terminal_len(), 1);
         assert!(matches!(
             manager.terminal(&payment_id).map(|t| &t.outcome),
-            Some(SettleOutcomeV2::Applied { terminal_seq: 7, .. })
+            Some(SettleOutcomeV3::Applied { terminal_seq: 7, .. })
         ));
     }
 }

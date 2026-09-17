@@ -2,8 +2,8 @@
 //! `MSG_SETTLE_V1` envelopes (P3).
 //!
 //! The [`crate::Envelope`] `msg_type` field ([`crate::MSG_SETTLE_V1`]) is the
-//! **outer** discriminator. The types here define the v1 body, turning the
-//! opaque [`Envelope::payload`](crate::Envelope) into a typed node-to-node
+//! **outer** discriminator. The types here define the versioned body, turning
+//! the opaque [`Envelope::payload`](crate::Envelope) into a typed node-to-node
 //! settlement message.
 //!
 //! # Frozen wire format
@@ -15,20 +15,28 @@
 //! # Versioning
 //!
 //! Variants do not carry a version field. The version lives at the codec layer:
-//! [`SettlePayloadV2::to_bytes`] prefixes [`SETTLE_PAYLOAD_VERSION`] to the
-//! postcard body, and [`SettlePayloadV2::from_bytes`] rejects any other version.
+//! [`SettlePayloadV3::to_bytes`] prefixes [`SETTLE_PAYLOAD_VERSION`] to the
+//! postcard body, and [`SettlePayloadV3::from_bytes`] rejects any other version.
+//!
 //! The v1 result shape carried a bare `terminal_entry`; v2 replaces it with a
-//! full [`EntryProofV1`], so the whole payload is re-versioned and a v1 frame is
+//! full [`EntryProofV1`]. v3 adds an optional [`EntryProofV1`] to each carried
+//! [`SettleHopV3`] (so the origin can audit any intermediate hop) and echoes the
+//! intermediate hops between origin and terminal in
+//! [`SettleOutcomeV3::Applied::intermediates`]. Because the hop and outcome
+//! shapes change, the whole payload is re-versioned: v1 and v2 frames are
 //! refused with [`SettlePayloadError::UnsupportedVersion`].
 //!
 //! # Bounds
 //!
-//! [`SettleForwardV1::hops`] is a wire-controlled `Vec`; decoding does **not**
-//! truncate it (silently dropping hops would be a correctness bug). Callers use
-//! [`SettleForwardV1::hops_within_bound`] / [`MAX_SETTLE_HOPS`] to reject an
-//! over-long forward at the use site. Likewise, an [`EntryProofV1`]'s audit
-//! path is only bounded by [`EntryProofV1::validate`], which callers must run
-//! after decoding.
+//! [`SettleForwardV3::hops`] and the applied outcome's `intermediates` are
+//! wire-controlled `Vec`s; decoding does **not** truncate them (silently
+//! dropping hops would be a correctness bug). Callers bound them at the use
+//! site: every forward checks [`SettleForwardV3::hops_within_bound`], and the
+//! settlement origin rejects a `Result` whose
+//! [`SettleResultV3::intermediates_within_bound`] is false before auditing it
+//! (it returns `true` for `Rejected`, which carries no intermediates). Likewise,
+//! an [`EntryProofV1`]'s audit path is only bounded by
+//! [`EntryProofV1::validate`], which callers must run after decoding.
 
 use serde::{Deserialize, Serialize};
 
@@ -42,12 +50,13 @@ use crate::envelope::MsgError;
 use crate::ledger_payload::OrderRejectV1;
 
 /// Wire version of the settlement payload, prefixed to every
-/// [`SettlePayloadV2::to_bytes`] encoding.
+/// [`SettlePayloadV3::to_bytes`] encoding.
 ///
-/// Bumped 1 -> 2: the `Forward` body is byte-identical, but the result shape
-/// changed from a bare `terminal_entry` to an [`EntryProofV1`]. A v1 frame is
-/// rejected with [`SettlePayloadError::UnsupportedVersion`].
-pub const SETTLE_PAYLOAD_VERSION: u8 = 2;
+/// Bumped 2 -> 3: each carried hop now optionally carries an [`EntryProofV1`],
+/// and an applied outcome echoes the intermediate hops between origin and
+/// terminal. A v1 or v2 frame is rejected with
+/// [`SettlePayloadError::UnsupportedVersion`].
+pub const SETTLE_PAYLOAD_VERSION: u8 = 3;
 
 /// Maximum number of carried settlement hops a caller should accept. This is a
 /// use-site bound (the v1 route is depth-1: `Ascend`/`Lca`/`Descend`); decoding
@@ -58,20 +67,20 @@ pub const MAX_SETTLE_HOPS: usize = 3;
 ///
 /// Variant order is frozen: postcard encodes the discriminant positionally
 /// (`Forward = 0`, `Result = 1`).
-// `SettleForwardV1` carries a full signed-entry vector, so the `Forward`
+// `SettleForwardV3` carries a full signed-entry vector, so the `Forward`
 // variant is much larger than `Result`. Boxing would change the in-memory type;
 // the wire layout is frozen, so keep the declared shape.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SettlePayloadV2 {
+pub enum SettlePayloadV3 {
     /// Origin -> next hop: the order, the payer's authorisation and keys, the
     /// payer/payee addresses, and the evidence hops gathered so far.
-    Forward(SettleForwardV1),
+    Forward(SettleForwardV3),
     /// Terminal -> origin: the outcome of the cascade.
-    Result(SettleResultV2),
+    Result(SettleResultV3),
 }
 
-impl SettlePayloadV2 {
+impl SettlePayloadV3 {
     /// Encode with the [`SETTLE_PAYLOAD_VERSION`] prefix followed by the
     /// postcard body.
     pub fn to_bytes(&self) -> Result<Vec<u8>, SettlePayloadError> {
@@ -84,7 +93,7 @@ impl SettlePayloadV2 {
 
     /// Decode a version-prefixed payload.
     ///
-    /// Rejects an empty buffer, an unsupported version (including v1), a
+    /// Rejects an empty buffer, an unsupported version (including v1 and v2), a
     /// truncated or invalid body, and any trailing bytes after the body. Never
     /// panics on arbitrary input.
     ///
@@ -112,7 +121,7 @@ impl SettlePayloadV2 {
 ///
 /// Field order is frozen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SettleForwardV1 {
+pub struct SettleForwardV3 {
     /// The payer's operator-signed order.
     pub order: PaymentOrder,
     /// The operator binding that travels with the order.
@@ -124,10 +133,10 @@ pub struct SettleForwardV1 {
     /// The payee's user address (used to derive each hop's role).
     pub payee_addr: OctAddr,
     /// Hops signed so far, in cascade order (evidence, not route input).
-    pub hops: Vec<SettleHopV1>,
+    pub hops: Vec<SettleHopV3>,
 }
 
-impl SettleForwardV1 {
+impl SettleForwardV3 {
     /// Whether [`hops`](Self::hops) fits the [`MAX_SETTLE_HOPS`] bound.
     /// Decoding never truncates; callers decide what to do on overflow.
     pub fn hops_within_bound(&self) -> bool {
@@ -140,24 +149,49 @@ impl SettleForwardV1 {
 /// The route (`role`/`first`/`second`) is always re-derived per hop from
 /// `classify_hop` + the node record, never read from this entry.
 ///
+/// `proof` is the signer's own [`EntryProofV1`] for its hop, when it was able to
+/// build one. The origin's own seeded hop carries `None` (it has nothing to
+/// prove to itself); every subsequent hop is expected to carry `Some` so the
+/// origin can audit it.
+///
 /// Field order is frozen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SettleHopV1 {
+pub struct SettleHopV3 {
     /// The asserting node address.
     pub signer_addr: OctAddr,
     /// The hop's signed ledger entry.
     pub entry: SignedEntry,
+    /// The hop's inclusion proof, when the signer built one.
+    pub proof: Option<EntryProofV1>,
 }
 
 /// Terminal -> origin: the cascade outcome.
 ///
 /// Field order is frozen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SettleResultV2 {
+pub struct SettleResultV3 {
     /// The cascade's shared `payment_id`.
     pub payment_id: Hash,
     /// Whether the cascade applied or was rejected.
-    pub outcome: SettleOutcomeV2,
+    pub outcome: SettleOutcomeV3,
+}
+
+impl SettleResultV3 {
+    /// Whether the echoed `intermediates` fit the depth-1 bound.
+    ///
+    /// A depth-1 route has exactly three signers, leaving at most one hop
+    /// strictly between origin and terminal
+    /// ([`MAX_SETTLE_HOPS`].saturating_sub(2)). Decoding never truncates; the
+    /// origin decides what to do on overflow (a `Rejected` outcome carries no
+    /// intermediates, so it is always within bound).
+    pub fn intermediates_within_bound(&self) -> bool {
+        match &self.outcome {
+            SettleOutcomeV3::Applied { intermediates, .. } => {
+                intermediates.len() <= MAX_SETTLE_HOPS.saturating_sub(2)
+            }
+            SettleOutcomeV3::Rejected { .. } => true,
+        }
+    }
 }
 
 /// Terminal status of a settlement cascade.
@@ -167,7 +201,7 @@ pub struct SettleResultV2 {
 // so keep the declared shape rather than boxing.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SettleOutcomeV2 {
+pub enum SettleOutcomeV3 {
     /// The terminal hop applied, carrying verifiable inclusion evidence.
     Applied {
         /// The terminal hop's ledger `seq`.
@@ -177,6 +211,10 @@ pub enum SettleOutcomeV2 {
         /// The terminal leaf's signed entry, signer row, commitment, and
         /// inclusion proof.
         proof: EntryProofV1,
+        /// The hops strictly between the origin and the terminal, in cascade
+        /// order (the origin's own seeded hop and the terminal's own hop are
+        /// excluded). Each normally carries its own inclusion proof.
+        intermediates: Vec<SettleHopV3>,
     },
     /// The cascade was refused; see [`SettleRejectV1`].
     Rejected {
@@ -185,9 +223,9 @@ pub enum SettleOutcomeV2 {
     },
 }
 
-/// Evidence that the applied terminal hop is committed by a leaf's log.
+/// Evidence that an applied hop is committed by a leaf's log.
 ///
-/// Shared by the node-to-node result path ([`SettleOutcomeV2::Applied`]) and the
+/// Shared by the node-to-node result path ([`SettleOutcomeV3::Applied`]) and the
 /// leaf-to-browser result path
 /// ([`crate::ledger_payload::OrderResultV3::proof`]).
 ///
@@ -203,11 +241,11 @@ pub enum SettleOutcomeV2 {
 /// `BalanceAttestation::proof` at the use site.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryProofV1 {
-    /// The applied terminal hop (`Direct` or `Descend`).
+    /// The applied hop.
     pub entry: SignedEntry,
-    /// The terminal leaf's self row: role [`PeerRole::Node`], with a ledger key.
+    /// The signer's self row: role [`PeerRole::Node`], with a ledger key.
     pub signer: PeerKeys,
-    /// The asserted signer address; must equal the payee leaf address.
+    /// The asserted signer address; must equal the hop's `signer_addr`.
     pub leaf_addr: OctAddr,
     /// The commitment the inclusion proof is against; its `entry_count` must
     /// equal [`inclusion.tree_size`](EntryInclusionProof::tree_size).
@@ -363,19 +401,22 @@ mod tests {
         SignedEntry::sign(entry, &key).unwrap()
     }
 
-    fn full_forward(hops: usize) -> SettleForwardV1 {
-        SettleForwardV1 {
+    fn hop(i: usize) -> SettleHopV3 {
+        SettleHopV3 {
+            signer_addr: addr(&format!("0.{}", i + 1)),
+            entry: signed_entry(),
+            proof: None,
+        }
+    }
+
+    fn full_forward(hops: usize) -> SettleForwardV3 {
+        SettleForwardV3 {
             order: order(),
             auth: auth(),
             payer_key: payer_key(),
             payer_addr: addr("0.1.3"),
             payee_addr: addr("0.2.4"),
-            hops: (0..hops)
-                .map(|i| SettleHopV1 {
-                    signer_addr: addr(&format!("0.{}", i + 1)),
-                    entry: signed_entry(),
-                })
-                .collect(),
+            hops: (0..hops).map(hop).collect(),
         }
     }
 
@@ -417,29 +458,43 @@ mod tests {
         }
     }
 
-    fn result(outcome: SettleOutcomeV2) -> SettleResultV2 {
-        SettleResultV2 {
+    fn applied(intermediates: Vec<SettleHopV3>) -> SettleOutcomeV3 {
+        SettleOutcomeV3::Applied {
+            terminal_seq: 9,
+            terminal_hash: Hash::from_bytes([0x55; 32]),
+            proof: sample_entry_proof(),
+            intermediates,
+        }
+    }
+
+    fn result(outcome: SettleOutcomeV3) -> SettleResultV3 {
+        SettleResultV3 {
             payment_id: Hash::from_bytes([0x22; 32]),
             outcome,
         }
     }
 
-    fn round_trip(payload: &SettlePayloadV2) {
+    fn round_trip(payload: &SettlePayloadV3) {
         let bytes = payload.to_bytes().unwrap();
         assert_eq!(bytes[0], SETTLE_PAYLOAD_VERSION);
-        let back = SettlePayloadV2::from_bytes(&bytes).unwrap();
+        let back = SettlePayloadV3::from_bytes(&bytes).unwrap();
         assert_eq!(&back, payload);
     }
 
     #[test]
     fn round_trip_every_variant() {
-        round_trip(&SettlePayloadV2::Forward(full_forward(0)));
-        round_trip(&SettlePayloadV2::Forward(full_forward(3)));
-        round_trip(&SettlePayloadV2::Result(result(SettleOutcomeV2::Applied {
-            terminal_seq: 9,
-            terminal_hash: Hash::from_bytes([0x55; 32]),
-            proof: sample_entry_proof(),
-        })));
+        round_trip(&SettlePayloadV3::Forward(full_forward(0)));
+        round_trip(&SettlePayloadV3::Forward(full_forward(2)));
+        // Every hop built by `hop` carries `proof: None`; also round-trip a hop
+        // that carries a real proof.
+        let mut forward = full_forward(2);
+        forward.hops[0].proof = Some(sample_entry_proof());
+        round_trip(&SettlePayloadV3::Forward(forward));
+        round_trip(&SettlePayloadV3::Result(result(applied(vec![]))));
+        round_trip(&SettlePayloadV3::Result(result(applied(vec![hop(0)]))));
+        let mut proven = hop(0);
+        proven.proof = Some(sample_entry_proof());
+        round_trip(&SettlePayloadV3::Result(result(applied(vec![proven]))));
         for reason in [
             SettleRejectV1::PayerRejected,
             SettleRejectV1::IntermediateRejected {
@@ -449,8 +504,8 @@ mod tests {
             SettleRejectV1::RouteTooDeep,
             SettleRejectV1::Malformed,
         ] {
-            round_trip(&SettlePayloadV2::Result(result(
-                SettleOutcomeV2::Rejected { reason },
+            round_trip(&SettlePayloadV3::Result(result(
+                SettleOutcomeV3::Rejected { reason },
             )));
         }
     }
@@ -458,13 +513,9 @@ mod tests {
     #[test]
     fn enum_discriminant_order_is_frozen() {
         let cases = [
-            (SettlePayloadV2::Forward(full_forward(0)), 0u8),
+            (SettlePayloadV3::Forward(full_forward(0)), 0u8),
             (
-                SettlePayloadV2::Result(result(SettleOutcomeV2::Applied {
-                    terminal_seq: 1,
-                    terminal_hash: Hash::from_bytes([1u8; 32]),
-                    proof: sample_entry_proof(),
-                })),
+                SettlePayloadV3::Result(result(applied(vec![]))),
                 1,
             ),
         ];
@@ -477,19 +528,12 @@ mod tests {
         }
 
         // Outcome discriminants are frozen too.
-        let applied =
-            postcard::to_allocvec(&SettleOutcomeV2::Applied {
-                terminal_seq: 0,
-                terminal_hash: Hash::ZERO,
-                proof: sample_entry_proof(),
-            })
-            .unwrap();
-        assert_eq!(applied[0], 0);
-        let rejected =
-            postcard::to_allocvec(&SettleOutcomeV2::Rejected {
-                reason: SettleRejectV1::Malformed,
-            })
-            .unwrap();
+        let applied_bytes = postcard::to_allocvec(&applied(vec![])).unwrap();
+        assert_eq!(applied_bytes[0], 0);
+        let rejected = postcard::to_allocvec(&SettleOutcomeV3::Rejected {
+            reason: SettleRejectV1::Malformed,
+        })
+        .unwrap();
         assert_eq!(rejected[0], 1);
 
         // Reject discriminants are frozen.
@@ -513,28 +557,34 @@ mod tests {
     #[test]
     fn malformed_and_truncated_bytes_are_errors() {
         // Empty buffer.
-        assert!(SettlePayloadV2::from_bytes(&[]).is_err());
+        assert!(SettlePayloadV3::from_bytes(&[]).is_err());
 
         // Version byte only, no body.
-        assert!(SettlePayloadV2::from_bytes(&[SETTLE_PAYLOAD_VERSION]).is_err());
+        assert!(SettlePayloadV3::from_bytes(&[SETTLE_PAYLOAD_VERSION]).is_err());
 
         // A v1 frame is rejected cleanly.
         assert_eq!(
-            SettlePayloadV2::from_bytes(&[1]),
+            SettlePayloadV3::from_bytes(&[1]),
             Err(SettlePayloadError::UnsupportedVersion(1))
+        );
+
+        // A v2 frame is rejected cleanly.
+        assert_eq!(
+            SettlePayloadV3::from_bytes(&[2]),
+            Err(SettlePayloadError::UnsupportedVersion(2))
         );
 
         // A future version is rejected cleanly.
         assert_eq!(
-            SettlePayloadV2::from_bytes(&[SETTLE_PAYLOAD_VERSION + 1]),
-            Err(SettlePayloadError::UnsupportedVersion(3))
+            SettlePayloadV3::from_bytes(&[SETTLE_PAYLOAD_VERSION + 1]),
+            Err(SettlePayloadError::UnsupportedVersion(4))
         );
 
         // Every strict prefix of a valid payload fails to decode; no panic.
-        let valid = SettlePayloadV2::Forward(full_forward(3)).to_bytes().unwrap();
+        let valid = SettlePayloadV3::Forward(full_forward(3)).to_bytes().unwrap();
         for cut in 0..valid.len() {
             assert!(
-                SettlePayloadV2::from_bytes(&valid[..cut]).is_err(),
+                SettlePayloadV3::from_bytes(&valid[..cut]).is_err(),
                 "prefix of length {cut} unexpectedly decoded"
             );
         }
@@ -542,11 +592,11 @@ mod tests {
         // Trailing garbage after an otherwise valid body is rejected.
         let mut trailing = valid.clone();
         trailing.push(0x00);
-        assert!(SettlePayloadV2::from_bytes(&trailing).is_err());
+        assert!(SettlePayloadV3::from_bytes(&trailing).is_err());
 
         // Arbitrary bytes never panic.
         for byte in 0u8..=255 {
-            let _ = SettlePayloadV2::from_bytes(&[byte, byte, byte, byte]);
+            let _ = SettlePayloadV3::from_bytes(&[byte, byte, byte, byte]);
         }
     }
 
@@ -604,5 +654,22 @@ mod tests {
         assert!(full_forward(0).hops_within_bound());
         assert!(full_forward(MAX_SETTLE_HOPS).hops_within_bound());
         assert!(!full_forward(MAX_SETTLE_HOPS + 1).hops_within_bound());
+    }
+
+    #[test]
+    fn intermediates_bound_is_enforced_at_the_use_site() {
+        assert!(result(applied(vec![])).intermediates_within_bound());
+        assert!(result(applied(vec![hop(0)])).intermediates_within_bound());
+        assert!(
+            !result(applied((0..MAX_SETTLE_HOPS).map(hop).collect()))
+                .intermediates_within_bound()
+        );
+        // A rejection carries no intermediates and is always within bound.
+        assert!(
+            result(SettleOutcomeV3::Rejected {
+                reason: SettleRejectV1::Malformed,
+            })
+            .intermediates_within_bound()
+        );
     }
 }

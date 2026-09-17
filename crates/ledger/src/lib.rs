@@ -22,6 +22,8 @@
 //! - `Transfer`/`OpenAccount` are **balanced**: `ΔParent == ΔΣChild`;
 //! - `Issue`/`Burn` are **boundary** operations on one child account
 //!   (`{Child:+amount}` / `{Child:−amount}`), exempt from the balance equation.
+//! - `EdgeClose` is a **boundary parent** write-off of the universal `Parent`
+//!   asset (`{Parent:−amount}`), likewise exempt.
 //!
 //! `E < 0` is normal and is never an overdraw; only `Parent`/`Child`
 //! non-negativity is enforced.
@@ -51,8 +53,9 @@ pub mod settlement;
 pub use account::{AccountRef, Balances, NodeId, Posting};
 pub use amount::{Amount, SignedAmount};
 pub use auth::{
-    BURN_CONTEXT, BurnRequest, ISSUE_CONTEXT, IssueRequest, ORDER_CONTEXT, PREFUND_CONTEXT,
-    PaymentOrder, PrefundRequest, verify_burn, verify_issue, verify_prefund, verify_transfer,
+    BURN_CONTEXT, BurnRequest, EDGE_CLOSE_CONTEXT, EdgeCloseRequest, ISSUE_CONTEXT, IssueRequest,
+    ORDER_CONTEXT, PREFUND_CONTEXT, PaymentOrder, PrefundRequest, verify_burn, verify_edge_close,
+    verify_issue, verify_prefund, verify_transfer,
 };
 pub use commit::{
     BalanceAttestation, COMMITMENT_CONTEXT, Commitment, EdgeAccount, SignedCommitment,

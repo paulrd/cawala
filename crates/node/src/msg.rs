@@ -40,8 +40,8 @@ use cawala_msg::{
     MSG_CONTROL_V1, MSG_LEDGER_V1, MSG_SETTLE_V1, MessageType, MsgError, MsgId, Neighbor,
     NeighborKind, OrderRejectV1, OrderResultV1, OrderResultV2, OrderResultV3, OrderStatusV1, PeerRef,
     RejectReason, Routable,
-    RouteDecision, RouteError, Seen, SeenConfig, SeenSet, SettleForwardV1, SettleHopV1,
-    SettleOutcomeV2, SettlePayloadV2, SettleRejectV1, SettleResultV2, SettlementStatusV2,
+    RouteDecision, RouteError, Seen, SeenConfig, SeenSet, SettleForwardV3, SettleHopV3,
+    SettleOutcomeV3, SettlePayloadV3, SettleRejectV1, SettleResultV3, SettlementStatusV2,
     ValueNoticeV1, VersionedLedgerPayload, decode_versioned,
 };
 use cawala_topology::ChildKind;
@@ -1316,15 +1316,18 @@ async fn handle_settlement_order(
                 send_settlement_reject(endpoint, source, config, env, order.hash(), OrderRejectV1::Internal).await;
                 return;
             };
-            let forward = SettleForwardV1 {
+            let forward = SettleForwardV3 {
                 order: order.clone(),
                 auth: auth.clone(),
                 payer_key,
                 payer_addr: payer_addr.clone(),
                 payee_addr: payee_addr.clone(),
-                hops: vec![SettleHopV1 {
+                hops: vec![SettleHopV3 {
                     signer_addr: this_addr.clone(),
                     entry,
+                    // The origin's own hop needs no proof: it has nothing to
+                    // prove to itself.
+                    proof: None,
                 }],
             };
             if !forward.hops_within_bound() {
@@ -1361,7 +1364,7 @@ async fn handle_settlement_order(
                 source,
                 config,
                 signers[1].clone(),
-                SettlePayloadV2::Forward(forward),
+                SettlePayloadV3::Forward(forward),
             )
             .await;
         }
@@ -1383,7 +1386,7 @@ async fn handle_settlement_order(
             }
             let status = match &terminal {
                 Some(term) => match &term.outcome {
-                    SettleOutcomeV2::Applied {
+                    SettleOutcomeV3::Applied {
                         terminal_seq,
                         terminal_hash,
                         ..
@@ -1393,7 +1396,7 @@ async fn handle_settlement_order(
                     },
                     // A cached downstream rejection is surfaced as the real
                     // partial/rejected state, not a bare duplicate.
-                    SettleOutcomeV2::Rejected { reason } => settle_reject_to_status(reason),
+                    SettleOutcomeV3::Rejected { reason } => settle_reject_to_status(reason),
                 },
                 // No cached terminal (e.g. the pending was evicted or the origin
                 // restarted): the origin holds only its own reservation hop, so
@@ -1602,7 +1605,7 @@ pub async fn dispatch_settle_envelope(
     node_id: &str,
     env: Envelope,
 ) {
-    let payload = match SettlePayloadV2::from_bytes(&env.payload) {
+    let payload = match SettlePayloadV3::from_bytes(&env.payload) {
         Ok(payload) => payload,
         Err(err) => {
             tracing::warn!(
@@ -1614,11 +1617,11 @@ pub async fn dispatch_settle_envelope(
         }
     };
     match payload {
-        SettlePayloadV2::Result(result) => {
+        SettlePayloadV3::Result(result) => {
             handle_settle_result(endpoint, source, config, ledger, manager, data_dir, node_id, env, result)
                 .await;
         }
-        SettlePayloadV2::Forward(forward) => {
+        SettlePayloadV3::Forward(forward) => {
             handle_settle_forward(endpoint, source, config, ledger, data_dir, node_id, env, forward)
                 .await;
         }
@@ -1772,8 +1775,17 @@ async fn handle_settle_result(
     data_dir: &Path,
     node_id: &str,
     env: Envelope,
-    result: SettleResultV2,
+    result: SettleResultV3,
 ) {
+    // M4: reject an over-long echoed intermediate set before any audit/trust
+    // decision. A `Rejected` outcome carries no intermediates and passes.
+    if !result.intermediates_within_bound() {
+        tracing::warn!(
+            payment_id = %result.payment_id.to_hex(),
+            "settlement result echoes over-long intermediates; ignoring"
+        );
+        return;
+    }
     let payment_id = result.payment_id;
     let (pending, status, proof) = {
         let mut mgr = manager.lock().await;
@@ -1786,7 +1798,7 @@ async fn handle_settle_result(
         // sender is only authenticated to the neighbor, so provenance is no
         // longer the security boundary: the terminal proof below is.
         match &result.outcome {
-            SettleOutcomeV2::Applied { .. } => {
+            SettleOutcomeV3::Applied { .. } => {
                 if env.src.addr != pending.payee_leaf_addr {
                     tracing::warn!(
                         src = %env.src.node,
@@ -1795,7 +1807,7 @@ async fn handle_settle_result(
                     return;
                 }
             }
-            SettleOutcomeV2::Rejected { .. } => {
+            SettleOutcomeV3::Rejected { .. } => {
                 let expected = expected_signers(&pending.payer_addr, &pending.payee_addr)
                     .map(|signers| signers.iter().any(|addr| addr == &env.src.addr))
                     .unwrap_or(false);
@@ -1814,11 +1826,12 @@ async fn handle_settle_result(
         // so this is self-consistency only; a failure resolves as
         // `Indeterminate` (the payer's debit is already committed) and is never
         // stored as a terminal record.
-        let (status, proof, resolved) = match &result.outcome {
-            SettleOutcomeV2::Applied {
+        let (status, proof, resolved, degraded) = match &result.outcome {
+            SettleOutcomeV3::Applied {
                 terminal_seq,
                 terminal_hash,
                 proof,
+                intermediates,
             } => {
                 if verify_terminal_proof(
                     proof,
@@ -1827,6 +1840,32 @@ async fn handle_settle_result(
                     *terminal_seq,
                     terminal_hash,
                 ) {
+                    // Accountability (not prevention): audit the echoed
+                    // intermediates against our own persisted parent row. A
+                    // failure is forensic only — we still accept the verified
+                    // terminal outcome and record it `degraded` (M2). The
+                    // terminal proof above remains the funds-correctness gate.
+                    let registry = ledger.lock().await.effective_registry().ok();
+                    let degraded = match registry {
+                        Some(registry) => !intermediates_accountable(
+                            &pending,
+                            proof,
+                            intermediates,
+                            data_dir,
+                            node_id,
+                            &registry,
+                        ),
+                        None => {
+                            audit_intermediate_degraded(
+                                data_dir,
+                                &payment_id,
+                                intermediates.first(),
+                                None,
+                                "registry",
+                            );
+                            true
+                        }
+                    };
                     (
                         SettlementStatusV2::Applied {
                             entry_seq: *terminal_seq,
@@ -1834,6 +1873,7 @@ async fn handle_settle_result(
                         },
                         Some(proof.clone()),
                         true,
+                        degraded,
                     )
                 } else {
                     tracing::warn!(
@@ -1846,13 +1886,16 @@ async fn handle_settle_result(
                         },
                         None,
                         false,
+                        false,
                     )
                 }
             }
             // `IntermediateRejected` means the payer's local hop (the origin
             // reservation) already applied, so it is a `Partial` cascade rather
             // than a plain rejection.
-            SettleOutcomeV2::Rejected { reason } => (settle_reject_to_status(reason), None, true),
+            SettleOutcomeV3::Rejected { reason } => {
+                (settle_reject_to_status(reason), None, true, false)
+            }
         };
 
         let Some(pending) = mgr.take_pending(&payment_id) else {
@@ -1868,11 +1911,12 @@ async fn handle_settle_result(
                     browser_msg_id: pending.browser_msg_id,
                     order: pending.order.clone(),
                     terminal_entry: match &result.outcome {
-                        SettleOutcomeV2::Applied { proof, .. } => Some(proof.entry.clone()),
-                        SettleOutcomeV2::Rejected { .. } => None,
+                        SettleOutcomeV3::Applied { proof, .. } => Some(proof.entry.clone()),
+                        SettleOutcomeV3::Rejected { .. } => None,
                     },
                     proof: proof.clone(),
                     outcome: result.outcome.clone(),
+                    degraded,
                 },
             );
         }
@@ -1934,6 +1978,235 @@ async fn handle_settle_result(
     }
 }
 
+/// Why an echoed intermediate hop failed the origin's accountability audit.
+struct IntermediateCheck {
+    /// A short, machine-readable name for the failed check.
+    which_check: &'static str,
+    /// The expected LCA node id, once it has been resolved.
+    expected_node_id: Option<NodeId>,
+}
+
+/// Audit the `intermediates` echoed in a verified `Applied` result.
+///
+/// Returns `true` when the single, positionally-checked intermediate is
+/// accountable to the origin's own persisted parent row. On failure it appends
+/// one best-effort audit line and returns `false`; the caller still treats the
+/// funds outcome as `Applied` (M2).
+fn intermediates_accountable(
+    pending: &PendingSettlement,
+    terminal_proof: &EntryProofV1,
+    intermediates: &[SettleHopV3],
+    data_dir: &Path,
+    node_id: &str,
+    registry: &PeerRegistry,
+) -> bool {
+    match intermediates_check(pending, terminal_proof, intermediates, data_dir, node_id, registry) {
+        Ok(()) => true,
+        Err(check) => {
+            audit_intermediate_degraded(
+                data_dir,
+                &pending.order.hash(),
+                intermediates.first(),
+                check.expected_node_id.as_ref(),
+                check.which_check,
+            );
+            false
+        }
+    }
+}
+
+/// The accountability checks themselves; see [`intermediates_accountable`].
+///
+/// In the depth-1 route there is exactly one intermediate: the LCA
+/// (`expected_signers[1]`). It must match the origin's own parent, carry a
+/// canonical `Lca` transfer of this order whose **accounts** bind the origin's
+/// own node id to the verified terminal signer's node id (M1), and carry a
+/// valid inclusion proof under the persisted parent's ledger key (M5).
+#[allow(clippy::too_many_arguments)]
+fn intermediates_check(
+    pending: &PendingSettlement,
+    terminal_proof: &EntryProofV1,
+    intermediates: &[SettleHopV3],
+    data_dir: &Path,
+    node_id: &str,
+    registry: &PeerRegistry,
+) -> Result<(), IntermediateCheck> {
+    macro_rules! fail {
+        ($which:expr, $node:expr) => {
+            return Err(IntermediateCheck {
+                which_check: $which,
+                expected_node_id: $node,
+            })
+        };
+    }
+
+    let Some(signers) = expected_signers(&pending.payer_addr, &pending.payee_addr) else {
+        return Err(IntermediateCheck {
+            which_check: "route",
+            expected_node_id: None,
+        });
+    };
+    // (a) exactly the expected intermediate set, positionally.
+    if intermediates.len() != signers.len() - 2 {
+        return Err(IntermediateCheck {
+            which_check: "intermediates_len",
+            expected_node_id: None,
+        });
+    }
+    let hop = &intermediates[0];
+    if hop.signer_addr != signers[1] {
+        return Err(IntermediateCheck {
+            which_check: "intermediate_signer",
+            expected_node_id: None,
+        });
+    }
+
+    // (b) the origin's persisted parent must be the expected LCA.
+    let record = RecordStore::open(data_dir, node_id)
+        .map(|store| store.record().clone())
+        .map_err(|_| IntermediateCheck {
+            which_check: "record",
+            expected_node_id: None,
+        })?;
+    if record.address.as_ref().and_then(|addr| addr.parent()) != Some(signers[1].clone()) {
+        return Err(IntermediateCheck {
+            which_check: "origin_parent_addr",
+            expected_node_id: None,
+        });
+    }
+    let Some(parent_link) = record.parent.as_ref() else {
+        return Err(IntermediateCheck {
+            which_check: "origin_parent_link",
+            expected_node_id: None,
+        });
+    };
+    let parent_node_id = NodeId::from(parent_link.parent_id.clone());
+    let expected_node_id = Some(parent_node_id.clone());
+
+    // (c) the persisted parent row must resolve to a ledger-bearing node; if it
+    // cannot (e.g. a ledger rotation left it stale), degrade rather than fail.
+    let Some(parent_row) = registry.get(&parent_node_id) else {
+        fail!("parent_row", expected_node_id.clone());
+    };
+    if parent_row.role != PeerRole::Node {
+        fail!("parent_role", expected_node_id.clone());
+    }
+    let Some(parent_ledger) = parent_row.ledger else {
+        fail!("parent_ledger", expected_node_id.clone());
+    };
+
+    // (d) the hop must be a canonical `Lca` transfer of this order.
+    let entry = &hop.entry.entry;
+    let cawala_ledger::EntryBody::Transfer {
+        payment_id,
+        amount,
+        role,
+    } = &entry.body
+    else {
+        fail!("intermediate_body", expected_node_id.clone());
+    };
+    if *payment_id != pending.order.hash()
+        || *amount != pending.order.amount
+        || *role != HopRole::Lca
+    {
+        fail!("intermediate_body", expected_node_id.clone());
+    }
+    if entry.check_conservation().is_err() {
+        fail!("intermediate_conservation", expected_node_id.clone());
+    }
+    if entry.ledger_id != parent_ledger {
+        fail!("intermediate_ledger_id", expected_node_id.clone());
+    }
+    if hop.entry.verify(&parent_ledger).is_err() {
+        fail!("intermediate_signature", expected_node_id.clone());
+    }
+
+    // (e) M1: bind the posting accounts, not just the shape. For `Lca` the
+    // tuple is `(debited_child, credited_child)`; the debit must name the
+    // origin's own node and the credit the verified terminal signer's node.
+    let Ok(accounts) = cawala_ledger::entry_hop_accounts(entry, HopRole::Lca) else {
+        fail!("intermediate_accounts", expected_node_id.clone());
+    };
+    let expected_from = cawala_ledger::AccountRef::Child(NodeId::from(node_id.to_string()));
+    let expected_to = cawala_ledger::AccountRef::Child(terminal_proof.signer.node_id.clone());
+    if accounts != (expected_from, expected_to) {
+        fail!("intermediate_accounts", expected_node_id.clone());
+    }
+
+    // (f) the hop's own inclusion proof, mirroring the terminal proof checks.
+    let Some(proof) = &hop.proof else {
+        fail!("intermediate_proof_missing", expected_node_id.clone());
+    };
+    if proof.leaf_addr != hop.signer_addr || proof.leaf_addr != signers[1] {
+        fail!("intermediate_proof_leaf", expected_node_id.clone());
+    }
+    if proof.entry != hop.entry {
+        fail!("intermediate_proof_entry", expected_node_id.clone());
+    }
+    if proof.signer.role != PeerRole::Node {
+        fail!("intermediate_proof_signer_role", expected_node_id.clone());
+    }
+    if proof.signer.node_id != parent_node_id {
+        fail!("intermediate_proof_signer_node", expected_node_id.clone());
+    }
+    if proof.signer.ledger != Some(parent_ledger) {
+        fail!("intermediate_proof_signer_ledger", expected_node_id.clone());
+    }
+    if proof.commitment.commitment.ledger_pubkey != parent_ledger {
+        fail!("intermediate_proof_commitment", expected_node_id.clone());
+    }
+    if proof.validate().is_err() {
+        fail!("intermediate_proof_validate", expected_node_id.clone());
+    }
+    if !cawala_ledger::verify_entry_inclusion(
+        &proof.entry,
+        &proof.inclusion,
+        &proof.commitment.commitment.entry_root,
+    ) {
+        fail!("intermediate_proof_inclusion", expected_node_id.clone());
+    }
+    Ok(())
+}
+
+/// Append the best-effort audit line for a degraded intermediate audit.
+///
+/// Never fails the settlement: any I/O or encoding error is ignored by
+/// [`crate::audit::append`].
+fn audit_intermediate_degraded(
+    data_dir: &Path,
+    payment_id: &Hash,
+    hop: Option<&SettleHopV3>,
+    expected_node_id: Option<&NodeId>,
+    which_check: &str,
+) {
+    let entry_hash = hop
+        .and_then(|hop| cawala_ledger::entry_hash(&hop.entry.entry).ok())
+        .map(Hash::to_hex)
+        .unwrap_or_default();
+    // Real-time surface for operators; the audit line below is best-effort and
+    // may be lost on I/O failure (which never changes the funds outcome).
+    tracing::warn!(
+        payment_id = %payment_id.to_hex(),
+        hop_index = 1,
+        signer_addr = %hop.map(|hop| hop.signer_addr.to_string()).unwrap_or_default(),
+        expected_node_id = %expected_node_id.map(NodeId::to_string).unwrap_or_default(),
+        which_check,
+        "settlement intermediate audit degraded; verified terminal outcome still accepted"
+    );
+    crate::audit::append(
+        data_dir,
+        serde_json::json!({
+            "event": "settle-intermediate-degraded",
+            "payment_id": payment_id.to_hex(),
+            "hop_index": 1,
+            "signer_addr": hop.map(|hop| hop.signer_addr.to_string()).unwrap_or_default(),
+            "expected_node_id": expected_node_id.map(NodeId::to_string).unwrap_or_default(),
+            "entry_hash": entry_hash,
+            "which_check": which_check,
+        }),
+    );
+}
+
 /// Handle a settlement `Forward` at an intermediate or terminal signer.
 #[allow(clippy::too_many_arguments)]
 async fn handle_settle_forward(
@@ -1944,7 +2217,7 @@ async fn handle_settle_forward(
     data_dir: &Path,
     node_id: &str,
     env: Envelope,
-    forward: SettleForwardV1,
+    forward: SettleForwardV3,
 ) {
     if !forward.hops_within_bound() {
         return;
@@ -2026,7 +2299,7 @@ async fn handle_settle_forward(
             config,
             signers[0].clone(),
             forward.order.hash(),
-            SettleOutcomeV2::Rejected {
+            SettleOutcomeV3::Rejected {
                 reason: SettleRejectV1::IntermediateRejected {
                     at: cawala_ledger::NodeId::from(this.node.clone()),
                     reason: OrderRejectV1::NotAChild,
@@ -2045,7 +2318,7 @@ async fn handle_settle_forward(
             config,
             signers[0].clone(),
             forward.order.hash(),
-            SettleOutcomeV2::Rejected {
+            SettleOutcomeV3::Rejected {
                 reason: SettleRejectV1::Malformed,
             },
         )
@@ -2137,7 +2410,7 @@ async fn handle_settle_forward(
                 config,
                 signers[0].clone(),
                 forward.order.hash(),
-                SettleOutcomeV2::Rejected {
+                SettleOutcomeV3::Rejected {
                     reason: SettleRejectV1::IntermediateRejected {
                         at: cawala_ledger::NodeId::from(this.node.clone()),
                         reason,
@@ -2156,20 +2429,16 @@ async fn handle_settle_forward(
         tracing::warn!(%err, "failed to journal an applied settlement hop");
     }
 
-    // Recover the appended (or already-applied) entry as evidence, and, at the
-    // terminal leaf, assemble the full inclusion proof the origin verifies. A
-    // terminal leaf builds it once from its own live ledger; an intermediate
-    // signer skips it.
+    // Recover the appended (or already-applied) entry as evidence, and assemble
+    // the full inclusion proof every non-origin signer echoes to the origin. The
+    // origin's own seeded hop carries `proof: None`; every hop handled here is
+    // expected to carry one so the origin can audit it.
     let ledger_arc = Arc::clone(ledger);
     let leaf_addr = this.addr.clone();
     let recovered = tokio::task::spawn_blocking(move || {
         let service = ledger_arc.blocking_lock();
         let entry = service.entry_at(seq).ok();
-        let proof = if is_terminal {
-            service.build_entry_proof(seq, leaf_addr).ok()
-        } else {
-            None
-        };
+        let proof = service.build_entry_proof(seq, leaf_addr).ok();
         (entry, proof)
     })
     .await;
@@ -2185,9 +2454,10 @@ async fn handle_settle_forward(
     if let Some(entry) = &entry
         && !hops.iter().any(|hop| hop.signer_addr == this.addr)
     {
-        hops.push(SettleHopV1 {
+        hops.push(SettleHopV3 {
             signer_addr: this.addr.clone(),
             entry: entry.clone(),
+            proof: proof.clone(),
         });
     }
 
@@ -2199,16 +2469,25 @@ async fn handle_settle_forward(
         let Some(proof) = proof else {
             return;
         };
+        // The hops strictly between the origin and this terminal, captured
+        // before this node appends its own hop: `forward.hops[1..]` drops the
+        // origin's seeded hop. Its own hop stays in `proof`.
+        let intermediates: Vec<SettleHopV3> = forward
+            .hops
+            .get(1..)
+            .map(<[SettleHopV3]>::to_vec)
+            .unwrap_or_default();
         send_settle_result(
             endpoint,
             source,
             config,
             signers[0].clone(),
             forward.order.hash(),
-            SettleOutcomeV2::Applied {
+            SettleOutcomeV3::Applied {
                 terminal_seq: seq,
                 terminal_hash: hash,
                 proof,
+                intermediates,
             },
         )
         .await;
@@ -2226,7 +2505,7 @@ async fn handle_settle_forward(
         .await;
     } else {
         let next = signers[index + 1].clone();
-        let relayed = SettleForwardV1 { hops, ..forward };
+        let relayed = SettleForwardV3 { hops, ..forward };
         relay_settle_forward(endpoint, source, config, &env, next, relayed).await;
     }
 }
@@ -2279,12 +2558,20 @@ fn note_unresolvable_signer(addr: &cawala_msg::OctAddr) -> bool {
 ///
 /// Residual: a carried hop naming a node that is neither us nor a known direct
 /// neighbor cannot be bound to that node's registered key here; it is logged and
-/// only the internal self-signature plus structural checks apply. A malicious
-/// parent/LCA can still author such a chain with its own well-formed key. Full
-/// route verification is deferred (Phase 2).
+/// only the internal self-signature plus structural checks apply. These
+/// next-hop checks are unchanged by Phase 2.
+///
+/// Phase 2 closes the *origin's* gap separately: the terminal echoes the
+/// intermediate hops in `SettleOutcomeV3::Applied::intermediates` and the origin
+/// audits them in `intermediates_accountable` — binding the LCA hop's posting
+/// **accounts** (debited child == the origin's own node id, credited child == the
+/// verified terminal signer's node id) and verifying the hop entry/signature and
+/// its inclusion proof against the origin's own persisted parent row. A failure
+/// is forensic only: the verified terminal `Applied` is still accepted and
+/// recorded `degraded`, with a `settle-intermediate-degraded` audit line (M2).
 #[allow(clippy::too_many_arguments)]
 fn carried_hops_match(
-    hops: &[SettleHopV1],
+    hops: &[SettleHopV3],
     signers: &[cawala_msg::OctAddr; 3],
     payer_addr: &cawala_msg::OctAddr,
     payee_addr: &cawala_msg::OctAddr,
@@ -2384,14 +2671,14 @@ async fn send_settle_result(
     config: &MsgConfig,
     origin: cawala_msg::OctAddr,
     payment_id: Hash,
-    outcome: SettleOutcomeV2,
+    outcome: SettleOutcomeV3,
 ) {
     send_settle_payload_to(
         endpoint,
         source,
         config,
         origin,
-        SettlePayloadV2::Result(SettleResultV2 {
+        SettlePayloadV3::Result(SettleResultV3 {
             payment_id,
             outcome,
         }),
@@ -2407,7 +2694,7 @@ async fn push_payee_receipt(
     config: &MsgConfig,
     ledger: &Arc<tokio::sync::Mutex<LedgerService>>,
     record: &NodeRecord,
-    forward: &SettleForwardV1,
+    forward: &SettleForwardV3,
     entry_seq: u64,
     entry_hash: Hash,
     now: u64,
@@ -2576,7 +2863,7 @@ async fn send_settle_payload_to(
     source: &NeighborSource,
     config: &MsgConfig,
     dst: cawala_msg::OctAddr,
-    payload: SettlePayloadV2,
+    payload: SettlePayloadV3,
 ) {
     let bytes = match payload.to_bytes() {
         Ok(bytes) => bytes,
@@ -2612,9 +2899,9 @@ async fn relay_settle_forward(
     config: &MsgConfig,
     env: &Envelope,
     next: cawala_msg::OctAddr,
-    forward: SettleForwardV1,
+    forward: SettleForwardV3,
 ) {
-    let bytes = match SettlePayloadV2::Forward(forward).to_bytes() {
+    let bytes = match SettlePayloadV3::Forward(forward).to_bytes() {
         Ok(bytes) => bytes,
         Err(err) => {
             tracing::warn!(%err, "failed to encode settle forward");
@@ -3601,7 +3888,7 @@ mod tests {
         role: HopRole,
         first: cawala_ledger::AccountRef,
         second: cawala_ledger::AccountRef,
-    ) -> SettleHopV1 {
+    ) -> SettleHopV3 {
         let m = i64::try_from(order.amount.get()).unwrap();
         let entry = cawala_ledger::Entry {
             ledger_id: ledger_key.public(),
@@ -3621,9 +3908,12 @@ mod tests {
                     .unwrap(),
             ),
         };
-        SettleHopV1 {
+        SettleHopV3 {
             signer_addr: signer_addr.parse().unwrap(),
             entry: SignedEntry::sign(entry, ledger_key).unwrap(),
+            // These unit tests exercise the next-hop entry checks, not origin
+            // proof verification, so no carried proof is needed.
+            proof: None,
         }
     }
 
@@ -3642,7 +3932,7 @@ mod tests {
         ledger_key: &cawala_ledger::LedgerSecretKey,
         role: HopRole,
         postings: Vec<cawala_ledger::Posting>,
-    ) -> SettleHopV1 {
+    ) -> SettleHopV3 {
         let entry = cawala_ledger::Entry {
             ledger_id: ledger_key.public(),
             seq: 0,
@@ -3661,13 +3951,16 @@ mod tests {
                     .unwrap(),
             ),
         };
-        SettleHopV1 {
+        SettleHopV3 {
             signer_addr: signer_addr.parse().unwrap(),
             entry: SignedEntry::sign(entry, ledger_key).unwrap(),
+            // These unit tests exercise the next-hop entry checks, not origin
+            // proof verification, so no carried proof is needed.
+            proof: None,
         }
     }
 
-    fn ascend_hop(order: &PaymentOrder, key: &cawala_ledger::LedgerSecretKey) -> SettleHopV1 {
+    fn ascend_hop(order: &PaymentOrder, key: &cawala_ledger::LedgerSecretKey) -> SettleHopV3 {
         make_hop(
             "0.1",
             order,
@@ -3678,7 +3971,7 @@ mod tests {
         )
     }
 
-    fn lca_hop(order: &PaymentOrder, key: &cawala_ledger::LedgerSecretKey) -> SettleHopV1 {
+    fn lca_hop(order: &PaymentOrder, key: &cawala_ledger::LedgerSecretKey) -> SettleHopV3 {
         make_hop(
             "0",
             order,
@@ -3947,5 +4240,485 @@ mod tests {
             "a distinct address should warn on its first sighting"
         );
         assert!(!note_unresolvable_signer(&other));
+    }
+
+    // ---------------------------------------------------------------------
+    // P2: origin accountability audit over echoed settlement intermediates
+    // ---------------------------------------------------------------------
+
+    /// Origin `A` at `0.1`, parent/LCA `P` at `0`, payee leaf `B` at `0.2`, so
+    /// `expected_signers(0.1.3, 0.2.4) == [0.1, 0, 0.2]`.
+    const ORIGIN_ID: &str = "A";
+    const PARENT_ID: &str = "P";
+    const PARENT_ADDR: &str = "0";
+    const PAYEE_ID: &str = "B";
+
+    fn audit_order() -> PaymentOrder {
+        PaymentOrder {
+            from: NodeId::from("uA"),
+            to: NodeId::from("uB"),
+            amount: cawala_ledger::Amount::new(100),
+            nonce: 7,
+            expiry: u64::MAX,
+        }
+    }
+
+    fn audit_pending(order: &PaymentOrder) -> PendingSettlement {
+        let op = OperatorSecretKey::from_bytes([9u8; 32]);
+        PendingSettlement {
+            browser: PeerRef {
+                addr: "0.1.3".parse().unwrap(),
+                node: "uA".to_string(),
+            },
+            browser_msg_id: MsgId([7u8; 16]),
+            order: order.clone(),
+            auth: AuthRef {
+                operator: op.public(),
+                nonce: 7,
+                order_hash: order.hash(),
+                signature: op.sign(b"x"),
+            },
+            payer_addr: "0.1.3".parse().unwrap(),
+            payee_addr: "0.2.4".parse().unwrap(),
+            payee_leaf_addr: "0.2".parse().unwrap(),
+            local_seq: 0,
+            local_hash: Hash::ZERO,
+            deadline_secs: u64::MAX,
+            reply_v2: true,
+        }
+    }
+
+    /// Write the origin's record (`A`, address `0.1`, parent `P` slot 1) so
+    /// `intermediates_check` reloads it from disk.
+    fn write_origin_record(dir: &Path) {
+        let mut store = RecordStore::open(dir, ORIGIN_ID).unwrap();
+        store.set_parent(PARENT_ID, 1).unwrap();
+        store.set_address("0.1".parse().unwrap()).unwrap();
+        store.save().unwrap();
+    }
+
+    fn audit_registry(parent_ledger: &cawala_ledger::LedgerSecretKey) -> PeerRegistry {
+        let mut registry = PeerRegistry::new();
+        registry
+            .insert(node_row(
+                PARENT_ID,
+                &OperatorSecretKey::from_bytes([2u8; 32]),
+                parent_ledger,
+            ))
+            .unwrap();
+        registry
+    }
+
+    struct AuditFixture {
+        dir: tempfile::TempDir,
+        pending: PendingSettlement,
+        parent_key: cawala_ledger::LedgerSecretKey,
+        registry: PeerRegistry,
+    }
+
+    fn audit_fixture() -> AuditFixture {
+        let dir = tempfile::tempdir().unwrap();
+        write_origin_record(dir.path());
+        let order = audit_order();
+        let parent_key = cawala_ledger::LedgerSecretKey::from_bytes([0x22; 32]);
+        let registry = audit_registry(&parent_key);
+        AuditFixture {
+            dir,
+            pending: audit_pending(&order),
+            parent_key,
+            registry,
+        }
+    }
+
+    /// Append one signed entry to a fresh in-memory ledger, tracking the head.
+    fn append_entry(
+        ledger: &mut cawala_ledger::Ledger,
+        key: &cawala_ledger::LedgerSecretKey,
+        prev: &mut Hash,
+        body: cawala_ledger::EntryBody,
+        postings: Vec<cawala_ledger::Posting>,
+        auth: Option<AuthRef>,
+    ) -> SignedEntry {
+        let seq = ledger.len() as u64;
+        let entry = cawala_ledger::Entry {
+            ledger_id: key.public(),
+            seq,
+            height: seq,
+            prev_hash: *prev,
+            issued_at: 0,
+            body,
+            postings,
+            auth,
+        };
+        let signed = SignedEntry::sign(entry, key).unwrap();
+        ledger.append(signed.clone()).unwrap();
+        *prev = cawala_ledger::entry_hash(&signed.entry).unwrap();
+        signed
+    }
+
+    /// Build a `SettleHopV3` for the LCA `P` (address `0`): a signed `Lca`
+    /// transfer of `order` with `postings`, plus (optionally) a self-consistent
+    /// inclusion proof under `hop_key`. The entry declares `hop_key` as its
+    /// `ledger_id`, so passing a decoy key models a substituted ledger.
+    fn build_lca_hop(
+        order: &PaymentOrder,
+        hop_key: &cawala_ledger::LedgerSecretKey,
+        postings: Vec<cawala_ledger::Posting>,
+        with_proof: bool,
+    ) -> SettleHopV3 {
+        let mut ledger = cawala_ledger::Ledger::new_root(hop_key.public());
+        let mut prev = Hash::ZERO;
+        let op = OperatorSecretKey::from_bytes([1u8; 32]);
+        let auth = order.authorize(&op).unwrap();
+
+        let mut children: Vec<NodeId> = Vec::new();
+        for posting in &postings {
+            if let cawala_ledger::AccountRef::Child(id) = &posting.account
+                && !children.contains(id)
+            {
+                children.push(id.clone());
+            }
+        }
+        for child in &children {
+            append_entry(
+                &mut ledger,
+                hop_key,
+                &mut prev,
+                cawala_ledger::EntryBody::OpenAccount {
+                    child: child.clone(),
+                    kind: ChildKind::Node,
+                },
+                vec![],
+                None,
+            );
+        }
+        // Fund the debited child so the transfer keeps balances non-negative.
+        let m = i64::try_from(order.amount.get()).unwrap();
+        let debit = postings.iter().find_map(|posting| match &posting.account {
+            cawala_ledger::AccountRef::Child(id) if posting.delta.get() < 0 => Some(id.clone()),
+            _ => None,
+        });
+        if let Some(child) = debit {
+            append_entry(
+                &mut ledger,
+                hop_key,
+                &mut prev,
+                cawala_ledger::EntryBody::Issue {
+                    child: child.clone(),
+                    amount: order.amount,
+                },
+                vec![posting(cawala_ledger::AccountRef::Child(child), m)],
+                Some(auth.clone()),
+            );
+        }
+        let seq = ledger.len() as u64;
+        let signed = SignedEntry::sign(
+            cawala_ledger::Entry {
+                ledger_id: hop_key.public(),
+                seq,
+                height: seq,
+                prev_hash: prev,
+                issued_at: 0,
+                body: cawala_ledger::EntryBody::Transfer {
+                    payment_id: order.hash(),
+                    amount: order.amount,
+                    role: HopRole::Lca,
+                },
+                postings,
+                auth: Some(auth),
+            },
+            hop_key,
+        )
+        .unwrap();
+        ledger.append(signed.clone()).unwrap();
+
+        let proof = with_proof.then(|| {
+            let inclusion = cawala_ledger::entry_inclusion_proof(&ledger, seq).unwrap();
+            let commitment = cawala_ledger::build_commitment(&ledger, Hash::ZERO, 0).unwrap();
+            let commitment = cawala_ledger::SignedCommitment::sign(commitment, hop_key).unwrap();
+            EntryProofV1 {
+                entry: signed.clone(),
+                signer: PeerKeys {
+                    node_id: NodeId::from(PARENT_ID),
+                    operator: op.public(),
+                    ledger: Some(hop_key.public()),
+                    role: PeerRole::Node,
+                },
+                leaf_addr: PARENT_ADDR.parse().unwrap(),
+                commitment,
+                inclusion,
+            }
+        });
+        SettleHopV3 {
+            signer_addr: PARENT_ADDR.parse().unwrap(),
+            entry: signed,
+            proof,
+        }
+    }
+
+    /// The origin's persisted-parent row check reads only the terminal proof's
+    /// `signer.node_id`; the rest is otherwise valid.
+    fn terminal_proof_for(node_id: &str) -> EntryProofV1 {
+        let order = audit_order();
+        let key = cawala_ledger::LedgerSecretKey::from_bytes([0x77; 32]);
+        let m = i64::try_from(order.amount.get()).unwrap();
+        let hop = build_lca_hop(
+            &order,
+            &key,
+            vec![
+                posting(cawala_ledger::AccountRef::Child(NodeId::from(ORIGIN_ID)), -m),
+                posting(cawala_ledger::AccountRef::Child(NodeId::from(PAYEE_ID)), m),
+            ],
+            true,
+        );
+        let mut proof = hop.proof.expect("honest hop carries a proof");
+        proof.signer.node_id = NodeId::from(node_id);
+        proof.leaf_addr = "0.2".parse().unwrap();
+        proof
+    }
+
+    fn honest_lca_postings(order: &PaymentOrder) -> Vec<cawala_ledger::Posting> {
+        let m = i64::try_from(order.amount.get()).unwrap();
+        vec![
+            posting(cawala_ledger::AccountRef::Child(NodeId::from(ORIGIN_ID)), -m),
+            posting(cawala_ledger::AccountRef::Child(NodeId::from(PAYEE_ID)), m),
+        ]
+    }
+
+    fn run_audit(fx: &AuditFixture, registry: &PeerRegistry, hops: &[SettleHopV3]) -> bool {
+        intermediates_accountable(
+            &fx.pending,
+            &terminal_proof_for(PAYEE_ID),
+            hops,
+            fx.dir.path(),
+            ORIGIN_ID,
+            registry,
+        )
+    }
+
+    fn degraded_audits(dir: &Path) -> Vec<serde_json::Value> {
+        let path = dir.join(crate::audit::CONTROL_AUDIT_FILE);
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| {
+                value.get("event").and_then(|event| event.as_str())
+                    == Some("settle-intermediate-degraded")
+            })
+            .collect()
+    }
+
+    fn assert_degraded_with(
+        fx: &AuditFixture,
+        registry: &PeerRegistry,
+        hops: &[SettleHopV3],
+        which_check: &str,
+    ) {
+        assert!(
+            !run_audit(fx, registry, hops),
+            "expected the intermediate audit to be degraded ({which_check})"
+        );
+        let audits = degraded_audits(fx.dir.path());
+        assert_eq!(audits.len(), 1, "exactly one degraded audit line");
+        assert_eq!(
+            audits[0].get("which_check").and_then(|value| value.as_str()),
+            Some(which_check)
+        );
+        assert!(
+            audits[0].get("payment_id").and_then(|value| value.as_str()).is_some(),
+            "the audit line carries the payment id"
+        );
+    }
+
+    fn assert_degraded(fx: &AuditFixture, hops: &[SettleHopV3], which_check: &str) {
+        assert_degraded_with(fx, &fx.registry, hops, which_check);
+    }
+
+    #[test]
+    fn intermediates_honest_lca_is_accountable() {
+        let fx = audit_fixture();
+        let order = fx.pending.order.clone();
+        let hop = build_lca_hop(
+            &order,
+            &fx.parent_key,
+            honest_lca_postings(&order),
+            true,
+        );
+        assert!(run_audit(&fx, &fx.registry, std::slice::from_ref(&hop)));
+        assert!(
+            degraded_audits(fx.dir.path()).is_empty(),
+            "an accountable hop writes no degraded audit line"
+        );
+    }
+
+    /// The headline M1 case: a canonically shaped `Lca` transfer that credits an
+    /// unrelated child is accepted only by shape checks; the account binding
+    /// must reject it.
+    #[test]
+    fn intermediates_m1_misposting_is_degraded() {
+        let fx = audit_fixture();
+        let order = fx.pending.order.clone();
+        let m = i64::try_from(order.amount.get()).unwrap();
+        let hop = build_lca_hop(
+            &order,
+            &fx.parent_key,
+            vec![
+                posting(cawala_ledger::AccountRef::Child(NodeId::from(ORIGIN_ID)), -m),
+                posting(
+                    cawala_ledger::AccountRef::Child(NodeId::from("attacker-account")),
+                    m,
+                ),
+            ],
+            true,
+        );
+        assert_degraded(&fx, &[hop], "intermediate_accounts");
+    }
+
+    #[test]
+    fn intermediates_wrong_debit_child_is_degraded() {
+        let fx = audit_fixture();
+        let order = fx.pending.order.clone();
+        let m = i64::try_from(order.amount.get()).unwrap();
+        let hop = build_lca_hop(
+            &order,
+            &fx.parent_key,
+            vec![
+                posting(
+                    cawala_ledger::AccountRef::Child(NodeId::from("someone-else")),
+                    -m,
+                ),
+                posting(cawala_ledger::AccountRef::Child(NodeId::from(PAYEE_ID)), m),
+            ],
+            true,
+        );
+        assert_degraded(&fx, &[hop], "intermediate_accounts");
+    }
+
+    #[test]
+    fn intermediates_missing_proof_is_degraded() {
+        let fx = audit_fixture();
+        let order = fx.pending.order.clone();
+        let hop = build_lca_hop(
+            &order,
+            &fx.parent_key,
+            honest_lca_postings(&order),
+            false,
+        );
+        assert_degraded(&fx, &[hop], "intermediate_proof_missing");
+    }
+
+    #[test]
+    fn intermediates_wrong_signer_addr_is_degraded() {
+        let fx = audit_fixture();
+        let order = fx.pending.order.clone();
+        let mut hop = build_lca_hop(
+            &order,
+            &fx.parent_key,
+            honest_lca_postings(&order),
+            true,
+        );
+        hop.signer_addr = "0.7".parse().unwrap();
+        assert_degraded(&fx, &[hop], "intermediate_signer");
+    }
+
+    #[test]
+    fn intermediates_empty_is_degraded() {
+        let fx = audit_fixture();
+        assert_degraded(&fx, &[], "intermediates_len");
+    }
+
+    #[test]
+    fn intermediates_extra_is_degraded() {
+        let fx = audit_fixture();
+        let order = fx.pending.order.clone();
+        let hop = build_lca_hop(
+            &order,
+            &fx.parent_key,
+            honest_lca_postings(&order),
+            true,
+        );
+        assert_degraded(&fx, &[hop.clone(), hop], "intermediates_len");
+    }
+
+    #[test]
+    fn intermediates_decoy_signature_is_degraded() {
+        let fx = audit_fixture();
+        let order = fx.pending.order.clone();
+        let decoy = cawala_ledger::LedgerSecretKey::from_bytes([0x55; 32]);
+        let mut hop = build_lca_hop(
+            &order,
+            &fx.parent_key,
+            honest_lca_postings(&order),
+            true,
+        );
+        // Declares the honest parent ledger id but is signed by a decoy key.
+        hop.entry.signature = decoy.sign(b"forged");
+        assert_degraded(&fx, &[hop], "intermediate_signature");
+    }
+
+    /// M7: a rotated LCA ledger key leaves the origin's persisted parent row
+    /// stale, so the audit degrades rather than denying the settlement.
+    #[test]
+    fn intermediates_rotated_parent_row_is_degraded() {
+        let fx = audit_fixture();
+        let order = fx.pending.order.clone();
+        let hop = build_lca_hop(
+            &order,
+            &fx.parent_key,
+            honest_lca_postings(&order),
+            true,
+        );
+        // The origin's persisted row names a fresh (rotated) ledger key, so the
+        // honest hop no longer verifies under it.
+        let rotated = cawala_ledger::LedgerSecretKey::from_bytes([0x66; 32]);
+        let registry = audit_registry(&rotated);
+        assert_degraded_with(&fx, &registry, &[hop], "intermediate_ledger_id");
+    }
+
+    #[test]
+    fn intermediates_wrong_proof_signer_node_is_degraded() {
+        let fx = audit_fixture();
+        let order = fx.pending.order.clone();
+        let mut hop = build_lca_hop(
+            &order,
+            &fx.parent_key,
+            honest_lca_postings(&order),
+            true,
+        );
+        hop.proof.as_mut().unwrap().signer.node_id = NodeId::from("evil");
+        assert_degraded(&fx, &[hop], "intermediate_proof_signer_node");
+    }
+
+    #[test]
+    fn intermediates_wrong_proof_signer_ledger_is_degraded() {
+        let fx = audit_fixture();
+        let order = fx.pending.order.clone();
+        let decoy = cawala_ledger::LedgerSecretKey::from_bytes([0x55; 32]);
+        let mut hop = build_lca_hop(
+            &order,
+            &fx.parent_key,
+            honest_lca_postings(&order),
+            true,
+        );
+        hop.proof.as_mut().unwrap().signer.ledger = Some(decoy.public());
+        assert_degraded(&fx, &[hop], "intermediate_proof_signer_ledger");
+    }
+
+    #[test]
+    fn intermediates_wrong_commitment_key_is_degraded() {
+        let fx = audit_fixture();
+        let order = fx.pending.order.clone();
+        let decoy = cawala_ledger::LedgerSecretKey::from_bytes([0x55; 32]);
+        let mut hop = build_lca_hop(
+            &order,
+            &fx.parent_key,
+            honest_lca_postings(&order),
+            true,
+        );
+        hop.proof.as_mut().unwrap().commitment.commitment.ledger_pubkey = decoy.public();
+        assert_degraded(&fx, &[hop], "intermediate_proof_commitment");
     }
 }

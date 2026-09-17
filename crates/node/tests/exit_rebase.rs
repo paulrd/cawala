@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cawala_control::{
     CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest, DetachChild, JoinApproval,
-    JoinRequest, NodeId, OperatorSecretKey, RebaseNotice, RejectCode, SignedControl,
+    JoinRequest, MoveChild, NodeId, OperatorSecretKey, RebaseNotice, RejectCode, SignedControl,
 };
 use cawala_ledger::{LedgerPubKey, LedgerSecretKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::{AckStatus, Envelope, MSG_LEDGER_V1, RejectReason};
@@ -1439,5 +1439,164 @@ async fn rolled_back_parent_stalls_child_until_pull_heals() {
     assert!(applied, "the pull must heal the stalled address");
     wait_record(&nodes[&world.a_id].control, Some(&world.p_id), "0.1").await;
     wait_record(&nodes[&world.c1_id].control, Some(&world.a_id), "0.1.0").await;
+}
+
+// ---------------------------------------------------------------------------
+// (I) MoveChild re-slot: push heals the child and its subtree; pull heals when
+//     the push is missed; the old address is intentionally dead
+// ---------------------------------------------------------------------------
+
+/// A same-parent `MoveChild` (re-slot) must heal the moved child **and its own
+/// child**. `P` re-slots `B` from slot 2 to slot 5; the single targeted `Rebase`
+/// moves `B` to `0.5` and `B` re-propagates `0.5.0` to `C`.
+///
+/// Then an envelope to the new address delivers locally, while the old address
+/// still fails `NoSuchChild` - this failure is **intended** (no moved pointers:
+/// a sender holding a stale address retries with a fresh one discovered out of
+/// band). Finally a second re-slot is pushed but its notice is dropped, and
+/// `B`'s own healing `RebasePull` still converges `B` (and `C`) on the new
+/// prefix.
+#[tokio::test]
+async fn move_child_reslots_child_and_heals_subtree_then_pull() {
+    let p_key = SecretKey::generate();
+    let b_key = SecretKey::generate();
+    let c_key = SecretKey::generate();
+    let p_id = p_key.public().to_string();
+    let b_id = b_key.public().to_string();
+    let c_id = c_key.public().to_string();
+    let p_op = operator(&p_key);
+    let b_op = operator(&b_key);
+    let c_op = operator(&c_key);
+
+    let defs = vec![
+        NodeDef {
+            key: p_key,
+            address: Some("0".to_string()),
+            parent: None,
+            children: vec![(b_id.clone(), ChildKind::Node, 2)],
+            peers: vec![node_row(&b_id, &b_op, 2)],
+        },
+        NodeDef {
+            key: b_key,
+            address: Some("0.2".to_string()),
+            parent: Some((p_id.clone(), 2)),
+            children: vec![(c_id.clone(), ChildKind::Node, 0)],
+            peers: vec![node_row(&p_id, &p_op, 0), node_row(&c_id, &c_op, 3)],
+        },
+        NodeDef {
+            key: c_key,
+            address: Some("0.2.0".to_string()),
+            parent: Some((b_id.clone(), 0)),
+            children: vec![],
+            peers: vec![node_row(&b_id, &b_op, 2)],
+        },
+    ];
+    let (mut nodes, addrs) = build(defs).await;
+
+    // P (self-admin) re-slots B from slot 2 to slot 5.
+    let move_child = authorize(
+        &p_id,
+        &p_op,
+        ControlRequest::MoveChild(MoveChild {
+            child: node(&b_id),
+            new_parent: node(&p_id),
+            slot: Some(5),
+        }),
+    );
+    assert_eq!(
+        deliver(&nodes[&p_id].control, &move_child).await,
+        ControlReply::Accepted
+    );
+    // The push heals B (`0.5`) and, recursively, B's child C (`0.5.0`).
+    propagate_from(&nodes, &p_id).await;
+    wait_record(&nodes[&b_id].control, Some(&p_id), "0.5").await;
+    wait_record(&nodes[&c_id].control, Some(&b_id), "0.5.0").await;
+
+    // An envelope to the new address is delivered locally to B.
+    let p_snapshot = nodes[&p_id].live_snapshot(&addrs).await;
+    let env = build_envelope(
+        &p_snapshot.routable.this,
+        "0.5".parse().unwrap(),
+        MSG_LEDGER_V1,
+        b"new-slot".to_vec(),
+        8,
+    )
+    .unwrap();
+    let ack = send_envelope(&nodes[&p_id].endpoint, &p_snapshot, &env, timeout())
+        .await
+        .expect("send to the new address");
+    assert_eq!(ack.status, AckStatus::Delivered);
+    let got = nodes
+        .get_mut(&b_id)
+        .expect("b")
+        .obs
+        .recv()
+        .await
+        .expect("B delivered locally");
+    assert_eq!(got.payload, b"new-slot");
+
+    // The old address fails `NoSuchChild`. This failure is intended: there are
+    // no moved pointers, so a stale sender must retry with a fresh address.
+    let stale = build_envelope(
+        &p_snapshot.routable.this,
+        "0.2".parse().unwrap(),
+        MSG_LEDGER_V1,
+        b"stale".to_vec(),
+        8,
+    )
+    .unwrap();
+    let err = send_envelope(&nodes[&p_id].endpoint, &p_snapshot, &stale, timeout())
+        .await
+        .expect_err("the old address must not route");
+    assert!(
+        matches!(
+            err,
+            cawala_node::msg::MsgSendError::NoRoute(cawala_msg::RouteError::NoSuchChild { .. })
+        ),
+        "unexpected old-address drop: {err}"
+    );
+
+    // Offline healing: P re-slots B again (slot 6) but the targeted notice is
+    // dropped, so B is still at `0.5`. B's own pull reads P's current snapshot
+    // and converges B (and, by re-propagation, C) on `0.6`.
+    let reslot = authorize(
+        &p_id,
+        &p_op,
+        ControlRequest::MoveChild(MoveChild {
+            child: node(&b_id),
+            new_parent: node(&p_id),
+            slot: Some(6),
+        }),
+    );
+    assert_eq!(
+        deliver(&nodes[&p_id].control, &reslot).await,
+        ControlReply::Accepted
+    );
+    let dropped = nodes[&p_id].control.lock().await.take_outbound();
+    assert_eq!(dropped.len(), 1, "exactly one targeted notice");
+    assert_eq!(
+        nodes[&b_id]
+            .control
+            .lock()
+            .await
+            .record()
+            .address
+            .as_ref()
+            .map(|a| a.to_string())
+            .as_deref(),
+        Some("0.5"),
+        "the missed notice must leave B on the previous prefix"
+    );
+    let applied = pull_rebase_from_parent(
+        &nodes[&b_id].endpoint,
+        &nodes[&b_id].control,
+        timeout(),
+        now_unix_seconds(),
+    )
+    .await
+    .expect("pull");
+    assert!(applied, "the pull must heal the missed re-slot");
+    wait_record(&nodes[&b_id].control, Some(&p_id), "0.6").await;
+    wait_record(&nodes[&c_id].control, Some(&b_id), "0.6.0").await;
 }
 
