@@ -18,10 +18,10 @@ use cawala_node::msg::{
     sweep_settlements,
 };
 use cawala_node::{
-    ControlNode, LedgerService, MsgConfig, RoutableSnapshot, SettlementManager, admin_cli,
-    build_envelope, claim_bundle, identity, ledger_commitments, ledger_keys, ledger_service,
-    ledger_store, netting_harness, record, send_envelope, spawn_control_only,
-    spawn_with_secret_key,
+    ControlNode, LedgerService, MsgConfig, RoutableSnapshot, SettlementManager, ValueLimits,
+    ValuePolicy, VALUE_POLICY_FILE, admin_cli, build_envelope, claim_bundle, identity,
+    ledger_commitments, ledger_keys, ledger_service, ledger_store, netting_harness, record,
+    send_envelope, spawn_control_only, spawn_with_secret_key,
 };
 use cawala_topology::OctAddr;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -306,6 +306,37 @@ enum AdminCommand {
     },
     /// List this node's admin grants.
     List,
+    /// Show or set the operator value policy (delegated issue/burn caps).
+    #[command(subcommand)]
+    ValuePolicy(ValuePolicyCommand),
+}
+
+/// `control admin value-policy` subcommands.
+///
+/// The policy bounds delegated `AdminIssue`/`AdminBurn`. It is deny-by-default:
+/// until a valid policy is written, every value operation is refused.
+#[derive(Subcommand)]
+enum ValuePolicyCommand {
+    /// Print the on-disk value policy (or state that none exists).
+    Show,
+    /// Set the default limits, or one controller's override with `--admin`.
+    Set {
+        /// Maximum amount for one issue/burn.
+        #[arg(long, value_name = "AMOUNT")]
+        per_request: u64,
+        /// Node-wide issuance window length, in seconds.
+        #[arg(long, value_name = "SECONDS")]
+        window_secs: u64,
+        /// Maximum total issued within the window.
+        #[arg(long, value_name = "AMOUNT")]
+        window_max: u64,
+        /// Maximum post-issue account balance.
+        #[arg(long, value_name = "AMOUNT")]
+        per_account: u64,
+        /// Set an override for this controller key (64 hex) instead of defaults.
+        #[arg(long, value_name = "OPERATOR_HEX")]
+        admin: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1912,7 +1943,16 @@ fn admin_command(
                 outcome.expiry
             );
             println!("bundle: {}", outcome.bundle);
+            if outcome.scopes.value {
+                println!(
+                    "note: a value-scoped admin can issue and burn value on this node's child \
+                     accounts (bounded by the value policy)."
+                );
+            }
             println!("node {node_id}: paste the bundle in Settings -> Node administration.");
+        }
+        AdminCommand::ValuePolicy(command) => {
+            value_policy_command(data_dir, command)?;
         }
         AdminCommand::Revoke { key } => {
             let admin = parse_operator_pubkey(&key)?;
@@ -1931,6 +1971,53 @@ fn admin_command(
                     println!("{}", entry.render(now));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Local `control admin value-policy show|set`.
+fn value_policy_command(data_dir: &std::path::Path, command: ValuePolicyCommand) -> Result<()> {
+    match command {
+        ValuePolicyCommand::Show => {
+            let path = data_dir.join(VALUE_POLICY_FILE);
+            match std::fs::read_to_string(&path) {
+                Ok(text) => println!("{text}"),
+                Err(_) => println!(
+                    "no value policy at {}; all delegated value operations are denied",
+                    path.display()
+                ),
+            }
+        }
+        ValuePolicyCommand::Set {
+            per_request,
+            window_secs,
+            window_max,
+            per_account,
+            admin,
+        } => {
+            let limits = ValueLimits {
+                per_request_max: per_request,
+                window_secs,
+                window_max,
+                per_account_max: per_account,
+            };
+            // Preserve the other limits when editing one entry.
+            let mut policy = ValuePolicy::load(data_dir).unwrap_or_else(|_| ValuePolicy::deny_all());
+            match admin {
+                Some(hex) => {
+                    let key = parse_operator_pubkey(&hex)?;
+                    policy.admins.insert(key.to_string(), limits);
+                    println!("value policy override saved for {key}");
+                }
+                None => {
+                    policy.defaults = limits;
+                    println!("value policy defaults saved");
+                }
+            }
+            policy
+                .save(data_dir)
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
         }
     }
     Ok(())
@@ -2023,6 +2110,15 @@ fn print_reply(reply: &ControlReply) {
             )
         }
         ControlReply::AdminLedgerSnapshot(snapshot) => print_admin_ledger_snapshot(snapshot),
+        ControlReply::AdminValueApplied(applied) => println!(
+            "admin-value-applied: direction={:?} account={} amount={} seq={} entry_hash={} duplicate={}",
+            applied.direction,
+            applied.account,
+            applied.amount,
+            applied.seq,
+            applied.entry_hash.to_hex(),
+            applied.duplicate
+        ),
     }
 }
 

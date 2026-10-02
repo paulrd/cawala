@@ -65,18 +65,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 
 use cawala_ledger::{
-    AccountRef, Amount, AuthRef, BalanceAttestation, EdgeCloseRequest, Entry, EntryBody, Hash,
-    HopRole, IssueRequest, Ledger, LedgerError, LedgerPubKey, LedgerSecretKey, NodeId,
+    AccountRef, Amount, AuthRef, BalanceAttestation, BurnRequest, EdgeCloseRequest, Entry, EntryBody,
+    Hash, HopRole, IssueRequest, Ledger, LedgerError, LedgerPubKey, LedgerSecretKey, NodeId,
     OperatorPubKey, OperatorSecretKey, PaymentOrder, PeerKeys, PeerRegistry, PeerRole, Posting,
     PrefundRequest, SignedAmount, SignedCommitment, SignedEntry, attest_balance, build_commitment,
-    commitment_hash, entry_hash, entry_inclusion_proof, hop_postings, verify_edge_close,
+    commitment_hash, entry_hash, entry_inclusion_proof, hop_postings, verify_burn, verify_edge_close,
     verify_issue, verify_prefund, verify_transfer,
 };
 use cawala_msg::{
     BalanceReceiptV1, EntryProofV1, MAX_RECEIPT_HISTORY, MsgId, OctAddr, OrderRejectV1,
     OrderStatusV1, ValueNoticeV1,
 };
-use cawala_control::{AdminLedgerAccount, AdminLedgerSnapshot, MAX_ADMIN_LEDGER_ACCOUNTS};
+use cawala_control::{
+    AdminLedgerAccount, AdminLedgerSnapshot, AdminValueDirection, MAX_ADMIN_LEDGER_ACCOUNTS,
+    ValueRequestId,
+};
 use cawala_topology::ChildKind;
 
 use crate::identity;
@@ -85,6 +88,7 @@ use crate::ledger_keys::load_or_create_ledger_key;
 use crate::ledger_peers::load_peers;
 use crate::ledger_store::{FileLog, LedgerLock, init_ledger, open_ledger};
 use crate::record::{NodeRecord, RecordStore};
+use crate::value_policy::ValueLimits;
 
 /// The result of applying one [`PaymentOrder`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,7 +140,7 @@ pub enum HopOutcome {
 }
 
 /// A leaf node's ledger: the replayed log, its signing key, the derived
-/// control-plane rootness, and the `payment_id` replay guard.
+/// control-plane rootness, and the replay guards.
 pub struct LedgerService {
     data_dir: PathBuf,
     node_id: String,
@@ -148,10 +152,83 @@ pub struct LedgerService {
     is_root: bool,
     /// `payment_id -> (entry seq, entry hash)` for every applied transfer.
     consumed: ConsumedIndex,
+    /// `(node_operator, nonce) -> value record` for every applied issue/burn.
+    ///
+    /// This is the end-to-end idempotency guard for delegated value ops: it is
+    /// rebuilt from the ledger on every load/refresh (no sidecar) and never
+    /// capped or evicted.
+    value_index: ValueIndex,
 }
 
 /// `payment_id -> (entry seq, entry hash)` for every applied transfer.
 type ConsumedIndex = BTreeMap<Hash, (u64, Hash)>;
+
+/// One applied delegated value operation, indexed by `(node_operator, nonce)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueRecord {
+    /// Whether the entry created or destroyed value.
+    pub direction: AdminValueDirection,
+    /// The affected child account.
+    pub account: NodeId,
+    /// The applied amount.
+    pub amount: u64,
+    /// The entry's sequence number.
+    pub seq: u64,
+    /// The entry's hash.
+    pub entry_hash: Hash,
+    /// The operator request hash (`auth.order_hash`) the entry was authorised
+    /// by; surfaced in the outcome audit line.
+    pub order_hash: Hash,
+}
+
+/// `(node_operator, nonce) -> value record` for every applied issue/burn.
+pub type ValueIndex = BTreeMap<(OperatorPubKey, u64), ValueRecord>;
+
+/// A successfully applied (or deduplicated) delegated value operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueApplied {
+    /// The applied (or original) entry's sequence number.
+    pub seq: u64,
+    /// The applied (or original) entry's hash.
+    pub entry_hash: Hash,
+    /// The account's current liability balance at reply time: the post-op
+    /// balance for a fresh apply, or the balance as of the reply for a
+    /// duplicate (which appends nothing). The web layer must not describe this
+    /// as the balance immediately after the *original* application.
+    pub balance_after: u64,
+    /// The operator request hash (`IssueRequest`/`BurnRequest`) that authorised
+    /// the applied (or original) entry.
+    pub order_hash: Hash,
+    /// Whether this replayed a prior identical application (nothing appended).
+    pub duplicate: bool,
+}
+
+/// Errors from a delegated value operation.
+#[derive(Debug, thiserror::Error)]
+pub enum ValueError {
+    /// The operation exceeds an operator-configured limit.
+    #[error("value operation exceeds a configured limit")]
+    LimitExceeded,
+    /// A burn exceeds the account's current balance (or the account is
+    /// unopened).
+    #[error("burn exceeds the account balance")]
+    InsufficientBalance,
+    /// The request id was already used with different parameters.
+    #[error("request_id was already used with different parameters")]
+    RequestIdConflict,
+    /// The amount was zero.
+    #[error("amount must be greater than zero")]
+    ZeroAmount,
+    /// A ledger/internal error occurred; nothing was applied.
+    #[error(transparent)]
+    Ledger(#[from] anyhow::Error),
+}
+
+impl From<LedgerError> for ValueError {
+    fn from(err: LedgerError) -> Self {
+        ValueError::Ledger(anyhow::Error::from(err))
+    }
+}
 
 impl std::fmt::Debug for LedgerService {
     /// Minimal seed-free `Debug` (the inner [`Ledger`] is not `Debug`).
@@ -168,7 +245,7 @@ impl LedgerService {
     /// replaying it, and rebuilding the replay guard from the log.
     pub fn open(data_dir: &Path, node_id: &str) -> Result<Self> {
         let key = load_or_create_ledger_key(data_dir)?;
-        let (ledger, consumed) = Self::load(data_dir, node_id, &key)?;
+        let (ledger, consumed, value_index) = Self::load(data_dir, node_id, &key)?;
         Ok(LedgerService {
             data_dir: data_dir.to_path_buf(),
             node_id: node_id.to_string(),
@@ -176,6 +253,7 @@ impl LedgerService {
             key,
             is_root: derive_is_root(data_dir, node_id),
             consumed,
+            value_index,
         })
     }
 
@@ -190,13 +268,14 @@ impl LedgerService {
         data_dir: &Path,
         node_id: &str,
         key: &LedgerSecretKey,
-    ) -> Result<(Ledger<FileLog>, ConsumedIndex)> {
+    ) -> Result<(Ledger<FileLog>, ConsumedIndex, ValueIndex)> {
         // `init_ledger` is idempotent; calling it explicitly makes loading
         // self-bootstrapping rather than relying on `open_ledger`'s side effect.
         init_ledger(data_dir, node_id, &key.public())?;
         let ledger = open_ledger(data_dir, node_id, key)?;
         let consumed = rebuild_consumed(&ledger)?;
-        Ok((ledger, consumed))
+        let value_index = rebuild_value_index(&ledger)?;
+        Ok((ledger, consumed, value_index))
     }
 
     /// Re-read the on-disk ledger, replacing the in-memory ledger, derived
@@ -220,10 +299,12 @@ impl LedgerService {
     /// its refresh-and-attest, so two writers can no longer race between resync
     /// and append.
     fn refresh_from_disk(&mut self) -> Result<()> {
-        let (ledger, consumed) = Self::load(&self.data_dir, &self.node_id, &self.key)?;
+        let (ledger, consumed, value_index) =
+            Self::load(&self.data_dir, &self.node_id, &self.key)?;
         self.ledger = ledger;
         self.is_root = derive_is_root(&self.data_dir, &self.node_id);
         self.consumed = consumed;
+        self.value_index = value_index;
         Ok(())
     }
 
@@ -557,6 +638,286 @@ impl LedgerService {
         let hash = entry_hash(&signed.entry)?;
         self.ledger.append(signed)?;
         Ok((seq, hash))
+    }
+
+    /// Destroy `amount` from `from`'s account, authorized by the node operator
+    /// key.
+    ///
+    /// Mirrors [`fund`](Self::fund) but debits instead of crediting: a
+    /// child-only boundary operation (`{Child(child):−amount}`) that raises the
+    /// node's derived equity. **No account auto-open**: an unopened/zero account
+    /// has balance 0, so any positive burn is
+    /// [`ValueError::InsufficientBalance`].
+    ///
+    /// Returns the appended entry's `(seq, hash)`.
+    pub fn burn(
+        &mut self,
+        from: &NodeId,
+        amount: u64,
+        operator: &OperatorSecretKey,
+        nonce: u64,
+        now: u64,
+    ) -> Result<(u64, Hash), ValueError> {
+        if amount == 0 {
+            return Err(ValueError::ZeroAmount);
+        }
+        let _lock = LedgerLock::acquire_exclusive(&self.data_dir)?;
+        self.refresh_from_disk()?;
+        let (seq, hash, _balance_after) =
+            self.apply_burn_locked(from, amount, operator, nonce, now)?;
+        Ok((seq, hash))
+    }
+
+    /// Apply one delegated value operation under the exclusive ledger lock.
+    ///
+    /// Steps: exclusive lock -> refresh from disk -> derive the controller-bound
+    /// nonce -> **dedupe** -> caps -> append -> update the value index. A
+    /// duplicate (`request_id` replayed with identical parameters) returns the
+    /// prior `(seq, entry_hash)` with `duplicate: true` and appends nothing; the
+    /// same nonce with different parameters is
+    /// [`ValueError::RequestIdConflict`].
+    ///
+    /// The caller (control plane) resolves and pre-checks the limits for an early
+    /// refusal; this method authoritatively re-enforces them against the freshly
+    /// replayed ledger.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admin_value_apply(
+        &mut self,
+        direction: AdminValueDirection,
+        account: &NodeId,
+        kind: ChildKind,
+        amount: u64,
+        controller: &OperatorPubKey,
+        request_id: ValueRequestId,
+        limits: ValueLimits,
+        now: u64,
+    ) -> Result<ValueApplied, ValueError> {
+        if amount == 0 {
+            return Err(ValueError::ZeroAmount);
+        }
+        let _lock = LedgerLock::acquire_exclusive(&self.data_dir)?;
+        self.refresh_from_disk()?;
+
+        // The signing key is loaded inside the service; it never enters the
+        // deferred work item or the wire.
+        let operator = self.node_operator_secret()?;
+        let nonce = derive_value_nonce(controller, &request_id);
+        let key = (operator.public(), nonce);
+
+        // Idempotency, under the exclusive lock and against the replayed ledger.
+        if let Some(prior) = self.value_index.get(&key) {
+            if prior.direction == direction && prior.account == *account && prior.amount == amount
+            {
+                return Ok(ValueApplied {
+                    seq: prior.seq,
+                    entry_hash: prior.entry_hash,
+                    // Current balance at reply time: a duplicate appends
+                    // nothing, so this is not necessarily the post-op balance of
+                    // the original application.
+                    balance_after: self.balance_of(account).get(),
+                    order_hash: prior.order_hash,
+                    duplicate: true,
+                });
+            }
+            return Err(ValueError::RequestIdConflict);
+        }
+
+        if amount > limits.per_request_max {
+            return Err(ValueError::LimitExceeded);
+        }
+        let applied = match direction {
+            AdminValueDirection::Issue => {
+                let balance = self.balance_of(account).get();
+                if balance.saturating_add(amount) > limits.per_account_max {
+                    return Err(ValueError::LimitExceeded);
+                }
+                let window_start = now.saturating_sub(limits.window_secs);
+                let window_sum = self.issue_sum_since(window_start)?;
+                if window_sum.saturating_add(amount) > limits.window_max {
+                    return Err(ValueError::LimitExceeded);
+                }
+                // Mirrors `fund`: open the account first when needed. A crash
+                // between the open and the issue is harmless (the retry applies
+                // once, and the open is idempotent).
+                self.ensure_account_open_inner(account, kind)?;
+                let (seq, entry_hash, balance_after) =
+                    self.apply_issue_locked(account, amount, &operator, nonce, now)?;
+                let order_hash = self
+                    .value_index
+                    .get(&key)
+                    .map(|record| record.order_hash)
+                    .unwrap_or(Hash::ZERO);
+                ValueApplied {
+                    seq,
+                    entry_hash,
+                    balance_after,
+                    order_hash,
+                    duplicate: false,
+                }
+            }
+            AdminValueDirection::Burn => {
+                let (seq, entry_hash, balance_after) =
+                    self.apply_burn_locked(account, amount, &operator, nonce, now)?;
+                let order_hash = self
+                    .value_index
+                    .get(&key)
+                    .map(|record| record.order_hash)
+                    .unwrap_or(Hash::ZERO);
+                ValueApplied {
+                    seq,
+                    entry_hash,
+                    balance_after,
+                    order_hash,
+                    duplicate: false,
+                }
+            }
+        };
+        Ok(applied)
+    }
+
+    /// Append an `Issue` entry (lock held and ledger refreshed by the caller).
+    fn apply_issue_locked(
+        &mut self,
+        account: &NodeId,
+        amount: u64,
+        operator: &OperatorSecretKey,
+        nonce: u64,
+        now: u64,
+    ) -> Result<(u64, Hash, u64), ValueError> {
+        let request = IssueRequest {
+            node: NodeId::from(self.node_id.clone()),
+            account: account.clone(),
+            amount: Amount::new(amount),
+            nonce,
+            expiry: now.saturating_add(3600),
+        };
+        let order_hash = request.hash();
+        let auth = request.authorize(operator)?;
+        let amount_i64 =
+            i64::try_from(amount).context("amount exceeds the ledger's signed range")?;
+        let seq = self.ledger.len() as u64;
+        let entry = Entry {
+            ledger_id: self.key.public(),
+            seq,
+            height: seq,
+            prev_hash: self.ledger.head_hash(),
+            issued_at: now,
+            body: EntryBody::Issue {
+                child: account.clone(),
+                amount: Amount::new(amount),
+            },
+            postings: vec![Posting {
+                account: AccountRef::Child(account.clone()),
+                delta: SignedAmount::new(amount_i64),
+            }],
+            auth: Some(auth),
+        };
+        let signed = SignedEntry::sign(entry, &self.key)?;
+        let registry = self.effective_registry()?;
+        verify_issue(&signed, &request, &registry, now)?;
+        let hash = entry_hash(&signed.entry)?;
+        self.ledger.append(signed)?;
+        self.value_index.insert(
+            (operator.public(), nonce),
+            ValueRecord {
+                direction: AdminValueDirection::Issue,
+                account: account.clone(),
+                amount,
+                seq,
+                entry_hash: hash,
+                order_hash,
+            },
+        );
+        Ok((seq, hash, self.balance_of(account).get()))
+    }
+
+    /// Append a `Burn` entry (lock held and ledger refreshed by the caller).
+    fn apply_burn_locked(
+        &mut self,
+        account: &NodeId,
+        amount: u64,
+        operator: &OperatorSecretKey,
+        nonce: u64,
+        now: u64,
+    ) -> Result<(u64, Hash, u64), ValueError> {
+        let balance = self.balance_of(account).get();
+        if amount > balance {
+            return Err(ValueError::InsufficientBalance);
+        }
+        let request = BurnRequest {
+            node: NodeId::from(self.node_id.clone()),
+            account: account.clone(),
+            amount: Amount::new(amount),
+            nonce,
+            expiry: now.saturating_add(3600),
+        };
+        let order_hash = request.hash();
+        let auth = request.authorize(operator)?;
+        let amount_i64 =
+            i64::try_from(amount).context("amount exceeds the ledger's signed range")?;
+        let seq = self.ledger.len() as u64;
+        let entry = Entry {
+            ledger_id: self.key.public(),
+            seq,
+            height: seq,
+            prev_hash: self.ledger.head_hash(),
+            issued_at: now,
+            body: EntryBody::Burn {
+                child: account.clone(),
+                amount: Amount::new(amount),
+            },
+            postings: vec![Posting {
+                account: AccountRef::Child(account.clone()),
+                delta: SignedAmount::new(-amount_i64),
+            }],
+            auth: Some(auth),
+        };
+        let signed = SignedEntry::sign(entry, &self.key)?;
+        let registry = self.effective_registry()?;
+        verify_burn(&signed, &request, &registry, now)?;
+        let hash = entry_hash(&signed.entry)?;
+        self.ledger.append(signed)?;
+        self.value_index.insert(
+            (operator.public(), nonce),
+            ValueRecord {
+                direction: AdminValueDirection::Burn,
+                account: account.clone(),
+                amount,
+                seq,
+                entry_hash: hash,
+                order_hash,
+            },
+        );
+        Ok((seq, hash, self.balance_of(account).get()))
+    }
+
+    /// Sum every `Issue` amount issued at or after `issued_at_or_after`.
+    ///
+    /// Backs the node-wide issuance window. **Fail closed**: a missing or
+    /// unreadable entry is an error, never silently skipped, because an
+    /// undercount would loosen the cap.
+    fn issue_sum_since(&self, issued_at_or_after: u64) -> Result<u64, ValueError> {
+        let mut sum: u64 = 0;
+        for index in 0..self.ledger.len() {
+            let signed = self.ledger.get(index)?.ok_or_else(|| {
+                ValueError::Ledger(anyhow::anyhow!(
+                    "ledger entry {index} missing while summing the value window"
+                ))
+            })?;
+            if signed.entry.issued_at >= issued_at_or_after
+                && let EntryBody::Issue { amount, .. } = &signed.entry.body
+            {
+                sum = sum.saturating_add(amount.get());
+            }
+        }
+        Ok(sum)
+    }
+
+    /// This node's operator secret key, loaded from the persisted identity.
+    fn node_operator_secret(&self) -> Result<OperatorSecretKey> {
+        let secret = identity::load_or_create_secret_key(&self.data_dir)
+            .context("failed to load node identity for a value operation")?;
+        Ok(OperatorSecretKey::from_bytes(secret.to_bytes()))
     }
 
     /// Extend `amount` from this node's parent account into `child`'s account,
@@ -1141,6 +1502,57 @@ fn rebuild_consumed(ledger: &Ledger<FileLog>) -> Result<ConsumedIndex> {
         }
     }
     Ok(consumed)
+}
+
+/// Rebuild `(node_operator, nonce) -> value record` from every applied
+/// issue/burn.
+///
+/// `OpenAccount` has `auth: None`; transfers keep the separate `consumed` index,
+/// so they are deliberately ignored here.
+fn rebuild_value_index(ledger: &Ledger<FileLog>) -> Result<ValueIndex> {
+    let mut index = BTreeMap::new();
+    for entry_index in 0..ledger.len() {
+        let signed = ledger.get(entry_index)?.ok_or_else(|| {
+            anyhow::anyhow!("ledger entry {entry_index} missing while rebuilding the value index")
+        })?;
+        let (direction, account, amount) = match &signed.entry.body {
+            EntryBody::Issue { child, amount } => {
+                (AdminValueDirection::Issue, child.clone(), amount.get())
+            }
+            EntryBody::Burn { child, amount } => {
+                (AdminValueDirection::Burn, child.clone(), amount.get())
+            }
+            _ => continue,
+        };
+        let Some(auth) = &signed.entry.auth else {
+            continue;
+        };
+        let hash = entry_hash(&signed.entry)?;
+        index.entry((auth.operator, auth.nonce)).or_insert(ValueRecord {
+            direction,
+            account,
+            amount,
+            seq: signed.entry.seq,
+            entry_hash: hash,
+            order_hash: auth.order_hash,
+        });
+    }
+    Ok(index)
+}
+
+/// Derive the controller-bound ledger nonce for a value request.
+///
+/// `BLAKE3("cawala-node/admin-value/v1", controller_pub ‖ request_id)[0..8]`.
+/// The browser never supplies the nonce, so it cannot collide two logical
+/// operations or reuse another controller's idempotency key.
+fn derive_value_nonce(controller: &OperatorPubKey, request_id: &ValueRequestId) -> u64 {
+    let mut hasher = blake3::Hasher::new_derive_key("cawala-node/admin-value/v1");
+    hasher.update(&controller.to_bytes());
+    hasher.update(request_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest.as_bytes()[0..8]);
+    u64::from_le_bytes(bytes)
 }
 
 /// Whether `node_id`'s ledger is a root: no readable `node.json`, or a record
@@ -2340,5 +2752,317 @@ mod tests {
         .unwrap();
         let record = NodeRecord::new(NODE);
         assert!(service.admin_ledger_view(&record).is_err());
+    }
+
+    // ── P5: delegated value operations ────────────────────────────────────────
+
+    fn value_controller() -> OperatorPubKey {
+        OperatorSecretKey::from_bytes([0x5a; 32]).public()
+    }
+
+    fn value_limits(per_request: u64, window_secs: u64, window_max: u64, per_account: u64) -> ValueLimits {
+        ValueLimits {
+            per_request_max: per_request,
+            window_secs,
+            window_max,
+            per_account_max: per_account,
+        }
+    }
+
+    #[test]
+    fn admin_value_issue_opens_account_and_dedupes_under_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = LedgerService::open(dir.path(), NODE).unwrap();
+        let account = user("child-a");
+        let controller = value_controller();
+        let request_id = ValueRequestId::from_bytes([1u8; 16]);
+        let limits = value_limits(100, 3600, 1000, 500);
+        let now = 1_000;
+
+        let first = service
+            .admin_value_apply(
+                AdminValueDirection::Issue,
+                &account,
+                ChildKind::User,
+                40,
+                &controller,
+                request_id,
+                limits,
+                now,
+            )
+            .unwrap();
+        assert!(!first.duplicate);
+        assert_eq!(first.balance_after, 40);
+        assert_eq!(service.ledger().height(), first.seq, "issue set the head");
+        // First issue opens the account (two entries: OpenAccount + Issue).
+        assert_eq!(service.ledger().len(), 2);
+        let signed = service.ledger().get(first.seq as usize).unwrap().unwrap();
+        let EntryBody::Issue { amount, .. } = &signed.entry.body else {
+            panic!("expected an Issue body");
+        };
+        assert_eq!(amount.get(), 40);
+        assert!(signed.entry.auth.is_some(), "the node signed the issue");
+
+        // Duplicate (same id + params) returns the prior entry and appends
+        // nothing.
+        let second = service
+            .admin_value_apply(
+                AdminValueDirection::Issue,
+                &account,
+                ChildKind::User,
+                40,
+                &controller,
+                request_id,
+                limits,
+                now + 10,
+            )
+            .unwrap();
+        assert!(second.duplicate);
+        assert_eq!(second.seq, first.seq);
+        assert_eq!(second.entry_hash, first.entry_hash);
+        assert_eq!(service.ledger().height(), first.seq, "duplicate appends nothing");
+        assert_eq!(service.ledger().len(), 2);
+
+        // Same id, different params -> conflict.
+        let conflict = service
+            .admin_value_apply(
+                AdminValueDirection::Issue,
+                &account,
+                ChildKind::User,
+                41,
+                &controller,
+                request_id,
+                limits,
+                now,
+            )
+            .unwrap_err();
+        assert!(matches!(conflict, ValueError::RequestIdConflict));
+
+        // Reopen: the ledger-derived index still dedupes.
+        let mut reopened = LedgerService::open(dir.path(), NODE).unwrap();
+        let after_reopen = reopened
+            .admin_value_apply(
+                AdminValueDirection::Issue,
+                &account,
+                ChildKind::User,
+                40,
+                &controller,
+                request_id,
+                limits,
+                now + 20,
+            )
+            .unwrap();
+        assert!(after_reopen.duplicate);
+        assert_eq!(after_reopen.entry_hash, first.entry_hash);
+        assert_eq!(reopened.ledger().height(), first.seq);
+    }
+
+    #[test]
+    fn admin_value_burn_mirrors_fund_and_refuses_overdraw() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = LedgerService::open(dir.path(), NODE).unwrap();
+        let account = user("child-a");
+        let operator = node_operator(dir.path());
+        // Fund the account so there is something to burn.
+        service
+            .ensure_account_open(&account, ChildKind::User)
+            .unwrap();
+        service.fund(&account, ChildKind::User, 50, &operator, 1, 1_000).unwrap();
+        let balance = service.balance_of(&account).get();
+        assert_eq!(balance, 50);
+        let before = service.ledger().len();
+
+        let (seq, hash) = service.burn(&account, 30, &operator, 2, 1_100).unwrap();
+        assert_eq!(seq as usize, before, "burn appends exactly one entry");
+        assert_eq!(service.ledger().len(), before + 1);
+        let signed = service.ledger().get(seq as usize).unwrap().unwrap();
+        let EntryBody::Burn { amount, .. } = &signed.entry.body else {
+            panic!("expected a Burn body");
+        };
+        assert_eq!(amount.get(), 30);
+        let _ = hash;
+        assert_eq!(service.balance_of(&account).get(), 20);
+
+        // Over-balance burn is refused with InsufficientBalance.
+        assert!(matches!(
+            service.burn(&account, 21, &operator, 3, 1_200),
+            Err(ValueError::InsufficientBalance)
+        ));
+        // Zero amount.
+        assert!(matches!(
+            service.burn(&account, 0, &operator, 4, 1_200),
+            Err(ValueError::ZeroAmount)
+        ));
+        // Unopened account -> InsufficientBalance.
+        assert!(matches!(
+            service.burn(&user("never-opened"), 1, &operator, 5, 1_200),
+            Err(ValueError::InsufficientBalance)
+        ));
+        // The refused burns appended nothing.
+        assert_eq!(service.ledger().len(), before + 1);
+    }
+
+    #[test]
+    fn admin_value_apply_enforces_caps() {
+        let account = user("child-a");
+        let controller = value_controller();
+
+        // Per-request: 11 > per_request_max 10.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut service = LedgerService::open(dir.path(), NODE).unwrap();
+            assert!(matches!(
+                service.admin_value_apply(
+                    AdminValueDirection::Issue,
+                    &account,
+                    ChildKind::User,
+                    11,
+                    &controller,
+                    ValueRequestId::from_bytes([1u8; 16]),
+                    value_limits(10, 3600, 1000, 1000),
+                    1_000,
+                ),
+                Err(ValueError::LimitExceeded)
+            ));
+        }
+
+        // Per-account: balance 40 + amount 20 > per_account_max 50.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut service = LedgerService::open(dir.path(), NODE).unwrap();
+            service
+                .admin_value_apply(
+                    AdminValueDirection::Issue,
+                    &account,
+                    ChildKind::User,
+                    40,
+                    &controller,
+                    ValueRequestId::from_bytes([2u8; 16]),
+                    value_limits(100, 3600, 1000, 50),
+                    1_000,
+                )
+                .unwrap();
+            assert!(matches!(
+                service.admin_value_apply(
+                    AdminValueDirection::Issue,
+                    &account,
+                    ChildKind::User,
+                    20,
+                    &controller,
+                    ValueRequestId::from_bytes([3u8; 16]),
+                    value_limits(100, 3600, 1000, 50),
+                    1_000,
+                ),
+                Err(ValueError::LimitExceeded)
+            ));
+        }
+
+        // Node-wide window: an older `fund` outside the window does not count,
+        // but a second in-window issue exceeds window_max.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut service = LedgerService::open(dir.path(), NODE).unwrap();
+            let other = user("child-b");
+            let operator = node_operator(dir.path());
+            service
+                .ensure_account_open(&other, ChildKind::User)
+                .unwrap();
+            service
+                .fund(&other, ChildKind::User, 30, &operator, 10, 500)
+                .unwrap();
+            // now=1000, window 100 s -> the 500 issue is outside; 40 fits 50.
+            service
+                .admin_value_apply(
+                    AdminValueDirection::Issue,
+                    &other,
+                    ChildKind::User,
+                    40,
+                    &controller,
+                    ValueRequestId::from_bytes([4u8; 16]),
+                    value_limits(100, 100, 50, 1000),
+                    1_000,
+                )
+                .unwrap();
+            assert!(matches!(
+                service.admin_value_apply(
+                    AdminValueDirection::Issue,
+                    &other,
+                    ChildKind::User,
+                    20,
+                    &controller,
+                    ValueRequestId::from_bytes([5u8; 16]),
+                    value_limits(100, 100, 50, 1000),
+                    1_000,
+                ),
+                Err(ValueError::LimitExceeded)
+            ));
+
+            // A zero-cap policy denies even a 1-unit issue.
+            assert!(matches!(
+                service.admin_value_apply(
+                    AdminValueDirection::Issue,
+                    &other,
+                    ChildKind::User,
+                    1,
+                    &controller,
+                    ValueRequestId::from_bytes([6u8; 16]),
+                    ValueLimits::deny_all(),
+                    1_000,
+                ),
+                Err(ValueError::LimitExceeded)
+            ));
+        }
+    }
+
+    #[test]
+    fn value_index_scans_issue_and_burn_and_ignores_open_account() {
+        let dir = tempfile::tempdir().unwrap();
+        // OpenAccount only -> the replayed index is empty.
+        {
+            let mut service = LedgerService::open(dir.path(), NODE).unwrap();
+            service
+                .ensure_account_open(&user("child-a"), ChildKind::User)
+                .unwrap();
+        }
+        let service = LedgerService::open(dir.path(), NODE).unwrap();
+        assert!(service.value_index.is_empty(), "OpenAccount is not indexed");
+
+        // A `fund` issue is indexed by (node_operator, nonce).
+        let mut service = service;
+        let account = user("child-a");
+        let operator = node_operator(dir.path());
+        service.fund(&account, ChildKind::User, 25, &operator, 77, 1_000).unwrap();
+        let reopened = LedgerService::open(dir.path(), NODE).unwrap();
+        assert_eq!(reopened.value_index.len(), 1);
+        let record = reopened
+            .value_index
+            .get(&(operator.public(), 77))
+            .expect("issue record");
+        assert_eq!(record.direction, AdminValueDirection::Issue);
+        assert_eq!(record.account, account);
+        assert_eq!(record.amount, 25);
+    }
+
+    /// Golden vector for the delegated-value nonce derivation.
+    ///
+    /// **Frozen**: the domain (`cawala-node/admin-value/v1`), the field order
+    /// (`controller_pub` bytes then `request_id` bytes), and the little-endian
+    /// truncation of the first 8 digest bytes. A change would silently break
+    /// cross-version dedupe: an in-flight retry after a binary upgrade would
+    /// derive a different `(node_operator, nonce)` key and re-apply within caps.
+    #[test]
+    fn derived_value_nonce_golden_is_frozen() {
+        let controller = OperatorSecretKey::from_bytes([1u8; 32]).public();
+        let id = ValueRequestId::from_bytes([9u8; 16]);
+        assert_eq!(
+            derive_value_nonce(&controller, &id),
+            2_650_107_687_553_871_971_u64,
+            "nonce derivation changed; see the frozen-formula note"
+        );
+
+        // Controller-bound and deterministic.
+        let controller_b = OperatorSecretKey::from_bytes([2u8; 32]).public();
+        assert_eq!(derive_value_nonce(&controller, &id), derive_value_nonce(&controller, &id));
+        assert_ne!(derive_value_nonce(&controller, &id), derive_value_nonce(&controller_b, &id));
     }
 }

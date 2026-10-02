@@ -6,6 +6,8 @@
 //! which supplies the operator signature; the types here carry no authority on
 //! their own.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use cawala_ledger::{LedgerPubKey, NodeId, OperatorPubKey};
@@ -532,6 +534,101 @@ impl AdminMoveChild {
     }
 }
 
+/// A client-generated idempotency key for a value operation.
+///
+/// The browser generates one `ValueRequestId` per logical issue/burn and reuses
+/// it on every retry; the node derives a controller-bound ledger nonce from it
+/// (`BLAKE3("cawala-node/admin-value/v1", controller_pub ‖ request_id)`), so the
+/// request field itself is never a signature, key, or nonce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ValueRequestId(pub [u8; 16]);
+
+impl ValueRequestId {
+    /// The raw byte length.
+    pub const LENGTH: usize = 16;
+
+    /// Wrap raw bytes.
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        ValueRequestId(bytes)
+    }
+
+    /// The raw bytes.
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    /// Whether the id is all-zero (invalid; a real id must be fresh).
+    pub fn is_zero(&self) -> bool {
+        self.0.iter().all(|byte| *byte == 0)
+    }
+}
+
+impl fmt::Display for ValueRequestId {
+    /// Lowercase hex (32 characters).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The direction of a delegated value operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminValueDirection {
+    /// Create `amount` into `account` (mints the node's liability).
+    Issue,
+    /// Destroy `amount` from `account` (raises the node's equity).
+    Burn,
+}
+
+/// A value-scoped admin request to issue or burn value on one child account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminValueRequest {
+    /// Client idempotency key (never all-zero).
+    pub request_id: ValueRequestId,
+    /// The child account to credit (issue) or debit (burn).
+    pub account: NodeId,
+    /// The amount (must be `> 0`).
+    pub amount: u64,
+    /// Mandatory human-readable reason (non-empty, at most [`MAX_REASON_LEN`]).
+    pub reason: String,
+}
+
+impl AdminValueRequest {
+    /// Check the account bound, the request id, the amount, and the reason.
+    ///
+    /// `account` must be at most [`MAX_NODE_ID_LEN`] bytes; `request_id` must not
+    /// be all-zero; `amount` must be `> 0`; `reason` must be non-empty and at
+    /// most [`MAX_REASON_LEN`] bytes. Whether the account is a current child is
+    /// the node's concern.
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_node_id("account", self.account.as_str())?;
+        if self.request_id.is_zero() {
+            return Err(ControlError::ZeroValueRequestId);
+        }
+        if self.amount == 0 {
+            return Err(ControlError::FieldBelowMinimum {
+                field: "amount",
+                value: 0,
+                min: 1,
+            });
+        }
+        if self.reason.is_empty() {
+            return Err(ControlError::EmptyValueReason);
+        }
+        if self.reason.len() > MAX_REASON_LEN {
+            return Err(ControlError::FieldTooLong {
+                field: "reason",
+                len: self.reason.len(),
+                max: MAX_REASON_LEN,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// The v1 control-request payload.
 ///
 /// Variant order is frozen: postcard encodes the discriminant positionally.
@@ -578,6 +675,11 @@ pub enum ControlRequest {
     /// Topology-scoped admin re-slot of a direct `Node` child (discriminant 18,
     /// format 6).
     AdminMoveChild(AdminMoveChild),
+    /// Value-scoped admin issue into a child account (discriminant 19,
+    /// format 7).
+    AdminIssue(AdminValueRequest),
+    /// Value-scoped admin burn from a child account (discriminant 20, format 7).
+    AdminBurn(AdminValueRequest),
 }
 
 impl ControlRequest {
@@ -603,6 +705,8 @@ impl ControlRequest {
             ControlRequest::AdminLedgerQuery => "admin-ledger-query",
             ControlRequest::AdminDetachChild(_) => "admin-detach-child",
             ControlRequest::AdminMoveChild(_) => "admin-move-child",
+            ControlRequest::AdminIssue(_) => "admin-issue",
+            ControlRequest::AdminBurn(_) => "admin-burn",
         }
     }
 
@@ -630,6 +734,9 @@ impl ControlRequest {
             ControlRequest::AdminLedgerQuery => Some(RequiredScope::Value),
             ControlRequest::AdminDetachChild(_) | ControlRequest::AdminMoveChild(_) => {
                 Some(RequiredScope::Topology)
+            }
+            ControlRequest::AdminIssue(_) | ControlRequest::AdminBurn(_) => {
+                Some(RequiredScope::Value)
             }
             _ => None,
         }
@@ -672,6 +779,15 @@ mod tests {
             location_hint: Some("0.3".to_string()),
             nonce: 1,
             expiry: 100,
+        }
+    }
+
+    fn value_request() -> AdminValueRequest {
+        AdminValueRequest {
+            request_id: ValueRequestId::from_bytes([7u8; 16]),
+            account: node("applicant"),
+            amount: 25,
+            reason: "rebalance".to_string(),
         }
     }
 
@@ -750,6 +866,8 @@ mod tests {
                 child: node("applicant"),
                 slot: Some(3),
             }),
+            ControlRequest::AdminIssue(value_request()),
+            ControlRequest::AdminBurn(value_request()),
         ]
     }
 
@@ -778,6 +896,8 @@ mod tests {
                 "admin-ledger-query",
                 "admin-detach-child",
                 "admin-move-child",
+                "admin-issue",
+                "admin-burn",
             ]
         );
     }
@@ -1014,6 +1134,8 @@ mod tests {
                     | ControlRequest::AdminLedgerQuery
                     | ControlRequest::AdminDetachChild(_)
                     | ControlRequest::AdminMoveChild(_)
+                    | ControlRequest::AdminIssue(_)
+                    | ControlRequest::AdminBurn(_)
             );
             assert_eq!(request.is_admin(), expected, "{request:?}");
             assert_eq!(is_admin_request(&request), expected, "{request:?}");
@@ -1022,8 +1144,8 @@ mod tests {
 
     #[test]
     fn new_admin_discriminants_are_frozen() {
-        // Variants 16/17/18 (0-based), appended after `RebasePull` (15). An
-        // insert or reorder would shift every later discriminant.
+        // Variants 16..=20 (0-based). An insert or reorder would shift every
+        // later discriminant.
         let ledger = postcard::to_allocvec(&ControlRequest::AdminLedgerQuery).unwrap();
         let detach = postcard::to_allocvec(&ControlRequest::AdminDetachChild(AdminDetachChild {
             child: node("c"),
@@ -1034,9 +1156,13 @@ mod tests {
             slot: Some(3),
         }))
         .unwrap();
+        let issue = postcard::to_allocvec(&ControlRequest::AdminIssue(value_request())).unwrap();
+        let burn = postcard::to_allocvec(&ControlRequest::AdminBurn(value_request())).unwrap();
         assert_eq!(ledger, vec![16]);
         assert_eq!(detach[0], 17);
         assert_eq!(move_child[0], 18);
+        assert_eq!(issue[0], 19);
+        assert_eq!(burn[0], 20);
     }
 
     #[test]
@@ -1074,12 +1200,86 @@ mod tests {
             assert_eq!(request.required_scope(), Some(RequiredScope::Topology));
         }
         for request in [
+            ControlRequest::AdminIssue(value_request()),
+            ControlRequest::AdminBurn(value_request()),
+        ] {
+            assert_eq!(request.required_scope(), Some(RequiredScope::Value));
+        }
+        for request in [
             ControlRequest::Query,
             ControlRequest::SetAddress(SetAddress { address: None }),
             ControlRequest::RebasePull(RebasePull { node: node("c") }),
         ] {
             assert_eq!(request.required_scope(), None);
         }
+    }
+
+    #[test]
+    fn value_request_validate_enforces_bounds() {
+        assert_eq!(value_request().validate(), Ok(()));
+
+        // All-zero request id.
+        let mut zero_id = value_request();
+        zero_id.request_id = ValueRequestId::from_bytes([0u8; 16]);
+        assert_eq!(zero_id.validate(), Err(ControlError::ZeroValueRequestId));
+
+        // Zero amount.
+        let mut zero_amount = value_request();
+        zero_amount.amount = 0;
+        assert_eq!(
+            zero_amount.validate(),
+            Err(ControlError::FieldBelowMinimum {
+                field: "amount",
+                value: 0,
+                min: 1,
+            })
+        );
+
+        // Empty reason.
+        let mut empty_reason = value_request();
+        empty_reason.reason = String::new();
+        assert_eq!(
+            empty_reason.validate(),
+            Err(ControlError::EmptyValueReason)
+        );
+
+        // Oversized reason.
+        let mut long_reason = value_request();
+        long_reason.reason = "x".repeat(MAX_REASON_LEN + 1);
+        assert_eq!(
+            long_reason.validate(),
+            Err(ControlError::FieldTooLong {
+                field: "reason",
+                len: MAX_REASON_LEN + 1,
+                max: MAX_REASON_LEN,
+            })
+        );
+        // Exactly the bound is accepted.
+        long_reason.reason = "x".repeat(MAX_REASON_LEN);
+        assert_eq!(long_reason.validate(), Ok(()));
+
+        // Long account.
+        let mut long_account = value_request();
+        long_account.account = node(&"n".repeat(MAX_NODE_ID_LEN + 1));
+        assert_eq!(
+            long_account.validate(),
+            Err(ControlError::FieldTooLong {
+                field: "account",
+                len: MAX_NODE_ID_LEN + 1,
+                max: MAX_NODE_ID_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn value_request_id_displays_lowercase_hex() {
+        let id = ValueRequestId::from_bytes([
+            0x00, 0x0f, 0x10, 0xff, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+        ]);
+        assert_eq!(id.to_string(), "000f10ff0102030405060708090a0b0c");
+        assert_eq!(id.to_string().len(), 32);
+        assert!(!id.is_zero());
+        assert!(ValueRequestId::from_bytes([0u8; 16]).is_zero());
     }
 
     #[test]

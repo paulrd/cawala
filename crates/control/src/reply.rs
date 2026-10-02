@@ -12,8 +12,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use cawala_ledger::{LedgerPubKey, NodeId, OperatorPubKey};
+use cawala_ledger::{Hash, LedgerPubKey, NodeId, OperatorPubKey};
 use cawala_topology::{ChildKind, OctAddr};
+
+use crate::request::{AdminValueDirection, ValueRequestId};
 
 /// Maximum number of account rows a [`ControlReply::AdminLedgerSnapshot`]
 /// carries.
@@ -30,10 +32,12 @@ pub const CONTROL_ALPN: &[u8] = b"cawala/control/0";
 ///
 /// Bumped to 2 when the admin reply variants ([`ControlReply::AdminSnapshot`],
 /// [`ControlReply::AdminApproved`], [`ControlReply::AdminRejected`]) were
-/// appended, and to 3 when [`ControlReply::AdminLedgerSnapshot`] was appended
-/// (read-only ledger view). There is no on-wire reader pinned to this constant
-/// yet; it exists so a future reader can reject a mismatched frame up front.
-pub const CONTROL_REPLY_VERSION: u8 = 3;
+/// appended, to 3 when [`ControlReply::AdminLedgerSnapshot`] was appended
+/// (read-only ledger view), and to 4 when
+/// [`ControlReply::AdminValueApplied`] was appended (delegated value ops). There
+/// is no on-wire reader pinned to this constant yet; it exists so a future
+/// reader can reject a mismatched frame up front.
+pub const CONTROL_REPLY_VERSION: u8 = 4;
 
 /// The node's answer to one direct control request.
 ///
@@ -63,6 +67,41 @@ pub enum ControlReply {
     /// [`ControlRequest::AdminLedgerQuery`](crate::ControlRequest::AdminLedgerQuery):
     /// a read-only view of this node's ledger (variant 7, reply version 3).
     AdminLedgerSnapshot(AdminLedgerSnapshot),
+    /// Reply to
+    /// [`ControlRequest::AdminIssue`](crate::ControlRequest::AdminIssue) /
+    /// [`ControlRequest::AdminBurn`](crate::ControlRequest::AdminBurn): the
+    /// applied (or duplicate) value operation (variant 8, reply version 4).
+    AdminValueApplied(AdminValueApplied),
+}
+
+/// The outcome of a delegated issue/burn, for idempotent retries.
+///
+/// Field order is frozen: postcard encodes positionally. `duplicate` is `true`
+/// when the request id had already been applied with identical parameters;
+/// `seq`/`entry_hash` then describe the **original** application and nothing was
+/// appended. `balance_after`, by contrast, is always the account's current
+/// balance at reply time (the post-op balance for a fresh apply, or the balance
+/// as of the reply for a duplicate).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminValueApplied {
+    /// The client idempotency key echoed back.
+    pub request_id: ValueRequestId,
+    /// The affected child account.
+    pub account: NodeId,
+    /// Whether value was created or destroyed.
+    pub direction: AdminValueDirection,
+    /// The amount applied.
+    pub amount: u64,
+    /// The account's liability balance **at reply time**: the post-op balance
+    /// for a fresh apply, or the balance as of the reply for a duplicate (the
+    /// duplicate appends nothing).
+    pub balance_after: u64,
+    /// The ledger sequence of the applied (or original) entry.
+    pub seq: u64,
+    /// The hash of the applied (or original) entry.
+    pub entry_hash: Hash,
+    /// Whether this reply replayed a prior identical application.
+    pub duplicate: bool,
 }
 
 /// A read-only view of one node's ledger, for a value-scoped admin.
@@ -143,6 +182,11 @@ pub enum RejectCode {
     Replay,
     /// An internal error occurred; the request was not applied.
     Internal,
+    /// A value operation exceeded an operator-configured limit.
+    LimitExceeded,
+    /// A burn exceeded the account's current balance (or the account is
+    /// unopened).
+    InsufficientBalance,
 }
 
 /// A point-in-time view of a node's control state.
@@ -276,6 +320,8 @@ mod tests {
             ControlReply::Rejected(RejectCode::Expired),
             ControlReply::Rejected(RejectCode::Replay),
             ControlReply::Rejected(RejectCode::Internal),
+            ControlReply::Rejected(RejectCode::LimitExceeded),
+            ControlReply::Rejected(RejectCode::InsufficientBalance),
             ControlReply::Snapshot(snapshot()),
             ControlReply::AdminSnapshot(admin_snapshot()),
             ControlReply::AdminApproved(AdminApproved {
@@ -289,7 +335,21 @@ mod tests {
                 delivery: DeliveryStatus::Rejected(RejectCode::Unauthorized),
             }),
             ControlReply::AdminLedgerSnapshot(admin_ledger_snapshot()),
+            ControlReply::AdminValueApplied(admin_value_applied()),
         ]
+    }
+
+    fn admin_value_applied() -> AdminValueApplied {
+        AdminValueApplied {
+            request_id: ValueRequestId::from_bytes([9u8; 16]),
+            account: node("child-a"),
+            direction: AdminValueDirection::Issue,
+            amount: 25,
+            balance_after: 85,
+            seq: 12,
+            entry_hash: cawala_ledger::Hash::from_bytes([0xab; 32]),
+            duplicate: false,
+        }
     }
 
     fn ledger_pubkey() -> LedgerPubKey {
@@ -411,6 +471,40 @@ mod tests {
         let reply = ControlReply::AdminLedgerSnapshot(admin_ledger_snapshot());
         let bytes = postcard::to_allocvec(&reply).unwrap();
         assert_eq!(bytes[0], 7, "AdminLedgerSnapshot must stay discriminant 7");
+    }
+
+    #[test]
+    fn admin_value_applied_reply_discriminant_is_frozen() {
+        let reply = ControlReply::AdminValueApplied(admin_value_applied());
+        let bytes = postcard::to_allocvec(&reply).unwrap();
+        assert_eq!(bytes[0], 8, "AdminValueApplied must stay discriminant 8");
+    }
+
+    #[test]
+    fn admin_value_applied_golden_field_order() {
+        let applied = admin_value_applied();
+        assert_postcard_field_order(
+            &applied,
+            &[
+                postcard::to_allocvec(&applied.request_id).unwrap(),
+                postcard::to_allocvec(&applied.account).unwrap(),
+                postcard::to_allocvec(&applied.direction).unwrap(),
+                postcard::to_allocvec(&applied.amount).unwrap(),
+                postcard::to_allocvec(&applied.balance_after).unwrap(),
+                postcard::to_allocvec(&applied.seq).unwrap(),
+                postcard::to_allocvec(&applied.entry_hash).unwrap(),
+                postcard::to_allocvec(&applied.duplicate).unwrap(),
+            ],
+        );
+    }
+
+    #[test]
+    fn new_reject_codes_round_trip() {
+        for code in [RejectCode::LimitExceeded, RejectCode::InsufficientBalance] {
+            let bytes = postcard::to_allocvec(&code).unwrap();
+            let back: RejectCode = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(back, code);
+        }
     }
 
     #[test]

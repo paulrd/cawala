@@ -2624,6 +2624,278 @@ export async function adminMoveChild(childEndpointId, slot = null, nodeId = unde
   return { status: 'moved', child: childEndpointId, slot: slot ?? null };
 }
 
+// ── Delegated value administration (P5) ───────────────────────
+
+/** localStorage key for the single in-flight value operation. */
+export const VALUE_PENDING_KEY = 'cawala.value.pending.v1';
+
+/**
+ * Whether the current administered-node capabilities permit a value operation:
+ * a value scope on a **non-self** target. Pure, so it is unit-testable.
+ * @param {{ isSelf?: boolean }|null|undefined} view
+ * @param {{ scopes?: { value?: boolean } }|null|undefined} caps
+ * @returns {boolean}
+ */
+export function canAdministerValue(view, caps) {
+  return Boolean(view != null && !view.isSelf && caps?.scopes?.value);
+}
+
+/** Reject-code → honest user-facing value error copy. */
+const VALUE_REJECT_MESSAGES = {
+  limit_exceeded:
+    'The node refused this operation: it exceeds the operator\u2019s per-request, window, or account limit.',
+  insufficient_balance: 'That burn exceeds the account\u2019s current balance.',
+  unauthorized:
+    'Value grant expired or revoked. Ask the node operator to grant value scope.',
+  not_found: 'That account is no longer a child of this node. Refresh and try again.',
+  bad_request:
+    'The node refused this value operation (check the amount and reason).',
+  expired: 'The request expired before it reached the node. Try again.',
+  replay: 'A duplicate frame was refused. Check the pending operation below.',
+  internal: 'The node could not apply the change (internal error).',
+};
+
+/**
+ * Map an `admin request rejected: <code>` (or other) error message to honest
+ * value copy. Pure, so it is unit-testable.
+ * @param {string} raw
+ * @returns {string}
+ */
+export function valueErrorMessage(raw) {
+  const message = String(raw ?? '');
+  const marker = 'admin request rejected: ';
+  const index = message.indexOf(marker);
+  const code = index >= 0 ? message.slice(index + marker.length).trim() : '';
+  const friendly = VALUE_REJECT_MESSAGES[code];
+  if (friendly) return friendly;
+  return message && !message.startsWith(marker)
+    ? message
+    : 'Value operation failed. Refresh and try again.';
+}
+
+/**
+ * Wrap [`valueErrorMessage`] in an `Error`.
+ * @param {any} err
+ * @returns {Error}
+ */
+function _valueError(err) {
+  return new Error(valueErrorMessage(err?.message ?? err));
+}
+
+/** Resolve a localStorage-like object, or null when unavailable. */
+function _persistenceStore() {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) return window.localStorage;
+  } catch {
+    /* ignore */
+  }
+  try {
+    if (typeof globalThis !== 'undefined' && globalThis.localStorage) return globalThis.localStorage;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+/**
+ * The single in-flight value operation, or null. Persisted **before** the wasm
+ * call so a reload/timeout can retry with the same idempotency key.
+ * @returns {{ requestId: string, target: string, direction: 'issue'|'burn', account: string, amount: number, reason: string, at: number }|null}
+ */
+export function readPendingValueOp() {
+  const store = _persistenceStore();
+  if (!store) return null;
+  let raw = null;
+  try {
+    raw = store.getItem(VALUE_PENDING_KEY);
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (
+      parsed &&
+      typeof parsed.requestId === 'string' &&
+      parsed.requestId.length === 32 &&
+      typeof parsed.target === 'string' &&
+      (parsed.direction === 'issue' || parsed.direction === 'burn') &&
+      typeof parsed.account === 'string' &&
+      Number.isFinite(parsed.amount) &&
+      typeof parsed.reason === 'string'
+    ) {
+      return parsed;
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+/**
+ * Clear the in-flight value operation. With no `requestId`, clears it
+ * unconditionally; with one, clears only when it matches.
+ * @param {string} [requestId]
+ */
+export function clearPendingValueOp(requestId = undefined) {
+  const store = _persistenceStore();
+  if (!store) return;
+  try {
+    if (requestId != null) {
+      const pending = readPendingValueOp();
+      if (!pending || pending.requestId !== requestId) return;
+    }
+    store.removeItem(VALUE_PENDING_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Persist the in-flight value operation (best-effort). */
+function _savePendingValueOp(pending) {
+  const store = _persistenceStore();
+  if (!store) return;
+  try {
+    store.setItem(VALUE_PENDING_KEY, JSON.stringify(pending));
+  } catch {
+    /* ignore */
+  }
+}
+
+/** A fresh 16-byte idempotency key as 32 lowercase hex characters. */
+function _randomRequestId() {
+  return _randomHex32().slice(0, 32);
+}
+
+/**
+ * Run one delegated value operation (issue or burn), persisting the
+ * idempotency key before the call and clearing it only once the node confirms
+ * the operation (applied or duplicate).
+ * @param {'issue'|'burn'} direction
+ * @param {string} account
+ * @param {number} amount
+ * @param {string} reason
+ * @param {string} [nodeId]
+ * @param {string} [reuseRequestId] reuse a persisted idempotency key (retry)
+ */
+async function _adminValue(
+  direction,
+  account,
+  amount,
+  reason,
+  nodeId = undefined,
+  reuseRequestId = undefined,
+) {
+  const target = _normalizeTarget(nodeId);
+  const requestId = reuseRequestId ?? _randomRequestId();
+  const pending = {
+    requestId,
+    target,
+    direction,
+    account,
+    amount,
+    reason,
+    at: Date.now(),
+  };
+
+  if (_useMock) {
+    await mockDelay(500);
+    _savePendingValueOp(pending);
+    clearPendingValueOp(requestId);
+    return {
+      status: 'applied',
+      requestId,
+      account,
+      direction,
+      amount,
+      balanceAfter: amount,
+      seq: 1,
+      entryHash: '00'.repeat(32),
+      duplicate: false,
+    };
+  }
+
+  if (!canAdministerValue(administeredNode, adminCapabilities)) {
+    throw new AdminUnavailableError('admin value operation (value)');
+  }
+  const entry = adminKeys.findAdminNode(target);
+  if (!entry || entry.expiresAt <= Date.now()) {
+    throw new AdminUnavailableError('admin value operation (grant expired or missing)');
+  }
+  const node = _ensureAdminKey(target, entry);
+
+  // Persist BEFORE sending so a reload/timeout retries the same logical op.
+  _savePendingValueOp(pending);
+  try {
+    const dto =
+      direction === 'issue'
+        ? await node.admin_issue(target, requestId, account, amount, reason, entry.nodeAddr ?? null)
+        : await node.admin_burn(target, requestId, account, amount, reason, entry.nodeAddr ?? null);
+    const result = {
+      status: dto.duplicate ? 'duplicate' : 'applied',
+      requestId: dto.request_id,
+      account: dto.account,
+      direction: dto.direction,
+      amount: dto.amount,
+      balanceAfter: dto.balance_after,
+      seq: dto.seq,
+      entryHash: dto.entry_hash,
+      duplicate: dto.duplicate,
+    };
+    try {
+      dto.free?.();
+    } finally {
+      // Clear only after the node confirmed the operation.
+      clearPendingValueOp(requestId);
+    }
+    return result;
+  } catch (err) {
+    // Keep the pending record so the UI can Retry / Discard.
+    throw _valueError(err);
+  }
+}
+
+/**
+ * Issue `amount` into `account` on the administered node (value scope).
+ * @param {string} account
+ * @param {number} amount
+ * @param {string} reason
+ * @param {string} [nodeId]
+ */
+export async function adminIssue(account, amount, reason, nodeId = undefined) {
+  return _adminValue('issue', account, amount, reason, nodeId);
+}
+
+/**
+ * Burn `amount` from `account` on the administered node (value scope).
+ * @param {string} account
+ * @param {number} amount
+ * @param {string} reason
+ * @param {string} [nodeId]
+ */
+export async function adminBurn(account, amount, reason, nodeId = undefined) {
+  return _adminValue('burn', account, amount, reason, nodeId);
+}
+
+/**
+ * Retry the persisted in-flight value operation (if any) against the current
+ * selection. On success the pending record is cleared; on failure it is kept.
+ * @returns {Promise<object|null>}
+ */
+export async function retryPendingValueOp() {
+  const pending = readPendingValueOp();
+  if (!pending) return null;
+  const result = await _adminValue(
+    pending.direction,
+    pending.account,
+    pending.amount,
+    pending.reason,
+    pending.target,
+    pending.requestId,
+  );
+  return result;
+}
+
 /**
  * Leave the current parent network.
  *

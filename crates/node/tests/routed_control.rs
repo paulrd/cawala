@@ -19,12 +19,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cawala_control::{
     ADMIN_GRANT_V1_VERSION, ADMIN_GRANT_VERSION, AdminDetachChild, AdminGrant, AdminGrantV2,
-    AdminJoinApprove, AdminMoveChild, AdminScope, AdminScopes, CONTROL_REQUEST_TTL_SECS, ChildKind,
-    ControlReply,
-    ControlRequest, DEFAULT_ADMIN_TTL_SECS, DeliveryStatus, JoinApproval, JoinRejection, JoinRequest,
+    AdminJoinApprove, AdminMoveChild, AdminScope, AdminScopes, AdminValueDirection,
+    AdminValueRequest, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest,
+    DEFAULT_ADMIN_TTL_SECS, DeliveryStatus, JoinApproval, JoinRejection, JoinRequest,
     MAX_CONTROL_FRAME, MAX_VALUE_ADMIN_TTL_SECS, NodeId, OperatorSecretKey, ROUTED_CONTROL_VERSION,
     RejectCode, RoutedControlV1, RoutedForward, SignedAdminGrant, SignedAdminGrantV2,
-    SignedControl, SignedRoutedReply,
+    SignedControl, SignedRoutedReply, ValueRequestId,
 };
 use cawala_ledger::{LedgerPubKey, LedgerSecretKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::{AckStatus, Envelope, MSG_CONTROL_V1, MsgId, PeerRef, RejectReason};
@@ -36,7 +36,9 @@ use cawala_node::msg::{
 };
 use cawala_node::admin_store::{ADMINS_FILE, StoredGrant};
 use cawala_node::record::RecordStore;
-use cawala_node::{AdminStore, LedgerService, OutboundKind};
+use cawala_node::{
+    AdminStore, LedgerService, OutboundKind, VALUE_POLICY_VERSION, ValueLimits, ValuePolicy,
+};
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
@@ -1167,6 +1169,106 @@ async fn routed_admin_move_failed_notice_is_requeued() {
     assert_eq!(pending.len(), 1, "the failed routed notice must be requeued");
     assert_eq!(pending[0].kind, OutboundKind::Rebase);
     assert_eq!(pending[0].target, node("ghost-node"));
+}
+
+/// (P5) A routed v7 `AdminIssue` executes at the destination and returns a
+/// verified `AdminValueApplied`; a retry with the same `request_id` dedupes.
+#[tokio::test]
+async fn routed_admin_issue_returns_verified_and_retry_dedupes() {
+    let w = world();
+    let lookup = MemoryLookup::new();
+    let mut nodes = build_world(&w, &lookup).await;
+    let [root, _a, _b, u] = &mut nodes[..] else {
+        panic!("world shape")
+    };
+
+    // Persist the root identity, attach a ledger, and write a value policy.
+    let dir = root.control.lock().await.data_dir().to_path_buf();
+    cawala_node::identity::persist_secret_key(&dir, &w.root_key).unwrap();
+    let ledger = LedgerService::open(&dir, &w.root_id).unwrap();
+    root.control
+        .lock()
+        .await
+        .attach_ledger(Arc::new(Mutex::new(ledger)));
+    ValuePolicy {
+        version: VALUE_POLICY_VERSION,
+        defaults: ValueLimits {
+            per_request_max: 1_000,
+            window_secs: 86_400,
+            window_max: 1_000,
+            per_account_max: 1_000,
+        },
+        admins: std::collections::BTreeMap::new(),
+    }
+    .save(&dir)
+    .unwrap();
+
+    root.control
+        .lock()
+        .await
+        .grant_admin(admin_grant_v2(
+            &w.root_id,
+            &w.root_op,
+            &w.admin_op,
+            AdminScopes {
+                joins: false,
+                topology: false,
+                value: true,
+            },
+        ))
+        .expect("grant value admin");
+
+    // The same request id is reused across both attempts (the retry path).
+    let issue = || {
+        ControlRequest::AdminIssue(AdminValueRequest {
+            request_id: ValueRequestId::from_bytes([11u8; 16]),
+            account: node(&w.a_id),
+            amount: 30,
+            reason: "routed issue".to_string(),
+        })
+    };
+
+    let intent = admin_intent(&w.root_id, &w.admin_op, issue());
+    let forward = own_forward(u, &intent.request).await;
+    let request = routed(
+        peer("0", &w.root_id),
+        peer("0.1.3", &w.u_id),
+        intent,
+        None,
+        vec![forward],
+    );
+    assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
+
+    let signed = recv_signed_reply(u).await;
+    signed
+        .verify(&w.root_op.public())
+        .expect("reply verifies under the root operator");
+    let ControlReply::AdminValueApplied(first) = signed.reply.reply else {
+        panic!("expected AdminValueApplied, got {:?}", signed.reply.reply);
+    };
+    assert_eq!(first.direction, AdminValueDirection::Issue);
+    assert_eq!(first.amount, 30);
+    assert!(!first.duplicate);
+
+    // Retry: same request_id/params, fresh control nonce -> duplicate.
+    let intent = admin_intent(&w.root_id, &w.admin_op, issue());
+    let forward = own_forward(u, &intent.request).await;
+    let request = routed(
+        peer("0", &w.root_id),
+        peer("0.1.3", &w.u_id),
+        intent,
+        None,
+        vec![forward],
+    );
+    assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
+    let signed = recv_signed_reply(u).await;
+    signed.verify(&w.root_op.public()).unwrap();
+    let ControlReply::AdminValueApplied(second) = signed.reply.reply else {
+        panic!("expected AdminValueApplied");
+    };
+    assert!(second.duplicate);
+    assert_eq!(second.seq, first.seq);
+    assert_eq!(second.entry_hash, first.entry_hash);
 }
 
 /// (4) A request whose `target.node` or `requester` disagrees with the envelope

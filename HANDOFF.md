@@ -192,21 +192,25 @@ how to verify, and conventions**. Detail lives elsewhere:
   `cargo test --workspace` and `cargo clippy --workspace --all-targets`.
 - `.slim/clonedeps/repos/` holds pinned read-only iroh source.
 - Hard breaks — recreate `node-data` and rebuild the wasm bundle when they
-  change: **control format 6** (mint 6; accept 5|6; v4 dropped),
+  change: **control format 7** (mint 7; accept 6|7; v5 dropped),
   **admin grant format 2** (a v2 `admins.json`
   row is not readable by a pre-P2 node binary - upgrade the binary before
   minting a v2 grant; v1 rows and P1 browsers keep working, joins-only),
   ledger (entry/signed) format 4, node on-disk
   ledger meta format 3, settlement payload 3, browser ledger payload 3. Control
-  mints v6 and accepts v5|v6 **inbound**; the v6-only topology-admin variants
-  (`AdminDetachChild`/`AdminMoveChild`) cannot reach a v5 peer (unknown postcard
+  mints v7 and accepts v6|v7 **inbound**; the v7-only value variants
+  (`AdminIssue`/`AdminBurn`) cannot reach a v6 peer (unknown postcard
   discriminant), so rebuild the wasm bundle with the node; pre-existing requests
-  stay compatible from v5 browsers (per-peer negotiation was assessed and
-  deferred — see above; `AdminLedgerQuery` is v5-introduced, and `MoveChild`/
-  `Rebase`/`Exit` are v4-introduced). Admin redelivery now re-signs the
-  retained request with a fresh nonce/expiry instead of re-sending the stored
-  (possibly expired) frame. Settlement v3 rejects v2 inbound, so node↔node
-  settlement is lockstep (same precedent as v1→v2).
+  stay compatible from v6 browsers (per-peer negotiation was assessed and
+  deferred — see above; `AdminDetachChild`/`AdminMoveChild` are v6-introduced,
+  `AdminLedgerQuery` is v5-introduced, and `MoveChild`/`Rebase`/`Exit` are
+  v4-introduced). Delegated value ops are idempotent end-to-end (a 16-byte
+  `request_id` -> ledger-derived nonce/index) and bounded by
+  `<data-dir>/value_policy.json`, which is deny-by-default when absent (no
+  `node-data` recreation needed). Admin redelivery now re-signs the retained
+  request with a fresh nonce/expiry instead of re-sending the stored (possibly
+  expired) frame. Settlement v3 rejects v2 inbound, so node↔node settlement is
+  lockstep (same precedent as v1→v2).
 - `web/src/wasm/` is gitignored; run `npm run build:wasm` after any
   `crates/client-wasm` change or the JS/wasm arity can desync.
 - Control-plane local state under `<data-dir>`: `control_seen.json` (durable

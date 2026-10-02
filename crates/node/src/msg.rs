@@ -47,7 +47,8 @@ use cawala_msg::{
 use cawala_topology::ChildKind;
 
 use crate::control::{
-    ControlNode, Handled, deliver_outbound_decisions, execute_ledger_query, now_unix_seconds,
+    ControlNode, Handled, deliver_outbound_decisions, execute_ledger_mutation,
+    execute_ledger_query, now_unix_seconds,
 };
 
 use crate::ledger_service::{ApplyOutcome, HopOutcome, LedgerService};
@@ -1728,6 +1729,17 @@ pub async fn dispatch_control_envelope(
             // `execute_ledger_query` returns only after releasing the ledger
             // guard; only then do we re-lock the engine to audit.
             let reply = execute_ledger_query(ledger, &pending).await;
+            {
+                let engine = control.lock().await;
+                engine.audit_request(&intent_for_audit, &reply, now);
+                engine.audit_routed(now, kind, &reply, &requester_node, &forwarder, hops);
+            }
+            reply
+        }
+        Handled::LedgerMutation(pending) => {
+            // Same two-phase shape: execute the mutation after the engine guard
+            // is dropped, then re-lock only to audit.
+            let reply = execute_ledger_mutation(ledger, &data_dir, &pending, now).await;
             {
                 let engine = control.lock().await;
                 engine.audit_request(&intent_for_audit, &reply, now);

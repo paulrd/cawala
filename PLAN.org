@@ -1117,6 +1117,49 @@
      removed from the record, so it learns of the detach on its next
      interaction (the P2 retry sweep cannot help a detached target).
 
+** P5 - delivered 2026-10-02 (delegated value administration; control 7, reply 4)
+   - Control (`cawala-control`): `AdminIssue`/`AdminBurn` (discriminants 19/20)
+     carry `AdminValueRequest { request_id: ValueRequestId, account, amount,
+     reason }` with `required_scope -> Value`; `ControlReply::AdminValueApplied`
+     (8) plus `RejectCode::{LimitExceeded, InsufficientBalance}`.
+     `CONTROL_FORMAT_VERSION` 6 -> 7 (mint 7, accept 6|7); `CONTROL_REPLY_VERSION`
+     3 -> 4; `min_control_version` arms -> 7.
+   - Node (`cawala-node`): `<data-dir>/value_policy.json` (`VALUE_POLICY_VERSION`
+     1, deny-by-default) bounds each op; `LedgerService::burn` mirrors `fund`
+     (no auto-open, `InsufficientBalance`), and `admin_value_apply` executes
+     issue/burn under the exclusive ledger lock with an **end-to-end idempotency**
+     guard: a 16-byte `request_id` derives a controller-bound ledger nonce
+     (`BLAKE3("cawala-node/admin-value/v1", controller_pub ‖ request_id)`), and a
+     ledger-derived `ValueIndex` keyed `(node_operator, nonce)` returns the prior
+     `(seq, entry_hash)` without appending on a duplicate (survives reopen; no
+     sidecar, never evicted). Caps are enforced in the engine (early per-request)
+     and authoritatively in the service (per-request, node-wide Issue window,
+     per-account ceiling, burn overdraw). The executor writes a **fail-closed
+     intent audit line** before touching the ledger (failure -> `Internal`, no
+     append) and a best-effort outcome line. The browser never holds
+     operator/ledger keys: the node builds/signs `IssueRequest`/`BurnRequest`
+     with its own keys, and no request field is a signature/key/posting.
+   - Browser/CLI: wasm `ClientNode::admin_issue`/`admin_burn` +
+     `AdminValueAppliedDto`; `api.adminIssue`/`adminBurn` persist a single
+     in-flight op (`cawala.value.pending.v1`) before sending and clear it only on
+     `AdminValueApplied`, with Retry/Discard on load; AccountsPage liability rows
+     gain Issue/Burn confirmations (mandatory reason). CLI
+     `control admin value-policy show|set`; `grant --scope value` reminds the
+     operator.
+   - Version matrix: `CONTROL_FORMAT_VERSION` 7, `CONTROL_REPLY_VERSION` 4,
+     `ROUTED_*` 1; no ledger/entry/settlement change and **no `node-data`
+     recreation** (the policy file is new and absent-is-deny). Hard break: a v6
+     node cannot decode discriminants 19/20, so rebuild the wasm bundle with the
+     node.
+   - Residual: value ops are node-asserted against its own books; a value-scoped
+     K_admin is an XSS-away mint until seed-at-rest hardening (P6). The value
+     index is keyed `(node_operator, nonce)`, so rotating the node operator key
+     while retaining the ledger makes old delegated records unmatchable - a retry
+     after re-granting could re-apply (outside the threat model, but noted).
+     `AdminValueApplied.balance_after` is the account's balance **at reply
+     time** (post-op for a fresh apply, current for a duplicate), not the
+     original application's post-op balance.
+
 ** Authority and value-op requirements (essential)
    - *Scope separation*: each admin request declares its required scope; grant
      management stays self-operator/CLI only (a delegated admin must never

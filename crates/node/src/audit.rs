@@ -19,24 +19,32 @@ pub const CONTROL_AUDIT_FILE: &str = "control_audit.jsonl";
 ///
 /// A non-object `event` is still written as a bare JSON line. Any failure is
 /// silently ignored.
-pub fn append(data_dir: &Path, mut event: serde_json::Value) {
+pub fn append(data_dir: &Path, event: serde_json::Value) {
+    let _ = try_append(data_dir, event);
+}
+
+/// Append `event` as one JSON line and **flush it to disk**, returning any I/O
+/// or encoding failure.
+///
+/// Unlike [`append`], this is fail-closed: the value-executor uses it for the
+/// write-ahead intent line, where an unrecorded intent must abort the operation
+/// before the ledger is touched.
+pub fn try_append(data_dir: &Path, mut event: serde_json::Value) -> std::io::Result<()> {
     if let Some(object) = event.as_object_mut() {
         object
             .entry("ts")
             .or_insert_with(|| serde_json::json!(now_unix_seconds()));
     }
-    let line = match serde_json::to_string(&event) {
-        Ok(line) => line,
-        Err(_) => return,
-    };
+    let line = serde_json::to_string(&event)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
     let path = data_dir.join(CONTROL_AUDIT_FILE);
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(file, "{line}");
-    }
+        .open(&path)?;
+    writeln!(file, "{line}")?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Current time as unix seconds.

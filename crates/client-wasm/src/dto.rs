@@ -8,8 +8,9 @@
 
 use cawala_control::{
     AdminApproved, AdminGrantBundleV1, AdminLedgerAccount, AdminLedgerSnapshot, AdminPendingJoin,
-    AdminRejected, AdminScope, AdminScopes, AdminSnapshot, ChildKind, DeliveryStatus, Invite,
-    NodeId, NodeSnapshot, OperatorPubKey, RejectCode,
+    AdminRejected, AdminScope, AdminScopes, AdminSnapshot, AdminValueApplied, AdminValueDirection,
+    ChildKind, DeliveryStatus, Invite, NodeId, NodeSnapshot, OperatorPubKey, RejectCode,
+    ValueRequestId,
 };
 use cawala_ledger::{Hash, LedgerPubKey};
 use cawala_msg::OctAddr;
@@ -53,6 +54,16 @@ pub(crate) fn reject_code_str(code: RejectCode) -> &'static str {
         RejectCode::Expired => "expired",
         RejectCode::Replay => "replay",
         RejectCode::Internal => "internal",
+        RejectCode::LimitExceeded => "limit_exceeded",
+        RejectCode::InsufficientBalance => "insufficient_balance",
+    }
+}
+
+/// Stable JS string for an [`AdminValueDirection`] (never `Debug`).
+pub(crate) fn value_direction_str(direction: AdminValueDirection) -> &'static str {
+    match direction {
+        AdminValueDirection::Issue => "issue",
+        AdminValueDirection::Burn => "burn",
     }
 }
 
@@ -1448,6 +1459,87 @@ impl AdminLedgerSnapshotDto {
     }
 }
 
+/// The outcome of a delegated issue/burn, as returned by
+/// [`crate::ClientNode::admin_issue`] / [`crate::ClientNode::admin_burn`].
+#[wasm_bindgen]
+pub struct AdminValueAppliedDto {
+    request_id: String,
+    account: String,
+    direction: String,
+    amount: f64,
+    balance_after: f64,
+    seq: f64,
+    entry_hash: String,
+    duplicate: bool,
+}
+
+impl AdminValueAppliedDto {
+    /// Convert an `AdminValueApplied` reply.
+    pub(crate) fn from_applied(applied: &AdminValueApplied) -> Self {
+        AdminValueAppliedDto {
+            request_id: applied.request_id.to_string(),
+            account: applied.account.as_str().to_string(),
+            direction: value_direction_str(applied.direction).to_string(),
+            amount: applied.amount as f64,
+            balance_after: applied.balance_after as f64,
+            seq: applied.seq as f64,
+            entry_hash: applied.entry_hash.to_hex(),
+            duplicate: applied.duplicate,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl AdminValueAppliedDto {
+    /// The client idempotency key, 32 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn request_id(&self) -> String {
+        self.request_id.clone()
+    }
+
+    /// The affected child account.
+    #[wasm_bindgen(getter)]
+    pub fn account(&self) -> String {
+        self.account.clone()
+    }
+
+    /// `"issue"` or `"burn"`.
+    #[wasm_bindgen(getter)]
+    pub fn direction(&self) -> String {
+        self.direction.clone()
+    }
+
+    /// The applied amount.
+    #[wasm_bindgen(getter)]
+    pub fn amount(&self) -> f64 {
+        self.amount
+    }
+
+    /// The account's liability balance after the operation.
+    #[wasm_bindgen(getter)]
+    pub fn balance_after(&self) -> f64 {
+        self.balance_after
+    }
+
+    /// The applied (or original) entry's ledger sequence (as an `f64`).
+    #[wasm_bindgen(getter)]
+    pub fn seq(&self) -> f64 {
+        self.seq
+    }
+
+    /// The applied (or original) entry's hash, 64 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn entry_hash(&self) -> String {
+        self.entry_hash.clone()
+    }
+
+    /// Whether this replayed a prior identical application (nothing appended).
+    #[wasm_bindgen(getter)]
+    pub fn duplicate(&self) -> bool {
+        self.duplicate
+    }
+}
+
 /// Parse a 64-hex operator public key.
 ///
 /// Returns a plain [`String`] error (not [`JsError`]) so the error paths are
@@ -1466,6 +1558,31 @@ pub(crate) fn parse_ledger_hex(raw: &str) -> Result<LedgerPubKey, String> {
     let bytes = decode_hex_32(raw)
         .ok_or_else(|| "ledger key must be exactly 64 hex characters".to_string())?;
     LedgerPubKey::from_bytes(&bytes).map_err(|err| err.to_string())
+}
+
+/// Parse a 32-hex `ValueRequestId`.
+///
+/// Returns a plain [`String`] error (not [`JsError`]) so the error paths are
+/// testable on native targets; the wasm boundary wraps it with [`to_js_err`].
+pub(crate) fn parse_request_id_hex(raw: &str) -> Result<ValueRequestId, String> {
+    let bytes = decode_hex_16(raw)
+        .ok_or_else(|| "request_id must be exactly 32 hex characters".to_string())?;
+    Ok(ValueRequestId::from_bytes(bytes))
+}
+
+/// Decode 32 hex digits into 16 bytes.
+fn decode_hex_16(raw: &str) -> Option<[u8; 16]> {
+    let raw = raw.as_bytes();
+    if raw.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        let hi = hex_nibble(raw[i * 2])?;
+        let lo = hex_nibble(raw[i * 2 + 1])?;
+        *byte = (hi << 4) | lo;
+    }
+    Some(bytes)
 }
 
 /// Decode 64 hex digits into 32 bytes.
@@ -2083,6 +2200,40 @@ mod tests {
         assert_eq!(dto.accounts[63].balance, 63.0);
         assert!(dto.root);
         assert!(!dto.truncated);
+    }
+
+    #[test]
+    fn admin_value_applied_dto_maps_fields() {
+        let applied = AdminValueApplied {
+            request_id: ValueRequestId::from_bytes([0xab; 16]),
+            account: node("child-a"),
+            direction: AdminValueDirection::Issue,
+            amount: 25,
+            balance_after: 75,
+            seq: 12,
+            entry_hash: Hash::from_bytes([0xcd; 32]),
+            duplicate: true,
+        };
+        let dto = AdminValueAppliedDto::from_applied(&applied);
+        assert_eq!(dto.request_id, "ab".repeat(16));
+        assert_eq!(dto.account, "child-a");
+        assert_eq!(dto.direction, "issue");
+        assert_eq!(dto.amount, 25.0);
+        assert_eq!(dto.balance_after, 75.0);
+        assert_eq!(dto.seq, 12.0);
+        assert_eq!(dto.entry_hash, "cd".repeat(32));
+        assert!(dto.duplicate);
+    }
+
+    #[test]
+    fn value_direction_and_request_id_are_stable() {
+        assert_eq!(value_direction_str(AdminValueDirection::Issue), "issue");
+        assert_eq!(value_direction_str(AdminValueDirection::Burn), "burn");
+
+        let id = ValueRequestId::from_bytes([0x01; 16]);
+        assert_eq!(parse_request_id_hex(&id.to_string()).unwrap(), id);
+        assert!(parse_request_id_hex("00").is_err());
+        assert!(parse_request_id_hex(&"z".repeat(32)).is_err());
     }
 
     #[test]

@@ -67,14 +67,16 @@ pub use claim::{
 pub use invite::{INVITE_SCHEME, Invite, InviteError};
 pub use reply::{
     AdminApproved, AdminLedgerAccount, AdminLedgerSnapshot, AdminPendingJoin, AdminRejected,
-    AdminSnapshot, CONTROL_ALPN, CONTROL_REPLY_VERSION, ChildSnapshot, ControlReply, DeliveryStatus,
-    MAX_ADMIN_LEDGER_ACCOUNTS, NodeSnapshot, ParentSnapshot, RejectCode,
+    AdminSnapshot, AdminValueApplied, CONTROL_ALPN, CONTROL_REPLY_VERSION, ChildSnapshot,
+    ControlReply, DeliveryStatus, MAX_ADMIN_LEDGER_ACCOUNTS, NodeSnapshot, ParentSnapshot,
+    RejectCode,
 };
 pub use request::{
     AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminMoveChild, AdminRedeliverJoin,
-    ControlRequest, CreateChild, DetachChild, DetachNotice, ExitRequest, JoinApproval, JoinRejection,
-    JoinRequest, MAX_LOCATION_HINT_LEN, MAX_NODE_ID_LEN, MAX_REASON_LEN, MoveChild, RebaseNotice,
-    RebasePull, SetAddress, is_admin_request,
+    AdminValueDirection, AdminValueRequest, ControlRequest, CreateChild, DetachChild, DetachNotice,
+    ExitRequest, JoinApproval, JoinRejection, JoinRequest, MAX_LOCATION_HINT_LEN, MAX_NODE_ID_LEN,
+    MAX_REASON_LEN, MoveChild, RebaseNotice, RebasePull, SetAddress, ValueRequestId,
+    is_admin_request,
 };
 pub use routed::{
     MAX_ROUTED_FORWARDS, ROUTED_CONTROL_VERSION, ROUTED_REPLY_CONTEXT, ROUTED_REPLY_VERSION,

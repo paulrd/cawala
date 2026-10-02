@@ -370,6 +370,7 @@ name = "cawala-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "cawala-control",
  "cawala-ledger",
  "cawala-msg",

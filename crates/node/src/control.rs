@@ -29,14 +29,15 @@ use tracing::{info, warn};
 
 use cawala_control::{
     AdminApproved, AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminMoveChild,
-    AdminPendingJoin, AdminRedeliverJoin, AdminRejected, AdminScopes, AdminSnapshot, CONTROL_ALPN,
-    CONTROL_REQUEST_MAX_TTL_SECS, CONTROL_REQUEST_TTL_SECS, ChildKind, ChildSnapshot, ControlError,
-    ControlReply, ControlRequest, CreateChild, DeliveryStatus, DetachChild, DetachNotice,
-    ExitRequest, Invite, JoinApproval, JoinRejection, JoinRequest, MAX_CONTROL_FRAME, MoveChild,
-    NodeId, NodeSnapshot, OctAddr, OperatorPubKey, OperatorSecretKey, ParentSnapshot,
-    ROUTED_REPLY_VERSION, RebaseNotice, RebasePull, RejectCode, RoutedControlV1, RoutedForward,
-    RoutedReplyV1, SetAddress, SignedControl, SignedRoutedReply, is_admin_request,
-    is_supported_control_version, min_control_version, senior_child, verify_control,
+    AdminPendingJoin, AdminRedeliverJoin, AdminRejected, AdminScopes, AdminSnapshot, AdminValueApplied,
+    AdminValueDirection, AdminValueRequest, CONTROL_ALPN, CONTROL_REQUEST_MAX_TTL_SECS,
+    CONTROL_REQUEST_TTL_SECS, ChildKind, ChildSnapshot, ControlError, ControlReply, ControlRequest,
+    CreateChild, DeliveryStatus, DetachChild, DetachNotice, ExitRequest, Invite, JoinApproval,
+    JoinRejection, JoinRequest, MAX_CONTROL_FRAME, MoveChild, NodeId, NodeSnapshot, OctAddr,
+    OperatorPubKey, OperatorSecretKey, ParentSnapshot, ROUTED_REPLY_VERSION, RebaseNotice,
+    RebasePull, RejectCode, RoutedControlV1, RoutedForward, RoutedReplyV1, SetAddress, SignedControl,
+    SignedRoutedReply, ValueRequestId, is_admin_request, is_supported_control_version,
+    min_control_version, senior_child, verify_control,
 };
 use cawala_ledger::{LedgerPubKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::{MsgId, PeerRef, Seen, SeenConfig};
@@ -44,10 +45,11 @@ use cawala_msg::{MsgId, PeerRef, Seen, SeenConfig};
 use crate::admin_store::{AdminStore, StoredGrant};
 use crate::control_store::ControlStore;
 use crate::ledger_peers;
-use crate::ledger_service::LedgerService;
+use crate::ledger_service::{LedgerService, ValueError};
 use crate::msg::{MSG_ALPN, MsgConfig, MsgHandler, NeighborSource, RoutableSnapshot};
 use crate::record::{NodeRecord, RecordError, RecordStore};
 use crate::seen_store::SeenStore;
+use crate::value_policy::ValuePolicy;
 
 /// Default sink capacity for locally delivered envelopes when control is
 /// co-hosted with messaging.
@@ -214,6 +216,9 @@ pub struct ControlNode {
     /// control handler can clone the handle, drop the control lock, and then
     /// take the ledger lock (control -> ledger ordering; never both at once).
     ledger: Option<Arc<tokio::sync::Mutex<LedgerService>>>,
+    /// The operator-configured value policy, reloaded per value request. `None`
+    /// means "invalid/absent": no value authority (fail closed).
+    value_policy: Option<ValuePolicy>,
 }
 
 /// The result of dispatching one control request.
@@ -228,6 +233,8 @@ pub enum Handled {
     Reply(ControlReply),
     /// A read-only ledger query to execute after releasing the control lock.
     Ledger(PendingLedgerQuery),
+    /// A delegated value mutation to execute after releasing the control lock.
+    LedgerMutation(PendingLedgerMutation),
 }
 
 /// A deferred `AdminLedgerQuery`, carrying the record snapshot to render and
@@ -240,6 +247,34 @@ pub struct PendingLedgerQuery {
     pub origin: NodeId,
     /// The authenticated controller key.
     pub controller: OperatorPubKey,
+}
+
+/// A deferred delegated value mutation (`AdminIssue`/`AdminBurn`).
+///
+/// Built and authorized under the control lock; executed only after that guard
+/// is dropped, so the engine and ledger locks are never held together. It
+/// carries no key material: the node loads its own operator/ledger keys inside
+/// [`LedgerService`].
+#[derive(Debug)]
+pub struct PendingLedgerMutation {
+    /// Whether value is created or destroyed.
+    pub direction: AdminValueDirection,
+    /// The affected child account.
+    pub account: NodeId,
+    /// The account's kind (resolved from the current record).
+    pub kind: ChildKind,
+    /// The requested amount.
+    pub amount: u64,
+    /// The client idempotency key.
+    pub request_id: ValueRequestId,
+    /// The mandatory reason (audited).
+    pub reason: String,
+    /// The querying origin (always this node).
+    pub origin: NodeId,
+    /// The authenticated controller key.
+    pub controller: OperatorPubKey,
+    /// The resolved operator limits for this controller.
+    pub limits: crate::value_policy::ValueLimits,
 }
 
 impl ControlNode {
@@ -274,6 +309,7 @@ impl ControlNode {
             decisions: VecDeque::new(),
             seen: SeenStore::empty(CONTROL_SEEN_CONFIG),
             ledger: None,
+            value_policy: None,
         }
     }
 
@@ -311,6 +347,7 @@ impl ControlNode {
             decisions: VecDeque::new(),
             seen,
             ledger: None,
+            value_policy: None,
         })
     }
 
@@ -719,6 +756,28 @@ impl ControlNode {
         }
     }
 
+    /// Reload the value policy from disk, failing closed to "no policy" on any
+    /// load error.
+    ///
+    /// Called per value request so an operator edit is observed without a
+    /// restart. An absent/corrupt/unknown-version/partial policy leaves
+    /// `value_policy` `None`, which the dispatch refuses as `Internal`; the
+    /// failure is audited (best effort).
+    fn reload_value_policy(&mut self) {
+        match ValuePolicy::load(&self.data_dir) {
+            Ok(policy) => self.value_policy = Some(policy),
+            Err(err) => {
+                warn!(%err, "value policy load failed; refusing value operations");
+                self.value_policy = None;
+                self.audit(serde_json::json!({
+                    "event": "value-policy",
+                    "loaded": false,
+                    "error": err.to_string(),
+                }));
+            }
+        }
+    }
+
     /// Handle one incoming request and produce its reply.
     ///
     /// Uses the system clock for join-expiry checks. Tests that need
@@ -747,7 +806,9 @@ impl ControlNode {
     ) -> ControlReply {
         match self.receive_at_handled(remote, signed, now).await {
             Handled::Reply(reply) => reply,
-            Handled::Ledger(_) => ControlReply::Rejected(RejectCode::Internal),
+            Handled::Ledger(_) | Handled::LedgerMutation(_) => {
+                ControlReply::Rejected(RejectCode::Internal)
+            }
         }
     }
 
@@ -878,9 +939,76 @@ impl ControlNode {
             ControlRequest::AdminMoveChild(move_child) => {
                 self.handle_admin_move_child(&signed, move_child, now)
             }
+            ControlRequest::AdminIssue(request) => {
+                match self.prepare_admin_value(AdminValueDirection::Issue, &signed, request, now) {
+                    Ok(pending) => return Handled::LedgerMutation(pending),
+                    Err(code) => ControlReply::Rejected(code),
+                }
+            }
+            ControlRequest::AdminBurn(request) => {
+                match self.prepare_admin_value(AdminValueDirection::Burn, &signed, request, now) {
+                    Ok(pending) => return Handled::LedgerMutation(pending),
+                    Err(code) => ControlReply::Rejected(code),
+                }
+            }
         };
         self.audit_request(&signed, &reply, now);
         Handled::Reply(reply)
+    }
+
+    /// Authorize and validate a delegated value request, resolving the actor,
+    /// the account kind, and the operator limits under the control lock.
+    ///
+    /// Returns a [`PendingLedgerMutation`] for deferred execution, or the
+    /// immediate refusal reply. It never reads the ledger (lock ordering) and
+    /// never loads key material.
+    fn prepare_admin_value(
+        &mut self,
+        direction: AdminValueDirection,
+        signed: &SignedControl,
+        request: &AdminValueRequest,
+        now: u64,
+    ) -> Result<PendingLedgerMutation, RejectCode> {
+        self.authorize_admin(signed, now)?;
+        if request.validate().is_err() {
+            return Err(RejectCode::BadRequest);
+        }
+        // The account must be a current child of the answering node.
+        let Some(kind) = self
+            .record
+            .record()
+            .children
+            .iter()
+            .find(|child| child.child_id == request.account.as_str())
+            .map(|child| child.kind)
+        else {
+            return Err(RejectCode::NotFound);
+        };
+        if self.ledger.is_none() {
+            return Err(RejectCode::Internal);
+        }
+        // Deny-by-default: an absent/corrupt policy serves no value authority.
+        self.reload_value_policy();
+        let Some(policy) = &self.value_policy else {
+            return Err(RejectCode::Internal);
+        };
+        let limits = policy.limits_for(&signed.controller);
+        // Early refusal on the per-request cap (policy-only; the window/account
+        // caps need the ledger and are re-enforced by the service).
+        if request.amount > limits.per_request_max {
+            return Err(RejectCode::LimitExceeded);
+        }
+        Ok(PendingLedgerMutation {
+            direction,
+            account: request.account.clone(),
+            kind,
+            amount: request.amount,
+            request_id: request.request_id,
+            reason: request.reason.clone(),
+            origin: signed.origin.clone(),
+            controller: signed.controller,
+            limits,
+        })
     }
 
     /// Handle one routed control request, using the system clock.
@@ -948,7 +1076,9 @@ impl ControlNode {
     ) -> ControlReply {
         match self.receive_routed_at_handled(remote, routed, now).await {
             Handled::Reply(reply) => reply,
-            Handled::Ledger(_) => ControlReply::Rejected(RejectCode::Internal),
+            Handled::Ledger(_) | Handled::LedgerMutation(_) => {
+                ControlReply::Rejected(RejectCode::Internal)
+            }
         }
     }
 
@@ -1078,9 +1208,10 @@ impl ControlNode {
                     self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
                     Handled::Reply(reply)
                 }
-                // A deferred ledger query: the caller audits the routed line
-                // after executing it (the reply is not known yet).
+                // A deferred ledger query/mutation: the caller audits the
+                // routed line after executing it (the reply is not known yet).
                 Handled::Ledger(pending) => Handled::Ledger(pending),
+                Handled::LedgerMutation(pending) => Handled::LedgerMutation(pending),
             };
         }
 
@@ -1095,6 +1226,7 @@ impl ControlNode {
                     Handled::Reply(reply)
                 }
                 Handled::Ledger(pending) => Handled::Ledger(pending),
+                Handled::LedgerMutation(pending) => Handled::LedgerMutation(pending),
             };
         }
 
@@ -1111,6 +1243,7 @@ impl ControlNode {
                 Handled::Reply(reply)
             }
             Handled::Ledger(pending) => Handled::Ledger(pending),
+            Handled::LedgerMutation(pending) => Handled::LedgerMutation(pending),
         }
     }
 
@@ -3018,6 +3151,14 @@ impl ProtocolHandler for ControlHandler {
                 }
                 reply
             }
+            Handled::LedgerMutation(pending) => {
+                let reply = execute_ledger_mutation(ledger, &data_dir, &pending, now).await;
+                {
+                    let engine = self.node.lock().await;
+                    engine.audit_request(&signed, &reply, now);
+                }
+                reply
+            }
         };
 
         // Deliver decisions owned by this node and patch the reply with the
@@ -3232,6 +3373,128 @@ pub(crate) async fn execute_ledger_query(
     }
 }
 
+/// Execute a deferred [`PendingLedgerMutation`] against the attached ledger.
+///
+/// **The caller must have already dropped the control-lock guard.** This locks
+/// only the ledger and never re-enters the control engine, preserving the
+/// `control -> ledger` ordering.
+///
+/// The write-ahead intent audit is **fail-closed**: if it cannot be recorded,
+/// the ledger is never touched. The outcome audit is best-effort (like every
+/// other audit line).
+pub(crate) async fn execute_ledger_mutation(
+    ledger: Option<Arc<tokio::sync::Mutex<LedgerService>>>,
+    data_dir: &Path,
+    pending: &PendingLedgerMutation,
+    now: u64,
+) -> ControlReply {
+    let intent = serde_json::json!({
+        "event": "admin-value",
+        "phase": "intent",
+        "actor": pending.controller.to_string(),
+        "scope": "value",
+        "direction": direction_label(pending.direction),
+        "account": pending.account.to_string(),
+        "amount": pending.amount,
+        "request_id": pending.request_id.to_string(),
+        "reason": pending.reason,
+    });
+    if let Err(err) = crate::audit::try_append(data_dir, intent) {
+        warn!(%err, "admin-value intent audit failed; refusing without touching the ledger");
+        return ControlReply::Rejected(RejectCode::Internal);
+    }
+
+    let Some(ledger) = ledger else {
+        return ControlReply::Rejected(RejectCode::Internal);
+    };
+    let result = {
+        let mut service = ledger.lock().await;
+        service.admin_value_apply(
+            pending.direction,
+            &pending.account,
+            pending.kind,
+            pending.amount,
+            &pending.controller,
+            pending.request_id,
+            pending.limits,
+            now,
+        )
+    };
+
+    match result {
+        Ok(applied) => {
+            crate::audit::append(
+                data_dir,
+                serde_json::json!({
+                    "ts": now,
+                    "event": "admin-value",
+                    "phase": if applied.duplicate { "duplicate" } else { "applied" },
+                    "actor": pending.controller.to_string(),
+                    "scope": "value",
+                    "direction": direction_label(pending.direction),
+                    "account": pending.account.to_string(),
+                    "amount": pending.amount,
+                    "request_id": pending.request_id.to_string(),
+                    "seq": applied.seq,
+                    "entry_hash": applied.entry_hash.to_hex(),
+                    "order_hash": applied.order_hash.to_hex(),
+                    "balance_after": applied.balance_after,
+                    "outcome": "ok",
+                }),
+            );
+            ControlReply::AdminValueApplied(AdminValueApplied {
+                request_id: pending.request_id,
+                account: pending.account.clone(),
+                direction: pending.direction,
+                amount: pending.amount,
+                balance_after: applied.balance_after,
+                seq: applied.seq,
+                entry_hash: applied.entry_hash,
+                duplicate: applied.duplicate,
+            })
+        }
+        Err(err) => {
+            let reply = match err {
+                ValueError::LimitExceeded => ControlReply::Rejected(RejectCode::LimitExceeded),
+                ValueError::InsufficientBalance => {
+                    ControlReply::Rejected(RejectCode::InsufficientBalance)
+                }
+                ValueError::RequestIdConflict | ValueError::ZeroAmount => {
+                    ControlReply::Rejected(RejectCode::BadRequest)
+                }
+                ValueError::Ledger(ref source) => {
+                    warn!(%source, "admin-value ledger error");
+                    ControlReply::Rejected(RejectCode::Internal)
+                }
+            };
+            crate::audit::append(
+                data_dir,
+                serde_json::json!({
+                    "ts": now,
+                    "event": "admin-value",
+                    "phase": "rejected",
+                    "actor": pending.controller.to_string(),
+                    "scope": "value",
+                    "direction": direction_label(pending.direction),
+                    "account": pending.account.to_string(),
+                    "amount": pending.amount,
+                    "request_id": pending.request_id.to_string(),
+                    "outcome": err.to_string(),
+                }),
+            );
+            reply
+        }
+    }
+}
+
+/// Stable `"issue"`/`"burn"` label for audit lines.
+fn direction_label(direction: AdminValueDirection) -> &'static str {
+    match direction {
+        AdminValueDirection::Issue => "issue",
+        AdminValueDirection::Burn => "burn",
+    }
+}
+
 /// A fresh request nonce from the OS randomness source.
 ///
 /// `getrandom` failing is effectively impossible on supported platforms; the
@@ -3288,6 +3551,7 @@ fn reply_outcome(reply: &ControlReply) -> String {
         ControlReply::AdminApproved(_) => "admin-approved".to_string(),
         ControlReply::AdminRejected(_) => "admin-rejected".to_string(),
         ControlReply::AdminLedgerSnapshot(_) => "admin-ledger-snapshot".to_string(),
+        ControlReply::AdminValueApplied(_) => "admin-value-applied".to_string(),
     }
 }
 
@@ -3532,6 +3796,7 @@ fn signed_kind(reply: &ControlReply) -> &'static str {
         ControlReply::AdminApproved(_) => "admin-approved",
         ControlReply::AdminRejected(_) => "admin-rejected",
         ControlReply::AdminLedgerSnapshot(_) => "admin-ledger-snapshot",
+        ControlReply::AdminValueApplied(_) => "admin-value-applied",
     }
 }
 
@@ -3567,7 +3832,9 @@ fn map_control_error(err: &ControlError) -> RejectCode {
         | ControlError::FieldBelowMinimum { .. }
         | ControlError::GrantExpiryNotAfterGrant { .. }
         | ControlError::GrantTtlTooLong { .. }
-        | ControlError::EmptyAdminScopes => RejectCode::BadRequest,
+        | ControlError::EmptyAdminScopes
+        | ControlError::ZeroValueRequestId
+        | ControlError::EmptyValueReason => RejectCode::BadRequest,
         ControlError::Codec(_) => RejectCode::Internal,
     }
 }
@@ -5795,85 +6062,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_frame_is_bad_version_and_v5_query_works() {
+    async fn v5_frame_is_bad_version_and_v6_query_works() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
         let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &[]);
 
-        // v4 is below the accepted window (5|6).
-        let v4_query = authorize_version("parent", &parent_op, 1, ControlRequest::Query, 4);
+        // v5 is below the accepted window (6|7).
+        let v5_query = authorize_version("parent", &parent_op, 1, ControlRequest::Query, 5);
         assert_eq!(
-            engine.receive_at(any_remote(), v4_query, 0).await,
+            engine.receive_at(any_remote(), v5_query, 0).await,
             ControlReply::Rejected(RejectCode::BadVersion)
         );
 
-        // A v5 frame over a pre-existing variant is dispatched normally.
-        let v5_query = authorize_version("parent", &parent_op, 2, ControlRequest::Query, 5);
+        // A v6 frame over a pre-existing variant is dispatched normally.
+        let v6_query = authorize_version("parent", &parent_op, 2, ControlRequest::Query, 6);
         assert!(matches!(
-            engine.receive_at(any_remote(), v5_query, 0).await,
+            engine.receive_at(any_remote(), v6_query, 0).await,
             ControlReply::Snapshot(_)
         ));
     }
 
-    /// A v5-declared frame cannot carry a v6-only topology-admin variant: the
-    /// shape gate rejects it as `BadVersion` before signature/dispatch. The v6
-    /// form passes the gate.
+    /// A v6-declared frame cannot carry a v7-only value variant (the shape gate
+    /// rejects it `BadVersion`), while v6 topology variants still pass.
     #[tokio::test]
-    async fn v5_frame_cannot_carry_topology_variant_but_v6_can() {
+    async fn v6_frame_cannot_carry_value_variant_but_v7_can() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
         let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &[]);
+        let value = |nonce| {
+            authorize_version(
+                "parent",
+                &parent_op,
+                nonce,
+                ControlRequest::AdminIssue(cawala_control::AdminValueRequest {
+                    request_id: cawala_control::ValueRequestId::from_bytes([4u8; 16]),
+                    account: NodeId::from("ghost"),
+                    amount: 1,
+                    reason: "test".to_string(),
+                }),
+                6,
+            )
+        };
 
-        let v5_detach = authorize_version(
-            "parent",
-            &parent_op,
-            1,
-            ControlRequest::AdminDetachChild(AdminDetachChild {
-                child: NodeId::from("ghost"),
-            }),
-            5,
-        );
+        // v6 cannot carry the v7-introduced issue variant.
         assert_eq!(
-            engine.receive_at(any_remote(), v5_detach, 0).await,
+            engine.receive_at(any_remote(), value(1), 0).await,
             ControlReply::Rejected(RejectCode::BadVersion)
         );
 
-        // The v6 form passes the gate; the self-operator is authorized and the
-        // unknown child is `NotFound` (not `BadVersion`).
-        let v6_detach = authorize_at(
+        // The v6 topology variant still passes (min 6); self-operator +
+        // unknown child -> NotFound.
+        let v6_detach = authorize_version(
             "parent",
             &parent_op,
             2,
             ControlRequest::AdminDetachChild(AdminDetachChild {
                 child: NodeId::from("ghost"),
             }),
+            6,
         );
         assert_eq!(
             engine.receive_at(any_remote(), v6_detach, 0).await,
             ControlReply::Rejected(RejectCode::NotFound)
         );
 
-        // `AdminLedgerQuery` (introduced in v5) still passes a v5 declaration;
-        // with no ledger attached it fails closed as `Internal`.
-        let v5_ledger = authorize_version(
+        // The v7 form of the value variant passes the gate; self-operator +
+        // unknown child -> NotFound.
+        let v7_issue = authorize_at(
             "parent",
             &parent_op,
             3,
-            ControlRequest::AdminLedgerQuery,
-            5,
+            ControlRequest::AdminIssue(cawala_control::AdminValueRequest {
+                request_id: cawala_control::ValueRequestId::from_bytes([4u8; 16]),
+                account: NodeId::from("ghost"),
+                amount: 1,
+                reason: "test".to_string(),
+            }),
         );
         assert_eq!(
-            engine.receive_at(any_remote(), v5_ledger, 0).await,
-            ControlReply::Rejected(RejectCode::Internal)
+            engine.receive_at(any_remote(), v7_issue, 0).await,
+            ControlReply::Rejected(RejectCode::NotFound)
         );
     }
 
-    /// A v4 frame is below the accepted window; v5 and v6 frames may carry the
+    /// A v5 frame is below the accepted window; v6 and v7 frames may carry the
     /// v4-introduced exit variant (`declared >= min_control_version`).
     #[tokio::test]
-    async fn v5_and_v6_frames_can_carry_exit_variant() {
+    async fn v6_and_v7_frames_can_carry_exit_variant() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let child_op = secret(2);
@@ -5887,34 +6164,34 @@ mod tests {
         let peers = [node_peer("child", &child_op, 2)];
         let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
 
-        // v4 is rejected wholesale (not just the shape gate).
-        let v4_exit = authorize_version("child", &child_op, 1, exit_request("child", 1), 4);
+        // v5 is rejected wholesale (not just the shape gate).
+        let v5_exit = authorize_version("child", &child_op, 1, exit_request("child", 1), 5);
         assert_eq!(
-            engine.receive_at(any_remote(), v4_exit, 0).await,
+            engine.receive_at(any_remote(), v5_exit, 0).await,
             ControlReply::Rejected(RejectCode::BadVersion)
         );
 
-        // v5 carries the v4-introduced variant (5 >= 4).
-        let v5_exit = authorize_version("child", &child_op, 2, exit_request("child", 1), 5);
-        assert_ne!(
-            engine.receive_at(any_remote(), v5_exit, 0).await,
-            ControlReply::Rejected(RejectCode::BadVersion),
-            "a v5 frame may carry a v4-introduced variant"
-        );
-
-        // The current (v6) mint also carries it.
-        let v6_exit = authorize_at("child", &child_op, 3, exit_request("child", 1));
+        // v6 carries the v4-introduced variant (6 >= 4).
+        let v6_exit = authorize_version("child", &child_op, 2, exit_request("child", 1), 6);
         assert_ne!(
             engine.receive_at(any_remote(), v6_exit, 0).await,
             ControlReply::Rejected(RejectCode::BadVersion),
             "a v6 frame may carry a v4-introduced variant"
         );
+
+        // The current (v7) mint also carries it.
+        let v7_exit = authorize_at("child", &child_op, 3, exit_request("child", 1));
+        assert_ne!(
+            engine.receive_at(any_remote(), v7_exit, 0).await,
+            ControlReply::Rejected(RejectCode::BadVersion),
+            "a v7 frame may carry a v4-introduced variant"
+        );
     }
 
-    /// A v5-declared frame carrying an *old* (pre-v4) variant dispatches
+    /// A v6-declared frame carrying an *old* (pre-v4) variant dispatches
     /// normally; only the introduction-version gate applies.
     #[tokio::test]
-    async fn v5_frame_carrying_old_variant_still_dispatches() {
+    async fn v6_frame_carrying_old_variant_still_dispatches() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let applicant_op = secret(2);
@@ -5931,17 +6208,17 @@ mod tests {
             nonce: 7,
             expiry: u64::MAX,
         };
-        let v5_join = authorize_version(
+        let v6_join = authorize_version(
             "applicant",
             &applicant_op,
             1,
             ControlRequest::Join(join),
-            5,
+            6,
         );
         assert_eq!(
-            engine.receive_at(any_remote(), v5_join, 0).await,
+            engine.receive_at(any_remote(), v6_join, 0).await,
             ControlReply::Pending,
-            "a v5 frame over a pre-existing variant must dispatch"
+            "a v6 frame over a pre-existing variant must dispatch"
         );
     }
 

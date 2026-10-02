@@ -682,6 +682,9 @@ fn reply_kind(reply: &ControlReply) -> &'static str {
         // P3 reply variant: the wasm DTO/mapping is P3c; this label arm only
         // keeps the match exhaustive after the control reply version bump.
         ControlReply::AdminLedgerSnapshot(_) => "admin-ledger-snapshot",
+        // P5 reply variant: the wasm DTO/mapping is P5c; this label arm only
+        // keeps the match exhaustive after the control reply version bump.
+        ControlReply::AdminValueApplied(_) => "admin-value-applied",
     }
 }
 

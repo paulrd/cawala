@@ -33,13 +33,14 @@ pub mod orders;
 pub mod record;
 pub mod seen_store;
 pub mod settlement;
+pub mod value_policy;
 
 pub use admin_cli::{AdminCliError, AdminListEntry, GrantOutcome};
 pub use admin_store::{ADMIN_STORE_VERSION, ADMINS_FILE, AdminStore, AdminStoreError};
 pub use audit::CONTROL_AUDIT_FILE;
 pub use control::{
     Authority, ControlHandler, ControlNode, Handled, OutboundControl, OutboundKind,
-    PendingLedgerQuery, spawn_control_node, spawn_control_node_live_with_ledger,
+    PendingLedgerMutation, PendingLedgerQuery, spawn_control_node, spawn_control_node_live_with_ledger,
     spawn_control_node_live_on_with_ledger, spawn_control_node_on, spawn_control_only,
     spawn_control_only_on,
 };
@@ -58,6 +59,9 @@ pub use msg::{
 pub use settlement::{
     DerivedHop, MAX_PENDING, MAX_TERMINAL, PendingSettlement, SettlementManager, TerminalRecord,
     derive_hop, expected_signers, route_is_depth_one,
+};
+pub use value_policy::{
+    VALUE_POLICY_FILE, VALUE_POLICY_VERSION, ValueLimits, ValuePolicy, ValuePolicyError,
 };
 
 /// Bind an endpoint with the given persisted [`iroh::SecretKey`] and start the

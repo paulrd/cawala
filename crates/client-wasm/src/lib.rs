@@ -23,8 +23,9 @@ use std::sync::{Arc, Mutex};
 
 use cawala_control::{
     AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminMoveChild, AdminRedeliverJoin,
-    CONTROL_ALPN, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest, ExitRequest,
-    Invite, JoinRequest, NodeId, OperatorSecretKey, RejectCode, SignedControl,
+    AdminValueRequest, CONTROL_ALPN, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply,
+    ControlRequest, ExitRequest, Invite, JoinRequest, NodeId, OperatorSecretKey, RejectCode,
+    SignedControl,
 };
 use cawala_msg::{
     Ack, AckStatus, BalanceQueryV1, Envelope, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
@@ -52,9 +53,9 @@ use crate::control::{
     routed_request_envelope, should_try_routed, sign_admin_request, verify_routed_reply_bytes,
 };
 use crate::dto::{
-    AdminActionDto, AdminLedgerSnapshotDto, AdminSnapshotDto, ControlEventDto, JoinOutcome,
-    JoinStatus, LeaveOutcome, LedgerEventDto, LedgerStatusDto, PaymentOutcome, SnapshotDto,
-    parse_operator_hex, reject_code_str,
+    AdminActionDto, AdminLedgerSnapshotDto, AdminSnapshotDto, AdminValueAppliedDto, ControlEventDto,
+    JoinOutcome, JoinStatus, LeaveOutcome, LedgerEventDto, LedgerStatusDto, PaymentOutcome,
+    SnapshotDto, parse_operator_hex, parse_request_id_hex, reject_code_str,
 };
 use crate::ledger_state::LedgerStateV1;
 use crate::state::{LocalStateV1, ParentLink, Transition};
@@ -1084,6 +1085,72 @@ impl ClientNode {
             ControlReply::Accepted => Ok(()),
             ControlReply::Rejected(code) => Err(admin_rejected(code)),
             _ => Err(unexpected_admin_reply("an admin move")),
+        }
+    }
+
+    /// Issue `amount` into `account` at `node` (value scope).
+    ///
+    /// `request_id_hex` is the client idempotency key (32 hex chars); the node
+    /// derives its ledger nonce. `node_addr` optionally names `node`'s asserted
+    /// address for the routed fallback; see [`ClientNode::admin_query`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn admin_issue(
+        &self,
+        node: String,
+        request_id_hex: String,
+        account: String,
+        amount: u64,
+        reason: String,
+        node_addr: Option<String>,
+    ) -> Result<AdminValueAppliedDto, JsError> {
+        let request_id = parse_request_id_hex(&request_id_hex).map_err(to_js_err)?;
+        let account = parse_child(&account)?;
+        let request = ControlRequest::AdminIssue(AdminValueRequest {
+            request_id,
+            account,
+            amount,
+            reason,
+        });
+        let reply = self.admin_exchange(&node, request, node_addr).await?;
+        match reply {
+            ControlReply::AdminValueApplied(applied) => {
+                Ok(AdminValueAppliedDto::from_applied(&applied))
+            }
+            ControlReply::Rejected(code) => Err(admin_rejected(code)),
+            _ => Err(unexpected_admin_reply("an admin issue")),
+        }
+    }
+
+    /// Burn `amount` from `account` at `node` (value scope).
+    ///
+    /// `request_id_hex` is the client idempotency key (32 hex chars); the node
+    /// derives its ledger nonce. `node_addr` optionally names `node`'s asserted
+    /// address for the routed fallback; see [`ClientNode::admin_query`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn admin_burn(
+        &self,
+        node: String,
+        request_id_hex: String,
+        account: String,
+        amount: u64,
+        reason: String,
+        node_addr: Option<String>,
+    ) -> Result<AdminValueAppliedDto, JsError> {
+        let request_id = parse_request_id_hex(&request_id_hex).map_err(to_js_err)?;
+        let account = parse_child(&account)?;
+        let request = ControlRequest::AdminBurn(AdminValueRequest {
+            request_id,
+            account,
+            amount,
+            reason,
+        });
+        let reply = self.admin_exchange(&node, request, node_addr).await?;
+        match reply {
+            ControlReply::AdminValueApplied(applied) => {
+                Ok(AdminValueAppliedDto::from_applied(&applied))
+            }
+            ControlReply::Rejected(code) => Err(admin_rejected(code)),
+            _ => Err(unexpected_admin_reply("an admin burn")),
         }
     }
 

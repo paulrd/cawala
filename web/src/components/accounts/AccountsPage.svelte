@@ -6,6 +6,7 @@
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
   import ErrorState from '../shared/ErrorState.svelte';
   import Badge from '../shared/Badge.svelte';
+  import ConfirmDialog from '../shared/ConfirmDialog.svelte';
   import GrantEmptyState from '../admin/GrantEmptyState.svelte';
   import {
     nodeState,
@@ -15,20 +16,106 @@
     administeredNode,
     adminCapabilities,
     targetEpoch,
+    showToast,
   } from '../../lib/stores.svelte.js';
-  import { getAccounts } from '../../lib/api.js';
+  import {
+    getAccounts,
+    canAdministerValue,
+    adminIssue,
+    adminBurn,
+    readPendingValueOp,
+    clearPendingValueOp,
+    retryPendingValueOp,
+  } from '../../lib/api.js';
   import { navigate } from '../../lib/router.svelte.js';
   import { ROUTES } from '../../lib/constants.js';
 
   let loaded = $state(false);
   let view = administeredNode;
   let canQuery = $derived(adminCapabilities.canQueryNode);
+  // Value actions need a non-self target and a value-scoped grant.
+  let canValue = $derived(canAdministerValue(view, adminCapabilities));
+
+  let selectedAccount = $state(null);
+  let valueDialog = $state(null); // 'issue' | 'burn' | null
+  let valueAmount = $state(0);
+  let valueReason = $state('');
+  let valueBusy = $state(false);
+  let pendingOp = $state(readPendingValueOp());
+
+  let valueAmountValid = $derived(Number.isFinite(valueAmount) && valueAmount > 0);
+  let valueReasonValid = $derived(valueReason.trim().length > 0);
+  let valueReady = $derived(valueAmountValid && valueReasonValid && !valueBusy);
 
   $effect(() => {
     void targetEpoch.value;
+    pendingOp = readPendingValueOp();
     if (!canQuery) return;
     void loadData();
   });
+
+  function handleSelectAccount(row) {
+    if (row.type !== 'liability') return;
+    selectedAccount = selectedAccount?.id === row.id ? null : row;
+  }
+
+  function openValueDialog(direction) {
+    if (!selectedAccount) return;
+    valueDialog = direction;
+    valueAmount = 0;
+    valueReason = '';
+  }
+
+  async function submitValue() {
+    if (!selectedAccount || !valueReady) return;
+    const direction = valueDialog;
+    const account = selectedAccount;
+    valueBusy = true;
+    try {
+      const result =
+        direction === 'issue'
+          ? await adminIssue(account.id, valueAmount, valueReason.trim())
+          : await adminBurn(account.id, valueAmount, valueReason.trim());
+      pendingOp = readPendingValueOp();
+      if (result.status === 'duplicate') {
+        showToast(
+          `Already applied (seq ${result.seq}, ${String(result.entryHash).slice(0, 12)}…).`,
+          'warn',
+        );
+      } else {
+        showToast(
+          `${direction === 'issue' ? 'Issued' : 'Burned'} ${valueAmount}; new balance ${result.balanceAfter}.`,
+          'ok',
+        );
+      }
+      valueDialog = null;
+      selectedAccount = null;
+      await loadData();
+    } catch (err) {
+      pendingOp = readPendingValueOp();
+      showToast(err?.message || 'Value operation failed.', 'danger');
+    } finally {
+      valueBusy = false;
+    }
+  }
+
+  async function handleRetryPending() {
+    try {
+      const result = await retryPendingValueOp();
+      pendingOp = readPendingValueOp();
+      if (result) showToast('Pending value operation applied.', 'ok');
+      await loadData();
+    } catch (err) {
+      pendingOp = readPendingValueOp();
+      showToast(err?.message || 'Retry failed.', 'danger');
+    }
+  }
+
+  function handleDiscardPending() {
+    clearPendingValueOp();
+    pendingOp = null;
+    showToast('Pending value operation discarded.', 'warn');
+  }
 
   async function loadData() {
     loadingState.accounts = true;
@@ -180,7 +267,62 @@
     {:else if !hasRows}
       <EmptyState title="No accounts" message={emptyMessage} />
     {:else}
-      <DataTable {columns} rows={nodeState.accounts} />
+      <DataTable
+        {columns}
+        rows={nodeState.accounts}
+        selectedId={selectedAccount?.id ?? null}
+        onRowClick={canValue ? handleSelectAccount : undefined}
+      />
+
+      {#if canValue}
+        <div class="value-actions">
+          <h4 class="value-heading">Value actions</h4>
+          {#if !selectedAccount}
+            <p class="text-sm muted">Select a liability account row to issue or burn value.</p>
+          {:else}
+            <p class="text-sm muted">
+              Selected <code class="mono">{selectedAccount.label}</code>
+              &middot; balance {selectedAccount.balance}
+            </p>
+            <div class="value-buttons">
+              <button
+                type="button"
+                class="btn btn--ghost btn--sm"
+                disabled={valueBusy}
+                onclick={() => openValueDialog('issue')}
+              >
+                Issue&hellip;
+              </button>
+              <button
+                type="button"
+                class="btn btn--danger-outline btn--sm"
+                disabled={valueBusy}
+                onclick={() => openValueDialog('burn')}
+              >
+                Burn&hellip;
+              </button>
+            </div>
+          {/if}
+
+          {#if pendingOp}
+            <div class="pending-note">
+              <span class="text-xs muted">
+                A value operation is pending: {pendingOp.direction} {pendingOp.amount} on
+                {pendingOp.account || 'an account'}. Retry it to reuse the same idempotency key.
+              </span>
+              <div class="value-buttons">
+                <button type="button" class="btn btn--ghost btn--sm" onclick={handleRetryPending}>
+                  Retry
+                </button>
+                <button type="button" class="btn btn--ghost btn--sm" onclick={handleDiscardPending}>
+                  Discard
+                </button>
+              </div>
+            </div>
+          {/if}
+        </div>
+      {/if}
+
       {#if truncated}
         <div class="truncated-note">
           <Badge variant="warn" label="Truncated" />
@@ -192,6 +334,40 @@
       {/if}
     {/if}
   </Card>
+
+  <ConfirmDialog
+    open={valueDialog !== null}
+    title={valueDialog === 'burn' ? 'Burn value?' : 'Issue value?'}
+    message={`This ${valueDialog === 'burn' ? 'destroys' : 'creates'} value on ${view.label || view.nodeId || 'this node'} and changes its equity. The operator's per-request/window/account limits apply; this cannot be undone except by a compensating operation.`}
+    confirmLabel={valueBusy ? 'Working…' : valueDialog === 'burn' ? 'Burn' : 'Issue'}
+    variant={valueDialog === 'burn' ? 'danger' : 'default'}
+    onConfirm={submitValue}
+    onCancel={() => { valueDialog = null; }}
+  >
+    <div class="value-form">
+      <label class="field-label" for="value-amount">Amount</label>
+      <input
+        id="value-amount"
+        type="number"
+        min="1"
+        class="value-input"
+        bind:value={valueAmount}
+        disabled={valueBusy}
+      />
+      <label class="field-label" for="value-reason">Reason (required)</label>
+      <input
+        id="value-reason"
+        type="text"
+        class="value-input"
+        placeholder="e.g. operator top-up"
+        bind:value={valueReason}
+        disabled={valueBusy}
+      />
+      {#if !valueReasonValid}
+        <span class="text-xs" style="color: var(--danger);">A reason is required.</span>
+      {/if}
+    </div>
+  </ConfirmDialog>
 </div>
 
 <style>
@@ -289,5 +465,70 @@
   .btn--sm {
     font-size: var(--text-xs);
     padding: var(--sp-1) var(--sp-3);
+  }
+  .btn--danger-outline {
+    background: transparent;
+    color: var(--danger);
+    border: 1px solid var(--danger);
+  }
+  .btn--danger-outline:hover:not(:disabled) {
+    background: var(--danger-dim);
+  }
+
+  /* ── Value actions panel ─────────────────────────── */
+  .value-actions {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+    margin-top: var(--sp-4);
+    padding-top: var(--sp-4);
+    border-top: 1px solid var(--border);
+  }
+  .value-heading {
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--fg);
+  }
+  .value-buttons {
+    display: flex;
+    gap: var(--sp-2);
+    flex-wrap: wrap;
+  }
+  .pending-note {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+    padding: var(--sp-3);
+    border: 1px solid var(--warn);
+    background: var(--warn-dim);
+    border-radius: var(--radius-md);
+  }
+  .value-form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+  }
+  .field-label {
+    font-size: var(--text-xs);
+    font-weight: 500;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .value-input {
+    padding: var(--sp-2) var(--sp-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg);
+    color: var(--fg);
+    font: inherit;
+    font-size: var(--text-sm);
+  }
+  .value-input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .mono {
+    font-family: var(--mono);
   }
 </style>
