@@ -3,7 +3,7 @@
   import { initRouter, currentRoute } from './lib/router.svelte.js';
   import { clientState, apiCapabilities } from './lib/stores.svelte.js';
   import { initApi, spawnClient, destroyClient, isMockMode, getCapabilities } from './lib/api.js';
-  import { CLIENT_STATUS, CONNECTION } from './lib/constants.js';
+  import { CLIENT_STATUS } from './lib/constants.js';
   import Shell from './components/layout/Shell.svelte';
   import Dashboard from './components/dashboard/Dashboard.svelte';
   import NodePage from './components/node/NodePage.svelte';
@@ -26,7 +26,8 @@
       clientState.status = CLIENT_STATUS.READY;
       clientState.endpointId = result.endpointId;
       clientState.address = result.address;
-      clientState.connectionStatus = CONNECTION.CONNECTED;
+      // Connection status is derived by api.js from join + parent-liveness
+      // signals (2 s control poller), never hard-coded here.
       // Sync capabilities into the store for downstream components.
       const caps = getCapabilities();
       Object.assign(apiCapabilities, caps);
@@ -68,14 +69,14 @@
   <Shell>
     {#if route === '/' || route === ''}
       <Dashboard />
+    {:else if route === '/node/joins'}
+      <JoinsPage />
     {:else if route === '/node' || route.startsWith('/node/')}
       <NodePage />
     {:else if route === '/accounts'}
       <AccountsPage />
     {:else if route === '/activity'}
       <ActivityPage />
-    {:else if route === '/node/joins'}
-      <JoinsPage />
     {:else if route === '/account'}
       <MyAccountPage />
     {:else if route === '/settings'}

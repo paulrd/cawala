@@ -134,11 +134,18 @@ export const ORDER_REJECT = {
 /** ALPN the live browser control client speaks to its parent node. */
 export const CONTROL_ALPN = 'cawala/control/0';
 
-/** Connection status values. */
+/**
+ * Connection status values.
+ *
+ * The indicator means "attached to a parent node", not merely "a wasm client
+ * exists". `MOCK` is a distinct neutral state so mock mode is never shown as a
+ * live green connection.
+ */
 export const CONNECTION = {
   DISCONNECTED: 'disconnected',
   CONNECTING: 'connecting',
   CONNECTED: 'connected',
+  MOCK: 'mock',
 };
 
 /** Client lifecycle states. */

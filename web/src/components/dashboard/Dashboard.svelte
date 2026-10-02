@@ -69,7 +69,10 @@
   // Detect the "detached" event from the control drain so the Dashboard can
   // show "Left the network" instead of the generic "not connected" copy.
   let hasLeft = $state(false);
-  let _detachedPoller = $state(null);
+  // Interval handle must NOT be reactive: the `$effect` below reads and writes
+  // it, so making it `$state` would self-invalidate the effect on every write
+  // (the interval restart writes it), tripping Svelte's infinite-loop guard.
+  let _detachedPoller = null;
 
   $effect(() => {
     if (showJoinCta && isLive) {

@@ -142,7 +142,7 @@
   }
   .version {
     font-size: var(--text-xs);
-    color: var(--border);
+    color: var(--muted);
     margin-top: var(--sp-1);
   }
 

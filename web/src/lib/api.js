@@ -355,6 +355,8 @@ async function _spawnRealNode() {
   _startControlPoller();
   // Surface a restored/approved join address app-wide before verifying it.
   _syncJoinStateIntoStore();
+  // Derive the initial attachment status now that the address is known.
+  _syncConnectionStatusIntoStore();
   // (Re)verify the persisted balance as soon as an address is known.
   _requestBalanceIfJoined();
   return node;
@@ -457,6 +459,60 @@ function _syncJoinStateIntoStore() {
 }
 
 /**
+ * Derive the parent-attachment connection status from the authoritative
+ * signals. Single source of truth for both the reactive store
+ * (`_syncConnectionStatusIntoStore`) and `getConnectionStatus()`.
+ *
+ * The indicator means "attached to a parent node", not merely "a wasm client
+ * exists":
+ *   - mock                                   → CONNECTION.MOCK
+ *   - live, no client                        → CONNECTION.DISCONNECTED
+ *   - live, join pending / awaiting approval → CONNECTION.CONNECTING
+ *   - live, no address (none/rejected)       → CONNECTION.DISCONNECTED
+ *   - live, joined + parent reachable        → CONNECTION.CONNECTED
+ *   - live, joined + parent unreachable      → CONNECTION.DISCONNECTED
+ *
+ * `parentStatus()` is passive/informational and MUST never gate an action.
+ *
+ * @returns {string} One of CONNECTION.*
+ */
+function _deriveConnectionStatus() {
+  if (_useMock) return CONNECTION.MOCK;
+  if (!_clientNode) return CONNECTION.DISCONNECTED;
+
+  let joinState = JOIN_STATE.NONE;
+  try {
+    joinState = getJoinStatus().state;
+  } catch (err) {
+    _warnOnce('connection-join-status', '[api] join status read failed', err);
+  }
+  // Awaiting approval: amber "Connecting…" even before an address exists.
+  if (joinState === JOIN_STATE.PENDING) return CONNECTION.CONNECTING;
+  // Not joined (state none/rejected) or detached: no parent to be attached to.
+  if (clientState.address == null) return CONNECTION.DISCONNECTED;
+
+  // Joined: the only green state is a reachable parent. A failed probe is red.
+  let reachable = true;
+  try {
+    reachable = parentStatus().reachable;
+  } catch (err) {
+    _warnOnce('connection-parent-status', '[api] parent status read failed', err);
+  }
+  return reachable ? CONNECTION.CONNECTED : CONNECTION.DISCONNECTED;
+}
+
+/**
+ * Mirror the derived parent-attachment status into `clientState` so the
+ * indicator stays current app-wide. Idempotent; only writes on change.
+ */
+function _syncConnectionStatusIntoStore() {
+  const next = _deriveConnectionStatus();
+  if (next !== clientState.connectionStatus) {
+    clientState.connectionStatus = next;
+  }
+}
+
+/**
  * Re-query the balance when the tab becomes visible again. Still subject to
  * the 1 s throttle in `_requestBalanceIfJoined`.
  */
@@ -475,6 +531,9 @@ function _startControlPoller() {
     _syncJoinStateIntoStore();
     _drainControlEvents();
     _drainLedgerEvents();
+    // Derive parent attachment after the drains so an approval/detach processed
+    // in this tick (which may set/clear `clientState.address`) is reflected.
+    _syncConnectionStatusIntoStore();
     // Periodic pull so a node-side (CLI) funding is picked up without a reload.
     if (
       clientState.address != null &&
@@ -946,6 +1005,8 @@ function _requestBalanceIfJoined() {
 export async function spawnClient() {
   if (_useMock) {
     await mockDelay(300);
+    // Mock is a distinct neutral state, never a live green "Connected".
+    _syncConnectionStatusIntoStore();
     return {
       endpointId: 'z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK',
       address: '0.3.1',
@@ -955,6 +1016,9 @@ export async function spawnClient() {
   const status = _readJoinStatus(node);
   const address = status.address ?? null;
   if (address) _requestBalanceIfJoined();
+  // `_spawnRealNode` already mirrored the address; re-derive so a restored
+  // join shows green immediately rather than after the first poller tick.
+  _syncConnectionStatusIntoStore();
   return {
     endpointId: node.endpoint_id(),
     address,
@@ -1241,12 +1305,14 @@ export function getAddress() {
 }
 
 /**
- * Get connection status.
+ * Get connection status: whether this client is attached to a parent node.
+ *
+ * Mirrors the derivation that keeps `clientState.connectionStatus` current;
+ * it no longer reports CONNECTED merely because a wasm client exists.
  * @returns {string} One of CONNECTION.*
  */
 export function getConnectionStatus() {
-  if (_useMock) return CONNECTION.CONNECTED;
-  return _clientNode ? CONNECTION.CONNECTED : CONNECTION.DISCONNECTED;
+  return _deriveConnectionStatus();
 }
 
 // ── Ping (existing wasm surface) ──────────────────────────────
@@ -2020,6 +2086,7 @@ export async function leave() {
     // cleared the parent-scoped ledger binding, so persist the ledger blob
     // before the state blob and resync the reactive store.
     _syncJoinStateIntoStore();
+    _syncConnectionStatusIntoStore();
     _persistLedgerState();
     _syncLedgerStoreFromStatus();
     _persistState();
