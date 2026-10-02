@@ -76,8 +76,9 @@
     see data that it holds.
   - Cawala doesn't support running nodes on phones.
 # Target Users
-  Cawala replaces the private for-profit banking system with an community-owned
-  alternative. Use this software if you want to be your own bank.
+  Cawala lets you transfer, create and destroy liabilities (IOU's). It creates a
+  network of communities based on trust whose tangible and intangible assets
+  back the creation of all liabilities.
 # Features / Functional Requirements
   - deploy a web client with WASM Iroh module as a static PWA on github pages
   - nodes are built using the Rust language and Iroh.
@@ -88,7 +89,7 @@
   - leaf nodes can have up to 8 users
   - one child node (the most senior) is selected to control its parent node
   - the web client allows a user to control more than one node but only
-    indirectly intermediate child nodes - not directly.
+    indirectly intermediate child nodes.
   - more than one node can be deployed to the same server
   - nodes can be deployed on almost any device
   - each node and user will have an octal address that will allow their position
@@ -110,9 +111,6 @@
 # Constraints
   - tech stack is Iroh, Rust, Typescript, Virtual Private Servers
 # Open Questions
-  - What javascript frontend framework should I use (Vue, Svelt, etc).
-  - How do new users join the network?
-  - How do new users query the SQLITE database to get their ideal octal address?
   - How do we allow nodes to split so that an already full node can get a new
     user or child node?
   - What other out-of-band services might be required? Some of these might be:
