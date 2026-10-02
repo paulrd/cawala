@@ -588,6 +588,10 @@ export function _ensureAdminKey(nodeId, grant = null) {
   const entry = grant ?? adminKeys.findAdminNode(target);
   if (!entry) throw new AdminUnavailableError('admin query');
 
+  if (adminKeys.adminSeedState(target) === 'locked') {
+    throw new AdminLockedError(target);
+  }
+
   let installed = null;
   try {
     installed = node.admin_public_key?.() ?? null;
@@ -605,6 +609,86 @@ export function _ensureAdminKey(nodeId, grant = null) {
     throw new AdminUnavailableError('admin query');
   }
   return node;
+}
+
+/**
+ * Unlock a protected (passphrase-wrapped) admin key, then install it.
+ *
+ * @param {string} nodeId
+ * @param {string} passphrase
+ * @returns {Promise<object>} the live client node
+ * @throws on a wrong passphrase
+ */
+export async function ensureAdminUnlocked(nodeId, passphrase) {
+  const target = String(nodeId).toLowerCase();
+  await adminKeys.unlockAdminSeed(target, passphrase);
+  return _ensureAdminKey(target);
+}
+
+/**
+ * Lock a protected key for `nodeId`: clear the in-memory unlock cache and, when
+ * it is the installed key, clear it from the wasm client so no further admin
+ * call can use it.
+ *
+ * @param {string} nodeId
+ */
+export function lockAdmin(nodeId) {
+  const target = String(nodeId).toLowerCase();
+  const entry = adminKeys.findAdminNode(target);
+  adminKeys.lockAdminSeed(target);
+  if (entry && _clientNode) {
+    try {
+      const installed = _clientNode.admin_public_key?.() ?? null;
+      if (installed && installed.toLowerCase() === entry.adminPubHex) {
+        _clientNode.clear_admin_key?.();
+      }
+    } catch (err) {
+      _warnOnce('admin-lock-clear', '[api] clear_admin_key failed', err);
+    }
+  }
+  _syncAdministeredNode();
+}
+
+/**
+ * Refuse a value action while its protected seed is locked, **before** any
+ * request_id is generated or pending record written. Plain or session-unlocked
+ * seeds pass.
+ *
+ * @param {string} target
+ */
+export function ensureValueSeedUnlocked(target) {
+  const state = adminKeys.adminSeedState(target);
+  if (state === 'locked') throw new AdminLockedError(target);
+  if (state === 'absent') throw new AdminUnavailableError('admin value operation');
+  // A value-scoped key must be wrapped before any value action ("required",
+  // not opt-in). A plain non-value entry never reaches here (value actions are
+  // gated on `scopes.value`).
+  const entry = adminKeys.findAdminNode(target);
+  if (state === 'plain' && entry?.scopes?.includes('value')) {
+    throw new AdminSeedProtectionRequiredError(target);
+  }
+}
+
+/**
+ * Wrap a value-scoped admin seed under `passphrase` (required before any value
+ * action). Refuses a non-value entry and any write that did not actually land.
+ *
+ * @param {string} nodeId
+ * @param {string} passphrase
+ * @returns {Promise<void>}
+ */
+export async function protectValueSeed(nodeId, passphrase) {
+  const target = String(nodeId).toLowerCase();
+  const entry = adminKeys.findAdminNode(target);
+  if (!entry) throw new AdminUnavailableError('protect value key');
+  if (!entry.scopes?.includes('value')) {
+    throw new AdminUnavailableError('protect value key (value scope required)');
+  }
+  await adminKeys.protectAdminSeed(target, passphrase);
+  // Fail closed for the caller: only report success when the row is wrapped.
+  if (!adminKeys.findAdminNode(target)?.seedProtected) {
+    throw new Error('Could not persist the protected value key (storage unavailable).');
+  }
 }
 
 /**
@@ -2187,6 +2271,41 @@ export class AdminUnavailableError extends Error {
   }
 }
 
+/**
+ * Typed error raised when an action needs a protected (passphrase-wrapped) seed
+ * that is currently locked. UI callers prompt for the passphrase and retry.
+ */
+export class AdminLockedError extends Error {
+  constructor(nodeId = null) {
+    super(
+      nodeId
+        ? `The value key for node ${nodeId} is locked. Unlock it with your passphrase to continue.`
+        : 'The value key is locked. Unlock it with your passphrase to continue.',
+    );
+    this.name = 'AdminLockedError';
+    this.code = 'ADMIN_LOCKED';
+    this.nodeId = nodeId;
+  }
+}
+
+/**
+ * Typed error raised when a value action needs a still-plaintext value key.
+ * Value actions require the key to be passphrase-wrapped first; UI callers open
+ * the protect dialog and retry.
+ */
+export class AdminSeedProtectionRequiredError extends Error {
+  constructor(nodeId = null) {
+    super(
+      nodeId
+        ? `The value key for node ${nodeId} must be protected with a passphrase before any value action.`
+        : 'The value key must be protected with a passphrase before any value action.',
+    );
+    this.name = 'AdminSeedProtectionRequiredError';
+    this.code = 'ADMIN_SEED_PROTECT_REQUIRED';
+    this.nodeId = nodeId;
+  }
+}
+
 // ── Delegated admin keys ──────────────────────────────────────
 
 /**
@@ -2643,7 +2762,7 @@ export function canAdministerValue(view, caps) {
 /** Reject-code → honest user-facing value error copy. */
 const VALUE_REJECT_MESSAGES = {
   limit_exceeded:
-    'The node refused this operation: it exceeds the operator\u2019s per-request, window, or account limit.',
+    'This exceeds the operator\u2019s per-request, window, or account limit. Ask the node operator for the current limits, or use a smaller amount.',
   insufficient_balance: 'That burn exceeds the account\u2019s current balance.',
   unauthorized:
     'Value grant expired or revoked. Ask the node operator to grant value scope.',
@@ -2787,20 +2906,11 @@ async function _adminValue(
   reuseRequestId = undefined,
 ) {
   const target = _normalizeTarget(nodeId);
-  const requestId = reuseRequestId ?? _randomRequestId();
-  const pending = {
-    requestId,
-    target,
-    direction,
-    account,
-    amount,
-    reason,
-    at: Date.now(),
-  };
 
   if (_useMock) {
     await mockDelay(500);
-    _savePendingValueOp(pending);
+    const requestId = reuseRequestId ?? _randomRequestId();
+    _savePendingValueOp({ requestId, target, direction, account, amount, reason, at: Date.now() });
     clearPendingValueOp(requestId);
     return {
       status: 'applied',
@@ -2818,11 +2928,25 @@ async function _adminValue(
   if (!canAdministerValue(administeredNode, adminCapabilities)) {
     throw new AdminUnavailableError('admin value operation (value)');
   }
+  // Fail closed on a locked protected seed BEFORE generating a request_id or
+  // writing the pending record (a retry must not burn a fresh id).
+  ensureValueSeedUnlocked(target);
+
   const entry = adminKeys.findAdminNode(target);
   if (!entry || entry.expiresAt <= Date.now()) {
     throw new AdminUnavailableError('admin value operation (grant expired or missing)');
   }
   const node = _ensureAdminKey(target, entry);
+  const requestId = reuseRequestId ?? _randomRequestId();
+  const pending = {
+    requestId,
+    target,
+    direction,
+    account,
+    amount,
+    reason,
+    at: Date.now(),
+  };
 
   // Persist BEFORE sending so a reload/timeout retries the same logical op.
   _savePendingValueOp(pending);

@@ -7,6 +7,7 @@
   import ErrorState from '../shared/ErrorState.svelte';
   import Badge from '../shared/Badge.svelte';
   import ConfirmDialog from '../shared/ConfirmDialog.svelte';
+  import UnlockAdminKeyDialog from '../shared/UnlockAdminKeyDialog.svelte';
   import GrantEmptyState from '../admin/GrantEmptyState.svelte';
   import {
     nodeState,
@@ -26,7 +27,12 @@
     readPendingValueOp,
     clearPendingValueOp,
     retryPendingValueOp,
+    AdminLockedError,
+    AdminSeedProtectionRequiredError,
+    ensureAdminUnlocked,
+    protectValueSeed,
   } from '../../lib/api.js';
+  import { valueReasonErrorVisible } from '../../lib/adminView.js';
   import { navigate } from '../../lib/router.svelte.js';
   import { ROUTES } from '../../lib/constants.js';
 
@@ -40,12 +46,23 @@
   let valueDialog = $state(null); // 'issue' | 'burn' | null
   let valueAmount = $state(0);
   let valueReason = $state('');
+  let valueReasonTouched = $state(false);
   let valueBusy = $state(false);
   let pendingOp = $state(readPendingValueOp());
+  // Unlock-on-demand for a protected seed, and protect-on-demand for a plain
+  // value seed (required before any value action).
+  let unlockOpen = $state(false);
+  let unlockBusy = $state(false);
+  let unlockError = $state(null);
+  let protectOpen = $state(false);
+  let protectBusy = $state(false);
+  let protectError = $state(null);
+  let pendingValueAction = $state(null); // { direction, accountId, amount, reason } | { retry: true }
 
   let valueAmountValid = $derived(Number.isFinite(valueAmount) && valueAmount > 0);
   let valueReasonValid = $derived(valueReason.trim().length > 0);
-  let valueReady = $derived(valueAmountValid && valueReasonValid && !valueBusy);
+  // The reason error is only shown after the field has been touched.
+  let valueReasonError = $derived(valueReasonErrorVisible(valueReasonTouched, valueReasonValid));
 
   $effect(() => {
     void targetEpoch.value;
@@ -64,18 +81,17 @@
     valueDialog = direction;
     valueAmount = 0;
     valueReason = '';
+    valueReasonTouched = false;
   }
 
-  async function submitValue() {
-    if (!selectedAccount || !valueReady) return;
-    const direction = valueDialog;
-    const account = selectedAccount;
+  /** Run one value call, routing a locked protected seed to the unlock dialog. */
+  async function performValue(direction, accountId, amount, reason) {
     valueBusy = true;
     try {
       const result =
         direction === 'issue'
-          ? await adminIssue(account.id, valueAmount, valueReason.trim())
-          : await adminBurn(account.id, valueAmount, valueReason.trim());
+          ? await adminIssue(accountId, amount, reason)
+          : await adminBurn(accountId, amount, reason);
       pendingOp = readPendingValueOp();
       if (result.status === 'duplicate') {
         showToast(
@@ -84,7 +100,7 @@
         );
       } else {
         showToast(
-          `${direction === 'issue' ? 'Issued' : 'Burned'} ${valueAmount}; new balance ${result.balanceAfter}.`,
+          `${direction === 'issue' ? 'Issued' : 'Burned'} ${amount}; new balance ${result.balanceAfter}.`,
           'ok',
         );
       }
@@ -92,6 +108,20 @@
       selectedAccount = null;
       await loadData();
     } catch (err) {
+      if (err instanceof AdminLockedError) {
+        // Retry once the user unlocks; no toast (the dialog explains).
+        pendingValueAction = { direction, accountId, amount, reason };
+        unlockError = null;
+        unlockOpen = true;
+        return;
+      }
+      if (err instanceof AdminSeedProtectionRequiredError) {
+        // Value actions require a protected key: prompt to wrap, then retry.
+        pendingValueAction = { direction, accountId, amount, reason };
+        protectError = null;
+        protectOpen = true;
+        return;
+      }
       pendingOp = readPendingValueOp();
       showToast(err?.message || 'Value operation failed.', 'danger');
     } finally {
@@ -99,22 +129,89 @@
     }
   }
 
-  async function handleRetryPending() {
+  async function submitValue() {
+    if (!selectedAccount) return;
+    valueReasonTouched = true;
+    if (!valueAmountValid || !valueReasonValid) return;
+    await performValue(valueDialog, selectedAccount.id, valueAmount, valueReason.trim());
+  }
+
+  async function performRetryPending() {
+    valueBusy = true;
     try {
       const result = await retryPendingValueOp();
       pendingOp = readPendingValueOp();
       if (result) showToast('Pending value operation applied.', 'ok');
       await loadData();
     } catch (err) {
+      if (err instanceof AdminLockedError) {
+        pendingValueAction = { retry: true };
+        unlockError = null;
+        unlockOpen = true;
+        return;
+      }
+      if (err instanceof AdminSeedProtectionRequiredError) {
+        pendingValueAction = { retry: true };
+        protectError = null;
+        protectOpen = true;
+        return;
+      }
       pendingOp = readPendingValueOp();
       showToast(err?.message || 'Retry failed.', 'danger');
+    } finally {
+      valueBusy = false;
     }
+  }
+
+  function handleRetryPending() {
+    void performRetryPending();
   }
 
   function handleDiscardPending() {
     clearPendingValueOp();
     pendingOp = null;
     showToast('Pending value operation discarded.', 'warn');
+  }
+
+  /** Retry the action that triggered the unlock/protect dialog (once). */
+  async function runPendingAction(action) {
+    if (action?.retry) {
+      await performRetryPending();
+    } else if (action) {
+      await performValue(action.direction, action.accountId, action.amount, action.reason);
+    }
+  }
+
+  async function handleUnlock(passphrase) {
+    unlockBusy = true;
+    unlockError = null;
+    const action = pendingValueAction;
+    try {
+      await ensureAdminUnlocked(view.nodeId, passphrase);
+      unlockOpen = false;
+      pendingValueAction = null;
+      await runPendingAction(action);
+    } catch (err) {
+      unlockError = err?.message || 'Could not unlock the value key.';
+    } finally {
+      unlockBusy = false;
+    }
+  }
+
+  async function handleProtect(passphrase) {
+    protectBusy = true;
+    protectError = null;
+    const action = pendingValueAction;
+    try {
+      await protectValueSeed(view.nodeId, passphrase);
+      protectOpen = false;
+      pendingValueAction = null;
+      await runPendingAction(action);
+    } catch (err) {
+      protectError = err?.message || 'Could not protect the value key.';
+    } finally {
+      protectBusy = false;
+    }
   }
 
   async function loadData() {
@@ -320,6 +417,10 @@
               </div>
             </div>
           {/if}
+          <p class="text-xs muted">
+            Operator-configured limits apply (per-request, window, per-account). The node
+            operator can share the current values.
+          </p>
         </div>
       {/if}
 
@@ -361,13 +462,37 @@
         class="value-input"
         placeholder="e.g. operator top-up"
         bind:value={valueReason}
+        oninput={() => { valueReasonTouched = true; }}
         disabled={valueBusy}
       />
-      {#if !valueReasonValid}
+      {#if valueReasonError}
         <span class="text-xs" style="color: var(--danger);">A reason is required.</span>
       {/if}
     </div>
   </ConfirmDialog>
+
+  <UnlockAdminKeyDialog
+    open={unlockOpen}
+    title="Unlock value key"
+    message="This value key is protected by a passphrase. Enter it to unlock the key for this browser session."
+    confirmLabel="Unlock"
+    busy={unlockBusy}
+    error={unlockError}
+    onSubmit={handleUnlock}
+    onCancel={() => { unlockOpen = false; pendingValueAction = null; unlockError = null; }}
+  />
+
+  <UnlockAdminKeyDialog
+    open={protectOpen}
+    title="Protect value key"
+    message="Value actions require the value key to be protected with a passphrase. It is used locally to wrap the key and is never sent anywhere. There is no recovery: if you forget it, remove and re-generate the key."
+    confirmLabel="Protect and continue"
+    busy={protectBusy}
+    error={protectError}
+    requireConfirm={true}
+    onSubmit={handleProtect}
+    onCancel={() => { protectOpen = false; pendingValueAction = null; protectError = null; }}
+  />
 </div>
 
 <style>

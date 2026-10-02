@@ -69,9 +69,28 @@ how to verify, and conventions**. Detail lives elsewhere:
   inconsistent pair (low probability).
 
 ## Next (recorded backlog)
-- **Unified node administration P4-P6** - see PLAN.org "Next Phases - Unified
-  Node Administration": P4 topology admin, P5 value admin (issue/burn with
-  idempotency + caps), P6 polish. P1-P3 DONE.
+- **Unified node administration P1-P6** - see PLAN.org "Next Phases - Unified
+  Node Administration". P1-P5 DONE (P4 topology admin; P5 value admin with
+  end-to-end idempotency and operator caps). **P6 (focused, web-only) DONE**:
+  a value-scoped seed **must** be passphrase-wrapped before any value action -
+  a plain value key raises `AdminSeedProtectionRequiredError` and the UI opens a
+  Protect dialog (passphrase + confirm), wraps, then retries once. Only value
+  keys may be wrapped; joins/topology stay plaintext. The browser store is now
+  **`cawala.admin.v3`** with read-migration from v2/v1 (plaintext rows read as
+  `seedKind:'plain'`), `AdminSeedState` lock/unlock/protect APIs, an unlock
+  dialog, and a zero-wire value-limits notice. Protect fails closed (a failed
+  persist throws, never reports success) and `removeAdminNode` clears the
+  session-unlocked cache. Honest residual: the wrap adds an
+  interaction gate and protects at-rest dumps / copied browser profiles, but it
+  does **not** stop in-session XSS while unlocked (the seed is in JS memory and a
+  copy is in the wasm heap after `set_admin_key`); GC zeroization is best-effort,
+  a fake prompt can phish the passphrase, and PBKDF2 depends on passphrase
+  strength. Deferred (with rationale): grant-embedded limits
+  (`ADMIN_GRANT_VERSION` 3), 2-person/time-locks, global config/credit limits,
+  persisted node `role`, bundle QR, anomaly dashboard, non-senior routed
+  topology, and an `AdminValuePolicyQuery` (format 8) - see the PLAN.org P6
+  entry. Migration caveat: a cached P5 bundle that reads only `cawala.admin.v2`
+  sees no grants after migration until reload (acceptable in a static PWA).
 - **`OctAddr` depth cap** — deliberately not done (PLAN decision 9: no hard depth
   cap; frames are already bounded by `MAX_CONTROL_FRAME`). The other exit-rights
   follow-ups are built (see the PLAN.org M5 entry): routed-path control-plane

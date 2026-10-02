@@ -211,3 +211,36 @@ web/
         ├── cawala_client.js
         └── cawala_client_bg.wasm
 ```
+
+## Manual checklist: protected value keys (P6)
+
+The value key wrap is browser-side only (no Rust/format change). A value key
+**must** be wrapped before any value action; that is enforced, not optional.
+Walk this on a real device against a live node:
+
+1. **Migration from a P5 store.** With a `cawala.admin.v2` store present, load
+   the app once. The grants still appear; `localStorage['cawala.admin.v3']` now
+   holds them and the v2 key is gone. (A cached P5 bundle that reads only v2 sees
+   no grants until reload — acceptable for a static PWA.)
+2. **Protect.** Settings → Node administration → Value key protection →
+   "Protect value key", set a passphrase (typed twice). The row shows a
+   `Protected` badge; `localStorage` no longer contains the plaintext seed. Only
+   value-scoped keys appear here; joins/topology stay plaintext.
+3. **Protect-on-first-use → issue.** On Accounts, issue value on a liability row
+   while the key is still plain. Instead of running, the Protect dialog opens
+   (passphrase + confirm); after wrapping, the operation runs and the balance
+   updates. This is the required path, not a separate opt-in step.
+4. **Unlock → issue.** With the key wrapped and locked, the value action opens
+   the unlock dialog; enter the passphrase; the operation runs.
+5. **Lock now.** Settings → "Lock now". The next value action prompts for the
+   passphrase again (joins/topology actions are unaffected).
+6. **Reload.** After a reload the key is locked; the unlock/protect dialog
+   appears before any value action. A pending value op (if one was interrupted)
+   offers Retry/Discard and does not burn a new request id until unlocked.
+7. **Wrong passphrase.** Entering a wrong passphrase shows an inline error and
+   leaves the key locked; the confirm field rejects mismatched entries.
+
+Honest limits (not tested here): the wrap does not stop in-session XSS while
+unlocked; GC zeroization is best-effort; a fake prompt can phish the passphrase;
+localStorage quota/private mode and multi-tab cache divergence are out of scope.
+

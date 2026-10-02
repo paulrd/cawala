@@ -175,6 +175,17 @@ export function buildSelectorItems({ self = {}, mock = false, nodes = [], select
 }
 
 /**
+ * Whether the value-reason validation error should be shown: only once the
+ * field has been touched **and** is still invalid. Pure, so it is unit-testable.
+ * @param {boolean} touched
+ * @param {boolean} valid
+ * @returns {boolean}
+ */
+export function valueReasonErrorVisible(touched, valid) {
+  return Boolean(touched) && !valid;
+}
+
+/**
  * Which grant/target states deserve a banner in the context bar.
  * @param {string} status
  * @returns {boolean}

@@ -1,46 +1,71 @@
 /**
- * Cawala — delegated admin key + administered-node selection store (v2).
+ * Cawala — delegated admin key + administered-node selection store (v3).
  *
  * A browser can be granted delegated admin authority (K_admin) over one or
  * more nodes. The generated admin seed is device-local key material: it is
  * persisted here (never in any exported identity bundle) and handed to the wasm
  * client via `api.configureAdminNode()` -> `ClientNode.set_admin_key()`.
  *
- * Storage: `cawala.admin.v2`, shape:
- *   { v: 2, selected: 'self' | <nodeId> | null, entries: [ {
- *       nodeId, adminSeedHex, adminPubHex, scope: 'admin',
+ * Storage: `cawala.admin.v3`, shape:
+ *   { v: 3, selected: 'self' | <nodeId> | null, entries: [ {
+ *       nodeId, adminSeedHex | seedWrapped, adminPubHex, scope: 'admin',
  *       scopes: ['joins' | 'topology' | 'value'],
+ *       seedKind: 'plain' | 'pbkdf2-aes-gcm', seedProtected: boolean,
  *       grantSource: 'manual' | 'bundle',
  *       grantedAt, expiresAt, label, nodeAddr,
  *       lastSeenStatus, lastSeenKind, lastSeenAddress, lastSeenAt } ] }
  *
- * `grantSource` is `'manual'` for a locally generated provisional grant (and
- * for pre-P2 rows) and `'bundle'` once an operator-signed `cawala://admin`
- * bundle has been applied via `applyAdminGrant` (which replaces the
- * provisional scopes/TTL without touching the seed).
+ * A seed is either plaintext (`adminSeedHex`, `seedKind: 'plain'`,
+ * `seedProtected: false`) or passphrase-wrapped (`seedWrapped`,
+ * `seedKind: 'pbkdf2-aes-gcm'`, `seedProtected: true`). A wrapped seed must be
+ * unlocked in this session before `adminSeedBytes()` returns it; the unwrapped
+ * seed is cached in memory only (never persisted) and cleared by lock/clear.
  *
- * Read-migration: a v1 envelope at `cawala.admin.v1` is read once, rewritten
- * as v2 (and the v1 key dropped) — see `_migrateV1()`. v1 grants are
- * interpreted as `scopes: ['joins']`; a v1 grant is never silently widened.
+ * Honest residual: the wrap adds an interaction gate and protects at-rest dumps
+ * and copied browser profiles, but it does **not** stop in-session XSS while
+ * unlocked (the seed is in JS memory and a copy is in the wasm heap after
+ * `set_admin_key`).
+ *
+ * Read-migration: a v2/v1 envelope is read once, rewritten as v3 (old keys
+ * retired). v1 grants are interpreted as `scopes: ['joins']`; a v1 grant is
+ * never silently widened.
  *
  * Selection is explicit. `activeAdminNode()` is the *selected* entry while it
  * is still valid — it is never an implicit "first non-expired entry". The only
- * implicit moments are one-time defaults that are persisted immediately: the
- * v1 -> v2 migration and the very first stored entry.
- *
- * `nodeAddr` (dotted octal, e.g. "0.1.2") is the target node's asserted address
- * used for tree-routed admin calls. It is additive: entries stored before it
- * existed read back as `nodeAddr: null`.
+ * implicit moments are one-time defaults that are persisted immediately: a
+ * migration and the very first stored entry.
  *
  * Every public accessor except `adminSeedBytes()` returns seed-free views, so
  * accidental logging/serialization can never leak K_admin. Pure ESM, no DOM
  * beyond localStorage, dependency-free and Node-testable.
  */
 
+import { isWrappedSeed, unwrapSeed, wrapSeed } from './adminSeedCrypto.js';
+
 const STORE_KEY_V1 = 'cawala.admin.v1';
-const STORE_KEY = 'cawala.admin.v2';
-const STORE_VERSION = 2;
+const STORE_KEY_V2 = 'cawala.admin.v2';
+const STORE_KEY = 'cawala.admin.v3';
+const STORE_VERSION = 3;
+/** Envelope versions this build reads (v3 is the only one it writes). */
+const ACCEPTED_STORE_VERSIONS = [1, 2, STORE_VERSION];
 const DEFAULT_TTL_MS = 7 * 24 * 3600 * 1000;
+
+/**
+ * The form a stored seed takes.
+ * - `plain`: the 64-hex seed is stored directly (joins/topology default).
+ * - `pbkdf2-aes-gcm`: the seed is passphrase-wrapped and must be unlocked.
+ */
+export const SEED_KIND = {
+  PLAIN: 'plain',
+  WRAPPED: 'pbkdf2-aes-gcm',
+};
+
+/**
+ * Per-session, per-node unlocked seeds (hex). In memory only: never persisted,
+ * and cleared by any lock/clear. A locked wrapped seed reads as `'locked'`.
+ * @type {Map<string, string>}
+ */
+const _unlockedSeeds = new Map();
 
 /** Selection value meaning "this browser's own node", not a granted node. */
 export const SELF_SELECTION = 'self';
@@ -178,6 +203,9 @@ function _publicEntry(record) {
     adminPubHex: record.adminPubHex,
     scope: record.scope,
     scopes: [...record.scopes],
+    // Seed-free status only: never the seed (plain or wrapped).
+    seedKind: record.seedKind === SEED_KIND.WRAPPED ? SEED_KIND.WRAPPED : SEED_KIND.PLAIN,
+    seedProtected: record.seedKind === SEED_KIND.WRAPPED,
     grantSource: record.grantSource === GRANT_SOURCE.BUNDLE ? GRANT_SOURCE.BUNDLE : GRANT_SOURCE.MANUAL,
     grantedAt: record.grantedAt,
     expiresAt: record.expiresAt,
@@ -198,7 +226,21 @@ function _publicEntry(record) {
  */
 function _normalizeStored(entry) {
   if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return null;
-  if (!_isHex64(entry.nodeId) || !_isHex64(entry.adminSeedHex) || !_isHex64(entry.adminPubHex)) {
+  if (!_isHex64(entry.nodeId) || !_isHex64(entry.adminPubHex)) {
+    return null;
+  }
+  // A seed is either a plaintext hex seed or a structurally valid wrapped
+  // record. A wrapped row is never dropped just because `adminSeedHex` is
+  // absent (and vice versa).
+  let adminSeedHex = null;
+  let seedWrapped = null;
+  let seedKind = SEED_KIND.PLAIN;
+  if (isWrappedSeed(entry.seedWrapped)) {
+    seedWrapped = entry.seedWrapped;
+    seedKind = SEED_KIND.WRAPPED;
+  } else if (_isHex64(entry.adminSeedHex)) {
+    adminSeedHex = entry.adminSeedHex.toLowerCase();
+  } else {
     return null;
   }
   const grantedAt = Number(entry.grantedAt);
@@ -208,7 +250,10 @@ function _normalizeStored(entry) {
   }
   return {
     nodeId: entry.nodeId.toLowerCase(),
-    adminSeedHex: entry.adminSeedHex.toLowerCase(),
+    adminSeedHex,
+    seedWrapped,
+    seedKind,
+    seedProtected: seedKind === SEED_KIND.WRAPPED,
     adminPubHex: entry.adminPubHex.toLowerCase(),
     scope: 'admin',
     // v1 rows carry `scope: 'admin'` and no `scopes`: joins-only, never widened.
@@ -261,7 +306,7 @@ function _parseEnvelope(raw) {
     parsed === null ||
     typeof parsed !== 'object' ||
     Array.isArray(parsed) ||
-    (parsed.v !== 1 && parsed.v !== STORE_VERSION) ||
+    !ACCEPTED_STORE_VERSIONS.includes(parsed.v) ||
     !Array.isArray(parsed.entries)
   ) {
     return null;
@@ -298,28 +343,34 @@ function _readEnvelope(now = Date.now()) {
   const store = _storage();
   if (!store) return null;
 
-  let rawV2 = null;
+  let raw = null;
   try {
-    rawV2 = store.getItem(STORE_KEY);
+    raw = store.getItem(STORE_KEY);
   } catch {
     return null;
   }
 
-  let envelope = _parseEnvelope(rawV2);
+  let envelope = _parseEnvelope(raw);
 
   if (!envelope) {
-    // No (or unusable) v2 store: try the legacy v1 location and migrate.
-    let rawV1 = null;
-    try {
-      rawV1 = store.getItem(STORE_KEY_V1);
-    } catch {
-      return null;
+    // Migrate from v2, then v1. Each row carries over in its stored form
+    // (plaintext or wrapped).
+    for (const key of [STORE_KEY_V2, STORE_KEY_V1]) {
+      let legacyRaw = null;
+      try {
+        legacyRaw = store.getItem(key);
+      } catch {
+        legacyRaw = null;
+      }
+      const legacy = _parseEnvelope(legacyRaw);
+      if (legacy) {
+        envelope = { v: STORE_VERSION, selected: legacy.selected, entries: legacy.entries };
+        _writeEnvelope(envelope);
+        break;
+      }
     }
-    const legacy = _parseEnvelope(rawV1);
-    if (!legacy) return null;
-    envelope = { v: STORE_VERSION, selected: legacy.selected, entries: legacy.entries };
-    _writeEnvelope(envelope); // writes v2, then drops the v1 key
   }
+  if (!envelope) return null;
 
   if (!_isKnownSelection(envelope.selected, envelope.entries)) {
     envelope.selected = _defaultSelection(envelope.entries, now);
@@ -329,14 +380,20 @@ function _readEnvelope(now = Date.now()) {
 }
 
 /**
- * Persist an envelope at the v2 key and retire the v1 key. Best-effort: an
- * unavailable/full store is a silent no-op (the v1 key is only dropped once
- * the v2 write has been attempted, so a failed write never destroys data).
+ * Persist an envelope at the v3 key and retire the v2/v1 keys.
+ *
+ * Returns `true` when the v3 write succeeded (or storage is unavailable, where
+ * there is nothing to persist); `false` when `setItem` threw. Most callers are
+ * best-effort and ignore the result, but `protectAdminSeed` is fail-closed and
+ * must surface a failed write. The old keys are only dropped once the v3 write
+ * has been attempted, so a failed write never destroys data.
+ *
  * @param {{ selected: string|null, entries: Array<object> }} envelope
+ * @returns {boolean}
  */
 function _writeEnvelope(envelope) {
   const store = _storage();
-  if (!store) return;
+  if (!store) return true;
   try {
     store.setItem(
       STORE_KEY,
@@ -346,9 +403,11 @@ function _writeEnvelope(envelope) {
         entries: envelope.entries,
       }),
     );
+    store.removeItem(STORE_KEY_V2);
     store.removeItem(STORE_KEY_V1);
+    return true;
   } catch {
-    /* ignore */
+    return false;
   }
 }
 
@@ -496,6 +555,9 @@ export function addAdminEntry({
   const record = {
     nodeId: normalizedNodeId,
     adminSeedHex: normalizedSeed,
+    seedWrapped: null,
+    seedKind: SEED_KIND.PLAIN,
+    seedProtected: false,
     adminPubHex: normalizedPub,
     scope: 'admin',
     scopes: _normalizeScopes(scopes, V1_SCOPES),
@@ -554,13 +616,15 @@ export function applyAdminGrant(nodeId, { scopes, grantedAt, expiresAt, label = 
   const existing = envelope.entries[index];
   envelope.entries[index] = {
     // Preserve seed/public key/nodeAddr/lastSeen*; only the grant's meaning
-    // (scopes, TTL, label, source) is replaced.
+    // (scopes, TTL, label, source) is replaced. The seed form is untouched: a
+    // wrapped value key stays wrapped.
     ...existing,
     scopes: normalizedScopes,
     grantedAt: granted,
     expiresAt: expires,
     label: typeof label === 'string' ? label : null,
     grantSource: GRANT_SOURCE.BUNDLE,
+    seedProtected: existing.seedKind === SEED_KIND.WRAPPED,
   };
   // Selection is untouched: applying a bundle never changes the target.
   _writeEnvelope(envelope);
@@ -602,6 +666,8 @@ export function updateLastSeen(nodeId, { status = null, kind = null, address = n
 export function removeAdminNode(nodeId) {
   if (typeof nodeId !== 'string') return;
   const wanted = nodeId.toLowerCase();
+  // Drop any session-unlocked seed for the removed node.
+  _unlockedSeeds.delete(wanted);
   const envelope = _readEnvelope();
   if (!envelope) return;
   envelope.entries = envelope.entries.filter((record) => record.nodeId !== wanted);
@@ -616,10 +682,12 @@ export function removeAdminNode(nodeId) {
  * Best-effort.
  */
 export function clearAllAdminEntries() {
+  _unlockedSeeds.clear();
   const store = _storage();
   if (store) {
     try {
       store.removeItem(STORE_KEY);
+      store.removeItem(STORE_KEY_V2);
       store.removeItem(STORE_KEY_V1);
     } catch {
       /* ignore */
@@ -627,9 +695,138 @@ export function clearAllAdminEntries() {
   }
 }
 
+// ── Seed protection (P6) ──────────────────────────────────────
+
+/**
+ * The seed state for `nodeId`:
+ * - `absent`: no stored entry.
+ * - `plain`: stored as plaintext hex (usable directly).
+ * - `unlocked`: wrapped and unlocked in this session.
+ * - `locked`: wrapped and not unlocked in this session.
+ * @param {string} nodeId
+ * @returns {'plain'|'locked'|'unlocked'|'absent'}
+ */
+export function adminSeedState(nodeId) {
+  if (typeof nodeId !== 'string') return 'absent';
+  const wanted = nodeId.toLowerCase();
+  const record = _readEnvelope()?.entries.find((entry) => entry.nodeId === wanted) ?? null;
+  if (!record) return 'absent';
+  if (record.seedKind !== SEED_KIND.WRAPPED) return 'plain';
+  return _unlockedSeeds.has(wanted) ? 'unlocked' : 'locked';
+}
+
+/**
+ * Unwrap a wrapped seed into the in-memory session cache.
+ *
+ * @param {string} nodeId
+ * @param {string} passphrase
+ * @returns {Promise<boolean>} true when the seed is now usable
+ * @throws on a wrong passphrase or an absent node
+ */
+export async function unlockAdminSeed(nodeId, passphrase) {
+  const wanted = _requireHex64(nodeId, HEX64_MESSAGE.nodeId);
+  const record =
+    _readEnvelope()?.entries.find((entry) => entry.nodeId === wanted) ?? null;
+  if (!record) {
+    throw new Error('Unknown administered node: no stored admin key for that node id');
+  }
+  // A plain entry has no passphrase to check; `true` here is not a passphrase
+  // check. The unlock dialog is only shown for a `'locked'` entry, so callers
+  // never prompt for a plain one.
+  if (record.seedKind !== SEED_KIND.WRAPPED) return true;
+  if (_unlockedSeeds.has(wanted)) return true;
+  const seedHex = await unwrapSeed(record.seedWrapped, passphrase, wanted);
+  _unlockedSeeds.set(wanted, seedHex);
+  return true;
+}
+
+/**
+ * Drop the in-memory unlocked seed for `nodeId` (no-op when absent).
+ * @param {string} nodeId
+ */
+export function lockAdminSeed(nodeId) {
+  if (typeof nodeId !== 'string') return;
+  _unlockedSeeds.delete(nodeId.toLowerCase());
+}
+
+/** Drop every in-memory unlocked seed. */
+export function lockAllAdminSeeds() {
+  _unlockedSeeds.clear();
+}
+
+/**
+ * Wrap `nodeId`'s plaintext seed under `passphrase`, dropping the plaintext.
+ * The freshly wrapped seed is cached as unlocked for this session (the caller
+ * just proved the passphrase).
+ *
+ * @param {string} nodeId
+ * @param {string} passphrase
+ * @returns {Promise<void>}
+ */
+export async function protectAdminSeed(nodeId, passphrase) {
+  const wanted = _requireHex64(nodeId, HEX64_MESSAGE.nodeId);
+  const envelope = _readEnvelope();
+  const index = envelope ? envelope.entries.findIndex((entry) => entry.nodeId === wanted) : -1;
+  if (index === -1) {
+    throw new Error('Unknown administered node: no stored admin key for that node id');
+  }
+  const record = envelope.entries[index];
+  // Only value-scoped keys are wrapped; joins/topology seeds stay plaintext.
+  if (!record.scopes.includes('value')) {
+    throw new Error('Only value-scoped admin keys can be protected');
+  }
+  if (record.seedKind === SEED_KIND.WRAPPED) return;
+  const wrapped = await wrapSeed(record.adminSeedHex, passphrase, wanted);
+  const { adminSeedHex: _drop, ...rest } = record;
+  envelope.entries[index] = {
+    ...rest,
+    seedWrapped: wrapped,
+    seedKind: SEED_KIND.WRAPPED,
+    seedProtected: true,
+  };
+  if (!_writeEnvelope(envelope)) {
+    // Fail closed: do not claim a protection that was not persisted, and do not
+    // leave the seed falsely unlocked.
+    throw new Error('Could not persist the protected value key (storage unavailable).');
+  }
+  // The caller just proved the passphrase: cache the seed for this session.
+  _unlockedSeeds.set(wanted, record.adminSeedHex);
+}
+
+/**
+ * Restore a wrapped seed to plaintext (explicit; not recommended). Requires the
+ * seed to be plain or already unlocked.
+ *
+ * @param {string} nodeId
+ */
+export function unprotectAdminSeed(nodeId) {
+  const wanted = _requireHex64(nodeId, HEX64_MESSAGE.nodeId);
+  const envelope = _readEnvelope();
+  const index = envelope ? envelope.entries.findIndex((entry) => entry.nodeId === wanted) : -1;
+  if (index === -1) {
+    throw new Error('Unknown administered node: no stored admin key for that node id');
+  }
+  const record = envelope.entries[index];
+  if (record.seedKind !== SEED_KIND.WRAPPED) return;
+  const seedHex = _unlockedSeeds.get(wanted);
+  if (typeof seedHex !== 'string') {
+    throw new Error('Unlock this value key before removing protection');
+  }
+  _unlockedSeeds.delete(wanted);
+  const { seedWrapped: _drop, ...rest } = record;
+  envelope.entries[index] = {
+    ...rest,
+    adminSeedHex: seedHex,
+    seedKind: SEED_KIND.PLAIN,
+    seedProtected: false,
+  };
+  _writeEnvelope(envelope);
+}
+
 /**
  * The ONLY accessor that returns admin key material. Returns the exact 32-byte
- * seed for `nodeId`, or null when absent / invalid.
+ * seed for `nodeId` only when it is plaintext or unlocked in this session;
+ * otherwise null (absent, invalid, or locked).
  * @param {string} nodeId
  * @returns {Uint8Array|null}
  */
@@ -637,5 +834,10 @@ export function adminSeedBytes(nodeId) {
   if (typeof nodeId !== 'string') return null;
   const wanted = nodeId.toLowerCase();
   const record = _readEnvelope()?.entries.find((entry) => entry.nodeId === wanted) ?? null;
-  return record ? _hexToBytes(record.adminSeedHex) : null;
+  if (!record) return null;
+  if (record.seedKind === SEED_KIND.WRAPPED) {
+    const seedHex = _unlockedSeeds.get(wanted);
+    return typeof seedHex === 'string' ? _hexToBytes(seedHex) : null;
+  }
+  return record.adminSeedHex ? _hexToBytes(record.adminSeedHex) : null;
 }

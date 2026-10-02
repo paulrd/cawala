@@ -1160,6 +1160,52 @@
      time** (post-op for a fresh apply, current for a duplicate), not the
      original application's post-op balance.
 
+** P6 (focused) - delivered 2026-10-02 (web-only seed hardening)
+   - Web-only; no Rust/control-format change and no `node-data` recreation.
+   - **Required wrap**: a value-scoped key must be passphrase-wrapped before
+     **any** value action (not opt-in). A plain value key is refused with a
+     distinct `AdminSeedProtectionRequiredError`; the UI opens a Protect dialog
+     (passphrase + confirm), wraps the seed, then retries the action once. Only
+     value-scoped keys may be wrapped, and joins/topology seeds stay plaintext.
+   - `web/src/lib/adminSeedCrypto.js`: passphrase wrap for delegated **value**
+     seeds (PBKDF2-SHA-256 600_000 iters + 16-byte salt, AES-256-GCM + 12-byte
+     IV, AAD `cawala.admin.seed.v1:<nodeId>`). The identity-bundle format is
+     untouched; the iteration count is pinned to the v1 constant so a tampered
+     record cannot force unbounded PBKDF2 work. Each wrap uses a fresh salt/IV.
+   - `web/src/lib/adminKeys.js` moves to **`cawala.admin.v3`** with read-migration
+     from v2/v1 (plaintext rows read as `seedKind:'plain'`). An entry's seed is
+     either plaintext or wrapped (`seedWrapped`, `seedKind:'plain'|'pbkdf2-aes-gcm'`,
+     `seedProtected`); a wrapped row is never dropped, and seed-free views expose
+      only `seedProtected`/`seedKind`. New `adminSeedState`/`unlockAdminSeed`/
+      `lockAdminSeed`/`lockAllAdminSeeds`/`protectAdminSeed`/`unprotectAdminSeed`;
+      `adminSeedBytes` returns bytes only when plain or session-unlocked.
+      `removeAdminNode` clears the session-unlocked cache; `protectAdminSeed`
+      throws when the write did not persist (no false "protected").
+   - `api.js`: typed `AdminLockedError` and `AdminSeedProtectionRequiredError`;
+      `_ensureAdminKey` raises the former for a locked entry and the latter for a
+      plain value key; `ensureAdminUnlocked`/`lockAdmin`/`protectValueSeed`
+      (value-only, verifies persistence). `adminIssue`/`adminBurn` refuse a
+      locked or unprotected seed **before** minting a request id or writing the
+      pending record. UI: `UnlockAdminKeyDialog` (passphrase + confirm for
+      protect), Settings per-node Protect/Lock shown only for value-scoped keys
+      with a `Protected` badge, AccountsPage unlock/protect-and-retry; zero-wire
+      limits notice plus actionable `limit_exceeded` copy (no fabricated numbers).
+   - Honest residual: the wrap adds an interaction gate and protects at-rest
+     dumps and copied browser profiles, but it does **not** stop in-session XSS
+     while unlocked (the seed is in JS memory and a copy is in the wasm heap
+     after `set_admin_key`); GC zeroization is best-effort, a fake prompt can
+     phish the passphrase, and PBKDF2 depends on passphrase strength.
+   - Deferrals (with rationale): grant-embedded limits (`ADMIN_GRANT_VERSION` 3)
+     needs a grant/format design and cross-version key distribution;
+     2-person/time-locks need quorum infrastructure and a recovery story; global
+     config/credit limits need a config model (none exists); persisted node
+     `role` is a snapshot additive not needed for the UI; bundle QR needs a
+     rendering dependency; an anomaly dashboard needs a metrics sink;
+     non-senior routed topology needs a routing-trust redesign; the
+     operator-key-rotation `ValueIndex` residual is intentional (outside the
+     threat model). `AdminValuePolicyQuery`/format 8 was explicitly deferred in
+     favour of zero-wire reject copy.
+
 ** Authority and value-op requirements (essential)
    - *Scope separation*: each admin request declares its required scope; grant
      management stays self-operator/CLI only (a delegated admin must never

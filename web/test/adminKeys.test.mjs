@@ -31,13 +31,22 @@ const {
   selectedNodeId,
   selectAdminNode,
   adminSeedBytes,
+  adminSeedState,
   addAdminEntry,
   applyAdminGrant,
   updateLastSeen,
   removeAdminNode,
   clearAllAdminEntries,
+  unlockAdminSeed,
+  lockAdminSeed,
+  lockAllAdminSeeds,
+  protectAdminSeed,
+  unprotectAdminSeed,
   GRANT_SOURCE,
+  SEED_KIND,
 } = await import('../src/lib/adminKeys.js');
+
+const { wrapSeed } = await import('../src/lib/adminSeedCrypto.js');
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -53,7 +62,8 @@ const PUB_C = 'ef'.repeat(32);
 const NODE_D = '12'.repeat(32);
 const SEED_D = '34'.repeat(32);
 const PUB_D = '56'.repeat(32);
-const ADMIN_KEY = 'cawala.admin.v2';   // current store
+const ADMIN_KEY = 'cawala.admin.v3';   // current store
+const V2_KEY = 'cawala.admin.v2';      // P1/P2 store, migrated on read
 const LEGACY_KEY = 'cawala.admin.v1';  // pre-scoped store, migrated on read
 
 function reset() {
@@ -99,6 +109,8 @@ test('add/load round-trip (seed-free view)', () => {
     adminPubHex: PUB_A,
     scope: 'admin',
     scopes: ['joins'],
+    seedKind: 'plain',
+    seedProtected: false,
     grantSource: 'manual',
     grantedAt: now,
     expiresAt: now + 1000,
@@ -402,6 +414,8 @@ test('getAdminNodes-equivalent public surface never exposes seed material', () =
     'nodeId',
     'scope',
     'scopes',
+    'seedKind',
+    'seedProtected',
     'selected',
   ]);
 });
@@ -445,7 +459,7 @@ test('clearAllAdminEntries empties the store', () => {
 
 // ── v1 → v2 migration ───────────────────────────────────────────────────────
 
-test('a stored v1 envelope migrates to v2 on first read', () => {
+test('a stored v1 envelope migrates to v3 on first read', () => {
   reset();
   const now = Date.now();
   memory.setItem(
@@ -465,16 +479,17 @@ test('a stored v1 envelope migrates to v2 on first read', () => {
       ],
     }),
   );
-  assert.equal(memory.getItem(ADMIN_KEY), null, 'nothing stored at the v2 key yet');
+  assert.equal(memory.getItem(ADMIN_KEY), null, 'nothing stored at the v3 key yet');
 
   const loaded = loadAdminEntries(now);
   assert.equal(loaded.length, 1);
 
-  // Migrated envelope: v2, seed intact, v1 key retired.
+  // Migrated envelope: v3, seed intact and plaintext, legacy keys retired.
   const raw = JSON.parse(memory.getItem(ADMIN_KEY));
-  assert.equal(raw.v, 2);
+  assert.equal(raw.v, 3);
   assert.equal(raw.entries.length, 1);
   assert.equal(raw.entries[0].adminSeedHex, SEED_A);
+  assert.equal(raw.entries[0].seedKind, 'plain');
   assert.equal(memory.getItem(LEGACY_KEY), null);
   assert.equal(loaded[0].label, 'legacy parent');
   assert.equal(Buffer.from(adminSeedBytes(NODE_A)).toString('hex'), SEED_A);
@@ -511,7 +526,7 @@ test('a migrated v1 grant stays joins-only and is never silently widened', () =>
     'the migrated record itself is joins-only',
   );
 
-  // A v1 record is never widened on read, even by a later v2 writer.
+  // A v1 record is never widened on read, even by a later v3 writer.
   addAdminEntry(entry(NODE_B, SEED_B, PUB_B, { grantedAt: now, expiresAt: now + 1000 }));
   assert.deepEqual(findAdminNode(NODE_B).scopes, ['joins'], 'omitted scopes default to joins');
 
@@ -535,7 +550,7 @@ test('a migrated v1 grant stays joins-only and is never silently widened', () =>
   }
 });
 
-test('a corrupt v2 store falls back to the v1 key instead of losing the grants', () => {
+test('a corrupt v3 store falls back through v2 to the v1 key instead of losing the grants', () => {
   reset();
   const now = Date.now();
   memory.setItem(ADMIN_KEY, '{not json');
@@ -558,9 +573,10 @@ test('a corrupt v2 store falls back to the v1 key instead of losing the grants',
 
   assert.equal(loadAdminEntries(now).length, 1);
   const repaired = JSON.parse(memory.getItem(ADMIN_KEY));
-  assert.equal(repaired.v, 2, 'the corrupt payload is replaced with a valid one');
+  assert.equal(repaired.v, 3, 'the corrupt payload is replaced with a valid one');
   assert.equal(repaired.entries[0].nodeId, NODE_A);
   assert.equal(memory.getItem(LEGACY_KEY), null, 'the legacy key is retired');
+  assert.equal(memory.getItem(V2_KEY), null, 'the v2 key is retired too');
 });
 
 // ── Probe memory ────────────────────────────────────────────────────────────
@@ -755,4 +771,204 @@ test('applyAdminGrant dedupes scopes and requires expiresAt > grantedAt', () => 
     () => applyAdminGrant(NODE_A, { scopes: ['joins'], grantedAt: 'nope', expiresAt: now }),
     /grantedAt must be a finite timestamp/,
   );
+});
+
+// ── P6: v3 store + seed protection ──────────────────────────────────────────
+
+test('a stored v2 envelope migrates to v3 with plaintext rows', () => {
+  reset();
+  const now = 1_700_000_000_000;
+  memory.setItem(
+    V2_KEY,
+    JSON.stringify({
+      v: 2,
+      selected: NODE_A,
+      entries: [entry(NODE_A, SEED_A, PUB_A, { grantedAt: now, expiresAt: now + 1000 })],
+    }),
+  );
+  assert.equal(memory.getItem(ADMIN_KEY), null);
+
+  const loaded = loadAdminEntries(now);
+  assert.equal(loaded.length, 1);
+  assert.equal(loaded[0].seedKind, 'plain');
+  assert.equal(loaded[0].seedProtected, false);
+
+  const raw = JSON.parse(memory.getItem(ADMIN_KEY));
+  assert.equal(raw.v, 3);
+  assert.equal(raw.entries[0].adminSeedHex, SEED_A);
+  assert.equal(memory.getItem(V2_KEY), null, 'the v2 key is retired');
+});
+
+test('protectAdminSeed wraps the seed and locks it from bytes until unlock', async () => {
+  reset();
+  const now = 1_700_000_000_000;
+  addAdminEntry(
+    entry(NODE_A, SEED_A, PUB_A, { grantedAt: now, expiresAt: now + 1000, scopes: ['value'] }),
+  );
+  assert.equal(adminSeedState(NODE_A), 'plain');
+  assert.deepEqual(adminSeedBytes(NODE_A), hexToBytes(SEED_A));
+
+  await protectAdminSeed(NODE_A, 'passphrase');
+  // Just wrapped: cached for this session.
+  assert.equal(adminSeedState(NODE_A), 'unlocked');
+  assert.deepEqual(adminSeedBytes(NODE_A), hexToBytes(SEED_A));
+
+  // Seed-free public views expose only the protection status.
+  const publicEntry = findAdminNode(NODE_A);
+  assert.equal(publicEntry.seedProtected, true);
+  assert.equal(publicEntry.seedKind, SEED_KIND.WRAPPED);
+  assert.equal(publicEntry.adminSeedHex, undefined);
+  assert.equal(publicEntry.seedWrapped, undefined);
+  assert.equal(JSON.stringify(publicEntry).includes(SEED_A), false);
+
+  // The persisted store no longer contains the plaintext seed.
+  const onDisk = memory.getItem(ADMIN_KEY);
+  assert.equal(onDisk.includes(SEED_A), false);
+  assert.equal(onDisk.includes('adminSeedHex'), false);
+  assert.equal(JSON.parse(onDisk).entries[0].seedKind, SEED_KIND.WRAPPED);
+
+  // Lock: bytes become unavailable; a wrong passphrase stays rejected.
+  lockAdminSeed(NODE_A);
+  assert.equal(adminSeedState(NODE_A), 'locked');
+  assert.equal(adminSeedBytes(NODE_A), null);
+  await assert.rejects(() => unlockAdminSeed(NODE_A, 'wrong'), /Incorrect passphrase/);
+  assert.equal(adminSeedState(NODE_A), 'locked');
+
+  // Correct unlock restores the bytes.
+  assert.equal(await unlockAdminSeed(NODE_A, 'passphrase'), true);
+  assert.equal(adminSeedState(NODE_A), 'unlocked');
+  assert.deepEqual(adminSeedBytes(NODE_A), hexToBytes(SEED_A));
+});
+
+test('lockAllAdminSeeds and clearAllAdminEntries clear the unlock cache', async () => {
+  reset();
+  const now = 1_700_000_000_000;
+  addAdminEntry(
+    entry(NODE_A, SEED_A, PUB_A, { grantedAt: now, expiresAt: now + 1000, scopes: ['value'] }),
+  );
+  await protectAdminSeed(NODE_A, 'passphrase');
+  assert.equal(adminSeedState(NODE_A), 'unlocked');
+
+  lockAllAdminSeeds();
+  assert.equal(adminSeedState(NODE_A), 'locked');
+
+  await unlockAdminSeed(NODE_A, 'passphrase');
+  assert.equal(adminSeedState(NODE_A), 'unlocked');
+  clearAllAdminEntries();
+  assert.equal(adminSeedState(NODE_A), 'absent');
+  assert.equal(adminSeedBytes(NODE_A), null);
+});
+
+test('unprotectAdminSeed requires an unlocked seed', async () => {
+  reset();
+  const now = 1_700_000_000_000;
+  addAdminEntry(
+    entry(NODE_A, SEED_A, PUB_A, { grantedAt: now, expiresAt: now + 1000, scopes: ['value'] }),
+  );
+  await protectAdminSeed(NODE_A, 'passphrase');
+  lockAdminSeed(NODE_A);
+
+  assert.throws(() => unprotectAdminSeed(NODE_A), /Unlock this value key/);
+  assert.equal(adminSeedState(NODE_A), 'locked');
+
+  await unlockAdminSeed(NODE_A, 'passphrase');
+  unprotectAdminSeed(NODE_A);
+  assert.equal(adminSeedState(NODE_A), 'plain');
+  assert.deepEqual(adminSeedBytes(NODE_A), hexToBytes(SEED_A));
+  assert.equal(findAdminNode(NODE_A).seedProtected, false);
+});
+
+test('protectAdminSeed refuses a non-value entry', async () => {
+  reset();
+  const now = 1_700_000_000_000;
+  addAdminEntry(entry(NODE_A, SEED_A, PUB_A, { grantedAt: now, expiresAt: now + 1000 }));
+  await assert.rejects(() => protectAdminSeed(NODE_A, 'passphrase'), /Only value-scoped/);
+  assert.equal(adminSeedState(NODE_A), 'plain');
+  assert.equal(findAdminNode(NODE_A).seedProtected, false);
+});
+
+test('removeAdminNode clears the session-unlocked seed', async () => {
+  reset();
+  const now = 1_700_000_000_000;
+  addAdminEntry(
+    entry(NODE_A, SEED_A, PUB_A, { grantedAt: now, expiresAt: now + 1000, scopes: ['value'] }),
+  );
+  await protectAdminSeed(NODE_A, 'passphrase');
+  assert.equal(adminSeedState(NODE_A), 'unlocked');
+
+  removeAdminNode(NODE_A);
+  assert.equal(adminSeedState(NODE_A), 'absent');
+
+  // Re-add the same node with a different wrapped seed: it must read locked,
+  // proving the old unlocked cache entry was dropped.
+  const wrapped = await wrapSeed(SEED_B, 'other passphrase', NODE_A);
+  memory.setItem(
+    ADMIN_KEY,
+    JSON.stringify({
+      v: 3,
+      selected: NODE_A,
+      entries: [
+        {
+          nodeId: NODE_A,
+          seedWrapped: wrapped,
+          adminPubHex: PUB_A,
+          seedKind: 'pbkdf2-aes-gcm',
+          seedProtected: true,
+          scopes: ['value'],
+          grantedAt: now,
+          expiresAt: now + 1000,
+        },
+      ],
+    }),
+  );
+  assert.equal(adminSeedState(NODE_A), 'locked');
+});
+
+test('a wrapped row survives public accessors but a malformed wrap is dropped', async () => {
+  reset();
+  const now = 1_700_000_000_000;
+  const wrapped = await wrapSeed(SEED_A, 'passphrase', NODE_A);
+  memory.setItem(
+    ADMIN_KEY,
+    JSON.stringify({
+      v: 3,
+      selected: NODE_A,
+      entries: [
+        {
+          nodeId: NODE_A,
+          seedWrapped: wrapped,
+          adminPubHex: PUB_A,
+          seedKind: 'pbkdf2-aes-gcm',
+          seedProtected: true,
+          grantedAt: now,
+          expiresAt: now + 1000,
+        },
+      ],
+    }),
+  );
+  const loaded = loadAdminEntries(now);
+  assert.equal(loaded.length, 1, 'a wrapped row is never dropped');
+  assert.equal(loaded[0].seedProtected, true);
+  assert.equal(loaded[0].seedKind, 'pbkdf2-aes-gcm');
+  assert.equal(adminSeedState(NODE_A), 'locked');
+  assert.equal(adminSeedBytes(NODE_A), null);
+
+  // A structurally invalid wrap drops just that row.
+  memory.setItem(
+    ADMIN_KEY,
+    JSON.stringify({
+      v: 3,
+      selected: NODE_A,
+      entries: [
+        {
+          nodeId: NODE_A,
+          seedWrapped: { kdf: {}, aead: {}, ct: 'x' },
+          adminPubHex: PUB_A,
+          grantedAt: now,
+          expiresAt: now + 1000,
+        },
+      ],
+    }),
+  );
+  assert.deepEqual(loadAdminEntries(now), []);
 });

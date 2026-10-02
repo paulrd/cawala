@@ -20,9 +20,12 @@
     configureAdminNode,
     removeAdminNode,
     applyAdminBundle,
+    lockAdmin,
+    protectValueSeed,
   } from '../../lib/api.js';
   import { copyToClipboard } from '../../lib/utils.js';
   import { isValidNodeAddr } from '../../lib/adminKeys.js';
+  import UnlockAdminKeyDialog from '../shared/UnlockAdminKeyDialog.svelte';
   import { buildSelectorItems } from '../../lib/adminView.js';
 
   let caps = $derived(getCapabilities());
@@ -147,6 +150,40 @@
   let bundleBusy = $state(false);
   let bundleMessage = $state(null); // { kind: 'ok' | 'danger', text } | null
 
+  // ── Value key protection ──────────────────────────────────
+  let protectDialog = $state(null); // { nodeId, mode: 'protect' } | null
+  let protectBusy = $state(false);
+  let protectError = $state(null);
+
+  function openProtect(nodeId) {
+    protectDialog = { nodeId, mode: 'protect' };
+    protectError = null;
+  }
+
+  async function handleProtectSubmit(passphrase) {
+    if (!protectDialog) return;
+    protectBusy = true;
+    protectError = null;
+    try {
+      // Fail closed: `protectValueSeed` verifies the wrapped row was persisted
+      // before it resolves, so a storage failure never reports success.
+      await protectValueSeed(protectDialog.nodeId, passphrase);
+      showToast('Value key protected.', 'ok');
+      protectDialog = null;
+      await loadAdminNodes();
+    } catch (err) {
+      protectError = err?.message || 'Could not protect the value key.';
+    } finally {
+      protectBusy = false;
+    }
+  }
+
+  function handleLock(nodeId) {
+    lockAdmin(nodeId);
+    showToast('Value key locked.', 'warn');
+    loadAdminNodes();
+  }
+
   let configureNodeAddrValid = $derived(
     configureNodeAddr === '' || isValidNodeAddr(configureNodeAddr),
   );
@@ -181,6 +218,9 @@
       selected: administeredNode.nodeId,
     }).groups,
   );
+
+  // Only value-scoped keys can/must be protected; joins/topology stay plaintext.
+  let valueAdminNodes = $derived(adminNodes.filter((node) => node.scopes?.includes('value')));
 
   /** Switch the whole console to this node (same action as the selector). */
   function handleSelectAdmin(item) {
@@ -545,6 +585,41 @@
         {/each}
       </div>
 
+      {#if !mock && valueAdminNodes.length > 0}
+        <div class="admin-block">
+          <h4 class="admin-heading">Value key protection</h4>
+          <p class="muted text-xs">
+            A value key must be wrapped with a passphrase (PBKDF2 + AES-GCM) before any value
+            action. It adds an unlock step and protects at-rest copies or copied browser profiles,
+            but it does not stop in-session XSS while the key is unlocked. Joins and topology keys
+            stay plaintext.
+          </p>
+          {#each valueAdminNodes as node (node.nodeId)}
+            <div class="protect-row">
+              <span class="text-sm mono">{node.label || `${node.nodeId.slice(0, 12)}…`}</span>
+              {#if node.seedProtected}
+                <Badge variant="ok" label="Protected" />
+                <button
+                  type="button"
+                  class="btn btn--ghost btn--sm"
+                  onclick={() => handleLock(node.nodeId)}
+                >
+                  Lock now
+                </button>
+              {:else}
+                <button
+                  type="button"
+                  class="btn btn--ghost btn--sm"
+                  onclick={() => openProtect(node.nodeId)}
+                >
+                  Protect value key
+                </button>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      {/if}
+
       {#if mock}
         <div class="muted text-sm">
           Generating an admin key needs a live node, so that step is unavailable in mock mode.
@@ -723,6 +798,19 @@
     variant="danger"
     onConfirm={doRemoveAdmin}
     onCancel={() => { removeConfirmOpen = false; removeTarget = null; }}
+  />
+
+  <!-- Value-key protection dialog -->
+  <UnlockAdminKeyDialog
+    open={protectDialog !== null}
+    title="Protect value key"
+    message="Choose a passphrase to wrap this value key. It is used locally to unwrap the key and is never sent anywhere. There is no recovery: if you forget it, remove and re-generate the key."
+    confirmLabel="Protect"
+    busy={protectBusy}
+    error={protectError}
+    requireConfirm={true}
+    onSubmit={handleProtectSubmit}
+    onCancel={() => { protectDialog = null; protectError = null; }}
   />
 
   <Card title="Location Service">
@@ -1022,5 +1110,11 @@
     text-transform: uppercase;
     letter-spacing: 0.05em;
     font-weight: 600;
+  }
+  .protect-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    flex-wrap: wrap;
   }
 </style>
