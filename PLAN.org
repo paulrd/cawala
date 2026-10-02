@@ -996,10 +996,47 @@
    - `isLive` layout forks removed from Dashboard, Node, Joins, Accounts,
      Activity and My Account: one layout driven by `adminCapabilities`/mock
      flags, with the Mode chip the only remaining live/mock distinction.
-   - Verified: `cd web && npx vite build` (186 modules, no Svelte warnings) and
-     `cd web && npm test` (67 tests pass: adminKeys v2/selection/migration,
-     nodeKind derivation, adminView selector model, identity bundle, parent
-     liveness).
+    - Verified: `cd web && npx vite build` (186 modules, no Svelte warnings) and
+      `cd web && npm test` (67 tests pass: adminKeys v2/selection/migration,
+      nodeKind derivation, adminView selector model, identity bundle, parent
+      liveness).
+
+** P2 - delivered 2026-10-02 (scoped grants + signed bundle; control stays v4, reply v2)
+   - Control (`cawala-control`): `AdminScope` gained `Joins`/`Topology`/`Value`
+     (append-only discriminants) and a fixed three-byte `AdminScopes` set
+     (`joins`/`topology`/`value`, >=1 true, cannot represent legacy `Admin`);
+     new `AdminGrantV2`/`SignedAdminGrantV2` signed in the
+     `cawala-control/admin-grant/v2` domain, `ADMIN_GRANT_VERSION` 2 (mint)
+     with `ADMIN_GRANT_V1_VERSION` 1 (read). The v1 `AdminGrant`, context, and
+     golden signing hash are unchanged. `MAX_VALUE_ADMIN_TTL_SECS` caps a
+     value-scoped grant at 24 h. `ControlRequest::required_scope()` maps
+     `AdminQuery -> AnyActive` and the three join mutations -> `Joins`;
+     `is_admin()` is exactly `required_scope().is_some()`. New
+     `AdminGrantBundleV1` codec + `cawala://admin?node=&grant=` URI (base64url,
+     version peek, `MAX_ADMIN_BUNDLE_BYTES`, trailing-byte rejection,
+     `node == grant.node`; the codec never verifies the signature).
+   - Node (`cawala-node`): `admins.json` dual-accepts v2 and legacy v1 rows
+     (`StoredGrant` untagged) with per-type version validation (shape/version
+     mismatch is a hard load error) and preserves each row's form on save; a v1
+     row means exactly `{ joins }`. `Authority::Delegated(AdminScopes)` and
+     scope-checking `authorize_admin`; the routed carried grant stays v1
+     evidence-only. `control admin grant --scope <joins|topology|value>`
+     (repeatable, default joins) mints/signs/stores v2 and prints the bundle
+     URI; `list` shows scopes+version. `ADMIN_STORE_VERSION` stays 1.
+   - Browser: wasm `parse_admin_bundle` (container -> `AdminGrantV2::validate`
+     -> operator signature derived from `grant.node`; expiry is not judged)
+     returns `AdminGrantInfo`. `adminKeys.applyAdminGrant` strictly applies a
+     verified grant's scopes/TTL to an existing entry (`grantSource: 'bundle'`;
+     provisional/manual and migrated rows default `'manual'`, never widened).
+     `api.applyAdminBundle` verifies via wasm, requires the stored entry and a
+     matching admin key, then syncs the administered-node view. Settings gains
+     a bundle paste/import control, the "Expiry (days)" field is relabeled a
+     local **provisional TTL**, and `AdminNodeRow` badges operator-signed vs
+     provisional.
+   - Hard break (unchanged from the P2 design): after the first v2 grant is
+     written, a pre-P2 node binary cannot load `admins.json`. Upgrade the
+     binary before minting v2; v1 rows and P1 browsers keep working,
+     joins-only.
 
 ** Authority and value-op requirements (essential)
    - *Scope separation*: each admin request declares its required scope; grant

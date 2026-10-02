@@ -18,10 +18,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cawala_control::{
-    ADMIN_GRANT_VERSION, AdminGrant, AdminJoinApprove, AdminScope, CONTROL_REQUEST_TTL_SECS,
-    ChildKind, ControlReply, ControlRequest, DEFAULT_ADMIN_TTL_SECS, DeliveryStatus, JoinApproval,
-    JoinRejection, JoinRequest, MAX_CONTROL_FRAME, NodeId, OperatorSecretKey, ROUTED_CONTROL_VERSION,
-    RejectCode, RoutedControlV1, RoutedForward, SignedAdminGrant, SignedControl, SignedRoutedReply,
+    ADMIN_GRANT_V1_VERSION, ADMIN_GRANT_VERSION, AdminGrant, AdminGrantV2, AdminJoinApprove,
+    AdminScope, AdminScopes, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest,
+    DEFAULT_ADMIN_TTL_SECS, DeliveryStatus, JoinApproval, JoinRejection, JoinRequest,
+    MAX_CONTROL_FRAME, MAX_VALUE_ADMIN_TTL_SECS, NodeId, OperatorSecretKey,
+    ROUTED_CONTROL_VERSION, RejectCode, RoutedControlV1, RoutedForward, SignedAdminGrant,
+    SignedAdminGrantV2, SignedControl, SignedRoutedReply,
 };
 use cawala_ledger::{LedgerPubKey, LedgerSecretKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::{AckStatus, Envelope, MSG_CONTROL_V1, MsgId, PeerRef, RejectReason};
@@ -31,6 +33,7 @@ use cawala_node::msg::{
     MsgConfig, NeighborSource, RoutableSnapshot, build_envelope, dispatch_control_envelope,
     send_envelope,
 };
+use cawala_node::admin_store::{ADMINS_FILE, StoredGrant};
 use cawala_node::record::RecordStore;
 use cawala_node::AdminStore;
 use iroh::address_lookup::memory::MemoryLookup;
@@ -399,7 +402,7 @@ fn admin_grant(root_id: &str, root_op: &OperatorSecretKey, admin_op: &OperatorSe
     let now = now_unix_seconds();
     SignedAdminGrant::authorize(
         AdminGrant {
-            version: ADMIN_GRANT_VERSION,
+            version: ADMIN_GRANT_V1_VERSION,
             node: node(root_id),
             admin: admin_op.public(),
             scope: AdminScope::Admin,
@@ -410,6 +413,36 @@ fn admin_grant(root_id: &str, root_op: &OperatorSecretKey, admin_op: &OperatorSe
         root_op,
     )
     .expect("sign admin grant")
+}
+
+/// A v2 grant with explicit scopes, for installing into the node's store.
+fn admin_grant_v2(
+    root_id: &str,
+    root_op: &OperatorSecretKey,
+    admin_op: &OperatorSecretKey,
+    scopes: AdminScopes,
+) -> StoredGrant {
+    let now = now_unix_seconds();
+    let ttl = if scopes.value {
+        DEFAULT_ADMIN_TTL_SECS.min(MAX_VALUE_ADMIN_TTL_SECS)
+    } else {
+        DEFAULT_ADMIN_TTL_SECS
+    };
+    StoredGrant::V2(
+        SignedAdminGrantV2::authorize(
+            AdminGrantV2 {
+                version: ADMIN_GRANT_VERSION,
+                node: node(root_id),
+                admin: admin_op.public(),
+                scopes,
+                granted_at: now.saturating_sub(1),
+                expiry: now + ttl,
+                label: Some("routed-test-v2".to_string()),
+            },
+            root_op,
+        )
+        .expect("sign v2 admin grant"),
+    )
 }
 
 /// An admin intent addressed to `root_id` and signed by `admin_op`.
@@ -548,7 +581,7 @@ async fn routed_admin_query_reaches_ancestor_and_reply_verifies() {
     root.control
         .lock()
         .await
-        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op))
+        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op).into())
         .expect("grant admin");
 
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
@@ -596,7 +629,7 @@ async fn routed_admin_approve_applies_and_delivers_to_applicant() {
     root.control
         .lock()
         .await
-        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op))
+        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op).into())
         .expect("grant admin");
 
     // A control-only applicant starts an outbound join and delivers it directly
@@ -700,7 +733,7 @@ async fn routed_admin_revoked_grant_is_refused_despite_carried_evidence() {
     root.control
         .lock()
         .await
-        .grant_admin(grant.clone())
+        .grant_admin(grant.clone().into())
         .expect("grant admin");
     assert!(
         root.control
@@ -735,6 +768,104 @@ async fn routed_admin_revoked_grant_is_refused_despite_carried_evidence() {
     );
 }
 
+/// (3b) A v2 `{topology}` grant reaches the routed admin surface but cannot
+/// authorize a join mutation: scope denial is enforced on the routed path too,
+/// not only by the shared direct-path code.
+#[tokio::test]
+async fn routed_v2_topology_grant_cannot_mutate_joins() {
+    let w = world();
+    let lookup = MemoryLookup::new();
+    let mut nodes = build_world(&w, &lookup).await;
+    let [root, _a, _b, u] = &mut nodes[..] else {
+        panic!("world shape")
+    };
+
+    root.control
+        .lock()
+        .await
+        .grant_admin(admin_grant_v2(
+            &w.root_id,
+            &w.root_op,
+            &w.admin_op,
+            AdminScopes {
+                joins: false,
+                topology: true,
+                value: false,
+            },
+        ))
+        .expect("grant v2 topology admin");
+
+    let intent = admin_intent(
+        &w.root_id,
+        &w.admin_op,
+        ControlRequest::AdminApproveJoin(AdminJoinApprove {
+            child: node("ghost"),
+            slot: None,
+        }),
+    );
+    let forward = own_forward(u, &intent.request).await;
+    let request = routed(
+        peer("0", &w.root_id),
+        peer("0.1.3", &w.u_id),
+        intent,
+        None,
+        vec![forward],
+    );
+    assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
+    assert_eq!(
+        recv_reply(u).await,
+        ControlReply::Rejected(RejectCode::Unauthorized),
+        "a topology-only v2 grant must not authorize a join mutation on the routed path"
+    );
+}
+
+/// (3c) A grant revoked *out of process* (only `admins.json` rewritten) must
+/// still be reflected in the `grant_store_missing` evidence line: the audit is
+/// derived from the reloaded on-disk store, not a stale in-memory copy.
+#[tokio::test]
+async fn routed_out_of_process_revoke_is_reflected_in_the_evidence_audit() {
+    let w = world();
+    let lookup = MemoryLookup::new();
+    let mut nodes = build_world(&w, &lookup).await;
+    let [root, _a, _b, u] = &mut nodes[..] else {
+        panic!("world shape")
+    };
+
+    let grant = admin_grant(&w.root_id, &w.root_op, &w.admin_op);
+    root.control
+        .lock()
+        .await
+        .grant_admin(grant.clone().into())
+        .expect("grant admin");
+
+    // Rewrite the store on disk without touching the engine's in-memory copy,
+    // simulating an operator CLI revoke in a separate process.
+    let dir = root.control.lock().await.data_dir().to_path_buf();
+    std::fs::write(dir.join(ADMINS_FILE), br#"{"version":1,"admins":[]}"#)
+        .expect("write emptied admin store");
+
+    let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
+    let forward = own_forward(u, &intent.request).await;
+    let request = routed(
+        peer("0", &w.root_id),
+        peer("0.1.3", &w.u_id),
+        intent,
+        Some(grant),
+        vec![forward],
+    );
+    assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
+    assert_eq!(
+        recv_reply(u).await,
+        ControlReply::Rejected(RejectCode::Unauthorized)
+    );
+
+    let audit = std::fs::read_to_string(dir.join("control_audit.jsonl")).expect("audit log");
+    assert!(
+        audit.contains("grant_store_missing"),
+        "the evidence line must reflect the on-disk store, not stale memory: {audit}"
+    );
+}
+
 /// (4) A request whose `target.node` or `requester` disagrees with the envelope
 /// is refused rather than dispatched. Sent directly from a neighbor so the
 /// relay-level coherence check does not mask the destination's refusal.
@@ -750,7 +881,7 @@ async fn routed_target_and_requester_mismatch_are_refused() {
     root.control
         .lock()
         .await
-        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op))
+        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op).into())
         .expect("grant admin");
 
     // `target.node` names someone else though the address is the root's.
@@ -800,7 +931,7 @@ async fn routed_expired_intent_and_intent_replay() {
     root.control
         .lock()
         .await
-        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op))
+        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op).into())
         .expect("grant admin");
 
     // Expired intent (sent directly, so no relay drops it first).
@@ -867,7 +998,7 @@ async fn routed_forged_last_forward_is_refused() {
     root.control
         .lock()
         .await
-        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op))
+        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op).into())
         .expect("grant admin");
 
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
@@ -1082,7 +1213,7 @@ async fn routed_reply_passes_through_relay_and_undecodable_payload_is_refused() 
     root.control
         .lock()
         .await
-        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op))
+        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op).into())
         .expect("grant admin");
 
     // The reply from test (1)'s request has to traverse A to reach U.
@@ -1127,7 +1258,7 @@ async fn routed_forward_hop_count_mismatch_rejected() {
     root.control
         .lock()
         .await
-        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op))
+        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op).into())
         .expect("grant admin");
 
     // Empty forwards against a one-hop chain.

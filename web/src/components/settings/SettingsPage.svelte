@@ -19,6 +19,7 @@
     setAdministeredNode,
     configureAdminNode,
     removeAdminNode,
+    applyAdminBundle,
   } from '../../lib/api.js';
   import { copyToClipboard } from '../../lib/utils.js';
   import { isValidNodeAddr } from '../../lib/adminKeys.js';
@@ -142,6 +143,9 @@
   let configureResult = $state(null); // { nodeId, adminPubHex } | null
   let removeConfirmOpen = $state(false);
   let removeTarget = $state(null); // nodeId string
+  let bundleUri = $state('');
+  let bundleBusy = $state(false);
+  let bundleMessage = $state(null); // { kind: 'ok' | 'danger', text } | null
 
   let configureNodeAddrValid = $derived(
     configureNodeAddr === '' || isValidNodeAddr(configureNodeAddr),
@@ -234,6 +238,26 @@
     copyToClipboard(cmd).then((ok) => {
       showToast(ok ? 'Command copied.' : 'Copy failed.', ok ? 'ok' : 'warn');
     });
+  }
+
+  async function handleApplyBundle() {
+    const uri = bundleUri.trim();
+    if (!uri || bundleBusy) return;
+    bundleBusy = true;
+    bundleMessage = null;
+    try {
+      const applied = await applyAdminBundle(uri);
+      bundleMessage = {
+        kind: 'ok',
+        text: `Imported operator-signed grant for ${applied.nodeId.slice(0, 12)}… — scopes: ${applied.scopes.join(', ')}.`,
+      };
+      bundleUri = '';
+      await loadAdminNodes();
+    } catch (err) {
+      bundleMessage = { kind: 'danger', text: err?.message || 'Could not import this bundle.' };
+    } finally {
+      bundleBusy = false;
+    }
   }
 
   function handleRemoveAdmin(nodeId) {
@@ -556,7 +580,7 @@
             />
           </div>
           <div class="field">
-            <label class="field-label" for="admin-days">Expiry (days)</label>
+            <label class="field-label" for="admin-days">Provisional TTL (days)</label>
             <input
               id="admin-days"
               type="number"
@@ -565,6 +589,10 @@
               bind:value={configureDays}
               disabled={adminBusy}
             />
+            <span class="field-hint">
+              Local placeholder only. It sets when this browser stops trying, not when
+              the node stops accepting. Import an operator-signed bundle to replace it.
+            </span>
           </div>
           <div class="field">
             <label class="field-label" for="admin-node-addr">Target address (optional)</label>
@@ -623,6 +651,43 @@
             </div>
           </div>
         {/if}
+
+        <!-- Verified grant bundle import -->
+        <div class="admin-block">
+          <h4 class="admin-heading">Import operator-signed grant</h4>
+          <p class="muted text-sm">
+            The node operator signs a grant that states your key, its scopes, and its real
+            expiry. Paste the bundle here; this browser verifies the signature and uses the
+            signed scopes and TTL instead of the provisional ones.
+          </p>
+          <div class="field">
+            <label class="field-label" for="admin-bundle">Bundle link</label>
+            <textarea
+              id="admin-bundle"
+              class="field-input field-input--textarea"
+              placeholder="cawala://admin?node=...&grant=..."
+              rows="3"
+              bind:value={bundleUri}
+              disabled={bundleBusy}
+            ></textarea>
+          </div>
+          <button
+            type="button"
+            class="btn btn--primary"
+            disabled={!bundleUri.trim() || bundleBusy}
+            onclick={handleApplyBundle}
+          >
+            {#if bundleBusy}Importing...{:else}Import bundle{/if}
+          </button>
+          {#if bundleMessage}
+            <p
+              class="text-sm"
+              style="color: {bundleMessage.kind === 'ok' ? 'var(--ok)' : 'var(--danger)'};"
+            >
+              {bundleMessage.text}
+            </p>
+          {/if}
+        </div>
       {/if}
     </div>
   </Card>

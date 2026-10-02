@@ -4,9 +4,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use cawala_control::{
-    CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest, CreateChild, DetachChild,
-    Invite, JoinRejection, JoinRequest, MoveChild, NodeId, OperatorPubKey, OperatorSecretKey,
-    SetAddress, SignedControl,
+    AdminScope, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest, CreateChild,
+    DetachChild, Invite, JoinRejection, JoinRequest, MoveChild, NodeId, OperatorPubKey,
+    OperatorSecretKey, SetAddress, SignedControl,
 };
 use cawala_ledger::{AccountRef, Amount, EntryBody, LedgerPubKey, commitment_hash, verify_chain};
 use cawala_msg::{MSG_CONTROL_V1, MSG_LEDGER_V1, MSG_SETTLE_V1};
@@ -261,6 +261,25 @@ enum ControlCommand {
 ///
 /// These are **local** operator commands: they edit `<data-dir>/admins.json`
 /// directly (no network). Grant/revoke sign with this node's operator key.
+/// A `--scope` value for `control admin grant`. The legacy `admin` scope is
+/// deliberately not selectable (it is v1-only).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ScopeArg {
+    Joins,
+    Topology,
+    Value,
+}
+
+impl From<ScopeArg> for AdminScope {
+    fn from(scope: ScopeArg) -> Self {
+        match scope {
+            ScopeArg::Joins => AdminScope::Joins,
+            ScopeArg::Topology => AdminScope::Topology,
+            ScopeArg::Value => AdminScope::Value,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum AdminCommand {
     /// Grant an operator key administrative authority over this node.
@@ -268,7 +287,11 @@ enum AdminCommand {
         /// The admin's operator public key, hex (64 chars).
         #[arg(long, value_name = "OPERATOR_HEX")]
         key: String,
-        /// Unix-seconds expiry; omitted defaults to 7 days from now.
+        /// Scope to grant; repeatable. Defaults to `joins` when omitted.
+        #[arg(long = "scope", value_name = "SCOPE", value_enum)]
+        scopes: Vec<ScopeArg>,
+        /// Unix-seconds expiry; omitted defaults to 7 days from now (24 h for
+        /// value-scoped grants).
         #[arg(long, value_name = "EPOCH_SECONDS")]
         expiry: Option<u64>,
         /// Human-readable label (at most 64 bytes).
@@ -1861,16 +1884,30 @@ fn admin_command(
     command: AdminCommand,
 ) -> Result<()> {
     match command {
-        AdminCommand::Grant { key, expiry, label } => {
+        AdminCommand::Grant {
+            key,
+            scopes,
+            expiry,
+            label,
+        } => {
             let admin = parse_operator_pubkey(&key)?;
+            let scopes = if scopes.is_empty() {
+                vec![AdminScope::Joins]
+            } else {
+                scopes.into_iter().map(AdminScope::from).collect()
+            };
             let now = now_unix_seconds();
-            let outcome = admin_cli::grant(data_dir, node_id, operator, admin, expiry, label, now)
-                .map_err(|err| anyhow::anyhow!("{err}"))?;
+            let outcome =
+                admin_cli::grant(data_dir, node_id, operator, admin, scopes, expiry, label, now)
+                    .map_err(|err| anyhow::anyhow!("{err}"))?;
             println!(
-                "granted admin={} scope=admin expires={}",
-                outcome.admin, outcome.expiry
+                "granted admin={} scopes={} expires={}",
+                outcome.admin,
+                outcome.scopes.label(),
+                outcome.expiry
             );
-            println!("node {node_id}: add this admin key in Settings -> Node administration.");
+            println!("bundle: {}", outcome.bundle);
+            println!("node {node_id}: paste the bundle in Settings -> Node administration.");
         }
         AdminCommand::Revoke { key } => {
             let admin = parse_operator_pubkey(&key)?;

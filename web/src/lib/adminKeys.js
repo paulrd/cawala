@@ -10,8 +10,14 @@
  *   { v: 2, selected: 'self' | <nodeId> | null, entries: [ {
  *       nodeId, adminSeedHex, adminPubHex, scope: 'admin',
  *       scopes: ['joins' | 'topology' | 'value'],
+ *       grantSource: 'manual' | 'bundle',
  *       grantedAt, expiresAt, label, nodeAddr,
  *       lastSeenStatus, lastSeenKind, lastSeenAddress, lastSeenAt } ] }
+ *
+ * `grantSource` is `'manual'` for a locally generated provisional grant (and
+ * for pre-P2 rows) and `'bundle'` once an operator-signed `cawala://admin`
+ * bundle has been applied via `applyAdminGrant` (which replaces the
+ * provisional scopes/TTL without touching the seed).
  *
  * Read-migration: a v1 envelope at `cawala.admin.v1` is read once, rewritten
  * as v2 (and the v1 key dropped) — see `_migrateV1()`. v1 grants are
@@ -57,6 +63,17 @@ export function isSpecialSelection(value) {
 /** Scopes a v1 (`scope: 'admin'`) grant is honoured with — never widened. */
 const V1_SCOPES = ['joins'];
 const KNOWN_SCOPES = ['joins', 'topology', 'value'];
+
+/**
+ * Where a stored grant's authority came from.
+ * - `manual`: a locally generated key with an invented/provisional TTL.
+ * - `bundle`: scopes/TTL imported from a node-operator-signed `cawala://admin`
+ *   bundle and therefore truthful.
+ */
+export const GRANT_SOURCE = {
+  MANUAL: 'manual',
+  BUNDLE: 'bundle',
+};
 
 const HEX64 = /^[0-9a-f]{64}$/i;
 const HEX64_MESSAGE = {
@@ -122,6 +139,29 @@ function _normalizeScopes(value, fallback = V1_SCOPES) {
   return scopes.length > 0 ? scopes : [...fallback];
 }
 
+/**
+ * Strictly validate the scopes of a verified bundle.
+ *
+ * Unlike `_normalizeScopes`, this never falls back: an unknown or empty scope
+ * set is an error, so a verified grant is never silently widened or narrowed to
+ * joins-only.
+ * @param {unknown} value
+ * @returns {string[]} deduped scopes in the order given
+ */
+function _requireScopes(value) {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error('A verified admin grant must list at least one scope');
+  }
+  const out = [];
+  for (const scope of value) {
+    if (!KNOWN_SCOPES.includes(scope)) {
+      throw new Error(`Unknown admin scope: ${String(scope)}`);
+    }
+    if (!out.includes(scope)) out.push(scope);
+  }
+  return out;
+}
+
 function _hexToBytes(hex) {
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < hex.length; i += 2) out[i / 2] = parseInt(hex.substr(i, 2), 16);
@@ -138,6 +178,7 @@ function _publicEntry(record) {
     adminPubHex: record.adminPubHex,
     scope: record.scope,
     scopes: [...record.scopes],
+    grantSource: record.grantSource === GRANT_SOURCE.BUNDLE ? GRANT_SOURCE.BUNDLE : GRANT_SOURCE.MANUAL,
     grantedAt: record.grantedAt,
     expiresAt: record.expiresAt,
     label: record.label,
@@ -172,6 +213,9 @@ function _normalizeStored(entry) {
     scope: 'admin',
     // v1 rows carry `scope: 'admin'` and no `scopes`: joins-only, never widened.
     scopes: _normalizeScopes(entry.scopes, V1_SCOPES),
+    // Additive field: pre-existing/provisional rows without a bundle read as
+    // `manual`.
+    grantSource: entry.grantSource === GRANT_SOURCE.BUNDLE ? GRANT_SOURCE.BUNDLE : GRANT_SOURCE.MANUAL,
     grantedAt,
     expiresAt,
     label: typeof entry.label === 'string' ? entry.label : null,
@@ -455,6 +499,9 @@ export function addAdminEntry({
     adminPubHex: normalizedPub,
     scope: 'admin',
     scopes: _normalizeScopes(scopes, V1_SCOPES),
+    // A locally generated key carries a provisional TTL — `manual` until an
+    // operator-signed bundle is imported.
+    grantSource: GRANT_SOURCE.MANUAL,
     grantedAt: granted,
     expiresAt: expires,
     label: typeof label === 'string' ? label : null,
@@ -472,6 +519,52 @@ export function addAdminEntry({
 
   _writeEnvelope(envelope);
   return _publicEntry(record);
+}
+
+/**
+ * Apply a verified, node-operator-signed grant to an **existing** entry.
+ *
+ * Unlike `addAdminEntry`, this requires a stored key for `nodeId` (the seed is
+ * never invented here) and strictly validates the scopes — a verified bundle
+ * with unknown or empty scopes throws rather than falling back to joins-only.
+ * It replaces `scopes`/`grantedAt`/`expiresAt`/`label`, marks the entry
+ * `grantSource: 'bundle'`, and preserves the seed, public key, node address,
+ * last-seen probe memory, and the current selection.
+ *
+ * @param {string} nodeId
+ * @param {{ scopes: string[], grantedAt: number, expiresAt: number, label?: string|null }} grant
+ * @returns {object} the seed-free stored entry
+ */
+export function applyAdminGrant(nodeId, { scopes, grantedAt, expiresAt, label = null } = {}) {
+  const wanted = _requireHex64(nodeId, HEX64_MESSAGE.nodeId);
+  const normalizedScopes = _requireScopes(scopes);
+
+  const granted = Number(grantedAt);
+  const expires = Number(expiresAt);
+  if (!Number.isFinite(granted)) throw new Error('grantedAt must be a finite timestamp');
+  if (!Number.isFinite(expires)) throw new Error('expiresAt must be a finite timestamp');
+  if (!(expires > granted)) throw new Error('expiresAt must be greater than grantedAt');
+
+  const envelope = _readEnvelope();
+  const index = envelope ? envelope.entries.findIndex((e) => e.nodeId === wanted) : -1;
+  if (index === -1) {
+    throw new Error('generate a key for this node first');
+  }
+
+  const existing = envelope.entries[index];
+  envelope.entries[index] = {
+    // Preserve seed/public key/nodeAddr/lastSeen*; only the grant's meaning
+    // (scopes, TTL, label, source) is replaced.
+    ...existing,
+    scopes: normalizedScopes,
+    grantedAt: granted,
+    expiresAt: expires,
+    label: typeof label === 'string' ? label : null,
+    grantSource: GRANT_SOURCE.BUNDLE,
+  };
+  // Selection is untouched: applying a bundle never changes the target.
+  _writeEnvelope(envelope);
+  return _publicEntry(envelope.entries[index]);
 }
 
 /**

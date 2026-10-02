@@ -28,20 +28,20 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use cawala_control::{
-    ADMIN_GRANT_VERSION, AdminApproved, AdminJoinApprove, AdminJoinReject, AdminPendingJoin,
-    AdminRedeliverJoin, AdminRejected, AdminScope, AdminSnapshot, CONTROL_ALPN,
-    CONTROL_FORMAT_VERSION, CONTROL_REQUEST_MAX_TTL_SECS, CONTROL_REQUEST_TTL_SECS, ChildKind,
-    ChildSnapshot, ControlError, ControlReply, ControlRequest, CreateChild, DeliveryStatus,
-    DetachChild, DetachNotice, ExitRequest, Invite, JoinApproval, JoinRejection, JoinRequest,
-    MAX_CONTROL_FRAME, MoveChild, NodeId, NodeSnapshot, OctAddr, OperatorPubKey, OperatorSecretKey,
-    ParentSnapshot, ROUTED_REPLY_VERSION, RebaseNotice, RebasePull, RejectCode, RoutedControlV1,
-    RoutedForward, RoutedReplyV1, SetAddress, SignedAdminGrant, SignedControl, SignedRoutedReply,
-    is_admin_request, is_supported_control_version, senior_child, verify_control,
+    AdminApproved, AdminJoinApprove, AdminJoinReject, AdminPendingJoin, AdminRedeliverJoin,
+    AdminRejected, AdminScopes, AdminSnapshot, CONTROL_ALPN, CONTROL_FORMAT_VERSION,
+    CONTROL_REQUEST_MAX_TTL_SECS, CONTROL_REQUEST_TTL_SECS, ChildKind, ChildSnapshot, ControlError,
+    ControlReply, ControlRequest, CreateChild, DeliveryStatus, DetachChild, DetachNotice,
+    ExitRequest, Invite, JoinApproval, JoinRejection, JoinRequest, MAX_CONTROL_FRAME, MoveChild,
+    NodeId, NodeSnapshot, OctAddr, OperatorPubKey, OperatorSecretKey, ParentSnapshot,
+    ROUTED_REPLY_VERSION, RebaseNotice, RebasePull, RejectCode, RoutedControlV1, RoutedForward,
+    RoutedReplyV1, SetAddress, SignedControl, SignedRoutedReply, is_admin_request,
+    is_supported_control_version, senior_child, verify_control,
 };
 use cawala_ledger::{LedgerPubKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::{MsgId, PeerRef, Seen, SeenConfig};
 
-use crate::admin_store::AdminStore;
+use crate::admin_store::{AdminStore, StoredGrant};
 use crate::control_store::ControlStore;
 use crate::ledger_peers;
 use crate::msg::{MSG_ALPN, MsgConfig, MsgHandler, NeighborSource, RoutableSnapshot};
@@ -97,8 +97,8 @@ const PENDING_DELIVERY: DeliveryStatus = DeliveryStatus::Unreachable;
 pub enum Authority {
     /// This node's own operator key (self-admin).
     SelfOperator,
-    /// An operator holding an active [`AdminScope`] scoped to this node.
-    Delegated(AdminScope),
+    /// An operator holding an active [`AdminScopes`] set scoped to this node.
+    Delegated(AdminScopes),
     /// A directly-controlled peer (senior child) verified against the registry.
     Peer,
 }
@@ -559,7 +559,7 @@ impl ControlNode {
     /// This is the **strict** surface: self-origin must be signed by this
     /// node's own operator key, and any other origin must be the senior child
     /// and verify against the peer registry. A *delegated admin* (an operator
-    /// with an [`AdminScope`] but not this node's operator key, and not a
+    /// with [`AdminScopes`] but not this node's operator key, and not a
     /// senior child) therefore never passes here, so it can never reach
     /// `CreateChild`/`DetachChild`/`MoveChild`/`SetAddress`/`Query`. Use
     /// [`ControlNode::authorize_admin`] for the admin surface.
@@ -583,9 +583,11 @@ impl ControlNode {
     /// Requirements, all mandatory:
     /// - `signed.origin` is this node (`self.node_id`), so a peer or senior
     ///   child can never drive the admin surface;
-    /// - the request is one of the `is_admin_request` variants;
+    /// - the request declares a [`RequiredScope`](cawala_control::RequiredScope);
     /// - the controller is either this node's own operator key (self-admin) or
-    ///   an operator holding an active [`AdminScope`] granted by this node.
+    ///   an operator holding an active [`AdminScopes`] set granted by this node
+    ///   that [`allows`](cawala_control::AdminScopes::allows) the required
+    ///   scope.
     ///
     /// The grant store is refreshed from disk before this is consulted (see
     /// [`ControlNode::receive_at`]); a grant is only active while
@@ -594,15 +596,15 @@ impl ControlNode {
         if signed.origin.as_str() != self.node_id {
             return Err(RejectCode::Unauthorized);
         }
-        if !is_admin_request(&signed.request) {
+        let Some(required) = signed.request.required_scope() else {
             return Err(RejectCode::Unauthorized);
-        }
+        };
         if signed.controller == self.operator.public() {
             return Ok(Authority::SelfOperator);
         }
-        match self.admins.active_scope(&signed.controller, now) {
-            Some(scope) => Ok(Authority::Delegated(scope)),
-            None => Err(RejectCode::Unauthorized),
+        match self.admins.active_scopes(&signed.controller, now) {
+            Some(scopes) if scopes.allows(required) => Ok(Authority::Delegated(scopes)),
+            _ => Err(RejectCode::Unauthorized),
         }
     }
 
@@ -648,6 +650,23 @@ impl ControlNode {
                     warn!(%err, "peer registry reload failed; using the in-memory registry");
                 }
             }
+        }
+    }
+
+    /// Reload admin grants from disk, failing closed to an empty store on any
+    /// load error.
+    ///
+    /// Shared by [`ControlNode::receive_at`] (before authorizing) and the
+    /// routed admin evidence path, so an audit line about the grant store can
+    /// never be derived from a stale in-memory copy after an out-of-process
+    /// grant/revoke. On failure it serves no delegated authority.
+    fn reload_admins(&mut self) {
+        if let Err(err) = self
+            .admins
+            .reload(&self.data_dir, &self.node_id, &self.operator.public())
+        {
+            warn!(%err, "admin grant reload failed; serving no delegated authority");
+            self.admins = AdminStore::empty();
         }
     }
 
@@ -705,13 +724,7 @@ impl ControlNode {
         // Full reload so a grant/revoke performed by a separate operator CLI
         // process is observed without a restart. On any load failure, serve no
         // delegated authority (fail closed).
-        if let Err(err) = self
-            .admins
-            .reload(&self.data_dir, &self.node_id, &self.operator.public())
-        {
-            warn!(%err, "admin grant reload failed; serving no delegated authority");
-            self.admins = AdminStore::empty();
-        }
+        self.reload_admins();
         // Replay guard: per (origin, controller), keyed by the request nonce.
         // Control requests are terminal, so a marked nonce is never unobserved.
         let seen_origin = format!("{}:{}", signed.origin, signed.controller);
@@ -817,7 +830,8 @@ impl ControlNode {
     ///    - topology requests dispatch the **last hop's** signed control, and
     ///      only when it is this node's senior node child (`Authority::Peer`).
     ///
-    /// A carried [`SignedAdminGrant`] is verified for audit only: it must verify
+    /// A carried [`SignedAdminGrant`](cawala_control::SignedAdminGrant) is
+    /// verified for audit only: it must verify
     /// under this node's operator, be scoped to this node, and name the intent
     /// controller, but it never authorizes on its own — the
     /// [`AdminStore`](crate::admin_store::AdminStore) is the authority, so a
@@ -911,11 +925,16 @@ impl ControlNode {
                 if !well_formed {
                     return ControlReply::Rejected(RejectCode::Unauthorized);
                 }
+                // Refresh the store from disk *before* deriving the evidence,
+                // exactly as `receive_at` will before authorizing: otherwise a
+                // grant/revoke by a separate process leaves the in-memory copy
+                // stale and the audit line disagrees with the decision.
+                self.reload_admins();
                 // Evidence, not authority: record when the store does not back
                 // the carried grant, then let `authorize_admin` refuse it.
                 if self
                     .admins
-                    .active_scope(&routed.intent.controller, now)
+                    .active_scopes(&routed.intent.controller, now)
                     .is_none()
                 {
                     self.audit(serde_json::json!({
@@ -2523,23 +2542,26 @@ impl ControlNode {
 
     /// Insert or replace an operator-signed admin grant and persist it.
     ///
-    /// The grant must be scoped to this node and signed by this node's own
-    /// operator key; otherwise it is refused before touching the store.
-    pub fn grant_admin(&mut self, grant: SignedAdminGrant) -> Result<(), ControlError> {
-        if grant.grant.version != ADMIN_GRANT_VERSION {
-            return Err(ControlError::UnsupportedVersion(grant.grant.version));
-        }
-        if grant.grant.node.as_str() != self.node_id {
+    /// The grant must validate against its **own** declared version, be scoped
+    /// to this node, and be signed by this node's own operator key; otherwise
+    /// it is refused before touching the store. Both v2 and legacy v1 grants are
+    /// accepted (the store preserves each row's form).
+    pub fn grant_admin(&mut self, grant: StoredGrant) -> Result<(), ControlError> {
+        grant.validate()?;
+        if grant.node().as_str() != self.node_id {
             return Err(ControlError::Codec(format!(
                 "admin grant is scoped to node '{}', expected '{}'",
-                grant.grant.node, self.node_id
+                grant.node(),
+                self.node_id
             )));
         }
         grant
             .verify(&self.operator.public())
             .map_err(|err| ControlError::Codec(err.to_string()))?;
-        let admin = grant.grant.admin;
-        let expiry = grant.grant.expiry;
+        let admin = grant.admin();
+        let expiry = grant.expiry();
+        let version = grant.version();
+        let scopes = grant.scopes().label();
         self.admins.grant(grant);
         self.admins
             .save(&self.data_dir)
@@ -2549,6 +2571,8 @@ impl ControlNode {
             "admin": admin.to_string(),
             "node": self.node_id,
             "expiry": expiry,
+            "version": version,
+            "scopes": scopes,
         }));
         Ok(())
     }
@@ -3204,7 +3228,8 @@ fn map_control_error(err: &ControlError) -> RejectCode {
         | ControlError::FieldTooLong { .. }
         | ControlError::FieldBelowMinimum { .. }
         | ControlError::GrantExpiryNotAfterGrant { .. }
-        | ControlError::GrantTtlTooLong { .. } => RejectCode::BadRequest,
+        | ControlError::GrantTtlTooLong { .. }
+        | ControlError::EmptyAdminScopes => RejectCode::BadRequest,
         ControlError::Codec(_) => RejectCode::Internal,
     }
 }
@@ -3222,8 +3247,11 @@ fn map_ledger_error(err: &cawala_ledger::LedgerError) -> RejectCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin_store::StoredGrant;
     use crate::record::ChildEntry;
-    use cawala_control::{AdminGrant, DEFAULT_ADMIN_TTL_SECS};
+    use cawala_control::{
+        ADMIN_GRANT_VERSION, AdminGrantV2, DEFAULT_ADMIN_TTL_SECS, SignedAdminGrantV2,
+    };
     use cawala_ledger::{LedgerPubKey, LedgerSecretKey};
     use iroh::SecretKey;
 
@@ -4075,17 +4103,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut engine, operator) = admin_engine(dir.path());
         let admin_op = OperatorSecretKey::from_bytes([5u8; 32]);
-        let grant = AdminGrant {
+        let grant = AdminGrantV2 {
             version: ADMIN_GRANT_VERSION,
             node: NodeId::from("parent"),
             admin: admin_op.public(),
-            scope: AdminScope::Admin,
+            scopes: AdminScopes {
+                joins: true,
+                topology: false,
+                value: false,
+            },
             granted_at: 10,
             expiry: 10 + DEFAULT_ADMIN_TTL_SECS,
             label: None,
         };
         engine
-            .grant_admin(SignedAdminGrant::authorize(grant, &operator).unwrap())
+            .grant_admin(StoredGrant::V2(
+                SignedAdminGrantV2::authorize(grant, &operator).unwrap(),
+            ))
             .unwrap();
 
         let remote = EndpointId::from(SecretKey::generate().public());

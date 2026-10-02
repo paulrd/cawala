@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use cawala_ledger::{LedgerPubKey, NodeId, OperatorPubKey};
 use cawala_topology::{ChildKind, MAX_SLOT, OctAddr};
 
+use crate::admin::RequiredScope;
 use crate::sign::ControlError;
 
 /// Maximum accepted length, in bytes, of a node id string (`JoinRequest::node`,
@@ -544,13 +545,27 @@ impl ControlRequest {
 
     /// Whether this is one of the admin-only variants.
     pub fn is_admin(&self) -> bool {
-        matches!(
-            self,
-            ControlRequest::AdminQuery
-                | ControlRequest::AdminApproveJoin(_)
-                | ControlRequest::AdminRejectJoin(_)
-                | ControlRequest::AdminRedeliverJoin(_)
-        )
+        self.required_scope().is_some()
+    }
+
+    /// The scope an admin request needs, or `None` for a non-admin request
+    /// (which is never authorized by an admin grant).
+    ///
+    /// Mapping (frozen):
+    /// - `AdminQuery` -> [`RequiredScope::AnyActive`] (any scope implies read);
+    /// - `AdminApproveJoin` / `AdminRejectJoin` / `AdminRedeliverJoin` ->
+    ///   [`RequiredScope::Joins`];
+    /// - every non-admin variant -> `None`.
+    ///
+    /// Future topology (P4) and value (P5) variants will extend this map.
+    pub fn required_scope(&self) -> Option<RequiredScope> {
+        match self {
+            ControlRequest::AdminQuery => Some(RequiredScope::AnyActive),
+            ControlRequest::AdminApproveJoin(_)
+            | ControlRequest::AdminRejectJoin(_)
+            | ControlRequest::AdminRedeliverJoin(_) => Some(RequiredScope::Joins),
+            _ => None,
+        }
     }
 }
 
@@ -890,6 +905,36 @@ mod tests {
             );
             assert_eq!(request.is_admin(), expected, "{request:?}");
             assert_eq!(is_admin_request(&request), expected, "{request:?}");
+        }
+    }
+
+    #[test]
+    fn required_scope_mapping_is_frozen() {
+        assert_eq!(
+            ControlRequest::AdminQuery.required_scope(),
+            Some(RequiredScope::AnyActive)
+        );
+        for request in [
+            ControlRequest::AdminApproveJoin(AdminJoinApprove {
+                child: node("applicant"),
+                slot: None,
+            }),
+            ControlRequest::AdminRejectJoin(AdminJoinReject {
+                child: node("applicant"),
+                reason: None,
+            }),
+            ControlRequest::AdminRedeliverJoin(AdminRedeliverJoin {
+                child: node("applicant"),
+            }),
+        ] {
+            assert_eq!(request.required_scope(), Some(RequiredScope::Joins));
+        }
+        for request in [
+            ControlRequest::Query,
+            ControlRequest::SetAddress(SetAddress { address: None }),
+            ControlRequest::RebasePull(RebasePull { node: node("c") }),
+        ] {
+            assert_eq!(request.required_scope(), None);
         }
     }
 

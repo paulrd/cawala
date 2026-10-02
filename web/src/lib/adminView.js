@@ -55,7 +55,7 @@ export function shortId(id) {
  * One row in the node selector.
  * @param {object} item
  */
-function toItem({ id, label, sublabel = '', kind = null, status, nodeAddr = null, grantedAt = null, expiresAt = null, scopes = [], isSelf = false, selected = false, now }) {
+function toItem({ id, label, sublabel = '', kind = null, status, nodeAddr = null, grantedAt = null, expiresAt = null, scopes = [], grantSource = null, isSelf = false, selected = false, now }) {
   return {
     id,
     label,
@@ -70,10 +70,26 @@ function toItem({ id, label, sublabel = '', kind = null, status, nodeAddr = null
     ttl: expiresAt ? formatTtl(expiresAt, now) : '',
     expiresAt,
     scopes,
+    grantSource,
+    // `bundle` scopes/TTL are operator-signed (truthful); `manual` is a local
+    // provisional grant. No badge when there is no grant at all (self/mock).
+    sourceBadge: sourceBadge(grantSource),
     isSelf,
     selected,
     disabled: status === ADMIN_STATUS.EXPIRED,
   };
+}
+
+/**
+ * Badge for where a grant's scopes/TTL came from, or null when there is no
+ * grant (self / mock rows).
+ * @param {string|null} grantSource
+ * @returns {{ variant: string, label: string }|null}
+ */
+export function sourceBadge(grantSource) {
+  if (grantSource === 'bundle') return { variant: 'ok', label: 'Operator-signed' };
+  if (grantSource === 'manual') return { variant: 'warn', label: 'Provisional' };
+  return null;
 }
 
 /**
@@ -100,6 +116,7 @@ export function grantToItem(node, { selected = false, now = Date.now() } = {}) {
     grantedAt: node.grantedAt ?? null,
     expiresAt: node.expiresAt,
     scopes: node.scopes || [],
+    grantSource: node.grantSource ?? 'manual',
     selected,
     now,
   });

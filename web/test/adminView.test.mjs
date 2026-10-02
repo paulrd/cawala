@@ -15,6 +15,7 @@ const {
   MOCK_ID,
   ADMIN_STATUS,
   statusBadge,
+  sourceBadge,
   shortId,
   grantToItem,
   buildSelectorItems,
@@ -114,6 +115,23 @@ test('an active grant renders Active with its ttl and scopes', () => {
   assert.deepEqual(item.scopes, ['joins']);
   assert.equal(item.disabled, false);
   assert.equal(item.isSelf, false);
+});
+
+test('source badge distinguishes operator-signed from provisional grants', () => {
+  assert.equal(sourceBadge('bundle').label, 'Operator-signed');
+  assert.equal(sourceBadge('bundle').variant, 'ok');
+  assert.equal(sourceBadge('manual').label, 'Provisional');
+  assert.equal(sourceBadge('manual').variant, 'warn');
+  // No grant (self/mock) or an unknown source never invents a badge.
+  assert.equal(sourceBadge(null), null);
+  assert.equal(sourceBadge('weird'), null);
+
+  // A stored grant defaults to `manual` when the row has no source field.
+  assert.equal(grantToItem(grant(), { now: NOW }).grantSource, 'manual');
+  assert.equal(grantToItem(grant(), { now: NOW }).sourceBadge.label, 'Provisional');
+  const signed = grantToItem(grant({ grantSource: 'bundle' }), { now: NOW });
+  assert.equal(signed.grantSource, 'bundle');
+  assert.equal(signed.sourceBadge.label, 'Operator-signed');
 });
 
 test('a probe that saw "unreachable" is shown as unreachable, not active', () => {

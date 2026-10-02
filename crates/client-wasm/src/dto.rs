@@ -7,8 +7,9 @@
 //! than `Debug` renderings.
 
 use cawala_control::{
-    AdminApproved, AdminPendingJoin, AdminRejected, AdminSnapshot, ChildKind, DeliveryStatus,
-    Invite, NodeId, NodeSnapshot, OperatorPubKey, RejectCode,
+    AdminApproved, AdminGrantBundleV1, AdminPendingJoin, AdminRejected, AdminScope, AdminScopes,
+    AdminSnapshot, ChildKind, DeliveryStatus, Invite, NodeId, NodeSnapshot, OperatorPubKey,
+    RejectCode,
 };
 use cawala_ledger::{Hash, LedgerPubKey};
 use cawala_msg::OctAddr;
@@ -156,6 +157,152 @@ impl InviteInfo {
     #[wasm_bindgen(getter)]
     pub fn ip(&self) -> Option<String> {
         self.ip.clone()
+    }
+}
+
+/// Stable JS string for an [`AdminScope`].
+///
+/// An explicit mapping (never `Debug`) so a future Rust refactor cannot silently
+/// change the scope names the web layer switches on.
+pub(crate) fn scope_str(scope: AdminScope) -> &'static str {
+    match scope {
+        AdminScope::Admin => "admin",
+        AdminScope::Joins => "joins",
+        AdminScope::Topology => "topology",
+        AdminScope::Value => "value",
+    }
+}
+
+/// The effective, non-empty scope list of a v2 grant, in the frozen order
+/// `joins`, `topology`, `value`.
+pub(crate) fn scopes_to_strings(scopes: AdminScopes) -> Vec<String> {
+    let mut out = Vec::new();
+    if scopes.joins {
+        out.push(scope_str(AdminScope::Joins).to_string());
+    }
+    if scopes.topology {
+        out.push(scope_str(AdminScope::Topology).to_string());
+    }
+    if scopes.value {
+        out.push(scope_str(AdminScope::Value).to_string());
+    }
+    out
+}
+
+/// Parse and verify a node-operator-signed `cawala://admin?node=&grant=` bundle.
+///
+/// Verification order: container (scheme/host/required params/bounds/node
+/// match) -> [`AdminGrantV2::validate`](cawala_control::AdminGrantV2::validate)
+/// -> operator signature derived from `grant.node`. It does **not** judge the
+/// grant's expiry: the UI displays the truthful `expiry` and decides.
+#[wasm_bindgen]
+pub fn parse_admin_bundle(uri: &str) -> Result<AdminGrantInfo, JsError> {
+    parse_admin_bundle_inner(uri).map_err(to_js_err)
+}
+
+/// Pure parse+validate+verify used by [`parse_admin_bundle`] and unit tests.
+///
+/// Kept separate because [`JsError`] cannot be constructed on non-wasm targets,
+/// which would make the error paths untestable natively.
+fn parse_admin_bundle_inner(uri: &str) -> Result<AdminGrantInfo, String> {
+    // (a) Container: scheme/host, required params, bounds, version, and
+    // `node == grant.node`.
+    let bundle = AdminGrantBundleV1::parse(uri).map_err(|err| err.to_string())?;
+    // (b) Structural validation of the grant itself.
+    bundle
+        .grant
+        .grant
+        .validate()
+        .map_err(|err| err.to_string())?;
+    // (c) The grant must be signed by the operator key derived from its node.
+    let node_key = crate::control::operator_key_from_node(bundle.grant.grant.node.as_str())
+        .map_err(|_| "admin bundle node is not a valid node id".to_string())?;
+    bundle
+        .grant
+        .verify(&node_key)
+        .map_err(|err| err.to_string())?;
+    // (d) Return; expiry is deliberately not judged here.
+    Ok(AdminGrantInfo::from_bundle(bundle))
+}
+
+/// A parsed, validated, signature-verified Cawala admin-grant bundle.
+#[wasm_bindgen]
+pub struct AdminGrantInfo {
+    node: String,
+    admin: String,
+    scopes: Vec<String>,
+    granted_at: f64,
+    expiry: f64,
+    label: Option<String>,
+    bundle_version: u8,
+    grant_version: u8,
+}
+
+impl AdminGrantInfo {
+    fn from_bundle(bundle: AdminGrantBundleV1) -> Self {
+        let grant = bundle.grant.grant;
+        AdminGrantInfo {
+            node: grant.node.as_str().to_string(),
+            // `Display` for the operator key is lowercase hex.
+            admin: grant.admin.to_string(),
+            scopes: scopes_to_strings(grant.scopes),
+            granted_at: grant.granted_at as f64,
+            expiry: grant.expiry as f64,
+            label: grant.label,
+            bundle_version: bundle.version,
+            grant_version: grant.version,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl AdminGrantInfo {
+    /// The granting node id (an endpoint id string).
+    #[wasm_bindgen(getter)]
+    pub fn node(&self) -> String {
+        self.node.clone()
+    }
+
+    /// The granted admin operator public key, 64 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn admin(&self) -> String {
+        self.admin.clone()
+    }
+
+    /// The grant's explicit scopes, in the frozen order `joins, topology, value`.
+    #[wasm_bindgen(getter)]
+    pub fn scopes(&self) -> Vec<String> {
+        self.scopes.clone()
+    }
+
+    /// Unix-seconds time the grant was issued (as an f64 for JS).
+    #[wasm_bindgen(getter)]
+    pub fn granted_at(&self) -> f64 {
+        self.granted_at
+    }
+
+    /// Unix-seconds expiry (as an f64 for JS). Not judged by the parser.
+    #[wasm_bindgen(getter)]
+    pub fn expiry(&self) -> f64 {
+        self.expiry
+    }
+
+    /// Optional human-readable label.
+    #[wasm_bindgen(getter)]
+    pub fn label(&self) -> Option<String> {
+        self.label.clone()
+    }
+
+    /// The bundle container version.
+    #[wasm_bindgen(getter)]
+    pub fn bundle_version(&self) -> u8 {
+        self.bundle_version
+    }
+
+    /// The inner grant's wire version.
+    #[wasm_bindgen(getter)]
+    pub fn grant_version(&self) -> u8 {
+        self.grant_version
     }
 }
 
@@ -1351,7 +1498,10 @@ pub(crate) fn parse_receive_uri_inner(uri: &str) -> Result<ParsedReceiveUri, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cawala_control::{ChildKind, Invite, NodeId, OctAddr, OperatorSecretKey};
+    use cawala_control::{
+        ADMIN_BUNDLE_VERSION, ADMIN_GRANT_VERSION, AdminGrantBundleV1, AdminGrantV2, ChildKind,
+        DEFAULT_ADMIN_TTL_SECS, Invite, NodeId, OctAddr, OperatorSecretKey, SignedAdminGrantV2,
+    };
 
     use crate::ledger_state::{ActivityEntryV1, SettlementRecordV1, SettlementStateV1};
     use crate::state::{ChildLink, LocalStateV1, ParentLink};
@@ -1362,6 +1512,49 @@ mod tests {
 
     fn node(id: &str) -> NodeId {
         NodeId::from(id)
+    }
+
+    /// A node operator secret + its endpoint id, which is the node id the grant
+    /// is scoped to (node id and operator key are the same Ed25519 key).
+    fn node_operator() -> (iroh::SecretKey, OperatorSecretKey, String) {
+        let secret = iroh::SecretKey::generate();
+        let id = secret.public().to_string();
+        let op = OperatorSecretKey::from_bytes(secret.to_bytes());
+        (secret, op, id)
+    }
+
+    fn admin_grant_v2(node_id: &str, admin_seed: u8, scopes: AdminScopes) -> AdminGrantV2 {
+        // A value-scoped grant is capped at the 24 h value TTL.
+        let ttl = if scopes.value {
+            DEFAULT_ADMIN_TTL_SECS.min(cawala_control::MAX_VALUE_ADMIN_TTL_SECS)
+        } else {
+            DEFAULT_ADMIN_TTL_SECS
+        };
+        AdminGrantV2 {
+            version: ADMIN_GRANT_VERSION,
+            node: NodeId::from(node_id),
+            admin: operator(admin_seed).public(),
+            scopes,
+            granted_at: 1_000,
+            expiry: 1_000 + ttl,
+            label: Some("bundle".to_string()),
+        }
+    }
+
+    fn bundle_uri(
+        signer: &OperatorSecretKey,
+        node_id: &str,
+        admin_seed: u8,
+        scopes: AdminScopes,
+    ) -> String {
+        let signed =
+            SignedAdminGrantV2::authorize(admin_grant_v2(node_id, admin_seed, scopes), signer)
+                .unwrap();
+        AdminGrantBundleV1 {
+            version: ADMIN_BUNDLE_VERSION,
+            grant: signed,
+        }
+        .encode()
     }
 
     #[test]
@@ -1391,6 +1584,111 @@ mod tests {
     fn parse_invite_rejects_garbage() {
         assert!(parse_invite_inner("not an invite").is_err());
         assert!(parse_invite_inner("https://join?parent=x&op=00").is_err());
+    }
+
+    #[test]
+    fn parse_admin_bundle_maps_and_verifies() {
+        let (_secret, signer, node_id) = node_operator();
+        let scopes = AdminScopes {
+            joins: true,
+            topology: false,
+            value: true,
+        };
+        let info = parse_admin_bundle_inner(&bundle_uri(&signer, &node_id, 3, scopes)).unwrap();
+        assert_eq!(info.node, node_id);
+        assert_eq!(info.admin, operator(3).public().to_string());
+        assert_eq!(info.admin.len(), 64);
+        assert!(info.admin.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(info.scopes, vec!["joins".to_string(), "value".to_string()]);
+        assert_eq!(info.granted_at, 1_000.0);
+        assert_eq!(
+            info.expiry,
+            (1_000 + cawala_control::MAX_VALUE_ADMIN_TTL_SECS) as f64
+        );
+        assert_eq!(info.label.as_deref(), Some("bundle"));
+        assert_eq!(info.bundle_version, ADMIN_BUNDLE_VERSION);
+        assert_eq!(info.grant_version, ADMIN_GRANT_VERSION);
+    }
+
+    #[test]
+    fn parse_admin_bundle_scope_mapping_is_stable_and_ordered() {
+        // Explicit strings, frozen order joins/topology/value. Never `Debug`.
+        let (_secret, signer, node_id) = node_operator();
+        for (scopes, expected) in [
+            (
+                AdminScopes {
+                    joins: true,
+                    topology: true,
+                    value: true,
+                },
+                vec!["joins", "topology", "value"],
+            ),
+            (
+                AdminScopes {
+                    joins: false,
+                    topology: true,
+                    value: false,
+                },
+                vec!["topology"],
+            ),
+            (AdminScopes::v1(), vec!["joins"]),
+        ] {
+            let info = parse_admin_bundle_inner(&bundle_uri(&signer, &node_id, 5, scopes)).unwrap();
+            assert_eq!(info.scopes, expected);
+        }
+        assert_eq!(scope_str(AdminScope::Admin), "admin");
+        assert_eq!(scope_str(AdminScope::Joins), "joins");
+        assert_eq!(scope_str(AdminScope::Topology), "topology");
+        assert_eq!(scope_str(AdminScope::Value), "value");
+    }
+
+    #[test]
+    fn parse_admin_bundle_rejects_wrong_signature() {
+        let (_secret, _signer, node_id) = node_operator();
+        // Signed by operator 9, but the grant names `node_id` whose operator is
+        // the derived key.
+        let uri = bundle_uri(&operator(9), &node_id, 3, AdminScopes::v1());
+        assert!(parse_admin_bundle_inner(&uri).is_err());
+    }
+
+    #[test]
+    fn parse_admin_bundle_rejects_node_mismatch() {
+        let (_secret, signer, node_id) = node_operator();
+        let (_other_secret, _other_signer, other_id) = node_operator();
+        // Splice a different `node` query value into an otherwise valid bundle.
+        let uri = bundle_uri(&signer, &node_id, 3, AdminScopes::v1())
+            .replace(&format!("node={node_id}"), &format!("node={other_id}"));
+        assert!(parse_admin_bundle_inner(&uri).is_err());
+    }
+
+    #[test]
+    fn parse_admin_bundle_rejects_unsupported_version() {
+        let (_secret, signer, node_id) = node_operator();
+        let signed =
+            SignedAdminGrantV2::authorize(admin_grant_v2(&node_id, 3, AdminScopes::v1()), &signer)
+                .unwrap();
+        let uri = AdminGrantBundleV1 {
+            version: ADMIN_BUNDLE_VERSION + 1,
+            grant: signed,
+        }
+        .encode();
+        assert!(parse_admin_bundle_inner(&uri).is_err());
+    }
+
+    #[test]
+    fn parse_admin_bundle_rejects_oversize() {
+        let (_secret, _signer, node_id) = node_operator();
+        // A valid base64 alphabet payload that decodes to more than the byte
+        // cap, so the container bounds check fires.
+        let uri = format!("cawala://admin?node={node_id}&grant={}", "A".repeat(6_000));
+        assert!(parse_admin_bundle_inner(&uri).is_err());
+    }
+
+    #[test]
+    fn parse_admin_bundle_rejects_bad_base64() {
+        let (_secret, _signer, node_id) = node_operator();
+        let uri = format!("cawala://admin?node={node_id}&grant=not%20base64%21%21");
+        assert!(parse_admin_bundle_inner(&uri).is_err());
     }
 
     #[test]

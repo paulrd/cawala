@@ -475,7 +475,9 @@ mod tests {
     use cawala_ledger::{NodeId, OperatorSecretKey};
     use cawala_msg::OctAddr;
 
-    use crate::admin::{ADMIN_GRANT_CONTEXT, ADMIN_GRANT_VERSION, AdminGrant, AdminScope};
+    use crate::admin::{
+        ADMIN_GRANT_CONTEXT, ADMIN_GRANT_V1_VERSION, AdminGrant, AdminScope,
+    };
     use crate::request::ControlRequest;
     use crate::sign::{CONTROL_CONTEXT, CONTROL_FORMAT_VERSION};
 
@@ -524,7 +526,7 @@ mod tests {
 
     fn sample_grant() -> AdminGrant {
         AdminGrant {
-            version: ADMIN_GRANT_VERSION,
+            version: ADMIN_GRANT_V1_VERSION,
             node: node("node-d"),
             admin: operator(3).public(),
             scope: AdminScope::Admin,

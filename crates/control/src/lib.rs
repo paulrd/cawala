@@ -40,6 +40,7 @@
 pub const MAX_CONTROL_FRAME: u32 = 64 * 1024;
 
 pub mod admin;
+pub mod admin_bundle;
 pub mod claim;
 pub mod invite;
 pub mod reply;
@@ -49,8 +50,13 @@ pub mod senior;
 pub mod sign;
 
 pub use admin::{
-    ADMIN_GRANT_CONTEXT, ADMIN_GRANT_VERSION, AdminGrant, AdminScope, DEFAULT_ADMIN_TTL_SECS,
-    MAX_ADMIN_TTL_SECS, SignedAdminGrant,
+    ADMIN_GRANT_CONTEXT, ADMIN_GRANT_V1_VERSION, ADMIN_GRANT_V2_CONTEXT, ADMIN_GRANT_VERSION,
+    AdminGrant, AdminGrantV2, AdminScope, AdminScopes, DEFAULT_ADMIN_TTL_SECS, MAX_ADMIN_TTL_SECS,
+    MAX_VALUE_ADMIN_TTL_SECS, RequiredScope, SignedAdminGrant, SignedAdminGrantV2,
+};
+pub use admin_bundle::{
+    ADMIN_BUNDLE_HOST, ADMIN_BUNDLE_SCHEME, ADMIN_BUNDLE_VERSION, AdminBundleError,
+    AdminGrantBundleV1, MAX_ADMIN_BUNDLE_BYTES,
 };
 pub use cawala_ledger::{NodeId, OperatorPubKey, OperatorSecretKey, Signature};
 pub use cawala_topology::{ChildKind, OctAddr};

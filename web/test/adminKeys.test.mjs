@@ -32,9 +32,11 @@ const {
   selectAdminNode,
   adminSeedBytes,
   addAdminEntry,
+  applyAdminGrant,
   updateLastSeen,
   removeAdminNode,
   clearAllAdminEntries,
+  GRANT_SOURCE,
 } = await import('../src/lib/adminKeys.js');
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -97,6 +99,7 @@ test('add/load round-trip (seed-free view)', () => {
     adminPubHex: PUB_A,
     scope: 'admin',
     scopes: ['joins'],
+    grantSource: 'manual',
     grantedAt: now,
     expiresAt: now + 1000,
     label: 'parent A',
@@ -388,6 +391,7 @@ test('getAdminNodes-equivalent public surface never exposes seed material', () =
     'active',
     'adminPubHex',
     'expiresAt',
+    'grantSource',
     'grantedAt',
     'label',
     'lastSeenAddress',
@@ -619,4 +623,136 @@ test('clearing every grant leaves no selection, which the API resolves to self',
   assert.equal(selectedNodeId(), null);
   assert.equal(activeAdminNode(now), null);
   assert.deepEqual(loadAdminEntries(), []);
+});
+
+// ── Verified grant application (applyAdminGrant) ────────────────────────────
+
+test('a locally generated entry defaults grantSource to manual', () => {
+  reset();
+  const now = 1_700_000_000_000;
+  const stored = addAdminEntry(entry(NODE_A, SEED_A, PUB_A, { grantedAt: now, expiresAt: now + 1000 }));
+  assert.equal(stored.grantSource, GRANT_SOURCE.MANUAL);
+  assert.equal(findAdminNode(NODE_A).grantSource, GRANT_SOURCE.MANUAL);
+});
+
+test('a migrated v1 row defaults grantSource to manual', () => {
+  reset();
+  const now = Date.now();
+  memory.setItem(
+    LEGACY_KEY,
+    JSON.stringify({
+      v: 1,
+      entries: [
+        {
+          nodeId: NODE_A,
+          adminSeedHex: SEED_A,
+          adminPubHex: PUB_A,
+          scope: 'admin',
+          grantedAt: now,
+          expiresAt: now + 1000,
+        },
+      ],
+    }),
+  );
+  assert.equal(loadAdminEntries(now)[0].grantSource, GRANT_SOURCE.MANUAL);
+});
+
+test('applyAdminGrant requires an existing entry', () => {
+  reset();
+  const now = 1_700_000_000_000;
+  assert.throws(
+    () => applyAdminGrant(NODE_A, { scopes: ['joins'], grantedAt: now, expiresAt: now + 1000 }),
+    /generate a key for this node first/,
+  );
+});
+
+test('applyAdminGrant rejects empty and unknown scopes without falling back to joins', () => {
+  reset();
+  const now = 1_700_000_000_000;
+  addAdminEntry(entry(NODE_A, SEED_A, PUB_A, { grantedAt: now, expiresAt: now + 1000 }));
+
+  assert.throws(
+    () => applyAdminGrant(NODE_A, { scopes: [], grantedAt: now, expiresAt: now + 2000 }),
+    /at least one scope/,
+  );
+  assert.throws(
+    () => applyAdminGrant(NODE_A, { scopes: ['bogus'], grantedAt: now, expiresAt: now + 2000 }),
+    /Unknown admin scope/,
+  );
+  assert.throws(
+    () => applyAdminGrant(NODE_A, { scopes: ['joins', 'nope'], grantedAt: now, expiresAt: now + 2000 }),
+    /Unknown admin scope/,
+  );
+
+  // The entry was not touched: still the provisional joins-only grant.
+  const after = findAdminNode(NODE_A);
+  assert.deepEqual(after.scopes, ['joins']);
+  assert.equal(after.grantSource, GRANT_SOURCE.MANUAL);
+  assert.equal(after.expiresAt, now + 1000);
+});
+
+test('applyAdminGrant replaces scopes/TTL/label, marks bundle, and preserves the rest', () => {
+  reset();
+  const now = 1_700_000_000_000;
+  addAdminEntry(
+    entry(NODE_A, SEED_A, PUB_A, {
+      grantedAt: now,
+      expiresAt: now + 1000,
+      label: 'provisional',
+      nodeAddr: '0.1.2',
+    }),
+  );
+  addAdminEntry(entry(NODE_B, SEED_B, PUB_B, { grantedAt: now - 10_000, expiresAt: now + 60_000 }));
+  // NODE_A was the first entry, so it is the selection.
+  assert.equal(selectedNodeId(), NODE_A);
+  updateLastSeen(NODE_A, { status: 'active', kind: 'internal', address: '0.3.1', at: now + 5 });
+
+  const expiresAt = now + 30 * 24 * 3600 * 1000;
+  const applied = applyAdminGrant(NODE_A, {
+    scopes: ['topology', 'joins'],
+    grantedAt: now,
+    expiresAt,
+    label: 'operator grant',
+  });
+
+  assert.deepEqual(applied.scopes, ['topology', 'joins'], 'order comes from the bundle, not joins-first');
+  assert.equal(applied.grantedAt, now);
+  assert.equal(applied.expiresAt, expiresAt);
+  assert.equal(applied.label, 'operator grant');
+  assert.equal(applied.grantSource, GRANT_SOURCE.BUNDLE);
+
+  // Seed/public key/address/probe memory/selection survive.
+  assert.equal(Buffer.from(adminSeedBytes(NODE_A)).toString('hex'), SEED_A);
+  assert.equal(findAdminNode(NODE_A).adminPubHex, PUB_A);
+  assert.equal(findAdminNode(NODE_A).nodeAddr, '0.1.2');
+  assert.equal(findAdminNode(NODE_A).lastSeenStatus, 'active');
+  assert.equal(findAdminNode(NODE_A).lastSeenKind, 'internal');
+  assert.equal(selectedNodeId(), NODE_A, 'importing a bundle never retargets the console');
+  assert.equal(activeAdminNode(now).nodeId, NODE_A);
+
+  // The other entry is untouched.
+  assert.deepEqual(findAdminNode(NODE_B).scopes, ['joins']);
+  assert.equal(findAdminNode(NODE_B).grantSource, GRANT_SOURCE.MANUAL);
+});
+
+test('applyAdminGrant dedupes scopes and requires expiresAt > grantedAt', () => {
+  reset();
+  const now = 1_700_000_000_000;
+  addAdminEntry(entry(NODE_A, SEED_A, PUB_A, { grantedAt: now, expiresAt: now + 1000 }));
+
+  const applied = applyAdminGrant(NODE_A, {
+    scopes: ['value', 'value', 'topology'],
+    grantedAt: now,
+    expiresAt: now + 1000,
+  });
+  assert.deepEqual(applied.scopes, ['value', 'topology']);
+
+  assert.throws(
+    () => applyAdminGrant(NODE_A, { scopes: ['joins'], grantedAt: now, expiresAt: now }),
+    /expiresAt must be greater than grantedAt/,
+  );
+  assert.throws(
+    () => applyAdminGrant(NODE_A, { scopes: ['joins'], grantedAt: 'nope', expiresAt: now }),
+    /grantedAt must be a finite timestamp/,
+  );
 });

@@ -278,6 +278,9 @@ pub enum ControlError {
         /// The permitted maximum lifetime in seconds.
         max: u64,
     },
+    /// An [`AdminGrantV2`](crate::AdminGrantV2) carried an empty scope set.
+    #[error("admin grant must carry at least one scope")]
+    EmptyAdminScopes,
 }
 
 #[cfg(test)]

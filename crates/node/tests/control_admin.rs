@@ -19,13 +19,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cawala_control::{
-    ADMIN_GRANT_VERSION, AdminGrant, AdminJoinApprove, AdminJoinReject, AdminRedeliverJoin,
-    AdminScope, CONTROL_REQUEST_MAX_TTL_SECS, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply,
-    ControlRequest, CreateChild, DEFAULT_ADMIN_TTL_SECS, DeliveryStatus, JoinRequest, NodeId,
-    OperatorSecretKey, RejectCode, SetAddress, SignedAdminGrant, SignedControl,
+    ADMIN_GRANT_V1_VERSION, ADMIN_GRANT_VERSION, AdminGrant, AdminGrantV2, AdminJoinApprove,
+    AdminJoinReject, AdminRedeliverJoin, AdminScope, AdminScopes, CONTROL_REQUEST_MAX_TTL_SECS,
+    CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest, CreateChild,
+    DEFAULT_ADMIN_TTL_SECS, DeliveryStatus, JoinRequest, MAX_VALUE_ADMIN_TTL_SECS, NodeId,
+    OperatorSecretKey, RejectCode, SetAddress, SignedAdminGrant, SignedAdminGrantV2, SignedControl,
 };
 use cawala_ledger::{LedgerSecretKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_node::AdminStore;
+use cawala_node::admin_store::StoredGrant;
 use cawala_node::control::{ControlNode, spawn_control_only_on};
 use cawala_node::control_store::ControlStore;
 use cawala_node::record::RecordStore;
@@ -89,24 +91,52 @@ fn admin_request(
     authorize(node(parent_id), admin_op, request)
 }
 
-/// A node-signed admin grant scoped to `parent_id`.
-fn admin_grant(
+/// A node-signed v2 admin grant scoped to `parent_id` with `scopes`.
+fn admin_grant_v2(
     parent_id: &str,
     parent_op: &OperatorSecretKey,
     admin_op: &OperatorSecretKey,
-) -> SignedAdminGrant {
+    scopes: AdminScopes,
+) -> StoredGrant {
+    let now = now_unix_seconds();
+    // A value-scoped grant is capped at the 24 h value TTL.
+    let ttl = if scopes.value {
+        DEFAULT_ADMIN_TTL_SECS.min(MAX_VALUE_ADMIN_TTL_SECS)
+    } else {
+        DEFAULT_ADMIN_TTL_SECS
+    };
+    let grant = AdminGrantV2 {
+        version: ADMIN_GRANT_VERSION,
+        node: node(parent_id),
+        admin: admin_op.public(),
+        scopes,
+        granted_at: now,
+        expiry: now + ttl,
+        label: Some("hermetic-admin".to_string()),
+    };
+    StoredGrant::V2(SignedAdminGrantV2::authorize(grant, parent_op).expect("sign v2 admin grant"))
+}
+
+/// A legacy v1 admin grant (interpreted joins-only) scoped to `parent_id`.
+fn admin_grant_v1(
+    parent_id: &str,
+    parent_op: &OperatorSecretKey,
+    admin_op: &OperatorSecretKey,
+) -> StoredGrant {
     let now = now_unix_seconds();
     let grant = AdminGrant {
-        version: ADMIN_GRANT_VERSION,
+        version: ADMIN_GRANT_V1_VERSION,
         node: node(parent_id),
         admin: admin_op.public(),
         scope: AdminScope::Admin,
         granted_at: now,
         expiry: now + DEFAULT_ADMIN_TTL_SECS,
-        label: Some("hermetic-admin".to_string()),
+        label: Some("hermetic-admin-v1".to_string()),
     };
-    SignedAdminGrant::authorize(grant, parent_op).expect("sign admin grant")
+    StoredGrant::V1(SignedAdminGrant::authorize(grant, parent_op).expect("sign v1 admin grant"))
 }
+
+
 
 // ---------------------------------------------------------------------------
 // Harness (mirrors tests/control.rs)
@@ -256,8 +286,18 @@ struct AdminFixture {
     _parent_dir: tempfile::TempDir,
 }
 
-/// Build the fixture, optionally binding the parent endpoint with `lookup`.
-async fn admin_fixture(lookup: Option<MemoryLookup>) -> AdminFixture {
+/// Which grant form the fixture installs.
+#[derive(Clone, Copy)]
+enum GrantForm {
+    /// A legacy v1 grant (interpreted joins-only).
+    V1,
+    /// A v2 grant with the given scopes.
+    V2(AdminScopes),
+}
+
+/// Build the fixture, optionally binding the parent endpoint with `lookup`,
+/// installing `form` as the delegated admin grant.
+async fn admin_fixture_form(lookup: Option<MemoryLookup>, form: GrantForm) -> AdminFixture {
     let parent_key = SecretKey::generate();
     let parent_id = parent_key.public().to_string();
     let parent_op = operator(&parent_key);
@@ -279,10 +319,12 @@ async fn admin_fixture(lookup: Option<MemoryLookup>) -> AdminFixture {
     )
     .await;
     {
+        let grant = match form {
+            GrantForm::V1 => admin_grant_v1(&parent_id, &parent_op, &admin_op),
+            GrantForm::V2(scopes) => admin_grant_v2(&parent_id, &parent_op, &admin_op, scopes),
+        };
         let mut engine = parent.engine().await;
-        engine
-            .grant_admin(admin_grant(&parent_id, &parent_op, &admin_op))
-            .expect("grant admin");
+        engine.grant_admin(grant).expect("grant admin");
     }
     let admin_endpoint = bind(&SecretKey::generate(), None).await;
     AdminFixture {
@@ -292,6 +334,11 @@ async fn admin_fixture(lookup: Option<MemoryLookup>) -> AdminFixture {
         admin_endpoint,
         _parent_dir: parent_dir,
     }
+}
+
+/// The default fixture: a v2 `{joins}` grant (parity with a legacy v1 grant).
+async fn admin_fixture(lookup: Option<MemoryLookup>) -> AdminFixture {
+    admin_fixture_form(lookup, GrantForm::V2(AdminScopes::v1())).await
 }
 
 /// Spawn a fresh browser-like applicant (a leaf engine with no address) and
@@ -673,6 +720,131 @@ async fn self_operator_still_authorized() {
         send(&fixture.admin_endpoint, &fixture.parent.addr, &signed).await,
         ControlReply::Snapshot(_)
     ));
+
+    fixture.admin_endpoint.close().await;
+    fixture.parent.shutdown().await;
+}
+
+/// Drive the three join mutations against a child that is not pending. The
+/// reply distinguishes scope authority: `NotFound` means the joins scope was
+/// admitted (and the handler then found nothing), while `Unauthorized` means
+/// the grant did not carry the joins scope.
+async fn assert_join_mutations(fixture: &AdminFixture, expect: RejectCode) {
+    let parent_id = fixture.parent.endpoint.id().to_string();
+    let requests = [
+        ControlRequest::AdminApproveJoin(AdminJoinApprove {
+            child: node("ghost"),
+            slot: None,
+        }),
+        ControlRequest::AdminRejectJoin(AdminJoinReject {
+            child: node("ghost"),
+            reason: None,
+        }),
+        ControlRequest::AdminRedeliverJoin(AdminRedeliverJoin {
+            child: node("ghost"),
+        }),
+    ];
+    for request in requests {
+        let signed = admin_request(&parent_id, &fixture.admin_op, request.clone());
+        assert_eq!(
+            send(&fixture.admin_endpoint, &fixture.parent.addr, &signed).await,
+            ControlReply::Rejected(expect),
+            "{request:?}"
+        );
+    }
+}
+
+/// A legacy v1 grant is joins-only parity: it may query and reach the join
+/// mutations.
+#[tokio::test]
+async fn legacy_v1_grant_is_joins_only_parity() {
+    let fixture = admin_fixture_form(None, GrantForm::V1).await;
+    let parent_id = fixture.parent.endpoint.id().to_string();
+
+    let query = admin_request(&parent_id, &fixture.admin_op, ControlRequest::AdminQuery);
+    assert!(matches!(
+        send(&fixture.admin_endpoint, &fixture.parent.addr, &query).await,
+        ControlReply::AdminSnapshot(_)
+    ));
+    assert_join_mutations(&fixture, RejectCode::NotFound).await;
+
+    fixture.admin_endpoint.close().await;
+    fixture.parent.shutdown().await;
+}
+
+/// A v2 `{joins}` grant is behavioural parity with v1.
+#[tokio::test]
+async fn v2_joins_grant_is_parity() {
+    let fixture = admin_fixture_form(None, GrantForm::V2(AdminScopes::v1())).await;
+    let parent_id = fixture.parent.endpoint.id().to_string();
+
+    let query = admin_request(&parent_id, &fixture.admin_op, ControlRequest::AdminQuery);
+    assert!(matches!(
+        send(&fixture.admin_endpoint, &fixture.parent.addr, &query).await,
+        ControlReply::AdminSnapshot(_)
+    ));
+    assert_join_mutations(&fixture, RejectCode::NotFound).await;
+
+    fixture.admin_endpoint.close().await;
+    fixture.parent.shutdown().await;
+}
+
+/// A v2 `{topology}` grant may read (`AdminQuery`) but is `Unauthorized` on all
+/// three join mutations.
+#[tokio::test]
+async fn v2_topology_grant_can_query_but_not_mutate_joins() {
+    let scopes = AdminScopes {
+        joins: false,
+        topology: true,
+        value: false,
+    };
+    let fixture = admin_fixture_form(None, GrantForm::V2(scopes)).await;
+    let parent_id = fixture.parent.endpoint.id().to_string();
+
+    let query = admin_request(&parent_id, &fixture.admin_op, ControlRequest::AdminQuery);
+    assert!(matches!(
+        send(&fixture.admin_endpoint, &fixture.parent.addr, &query).await,
+        ControlReply::AdminSnapshot(_)
+    ));
+    assert_join_mutations(&fixture, RejectCode::Unauthorized).await;
+
+    fixture.admin_endpoint.close().await;
+    fixture.parent.shutdown().await;
+}
+
+/// A v2 `{value}` grant may read (`AdminQuery`) but is `Unauthorized` on all
+/// three join mutations.
+#[tokio::test]
+async fn v2_value_grant_can_query_but_not_mutate_joins() {
+    let scopes = AdminScopes {
+        joins: false,
+        topology: false,
+        value: true,
+    };
+    let fixture = admin_fixture_form(None, GrantForm::V2(scopes)).await;
+    let parent_id = fixture.parent.endpoint.id().to_string();
+
+    let query = admin_request(&parent_id, &fixture.admin_op, ControlRequest::AdminQuery);
+    assert!(matches!(
+        send(&fixture.admin_endpoint, &fixture.parent.addr, &query).await,
+        ControlReply::AdminSnapshot(_)
+    ));
+    assert_join_mutations(&fixture, RejectCode::Unauthorized).await;
+
+    fixture.admin_endpoint.close().await;
+    fixture.parent.shutdown().await;
+}
+
+/// A v2 `{joins,topology}` grant still reaches the join mutations.
+#[tokio::test]
+async fn v2_multi_scope_grant_reaches_joins() {
+    let scopes = AdminScopes {
+        joins: true,
+        topology: true,
+        value: false,
+    };
+    let fixture = admin_fixture_form(None, GrantForm::V2(scopes)).await;
+    assert_join_mutations(&fixture, RejectCode::NotFound).await;
 
     fixture.admin_endpoint.close().await;
     fixture.parent.shutdown().await;

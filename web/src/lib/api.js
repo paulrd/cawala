@@ -469,6 +469,9 @@ function _deriveAdminView() {
       label: isMockNode ? 'Mock node' : isSelf ? 'This browser' : grant?.label ?? null,
       nodeAddr: grant?.nodeAddr ?? (isMockNode ? '0.3' : null),
       scopes,
+      // `bundle` means the scopes/TTL came from a node-operator-signed bundle;
+      // `manual` is a locally generated provisional grant. `null` for self/mock.
+      grantSource: grant?.grantSource ?? null,
       grantExpiresAt: grant?.expiresAt ?? null,
       kind,
       status,
@@ -2275,10 +2278,90 @@ export function removeAdminNode(nodeId) {
 
 /**
  * Admin nodes for UI display (seed-free).
- * @returns {Array<{ nodeId: string, adminPubHex: string, scope: 'admin', grantedAt: number, expiresAt: number, label: string|null, nodeAddr: string|null, active: boolean }>}
+ * @returns {Array<{ nodeId: string, adminPubHex: string, scope: 'admin', scopes: string[], grantSource: 'manual'|'bundle', grantedAt: number, expiresAt: number, label: string|null, nodeAddr: string|null, active: boolean }>}
  */
 export function getAdminNodes() {
   return adminKeys.listAdminNodes();
+}
+
+/**
+ * Import a node-operator-signed `cawala://admin?node=&grant=` bundle.
+ *
+ * Parses and verifies the bundle in wasm, then applies its truthful
+ * scopes/TTL to the **existing** stored key for the bundle's node. The browser
+ * never holds operator/ledger keys: the bundle is public signed data, and the
+ * admin seed already in this browser is preserved (only the grant's meaning
+ * changes). Returns the updated seed-free entry.
+ *
+ * @param {string} uri
+ * @returns {Promise<object>}
+ * @throws {AdminUnavailableError} in mock mode (no live node).
+ * @throws {Error} on an invalid/unverifiable bundle, no stored key, or a key mismatch.
+ */
+export async function applyAdminBundle(uri) {
+  const trimmed = (uri || '').trim();
+  if (!trimmed) {
+    throw new Error('Paste an admin bundle link from a node operator.');
+  }
+  if (_useMock) {
+    throw new AdminUnavailableError('apply admin bundle');
+  }
+  if (!_wasmModule) {
+    throw new Error('Admin bundle import is unavailable: the wasm client is not loaded.');
+  }
+
+  let info;
+  try {
+    info = _wasmModule.parse_admin_bundle(trimmed);
+  } catch (err) {
+    throw new Error(`Invalid admin bundle: ${err?.message ?? err}`);
+  }
+
+  try {
+    // Normalize the wasm getters (snake_case) into the plain camelCase shape
+    // `applyAdminGrantInfo` takes, before the wasm object is freed.
+    return applyAdminGrantInfo({
+      node: info.node,
+      admin: info.admin,
+      scopes: Array.from(info.scopes || []),
+      grantedAt: info.granted_at,
+      expiry: info.expiry,
+      label: info.label ?? null,
+    });
+  } finally {
+    info.free?.();
+  }
+}
+
+/**
+ * The post-verification half of [`applyAdminBundle`]: apply already-parsed and
+ * signature-verified bundle fields to the stored key for that node.
+ *
+ * Split out (and exported) so it is unit-testable without a wasm module. It
+ * requires an existing entry, requires the bundle's admin key to match the
+ * stored public key, and then delegates the strict scope/TTL update to
+ * `adminKeys.applyAdminGrant`. Re-derives the administered-node view.
+ *
+ * @param {{ node: string, admin: string, scopes: string[], grantedAt: number, expiry: number, label?: string|null }} info
+ * @returns {object} the updated seed-free stored entry
+ */
+export function applyAdminGrantInfo(info) {
+  const nodeId = String(info?.node || '').toLowerCase();
+  const entry = adminKeys.findAdminNode(nodeId);
+  if (!entry) {
+    throw new Error('generate a key for this node first');
+  }
+  if (String(info?.admin || '').toLowerCase() !== entry.adminPubHex) {
+    throw new Error('This bundle grants a different admin key than the one stored for this node.');
+  }
+  const applied = adminKeys.applyAdminGrant(nodeId, {
+    scopes: Array.from(info.scopes || []),
+    grantedAt: info.grantedAt,
+    expiresAt: info.expiry,
+    label: info.label ?? null,
+  });
+  _syncAdministeredNode();
+  return applied;
 }
 
 /**

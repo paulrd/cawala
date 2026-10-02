@@ -639,7 +639,7 @@ pub(crate) fn verify_routed_reply_bytes(
 ///
 /// Node ids and operator keys are the same Ed25519 key, so a node id must
 /// round-trip through [`EndpointId`]; anything else fails closed.
-fn operator_key_from_node(node: &str) -> Result<OperatorPubKey, String> {
+pub(crate) fn operator_key_from_node(node: &str) -> Result<OperatorPubKey, String> {
     let endpoint: EndpointId = node
         .parse()
         .map_err(|_| "routed reply responder node id is not a valid endpoint id".to_string())?;

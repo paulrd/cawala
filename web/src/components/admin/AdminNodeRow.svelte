@@ -31,6 +31,9 @@
         <Badge variant={item.kindVariant} label={item.kindLabel} />
       {/if}
       <Badge variant={item.statusBadge.variant} label={item.statusBadge.label} />
+      {#if item.sourceBadge}
+        <Badge variant={item.sourceBadge.variant} label={item.sourceBadge.label} />
+      {/if}
       {#if item.selected}
         <Badge variant="info" label="Selected" />
       {/if}
