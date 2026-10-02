@@ -12,8 +12,16 @@
 
 use serde::{Deserialize, Serialize};
 
-use cawala_ledger::{NodeId, OperatorPubKey};
+use cawala_ledger::{LedgerPubKey, NodeId, OperatorPubKey};
 use cawala_topology::{ChildKind, OctAddr};
+
+/// Maximum number of account rows a [`ControlReply::AdminLedgerSnapshot`]
+/// carries.
+///
+/// The topology cap is 8 child slots, but a ledger may retain detached/legacy
+/// child accounts, so this is deliberately larger while keeping an encoded
+/// snapshot far under [`MAX_CONTROL_FRAME`](crate::MAX_CONTROL_FRAME).
+pub const MAX_ADMIN_LEDGER_ACCOUNTS: usize = 64;
 
 /// ALPN negotiated on every direct control connection.
 pub const CONTROL_ALPN: &[u8] = b"cawala/control/0";
@@ -22,9 +30,10 @@ pub const CONTROL_ALPN: &[u8] = b"cawala/control/0";
 ///
 /// Bumped to 2 when the admin reply variants ([`ControlReply::AdminSnapshot`],
 /// [`ControlReply::AdminApproved`], [`ControlReply::AdminRejected`]) were
-/// appended. There is no on-wire reader pinned to this constant yet; it exists
-/// so a future reader can reject a mismatched frame up front.
-pub const CONTROL_REPLY_VERSION: u8 = 2;
+/// appended, and to 3 when [`ControlReply::AdminLedgerSnapshot`] was appended
+/// (read-only ledger view). There is no on-wire reader pinned to this constant
+/// yet; it exists so a future reader can reject a mismatched frame up front.
+pub const CONTROL_REPLY_VERSION: u8 = 3;
 
 /// The node's answer to one direct control request.
 ///
@@ -50,6 +59,57 @@ pub enum ControlReply {
     /// Reply to
     /// [`ControlRequest::AdminRejectJoin`](crate::ControlRequest::AdminRejectJoin).
     AdminRejected(AdminRejected),
+    /// Reply to
+    /// [`ControlRequest::AdminLedgerQuery`](crate::ControlRequest::AdminLedgerQuery):
+    /// a read-only view of this node's ledger (variant 7, reply version 3).
+    AdminLedgerSnapshot(AdminLedgerSnapshot),
+}
+
+/// A read-only view of one node's ledger, for a value-scoped admin.
+///
+/// Field order is frozen: postcard encodes positionally. `equity` is
+/// `parent_balance - sum(child balances)` (it may be negative), and
+/// `parent_balance`/`equity` are computed over **all** balances even when
+/// `truncated` is set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminLedgerSnapshot {
+    /// The reporting node.
+    pub node_id: NodeId,
+    /// The node's ledger public key.
+    pub ledger_id: LedgerPubKey,
+    /// The ledger height (number of accepted entries).
+    pub height: u64,
+    /// The node's asset balance with its parent (0 when unset).
+    pub parent_balance: u64,
+    /// The node's derived equity (`parent - sum(children)`); may be negative.
+    pub equity: i128,
+    /// Whether the record is top-level (no parent link).
+    pub root: bool,
+    /// Whether `accounts` was truncated at
+    /// [`MAX_ADMIN_LEDGER_ACCOUNTS`]; the totals above still cover every
+    /// balance.
+    pub truncated: bool,
+    /// The account rows (record children first in slot order, then remaining
+    /// ledger `Child` accounts in `NodeId` order).
+    pub accounts: Vec<AdminLedgerAccount>,
+}
+
+/// One account row of an [`AdminLedgerSnapshot`].
+///
+/// `kind`/`slot`/`address` are `None` for a ledger `Child` account that is not
+/// a current `node.json` child (detached/legacy).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminLedgerAccount {
+    /// The child node id.
+    pub id: NodeId,
+    /// The child kind, when this is a current `node.json` child.
+    pub kind: Option<ChildKind>,
+    /// The child's slot, when it has one.
+    pub slot: Option<u8>,
+    /// The child's derived address, when derivable.
+    pub address: Option<OctAddr>,
+    /// The liability balance held for this child (0 when unopened).
+    pub balance: u64,
 }
 
 /// Why a control request was refused.
@@ -228,7 +288,49 @@ mod tests {
                 child: node("applicant"),
                 delivery: DeliveryStatus::Rejected(RejectCode::Unauthorized),
             }),
+            ControlReply::AdminLedgerSnapshot(admin_ledger_snapshot()),
         ]
+    }
+
+    fn ledger_pubkey() -> LedgerPubKey {
+        cawala_ledger::LedgerSecretKey::from_bytes([7u8; 32]).public()
+    }
+
+    /// A snapshot exercising a negative equity and `None` kind/slot/address
+    /// (a detached ledger account).
+    fn admin_ledger_snapshot() -> AdminLedgerSnapshot {
+        AdminLedgerSnapshot {
+            node_id: node("parent"),
+            ledger_id: ledger_pubkey(),
+            height: 42,
+            parent_balance: 100,
+            equity: -25,
+            root: false,
+            truncated: false,
+            accounts: vec![
+                AdminLedgerAccount {
+                    id: node("child-a"),
+                    kind: Some(ChildKind::Node),
+                    slot: Some(1),
+                    address: Some("0.3.1".parse().unwrap()),
+                    balance: 60,
+                },
+                AdminLedgerAccount {
+                    id: node("user-b"),
+                    kind: Some(ChildKind::User),
+                    slot: None,
+                    address: None,
+                    balance: 65,
+                },
+                AdminLedgerAccount {
+                    id: node("detached-c"),
+                    kind: None,
+                    slot: None,
+                    address: None,
+                    balance: 0,
+                },
+            ],
+        }
     }
 
     fn admin_snapshot() -> AdminSnapshot {
@@ -288,6 +390,114 @@ mod tests {
             let back: ControlReply = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(back, reply);
         }
+    }
+
+    /// Pin the frozen postcard field order of a struct by asserting its
+    /// encoding equals the concatenation of its fields' encodings.
+    fn assert_postcard_field_order<T: Serialize>(value: &T, fields: &[Vec<u8>]) {
+        let mut expected = Vec::new();
+        for field in fields {
+            expected.extend_from_slice(field);
+        }
+        assert_eq!(
+            postcard::to_allocvec(value).unwrap(),
+            expected,
+            "field order changed"
+        );
+    }
+
+    #[test]
+    fn admin_ledger_snapshot_reply_discriminant_is_frozen() {
+        let reply = ControlReply::AdminLedgerSnapshot(admin_ledger_snapshot());
+        let bytes = postcard::to_allocvec(&reply).unwrap();
+        assert_eq!(bytes[0], 7, "AdminLedgerSnapshot must stay discriminant 7");
+    }
+
+    #[test]
+    fn admin_ledger_snapshot_golden_field_order() {
+        let snapshot = admin_ledger_snapshot();
+        assert_postcard_field_order(
+            &snapshot,
+            &[
+                postcard::to_allocvec(&snapshot.node_id).unwrap(),
+                postcard::to_allocvec(&snapshot.ledger_id).unwrap(),
+                postcard::to_allocvec(&snapshot.height).unwrap(),
+                postcard::to_allocvec(&snapshot.parent_balance).unwrap(),
+                postcard::to_allocvec(&snapshot.equity).unwrap(),
+                postcard::to_allocvec(&snapshot.root).unwrap(),
+                postcard::to_allocvec(&snapshot.truncated).unwrap(),
+                postcard::to_allocvec(&snapshot.accounts).unwrap(),
+            ],
+        );
+    }
+
+    #[test]
+    fn admin_ledger_account_golden_field_order() {
+        let account = AdminLedgerAccount {
+            id: node("child-a"),
+            kind: Some(ChildKind::Node),
+            slot: Some(3),
+            address: Some("0.3".parse().unwrap()),
+            balance: 7,
+        };
+        assert_postcard_field_order(
+            &account,
+            &[
+                postcard::to_allocvec(&account.id).unwrap(),
+                postcard::to_allocvec(&account.kind).unwrap(),
+                postcard::to_allocvec(&account.slot).unwrap(),
+                postcard::to_allocvec(&account.address).unwrap(),
+                postcard::to_allocvec(&account.balance).unwrap(),
+            ],
+        );
+    }
+
+    #[test]
+    fn admin_ledger_snapshot_negative_equity_round_trips() {
+        let snapshot = admin_ledger_snapshot();
+        assert_eq!(snapshot.equity, -25);
+        let bytes = postcard::to_allocvec(&snapshot).unwrap();
+        let back: AdminLedgerSnapshot = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, snapshot);
+        assert_eq!(back.equity, -25);
+        assert_eq!(back.accounts[2].kind, None, "detached account keeps kind None");
+        assert_eq!(back.accounts[2].slot, None);
+        assert_eq!(back.accounts[2].address, None);
+    }
+
+    #[test]
+    fn admin_ledger_snapshot_at_account_cap_fits_the_frame() {
+        // 64 rows of a plausible worst case (long node ids, full address depth)
+        // must stay far under `MAX_CONTROL_FRAME`.
+        let accounts: Vec<AdminLedgerAccount> = (0..MAX_ADMIN_LEDGER_ACCOUNTS)
+            .map(|i| AdminLedgerAccount {
+                id: node(&format!("{i:0>64}")),
+                kind: Some(ChildKind::Node),
+                slot: Some((i % 8) as u8),
+                address: Some("0.1.2.3.4.5.6.7".parse().unwrap()),
+                balance: u64::MAX,
+            })
+            .collect();
+        let snapshot = AdminLedgerSnapshot {
+            node_id: node(&"f".repeat(64)),
+            ledger_id: ledger_pubkey(),
+            height: u64::MAX,
+            parent_balance: u64::MAX,
+            equity: i128::MIN,
+            root: false,
+            truncated: true,
+            accounts,
+        };
+        let reply = ControlReply::AdminLedgerSnapshot(snapshot);
+        let bytes = postcard::to_allocvec(&reply).unwrap();
+        assert!(
+            bytes.len() < crate::MAX_CONTROL_FRAME as usize,
+            "encoded snapshot is {} bytes, frame cap is {}",
+            bytes.len(),
+            crate::MAX_CONTROL_FRAME
+        );
+        // Also comfortably below the 10 KiB estimate.
+        assert!(bytes.len() < 10 * 1024, "encoded snapshot is {} bytes", bytes.len());
     }
 
     #[test]

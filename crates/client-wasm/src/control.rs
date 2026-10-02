@@ -679,6 +679,9 @@ fn reply_kind(reply: &ControlReply) -> &'static str {
         ControlReply::AdminSnapshot(_) => "admin-snapshot",
         ControlReply::AdminApproved(_) => "admin-approved",
         ControlReply::AdminRejected(_) => "admin-rejected",
+        // P3 reply variant: the wasm DTO/mapping is P3c; this label arm only
+        // keeps the match exhaustive after the control reply version bump.
+        ControlReply::AdminLedgerSnapshot(_) => "admin-ledger-snapshot",
     }
 }
 

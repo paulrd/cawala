@@ -35,7 +35,7 @@ use cawala_node::msg::{
 };
 use cawala_node::admin_store::{ADMINS_FILE, StoredGrant};
 use cawala_node::record::RecordStore;
-use cawala_node::AdminStore;
+use cawala_node::{AdminStore, LedgerService};
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
@@ -435,7 +435,7 @@ fn admin_grant_v2(
                 node: node(root_id),
                 admin: admin_op.public(),
                 scopes,
-                granted_at: now.saturating_sub(1),
+                granted_at: now,
                 expiry: now + ttl,
                 label: Some("routed-test-v2".to_string()),
             },
@@ -819,6 +819,46 @@ async fn routed_v2_topology_grant_cannot_mutate_joins() {
     );
 }
 
+/// (3e) A joins-only v2 grant cannot read the ledger over the routed path:
+/// `AdminLedgerQuery` requires the `value` scope, and the routed admin class
+/// reuses the same gate.
+#[tokio::test]
+async fn routed_joins_only_grant_cannot_read_ledger() {
+    let w = world();
+    let lookup = MemoryLookup::new();
+    let mut nodes = build_world(&w, &lookup).await;
+    let [root, _a, _b, u] = &mut nodes[..] else {
+        panic!("world shape")
+    };
+
+    root.control
+        .lock()
+        .await
+        .grant_admin(admin_grant_v2(
+            &w.root_id,
+            &w.root_op,
+            &w.admin_op,
+            AdminScopes::v1(),
+        ))
+        .expect("grant joins-only admin");
+
+    let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminLedgerQuery);
+    let forward = own_forward(u, &intent.request).await;
+    let request = routed(
+        peer("0", &w.root_id),
+        peer("0.1.3", &w.u_id),
+        intent,
+        None,
+        vec![forward],
+    );
+    assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
+    assert_eq!(
+        recv_reply(u).await,
+        ControlReply::Rejected(RejectCode::Unauthorized),
+        "a joins-only grant must not read the ledger on the routed path"
+    );
+}
+
 /// (3c) A grant revoked *out of process* (only `admins.json` rewritten) must
 /// still be reflected in the `grant_store_missing` evidence line: the audit is
 /// derived from the reloaded on-disk store, not a stale in-memory copy.
@@ -864,6 +904,89 @@ async fn routed_out_of_process_revoke_is_reflected_in_the_evidence_audit() {
         audit.contains("grant_store_missing"),
         "the evidence line must reflect the on-disk store, not stale memory: {audit}"
     );
+}
+
+/// (3d) A routed value-scoped `AdminLedgerQuery` executes the ledger read at the
+/// destination and returns a verified snapshot. This exercises the two-phase
+/// handled dispatch through `dispatch_control_envelope`: the engine lock is
+/// captured and dropped, then the ledger lock is taken.
+#[tokio::test]
+async fn routed_value_query_returns_verified_snapshot() {
+    let w = world();
+    let lookup = MemoryLookup::new();
+    let mut nodes = build_world(&w, &lookup).await;
+    let [root, _a, _b, u] = &mut nodes[..] else {
+        panic!("world shape")
+    };
+
+    // Attach a running ledger to the root and fund one user account.
+    let dir = root.control.lock().await.data_dir().to_path_buf();
+    cawala_node::identity::persist_secret_key(&dir, &w.root_key).unwrap();
+    let mut ledger = LedgerService::open(&dir, &w.root_id).unwrap();
+    let ledger_id = ledger.ledger_key_public();
+    let user_x = node("user-x");
+    ledger
+        .ensure_account_open(&user_x, ChildKind::User)
+        .unwrap();
+    ledger
+        .fund(&user_x, ChildKind::User, 30, &w.root_op, 1, now_unix_seconds())
+        .unwrap();
+    root.control
+        .lock()
+        .await
+        .attach_ledger(Arc::new(Mutex::new(ledger)));
+
+    root.control
+        .lock()
+        .await
+        .grant_admin(admin_grant_v2(
+            &w.root_id,
+            &w.root_op,
+            &w.admin_op,
+            AdminScopes {
+                joins: false,
+                topology: false,
+                value: true,
+            },
+        ))
+        .expect("grant value admin");
+
+    let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminLedgerQuery);
+    let forward = own_forward(u, &intent.request).await;
+    let request = routed(
+        peer("0", &w.root_id),
+        peer("0.1.3", &w.u_id),
+        intent,
+        None,
+        vec![forward],
+    );
+    assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
+
+    let signed = recv_signed_reply(u).await;
+    signed
+        .verify(&w.root_op.public())
+        .expect("reply must verify under the root operator key");
+    let ControlReply::AdminLedgerSnapshot(snapshot) = signed.reply.reply else {
+        panic!("expected AdminLedgerSnapshot, got {:?}", signed.reply.reply);
+    };
+    assert_eq!(snapshot.node_id, node(&w.root_id));
+    assert_eq!(snapshot.ledger_id, ledger_id);
+    assert_eq!(snapshot.parent_balance, 0);
+    assert_eq!(snapshot.equity, -30);
+
+    let funded = snapshot
+        .accounts
+        .iter()
+        .find(|row| row.id == user_x)
+        .expect("funded user row");
+    assert_eq!(funded.balance, 30);
+    let child = snapshot
+        .accounts
+        .iter()
+        .find(|row| row.id == node(&w.a_id))
+        .expect("record child row");
+    assert_eq!(child.kind, Some(ChildKind::Node));
+    assert_eq!(child.balance, 0);
 }
 
 /// (4) A request whose `target.node` or `requester` disagrees with the envelope

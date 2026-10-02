@@ -57,10 +57,12 @@ export const ledgerState = $state({
 
 // ── Node / data state ─────────────────────────────────────────
 
-/** @type {{ children: Array, accounts: Array, joinRequests: Array, activity: Array }} */
+/** @type {{ children: Array, accounts: Array, accountsTruncated: boolean, joinRequests: Array, activity: Array }} */
 export const nodeState = $state({
   children: [],
   accounts: [],
+  // Whether the node's ledger view reported its account-row cap was hit.
+  accountsTruncated: false,
   joinRequests: [],
   activity: [],
 });
@@ -216,6 +218,7 @@ export function dismissToast(id) {
 export function resetDataState() {
   nodeState.children = [];
   nodeState.accounts = [];
+  nodeState.accountsTruncated = false;
   nodeState.joinRequests = [];
   nodeState.activity = [];
   Object.keys(loadingState).forEach((k) => (loadingState[k] = false));

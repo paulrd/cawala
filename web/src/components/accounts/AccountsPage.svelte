@@ -34,7 +34,9 @@
     loadingState.accounts = true;
     errorState.accounts = null;
     try {
-      nodeState.accounts = await getAccounts();
+      const rows = await getAccounts();
+      nodeState.accounts = rows;
+      nodeState.accountsTruncated = Array.isArray(rows) ? Boolean(rows.truncated) : false;
       loaded = true;
     } catch (err) {
       errorState.accounts = err?.message || 'Failed to load accounts';
@@ -75,12 +77,16 @@
   );
   let hasRows = $derived(nodeState.accounts.length > 0);
   let balanceReady = $derived(ledgerState.balance != null);
+  let truncated = $derived(Boolean(nodeState.accountsTruncated));
 
   let emptyMessage = $derived.by(() => {
     if (view.isSelf) {
       return 'Your verified balance will appear here once a receipt arrives from your leaf process.';
     }
-    return 'Balances stay with the node operator. This console reads topology and joins for an administered node, never its ledger.';
+    if (!adminCapabilities.scopes.value) {
+      return 'Reading an administered node\u2019s balances needs a value-scoped grant. This browser holds a joins-only or topology-only grant.';
+    }
+    return 'This node reported no accounts yet.';
   });
 </script>
 
@@ -175,6 +181,15 @@
       <EmptyState title="No accounts" message={emptyMessage} />
     {:else}
       <DataTable {columns} rows={nodeState.accounts} />
+      {#if truncated}
+        <div class="truncated-note">
+          <Badge variant="warn" label="Truncated" />
+          <span class="text-xs muted">
+            This node&rsquo;s account list exceeded its display limit and was shortened.
+            The totals above still cover every balance.
+          </span>
+        </div>
+      {/if}
     {/if}
   </Card>
 </div>
@@ -239,6 +254,14 @@
     font-size: var(--text-2xl);
     font-weight: 300;
     line-height: 1;
+  }
+
+  .truncated-note {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    margin-top: var(--sp-3);
+    flex-wrap: wrap;
   }
 
   .btn {

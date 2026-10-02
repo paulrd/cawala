@@ -7,9 +7,9 @@
 //! than `Debug` renderings.
 
 use cawala_control::{
-    AdminApproved, AdminGrantBundleV1, AdminPendingJoin, AdminRejected, AdminScope, AdminScopes,
-    AdminSnapshot, ChildKind, DeliveryStatus, Invite, NodeId, NodeSnapshot, OperatorPubKey,
-    RejectCode,
+    AdminApproved, AdminGrantBundleV1, AdminLedgerAccount, AdminLedgerSnapshot, AdminPendingJoin,
+    AdminRejected, AdminScope, AdminScopes, AdminSnapshot, ChildKind, DeliveryStatus, Invite,
+    NodeId, NodeSnapshot, OperatorPubKey, RejectCode,
 };
 use cawala_ledger::{Hash, LedgerPubKey};
 use cawala_msg::OctAddr;
@@ -1304,6 +1304,150 @@ impl AdminActionDto {
     }
 }
 
+/// One account row of an [`AdminLedgerSnapshotDto`].
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct AdminLedgerAccountDto {
+    id: String,
+    kind: Option<String>,
+    slot: Option<u8>,
+    address: Option<String>,
+    balance: f64,
+}
+
+impl AdminLedgerAccountDto {
+    /// Convert one wire account row.
+    pub(crate) fn from_account(account: &AdminLedgerAccount) -> Self {
+        AdminLedgerAccountDto {
+            id: account.id.as_str().to_string(),
+            // Explicit stable mapping (never `Debug`); `None` is a detached
+            // ledger account, not a current record child.
+            kind: account.kind.map(|kind| child_kind_str(kind).to_string()),
+            slot: account.slot,
+            address: account.address.as_ref().map(|address| address.to_string()),
+            balance: account.balance as f64,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl AdminLedgerAccountDto {
+    /// The child node id.
+    #[wasm_bindgen(getter)]
+    pub fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    /// `"node"` or `"user"`, or `None` for a detached ledger-only account.
+    #[wasm_bindgen(getter)]
+    pub fn kind(&self) -> Option<String> {
+        self.kind.clone()
+    }
+
+    /// The child's slot, when it has one.
+    #[wasm_bindgen(getter)]
+    pub fn slot(&self) -> Option<u8> {
+        self.slot
+    }
+
+    /// The child's derived address, when derivable.
+    #[wasm_bindgen(getter)]
+    pub fn address(&self) -> Option<String> {
+        self.address.clone()
+    }
+
+    /// The liability balance held for this account (0 when unopened).
+    #[wasm_bindgen(getter)]
+    pub fn balance(&self) -> f64 {
+        self.balance
+    }
+}
+
+/// A read-only view of one node's ledger, as returned by
+/// [`crate::ClientNode::admin_ledger_query`].
+#[wasm_bindgen]
+pub struct AdminLedgerSnapshotDto {
+    node_id: String,
+    ledger_id: String,
+    height: f64,
+    parent_balance: f64,
+    equity: f64,
+    root: bool,
+    truncated: bool,
+    accounts: Vec<AdminLedgerAccountDto>,
+}
+
+impl AdminLedgerSnapshotDto {
+    /// Convert an `AdminLedgerSnapshot` reply.
+    pub(crate) fn from_snapshot(snapshot: &AdminLedgerSnapshot) -> Self {
+        AdminLedgerSnapshotDto {
+            node_id: snapshot.node_id.as_str().to_string(),
+            ledger_id: snapshot.ledger_id.to_string(),
+            height: snapshot.height as f64,
+            parent_balance: snapshot.parent_balance as f64,
+            equity: snapshot.equity as f64,
+            root: snapshot.root,
+            truncated: snapshot.truncated,
+            accounts: snapshot
+                .accounts
+                .iter()
+                .map(AdminLedgerAccountDto::from_account)
+                .collect(),
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl AdminLedgerSnapshotDto {
+    /// The reporting node.
+    #[wasm_bindgen(getter)]
+    pub fn node_id(&self) -> String {
+        self.node_id.clone()
+    }
+
+    /// The node's ledger public key as 64 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn ledger_id(&self) -> String {
+        self.ledger_id.clone()
+    }
+
+    /// The ledger height (as an `f64`; never a raw `u64`).
+    #[wasm_bindgen(getter)]
+    pub fn height(&self) -> f64 {
+        self.height
+    }
+
+    /// The node's asset balance with its parent (0 when unset).
+    #[wasm_bindgen(getter)]
+    pub fn parent_balance(&self) -> f64 {
+        self.parent_balance
+    }
+
+    /// The node's derived equity (`parent - sum(children)`); may be negative.
+    #[wasm_bindgen(getter)]
+    pub fn equity(&self) -> f64 {
+        self.equity
+    }
+
+    /// Whether the record is top-level (no parent link).
+    #[wasm_bindgen(getter)]
+    pub fn root(&self) -> bool {
+        self.root
+    }
+
+    /// Whether `accounts` was truncated; the totals still cover every balance.
+    #[wasm_bindgen(getter)]
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// The account rows (record children first, then remaining ledger accounts).
+    #[wasm_bindgen(getter)]
+    pub fn accounts(&self) -> Vec<AdminLedgerAccountDto> {
+        self.accounts.clone()
+    }
+}
+
 /// Parse a 64-hex operator public key.
 ///
 /// Returns a plain [`String`] error (not [`JsError`]) so the error paths are
@@ -1843,6 +1987,102 @@ mod tests {
         assert_eq!(pending.operator.len(), 64);
         assert_eq!(pending.desired_slot, Some(2));
         assert_eq!(pending.expiry, 1_700_000_000.0);
+    }
+
+    #[test]
+    fn admin_ledger_snapshot_dto_maps_rows_equity_and_truncation() {
+        let ledger_id = cawala_ledger::LedgerSecretKey::from_bytes([7u8; 32]).public();
+        let snapshot = AdminLedgerSnapshot {
+            node_id: node("parent"),
+            ledger_id,
+            height: 42,
+            parent_balance: 100,
+            equity: -25,
+            root: false,
+            truncated: true,
+            accounts: vec![
+                AdminLedgerAccount {
+                    id: node("child-a"),
+                    kind: Some(ChildKind::Node),
+                    slot: Some(1),
+                    address: Some("0.3.1".parse().unwrap()),
+                    balance: 60,
+                },
+                AdminLedgerAccount {
+                    id: node("user-b"),
+                    kind: Some(ChildKind::User),
+                    slot: Some(5),
+                    address: Some("0.3.5".parse().unwrap()),
+                    balance: 65,
+                },
+                // A detached ledger-only account: no kind/slot/address.
+                AdminLedgerAccount {
+                    id: node("detached-c"),
+                    kind: None,
+                    slot: None,
+                    address: None,
+                    balance: 0,
+                },
+            ],
+        };
+
+        let dto = AdminLedgerSnapshotDto::from_snapshot(&snapshot);
+        assert_eq!(dto.node_id, "parent");
+        assert_eq!(dto.ledger_id, ledger_id.to_string());
+        assert_eq!(dto.ledger_id.len(), 64);
+        assert_eq!(dto.height, 42.0);
+        assert_eq!(dto.parent_balance, 100.0);
+        assert_eq!(dto.equity, -25.0, "negative equity stays negative");
+        assert!(!dto.root);
+        assert!(dto.truncated);
+
+        assert_eq!(dto.accounts.len(), 3);
+        let node_row = &dto.accounts[0];
+        assert_eq!(node_row.id, "child-a");
+        assert_eq!(node_row.kind.as_deref(), Some("node"));
+        assert_eq!(node_row.slot, Some(1));
+        assert_eq!(node_row.address.as_deref(), Some("0.3.1"));
+        assert_eq!(node_row.balance, 60.0);
+
+        let user_row = &dto.accounts[1];
+        assert_eq!(user_row.kind.as_deref(), Some("user"));
+        assert_eq!(user_row.address.as_deref(), Some("0.3.5"));
+
+        let detached = &dto.accounts[2];
+        assert_eq!(detached.id, "detached-c");
+        assert_eq!(detached.kind, None);
+        assert_eq!(detached.slot, None);
+        assert_eq!(detached.address, None);
+        assert_eq!(detached.balance, 0.0);
+    }
+
+    #[test]
+    fn admin_ledger_snapshot_dto_maps_all_64_accounts() {
+        let accounts: Vec<AdminLedgerAccount> = (0..64)
+            .map(|i| AdminLedgerAccount {
+                id: node(&format!("acct-{i:02}")),
+                kind: None,
+                slot: None,
+                address: None,
+                balance: i as u64,
+            })
+            .collect();
+        let snapshot = AdminLedgerSnapshot {
+            node_id: node("parent"),
+            ledger_id: cawala_ledger::LedgerSecretKey::from_bytes([1u8; 32]).public(),
+            height: 64,
+            parent_balance: 0,
+            equity: 0,
+            root: true,
+            truncated: false,
+            accounts,
+        };
+        let dto = AdminLedgerSnapshotDto::from_snapshot(&snapshot);
+        assert_eq!(dto.accounts.len(), 64);
+        assert_eq!(dto.accounts[63].id, "acct-63");
+        assert_eq!(dto.accounts[63].balance, 63.0);
+        assert!(dto.root);
+        assert!(!dto.truncated);
     }
 
     #[test]

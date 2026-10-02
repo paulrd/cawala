@@ -518,6 +518,9 @@ pub enum ControlRequest {
     Rebase(RebaseNotice),
     /// A child's request for the parent's snapshot (variant 16, format 4).
     RebasePull(RebasePull),
+    /// Read-only value-scoped admin view of the node's ledger (discriminant 16,
+    /// format 5).
+    AdminLedgerQuery,
 }
 
 impl ControlRequest {
@@ -540,6 +543,7 @@ impl ControlRequest {
             ControlRequest::DetachNotice(_) => "detach-notice",
             ControlRequest::Rebase(_) => "rebase",
             ControlRequest::RebasePull(_) => "rebase-pull",
+            ControlRequest::AdminLedgerQuery => "admin-ledger-query",
         }
     }
 
@@ -555,15 +559,17 @@ impl ControlRequest {
     /// - `AdminQuery` -> [`RequiredScope::AnyActive`] (any scope implies read);
     /// - `AdminApproveJoin` / `AdminRejectJoin` / `AdminRedeliverJoin` ->
     ///   [`RequiredScope::Joins`];
+    /// - `AdminLedgerQuery` -> [`RequiredScope::Value`];
     /// - every non-admin variant -> `None`.
     ///
-    /// Future topology (P4) and value (P5) variants will extend this map.
+    /// Future topology (P4) variants will extend this map.
     pub fn required_scope(&self) -> Option<RequiredScope> {
         match self {
             ControlRequest::AdminQuery => Some(RequiredScope::AnyActive),
             ControlRequest::AdminApproveJoin(_)
             | ControlRequest::AdminRejectJoin(_)
             | ControlRequest::AdminRedeliverJoin(_) => Some(RequiredScope::Joins),
+            ControlRequest::AdminLedgerQuery => Some(RequiredScope::Value),
             _ => None,
         }
     }
@@ -675,6 +681,7 @@ mod tests {
             ControlRequest::RebasePull(RebasePull {
                 node: node("applicant"),
             }),
+            ControlRequest::AdminLedgerQuery,
         ]
     }
 
@@ -700,6 +707,7 @@ mod tests {
                 "detach-notice",
                 "rebase",
                 "rebase-pull",
+                "admin-ledger-query",
             ]
         );
     }
@@ -902,10 +910,21 @@ mod tests {
                     | ControlRequest::AdminApproveJoin(_)
                     | ControlRequest::AdminRejectJoin(_)
                     | ControlRequest::AdminRedeliverJoin(_)
+                    | ControlRequest::AdminLedgerQuery
             );
             assert_eq!(request.is_admin(), expected, "{request:?}");
             assert_eq!(is_admin_request(&request), expected, "{request:?}");
         }
+    }
+
+    #[test]
+    fn admin_ledger_query_discriminant_is_frozen() {
+        // Variant 16 (0-based), appended after `RebasePull` (15). An insert or
+        // reorder would shift every later discriminant and change this byte.
+        assert_eq!(
+            postcard::to_allocvec(&ControlRequest::AdminLedgerQuery).unwrap(),
+            vec![16]
+        );
     }
 
     #[test]
@@ -929,6 +948,10 @@ mod tests {
         ] {
             assert_eq!(request.required_scope(), Some(RequiredScope::Joins));
         }
+        assert_eq!(
+            ControlRequest::AdminLedgerQuery.required_scope(),
+            Some(RequiredScope::Value)
+        );
         for request in [
             ControlRequest::Query,
             ControlRequest::SetAddress(SetAddress { address: None }),

@@ -38,8 +38,10 @@ pub use admin_cli::{AdminCliError, AdminListEntry, GrantOutcome};
 pub use admin_store::{ADMIN_STORE_VERSION, ADMINS_FILE, AdminStore, AdminStoreError};
 pub use audit::CONTROL_AUDIT_FILE;
 pub use control::{
-    Authority, ControlHandler, ControlNode, OutboundControl, OutboundKind, spawn_control_node,
-    spawn_control_node_on, spawn_control_only, spawn_control_only_on,
+    Authority, ControlHandler, ControlNode, Handled, OutboundControl, OutboundKind,
+    PendingLedgerQuery, spawn_control_node, spawn_control_node_live_with_ledger,
+    spawn_control_node_live_on_with_ledger, spawn_control_node_on, spawn_control_only,
+    spawn_control_only_on,
 };
 pub use control_store::{ControlStore, OUTBOUND_JOIN_FILE, OutboundJoin, PENDING_JOINS_FILE};
 pub use ledger_keys::{LEDGER_KEY_FILE, load_or_create_ledger_key, persist_ledger_key};

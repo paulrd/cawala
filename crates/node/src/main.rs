@@ -561,6 +561,11 @@ async fn run(data_dir: PathBuf) -> Result<()> {
         let ledger = Arc::new(Mutex::new(LedgerService::open(&data_dir, &node_id)?));
         let manager = Arc::new(Mutex::new(SettlementManager::new()));
 
+        // Attach the running ledger *before* the control node starts serving, so
+        // a value-scoped `AdminLedgerQuery` can read it. `spawn_control_only`
+        // (address-less nodes) deliberately leaves the handle unset.
+        control.lock().await.attach_ledger(Arc::clone(&ledger));
+
         // Must stay alive for the accept loop; dropped at process exit.
         // Clone the control handle first: `spawn_control_node_live` takes
         // ownership, but the drain loop and the sweeps still need it.
@@ -2017,6 +2022,26 @@ fn print_reply(reply: &ControlReply) {
                 rejected.child, rejected.delivery
             )
         }
+        ControlReply::AdminLedgerSnapshot(snapshot) => print_admin_ledger_snapshot(snapshot),
+    }
+}
+
+fn print_admin_ledger_snapshot(snapshot: &cawala_control::AdminLedgerSnapshot) {
+    println!(
+        "ledger: node={} ledger_id={} height={} parent_balance={} equity={} root={} truncated={}",
+        snapshot.node_id,
+        snapshot.ledger_id,
+        snapshot.height,
+        snapshot.parent_balance,
+        snapshot.equity,
+        snapshot.root,
+        snapshot.truncated,
+    );
+    for row in &snapshot.accounts {
+        println!(
+            "  account id={} kind={:?} slot={:?} address={:?} balance={}",
+            row.id, row.kind, row.slot, row.address, row.balance
+        );
     }
 }
 

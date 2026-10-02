@@ -39,36 +39,74 @@ use crate::request::ControlRequest;
 ///
 /// Bumped to 4 when the four exit-rights variants ([`ControlRequest::Exit`],
 /// [`ControlRequest::DetachNotice`], [`ControlRequest::Rebase`],
-/// [`ControlRequest::RebasePull`]) were appended. Those variants are only
-/// *additive*, so a v3 verifier parses every pre-existing variant identically;
-/// [`is_supported_control_version`] therefore accepts both 3 and 4 for rolling
-/// upgrades.
+/// [`ControlRequest::RebasePull`]) were appended.
+///
+/// Bumped to 5 when [`ControlRequest::AdminLedgerQuery`] was appended. Variants
+/// are only *additive*, so a v4 verifier parses every pre-existing variant
+/// identically; [`is_supported_control_version`] therefore accepts both 4 and 5
+/// for rolling upgrades, and [`min_control_version`] is the per-request shape
+/// gate (a v5-only variant on a v4 declaration is `BadVersion`).
 ///
 /// # Dual-accept is inbound-only
 ///
-/// This build always **mints** frames at [`CONTROL_FORMAT_VERSION`] (4):
+/// This build always **mints** frames at [`CONTROL_FORMAT_VERSION`] (5):
 /// `sign_decision`/`sign_forward` in the node and
-/// [`SignedControl::authorize`] everywhere stamp v4. A v3 peer therefore cannot
-/// consume a v4 `JoinApproved`, an admin reply, or a routed forward that carries
-/// a v4 variant, and a v4 node emits only v4. The upgrade is effectively
+/// [`SignedControl::authorize`] everywhere stamp v5. A v4 peer therefore cannot
+/// consume a v5 `AdminLedgerQuery` (unknown postcard discriminant) or a routed
+/// forward carrying it, and a v5 node emits only v5. The upgrade is effectively
 /// **lockstep for node-to-child and routed frames**; version negotiation is a
-/// v2 item. Accepting v3 here keeps a v3 peer's *pre-existing* requests
+/// v2 item. Accepting v4 here keeps a v4 peer's *pre-existing* requests
 /// readable during a rolling upgrade, nothing more.
-pub const CONTROL_FORMAT_VERSION: u8 = 4;
+pub const CONTROL_FORMAT_VERSION: u8 = 5;
 
 /// Whether `version` is a [`SignedControl`] wire version this build accepts
 /// **inbound**.
 ///
-/// Accepts [`CONTROL_FORMAT_VERSION`] (4) and the immediately preceding
-/// version 3. Version 4 only *appended* request variants, so every pre-existing
-/// variant is byte-identical in both versions and a v3 frame may carry only the
-/// pre-existing variants (the node enforces that shape gate). Anything else is
-/// rejected up front.
+/// Accepts [`CONTROL_FORMAT_VERSION`] (5) and the immediately preceding
+/// version 4. Versions only *appended* request variants, so every pre-existing
+/// variant is byte-identical in both; [`min_control_version`] is the per-request
+/// shape gate. Anything else (including v3) is rejected up front.
 ///
-/// This does **not** mean minted frames are ever v3: see the inbound-only note
+/// This does **not** mean minted frames are ever v4: see the inbound-only note
 /// on [`CONTROL_FORMAT_VERSION`].
 pub fn is_supported_control_version(version: u8) -> bool {
-    matches!(version, 3 | CONTROL_FORMAT_VERSION)
+    matches!(version, 4 | CONTROL_FORMAT_VERSION)
+}
+
+/// The minimum [`SignedControl`] wire version that can carry `request`.
+///
+/// Variants are append-only, so each variant has a monotone introduction
+/// version. A sender's declared `version` must be `>= min_control_version` for
+/// the carried request; otherwise the frame is malformed and must be rejected
+/// as [`RejectCode::BadVersion`](crate::RejectCode::BadVersion) rather than
+/// dispatched (a v4 peer cannot be expected to decode a v5 variant).
+///
+/// Mapping (frozen). The match is **exhaustive** on purpose: a future
+/// `ControlRequest` variant must explicitly declare its introduction version
+/// (normally [`CONTROL_FORMAT_VERSION`]) rather than silently defaulting.
+pub fn min_control_version(request: &ControlRequest) -> u8 {
+    match request {
+        // Pre-v4 variants: the accepted window's lower bound.
+        ControlRequest::Join(_)
+        | ControlRequest::JoinApproved(_)
+        | ControlRequest::JoinRejected(_)
+        | ControlRequest::CreateChild(_)
+        | ControlRequest::DetachChild(_)
+        | ControlRequest::MoveChild(_)
+        | ControlRequest::SetAddress(_)
+        | ControlRequest::Query
+        | ControlRequest::AdminQuery
+        | ControlRequest::AdminApproveJoin(_)
+        | ControlRequest::AdminRejectJoin(_)
+        | ControlRequest::AdminRedeliverJoin(_) => 3,
+        // Appended in control format 4.
+        ControlRequest::Exit(_)
+        | ControlRequest::DetachNotice(_)
+        | ControlRequest::Rebase(_)
+        | ControlRequest::RebasePull(_) => 4,
+        // Appended in control format 5.
+        ControlRequest::AdminLedgerQuery => 5,
+    }
 }
 
 /// Recommended lifetime, in seconds, of a control request (`nonce`/`expiry`).
@@ -494,11 +532,30 @@ mod tests {
     }
 
     #[test]
-    fn is_supported_control_version_accepts_3_and_4_only() {
-        assert!(is_supported_control_version(3));
+    fn verify_control_rejects_v3_version() {
+        // v3 is now below the accepted window (4|5); a v3 envelope must be
+        // rejected up front rather than parsed with a newer shape.
+        assert_ne!(CONTROL_FORMAT_VERSION, 3);
+        let op = operator(1);
+        let registry = registry_with(&[("origin", &op, &ledger(11))]);
+        let mut signed = signed_with(&op);
+        signed.version = 3;
+        assert_eq!(
+            verify_control(&signed, &registry),
+            Err(ControlError::UnsupportedVersion(3))
+        );
+        assert_eq!(
+            verify_control(&signed, &PeerRegistry::new()),
+            Err(ControlError::UnsupportedVersion(3))
+        );
+    }
+
+    #[test]
+    fn is_supported_control_version_accepts_4_and_5_only() {
         assert!(is_supported_control_version(4));
-        assert_eq!(CONTROL_FORMAT_VERSION, 4);
-        for version in [0, 1, 2, 5, 6, u8::MAX] {
+        assert!(is_supported_control_version(5));
+        assert_eq!(CONTROL_FORMAT_VERSION, 5);
+        for version in [0, 1, 2, 3, 6, u8::MAX] {
             assert!(
                 !is_supported_control_version(version),
                 "version {version} must be unsupported"
@@ -516,28 +573,142 @@ mod tests {
     }
 
     #[test]
-    fn verify_control_accepts_v3_and_v4_frames() {
+    fn verify_control_accepts_v4_and_v5_frames() {
         let op = operator(1);
         let registry = registry_with(&[("origin", &op, &ledger(11))]);
 
-        // The current (v4) frame.
-        let v4 = signed_version(&op, CONTROL_FORMAT_VERSION);
+        // The current (v5) frame.
+        let v5 = signed_version(&op, CONTROL_FORMAT_VERSION);
+        assert_eq!(v5.verify_signature(), Ok(()));
+        assert!(verify_control(&v5, &registry).is_ok());
+
+        // A real v4 frame: the version byte is covered by the signature, so it
+        // must be re-signed after the downgrade.
+        let v4 = signed_version(&op, 4);
         assert_eq!(v4.verify_signature(), Ok(()));
         assert!(verify_control(&v4, &registry).is_ok());
 
-        // A real v3 frame: the version byte is covered by the signature, so it
-        // must be re-signed after the downgrade.
-        let v3 = signed_version(&op, 3);
-        assert_eq!(v3.verify_signature(), Ok(()));
-        assert!(verify_control(&v3, &registry).is_ok());
-
-        // A v3 frame whose signature was produced over the v4 preimage fails.
+        // A v4 frame whose signature was produced over the v5 preimage fails.
         let mut tampered = signed_with(&op);
-        tampered.version = 3;
+        tampered.version = 4;
         assert_eq!(
             verify_control(&tampered, &registry),
             Err(ControlError::InvalidSignature)
         );
+    }
+
+    #[test]
+    fn min_control_version_is_frozen_for_every_variant() {
+        use crate::request::{
+            AdminJoinApprove, AdminJoinReject, AdminRedeliverJoin, CreateChild, DetachChild,
+            DetachNotice, ExitRequest, JoinApproval, JoinRejection, MoveChild, RebaseNotice,
+            RebasePull, SetAddress,
+        };
+        let child = || node("c");
+        let request = |request: ControlRequest, expected: u8| {
+            assert_eq!(min_control_version(&request), expected, "{request:?}");
+        };
+
+        // Every pre-v4 variant needs only v3.
+        request(
+            ControlRequest::Join(JoinRequest {
+                node: child(),
+                kind: ChildKind::Node,
+                operator: operator(1).public(),
+                ledger: Some(ledger(11).public()),
+                desired_slot: Some(3),
+                location_hint: None,
+                nonce: 1,
+                expiry: 100,
+            }),
+            3,
+        );
+        request(
+            ControlRequest::JoinApproved(JoinApproval {
+                child: child(),
+                child_operator: operator(1).public(),
+                child_ledger: Some(ledger(11).public()),
+                kind: ChildKind::Node,
+                slot: 3,
+                address: "0.3".parse().unwrap(),
+                date_joined: 50,
+                nonce: 1,
+                parent_ledger: ledger(12).public(),
+            }),
+            3,
+        );
+        request(
+            ControlRequest::JoinRejected(JoinRejection {
+                child: child(),
+                reason: "no".to_string(),
+                nonce: 1,
+            }),
+            3,
+        );
+        request(
+            ControlRequest::CreateChild(CreateChild {
+                child: child(),
+                operator: operator(1).public(),
+                ledger: Some(ledger(11).public()),
+                kind: ChildKind::Node,
+                slot: Some(3),
+                date_joined: 50,
+            }),
+            3,
+        );
+        request(ControlRequest::DetachChild(DetachChild { child: child() }), 3);
+        request(
+            ControlRequest::MoveChild(MoveChild {
+                child: child(),
+                new_parent: node("parent"),
+                slot: Some(4),
+            }),
+            3,
+        );
+        request(ControlRequest::SetAddress(SetAddress { address: None }), 3);
+        request(ControlRequest::Query, 3);
+        request(ControlRequest::AdminQuery, 3);
+        request(
+            ControlRequest::AdminApproveJoin(AdminJoinApprove {
+                child: child(),
+                slot: None,
+            }),
+            3,
+        );
+        request(
+            ControlRequest::AdminRejectJoin(AdminJoinReject {
+                child: child(),
+                reason: None,
+            }),
+            3,
+        );
+        request(
+            ControlRequest::AdminRedeliverJoin(AdminRedeliverJoin { child: child() }),
+            3,
+        );
+
+        // The four exit-rights variants were introduced in v4.
+        request(
+            ControlRequest::Exit(ExitRequest {
+                node: child(),
+                subtree_nodes: 1,
+            }),
+            4,
+        );
+        request(ControlRequest::DetachNotice(DetachNotice { node: child() }), 4);
+        request(
+            ControlRequest::Rebase(RebaseNotice {
+                node: child(),
+                parent_address: "0".parse().unwrap(),
+                address: "0.3".parse().unwrap(),
+                generation: 1,
+            }),
+            4,
+        );
+        request(ControlRequest::RebasePull(RebasePull { node: child() }), 4);
+
+        // The ledger view was introduced in v5.
+        request(ControlRequest::AdminLedgerQuery, 5);
     }
 
     #[test]
@@ -548,12 +719,13 @@ mod tests {
         // value must only ever change as part of a deliberate protocol version
         // bump. It changed at version 2 when `JoinApproval` gained
         // `parent_ledger`, at version 3 when `SignedControl` gained
-        // `nonce` and `expiry`, and at version 4 when the exit-rights variants
-        // were appended (the version byte is inside the preimage).
+        // `nonce` and `expiry`, at version 4 when the exit-rights variants were
+        // appended, and at version 5 when `AdminLedgerQuery` was appended (the
+        // version byte is inside the preimage).
         let signed = signed_with(&operator(7));
         assert_eq!(
             signed.signing_hash().to_hex(),
-            "48852479306c362910af678b54a9ece6f06b17dd9bd182f52ff7954e4ab25676"
+            "fdda7180c8e09f3f7b349d8bd533f3305e190e5d2229786912462f6ba26d3314"
         );
     }
 

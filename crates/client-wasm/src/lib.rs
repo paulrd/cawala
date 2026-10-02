@@ -52,9 +52,9 @@ use crate::control::{
     routed_request_envelope, should_try_routed, sign_admin_request, verify_routed_reply_bytes,
 };
 use crate::dto::{
-    AdminActionDto, AdminSnapshotDto, ControlEventDto, JoinOutcome, JoinStatus, LeaveOutcome,
-    LedgerEventDto, LedgerStatusDto, PaymentOutcome, SnapshotDto, parse_operator_hex,
-    reject_code_str,
+    AdminActionDto, AdminLedgerSnapshotDto, AdminSnapshotDto, ControlEventDto, JoinOutcome,
+    JoinStatus, LeaveOutcome, LedgerEventDto, LedgerStatusDto, PaymentOutcome, SnapshotDto,
+    parse_operator_hex, reject_code_str,
 };
 use crate::ledger_state::LedgerStateV1;
 use crate::state::{LocalStateV1, ParentLink, Transition};
@@ -949,6 +949,30 @@ impl ClientNode {
             ControlReply::AdminSnapshot(snapshot) => Ok(AdminSnapshotDto::from_snapshot(&snapshot)),
             ControlReply::Rejected(code) => Err(admin_rejected(code)),
             _ => Err(unexpected_admin_reply("an admin query")),
+        }
+    }
+
+    /// Query `node`'s read-only ledger view (accounts, parent balance, equity).
+    ///
+    /// Requires a configured admin key holding the `value` scope (or the
+    /// node's own operator). `node_addr` optionally names `node`'s asserted
+    /// address for the routed fallback; see [`ClientNode::admin_query`].
+    ///
+    /// This is read-only: the node never mutates its ledger to answer.
+    pub async fn admin_ledger_query(
+        &self,
+        node: String,
+        node_addr: Option<String>,
+    ) -> Result<AdminLedgerSnapshotDto, JsError> {
+        let reply = self
+            .admin_exchange(&node, ControlRequest::AdminLedgerQuery, node_addr)
+            .await?;
+        match reply {
+            ControlReply::AdminLedgerSnapshot(snapshot) => {
+                Ok(AdminLedgerSnapshotDto::from_snapshot(&snapshot))
+            }
+            ControlReply::Rejected(code) => Err(admin_rejected(code)),
+            _ => Err(unexpected_admin_reply("a ledger query")),
         }
     }
 

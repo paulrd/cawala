@@ -66,9 +66,9 @@ pub use claim::{
 };
 pub use invite::{INVITE_SCHEME, Invite, InviteError};
 pub use reply::{
-    AdminApproved, AdminPendingJoin, AdminRejected, AdminSnapshot, CONTROL_ALPN,
-    CONTROL_REPLY_VERSION, ChildSnapshot, ControlReply, DeliveryStatus, NodeSnapshot,
-    ParentSnapshot, RejectCode,
+    AdminApproved, AdminLedgerAccount, AdminLedgerSnapshot, AdminPendingJoin, AdminRejected,
+    AdminSnapshot, CONTROL_ALPN, CONTROL_REPLY_VERSION, ChildSnapshot, ControlReply, DeliveryStatus,
+    MAX_ADMIN_LEDGER_ACCOUNTS, NodeSnapshot, ParentSnapshot, RejectCode,
 };
 pub use request::{
     AdminJoinApprove, AdminJoinReject, AdminRedeliverJoin, ControlRequest, CreateChild,
@@ -84,5 +84,5 @@ pub use senior::senior_child;
 pub use sign::{
     CONTROL_CONTEXT, CONTROL_FORMAT_VERSION, CONTROL_REQUEST_MAX_TTL_SECS,
     CONTROL_REQUEST_TTL_SECS, ControlError, SignedControl, is_supported_control_version,
-    verify_control,
+    min_control_version, verify_control,
 };

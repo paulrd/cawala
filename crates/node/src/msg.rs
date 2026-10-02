@@ -46,7 +46,9 @@ use cawala_msg::{
 };
 use cawala_topology::ChildKind;
 
-use crate::control::{ControlNode, deliver_outbound_decisions};
+use crate::control::{
+    ControlNode, Handled, deliver_outbound_decisions, execute_ledger_query, now_unix_seconds,
+};
 
 use crate::ledger_service::{ApplyOutcome, HopOutcome, LedgerService};
 use crate::orders;
@@ -1699,12 +1701,40 @@ pub async fn dispatch_control_envelope(
     }
 
     let requester = routed.requester.clone();
-    let (mut reply, outbound, data_dir) = {
+    let requester_node = routed.requester.node.clone();
+    let forwarder = routed
+        .forwards
+        .last()
+        .map(|last| last.hop.node.clone())
+        .unwrap_or_default();
+    let hops = routed.forwards.len();
+    let kind = routed.intent.request.kind();
+    let intent_for_audit = routed.intent.clone();
+    let now = now_unix_seconds();
+    // Two-phase: capture the ledger handle under the engine lock, drop that
+    // guard, then execute a deferred ledger read before re-locking to audit.
+    // The control and ledger locks are never held at the same time.
+    let (handled, ledger, outbound, data_dir) = {
         let mut engine = control.lock().await;
-        let reply = engine.receive_routed(remote, routed).await;
+        let ledger = engine.ledger_handle();
+        let handled = engine.receive_routed_at_handled(remote, routed, now).await;
         let outbound = engine.take_outbound();
         let data_dir = engine.data_dir().to_path_buf();
-        (reply, outbound, data_dir)
+        (handled, ledger, outbound, data_dir)
+    };
+    let mut reply = match handled {
+        Handled::Reply(reply) => reply,
+        Handled::Ledger(pending) => {
+            // `execute_ledger_query` returns only after releasing the ledger
+            // guard; only then do we re-lock the engine to audit.
+            let reply = execute_ledger_query(ledger, &pending).await;
+            {
+                let engine = control.lock().await;
+                engine.audit_request(&intent_for_audit, &reply, now);
+                engine.audit_routed(now, kind, &reply, &requester_node, &forwarder, hops);
+            }
+            reply
+        }
     };
     // Reverse-dial any queued join decision, patch `delivery`, then sign the
     // reply. The engine lock is not held across the dials.

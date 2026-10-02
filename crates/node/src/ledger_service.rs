@@ -76,6 +76,7 @@ use cawala_msg::{
     BalanceReceiptV1, EntryProofV1, MAX_RECEIPT_HISTORY, MsgId, OctAddr, OrderRejectV1,
     OrderStatusV1, ValueNoticeV1,
 };
+use cawala_control::{AdminLedgerAccount, AdminLedgerSnapshot, MAX_ADMIN_LEDGER_ACCOUNTS};
 use cawala_topology::ChildKind;
 
 use crate::identity;
@@ -151,6 +152,16 @@ pub struct LedgerService {
 
 /// `payment_id -> (entry seq, entry hash)` for every applied transfer.
 type ConsumedIndex = BTreeMap<Hash, (u64, Hash)>;
+
+impl std::fmt::Debug for LedgerService {
+    /// Minimal seed-free `Debug` (the inner [`Ledger`] is not `Debug`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LedgerService")
+            .field("node_id", &self.node_id)
+            .field("is_root", &self.is_root)
+            .finish_non_exhaustive()
+    }
+}
 
 impl LedgerService {
     /// Open the node's ledger, auto-initializing it if absent (idempotent),
@@ -250,6 +261,91 @@ impl LedgerService {
     /// The replayed ledger (read access for inspection/commitments).
     pub fn ledger(&self) -> &Ledger<FileLog> {
         &self.ledger
+    }
+
+    /// Build a read-only [`AdminLedgerSnapshot`] for `record`'s node.
+    ///
+    /// Takes the shared ledger lock, refreshes from disk, and derives the
+    /// account rows as the **union** of `record.children` (slot order) and the
+    /// remaining ledger `Child` accounts (`NodeId` order, with
+    /// `kind`/`slot`/`address` `None` — detached/legacy or a listed-but-unopened
+    /// child). `parent_balance` and `equity` are computed over **all** balances,
+    /// even when the row list is truncated at [`MAX_ADMIN_LEDGER_ACCOUNTS`].
+    ///
+    /// Read-only: it never appends an entry and never takes the exclusive lock.
+    pub fn admin_ledger_view(&mut self, record: &NodeRecord) -> Result<AdminLedgerSnapshot> {
+        let _lock = self.acquire_shared_read_lock()?;
+        self.refresh_from_disk()?;
+
+        let balances = self.ledger.balances();
+        let parent_balance = balances.parent_balance().map(Amount::get).unwrap_or(0);
+        let equity = balances.equity();
+        let ledger_id = *self.ledger.ledger_id();
+
+        // 1. Current record children, in **slot order**. The stored Vec is in
+        //    insertion order and can drift after `move_child_slot` /
+        //    detach-re-attach churn, so sort a copy by the frozen slot.
+        let mut ordered: Vec<_> = record.children.iter().collect();
+        ordered.sort_by_key(|child| child.slot);
+        let mut listed: Vec<&str> = Vec::with_capacity(ordered.len());
+        let mut rows: Vec<AdminLedgerAccount> = Vec::with_capacity(ordered.len());
+        for child in ordered {
+            listed.push(child.child_id.as_str());
+            let id = NodeId::from(child.child_id.clone());
+            let address = record
+                .address
+                .as_ref()
+                .map(|address| address.child(child.slot));
+            let balance = balances.child_balance(&id).get();
+            rows.push(AdminLedgerAccount {
+                id,
+                kind: Some(child.kind),
+                slot: Some(child.slot),
+                address,
+                balance,
+            });
+        }
+
+        // 2. Remaining ledger `Child` accounts (detached/legacy or
+        // listed-but-unopened), in `NodeId` order. Only the small (<= 8)
+        // record-child id set can collide (`Balances` keys are unique), so the
+        // dedupe is O(1) per ledger account rather than O(rows). Stop once the
+        // row cap is exceeded to bound allocations; the union size (which drives
+        // `truncated`) is still exact.
+        let mut truncated = false;
+        for (account, balance) in balances.accounts() {
+            let AccountRef::Child(id) = account else {
+                continue;
+            };
+            if listed.contains(&id.as_str()) {
+                continue;
+            }
+            rows.push(AdminLedgerAccount {
+                id,
+                kind: None,
+                slot: None,
+                address: None,
+                balance: u64::try_from(balance).unwrap_or(0),
+            });
+            if rows.len() > MAX_ADMIN_LEDGER_ACCOUNTS {
+                truncated = true;
+                break;
+            }
+        }
+
+        truncated |= rows.len() > MAX_ADMIN_LEDGER_ACCOUNTS;
+        rows.truncate(MAX_ADMIN_LEDGER_ACCOUNTS);
+
+        Ok(AdminLedgerSnapshot {
+            node_id: NodeId::from(self.node_id.clone()),
+            ledger_id,
+            height: self.ledger.height(),
+            parent_balance,
+            equity,
+            root: record.parent.is_none(),
+            truncated,
+            accounts: rows,
+        })
     }
 
     /// A copy of the accepted entry at `seq`.
@@ -2069,5 +2165,180 @@ mod tests {
             }
         );
         assert_eq!(service.ledger().len(), len, "rejected hop must not append");
+    }
+
+    // ── admin_ledger_view (P3) ────────────────────────────────────────────────
+
+    /// A record with a `Node` child (slot 1), a funded `User` child (slot 5),
+    /// and a listed-but-unopened `User` child (slot 6), with an asserted
+    /// address so derived child addresses are exercised.
+    fn mixed_record() -> NodeRecord {
+        let mut record = NodeRecord::new(NODE);
+        record.address = Some("0.3".parse().unwrap());
+        for (id, kind, slot) in [
+            ("node-child", ChildKind::Node, 1u8),
+            ("user-a", ChildKind::User, 5),
+            ("user-unopened", ChildKind::User, 6),
+        ] {
+            record.children.push(ChildEntry {
+                child_id: id.to_string(),
+                kind,
+                slot,
+                date_joined: 0,
+            });
+        }
+        record
+    }
+
+    #[test]
+    fn admin_ledger_view_unions_record_and_ledger_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = LedgerService::open(dir.path(), NODE).unwrap();
+        let node_child = user("node-child");
+        let user_a = user("user-a");
+        let detached = user("detached-ledger");
+        let operator = node_operator(dir.path());
+
+        service
+            .fund(&node_child, ChildKind::Node, 100, &operator, 1, 1_000)
+            .unwrap();
+        service
+            .fund(&user_a, ChildKind::User, 50, &operator, 2, 1_000)
+            .unwrap();
+        // A ledger account with no matching record child (detached/legacy).
+        service
+            .ensure_account_open(&detached, ChildKind::User)
+            .unwrap();
+
+        let record = mixed_record();
+        let view = service.admin_ledger_view(&record).unwrap();
+
+        assert_eq!(view.node_id, user(NODE));
+        assert_eq!(view.ledger_id, service.ledger_key_public());
+        assert_eq!(view.height, service.ledger().height());
+        assert_eq!(view.parent_balance, 0, "no parent asset");
+        // Two funded liabilities, no parent asset -> equity is negative.
+        assert_eq!(view.equity, -150);
+        assert!(view.root, "record has no parent link");
+        assert!(!view.truncated);
+        assert_eq!(view.accounts.len(), 4, "{:?}", view.accounts);
+
+        // Record children first, in slot order, with kind/slot/address.
+        assert_eq!(view.accounts[0].id, node_child);
+        assert_eq!(view.accounts[0].kind, Some(ChildKind::Node));
+        assert_eq!(view.accounts[0].slot, Some(1));
+        assert_eq!(view.accounts[0].address, Some("0.3.1".parse().unwrap()));
+        assert_eq!(view.accounts[0].balance, 100);
+
+        assert_eq!(view.accounts[1].id, user_a);
+        assert_eq!(view.accounts[1].kind, Some(ChildKind::User));
+        assert_eq!(view.accounts[1].slot, Some(5));
+        assert_eq!(view.accounts[1].address, Some("0.3.5".parse().unwrap()));
+        assert_eq!(view.accounts[1].balance, 50);
+
+        // A listed-but-unopened child is a zero row (and never panics).
+        let unopened = view
+            .accounts
+            .iter()
+            .find(|row| row.id == user("user-unopened"))
+            .unwrap();
+        assert_eq!(unopened.kind, Some(ChildKind::User));
+        assert_eq!(unopened.slot, Some(6));
+        assert_eq!(unopened.address, Some("0.3.6".parse().unwrap()));
+        assert_eq!(unopened.balance, 0);
+
+        // A ledger-only account has no record labels.
+        let detached_row = view
+            .accounts
+            .iter()
+            .find(|row| row.id == detached)
+            .unwrap();
+        assert_eq!(detached_row.kind, None);
+        assert_eq!(detached_row.slot, None);
+        assert_eq!(detached_row.address, None);
+        assert_eq!(detached_row.balance, 0);
+
+        // Reopen parity: a fresh service replays to the same view.
+        let mut reopened = LedgerService::open(dir.path(), NODE).unwrap();
+        assert_eq!(reopened.admin_ledger_view(&record).unwrap(), view);
+
+        // A record with a parent link reports `root: false`.
+        let mut non_root = record.clone();
+        non_root.parent = Some(crate::record::ParentLink {
+            parent_id: "some-parent".to_string(),
+            slot: 3,
+            generation: 0,
+        });
+        assert!(!service.admin_ledger_view(&non_root).unwrap().root);
+    }
+
+    #[test]
+    fn admin_ledger_view_emits_record_children_in_slot_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = LedgerService::open(dir.path(), NODE).unwrap();
+        // The stored Vec is insertion-ordered; push deliberately out of slot
+        // order to prove the view sorts (routine churn can reorder it).
+        let mut record = NodeRecord::new(NODE);
+        record.address = Some("0.3".parse().unwrap());
+        for (id, kind, slot) in [
+            ("user-late", ChildKind::User, 6u8),
+            ("node-early", ChildKind::Node, 1),
+            ("user-mid", ChildKind::User, 5),
+        ] {
+            record.children.push(ChildEntry {
+                child_id: id.to_string(),
+                kind,
+                slot,
+                date_joined: 0,
+            });
+        }
+
+        let view = service.admin_ledger_view(&record).unwrap();
+        let order: Vec<&str> = view.accounts.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(order, ["node-early", "user-mid", "user-late"]);
+        let slots: Vec<Option<u8>> = view.accounts.iter().map(|row| row.slot).collect();
+        assert_eq!(slots, [Some(1), Some(5), Some(6)]);
+    }
+
+    #[test]
+    fn admin_ledger_view_truncates_rows_but_totals_over_all_balances() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = LedgerService::open(dir.path(), NODE).unwrap();
+        // 70 ledger accounts (all detached from an empty record) exceed the cap.
+        for i in 0..70u32 {
+            service
+                .ensure_account_open(&user(&format!("acct-{i:02}")), ChildKind::User)
+                .unwrap();
+        }
+        let funded = user("acct-69");
+        service
+            .fund(&funded, ChildKind::User, 25, &node_operator(dir.path()), 1, 1_000)
+            .unwrap();
+
+        let record = NodeRecord::new(NODE);
+        let view = service.admin_ledger_view(&record).unwrap();
+        assert!(view.truncated, "70 rows must report truncated");
+        assert_eq!(view.accounts.len(), MAX_ADMIN_LEDGER_ACCOUNTS);
+        // Totals are computed over every balance, not just the retained rows.
+        assert_eq!(view.equity, -25);
+        assert_eq!(view.parent_balance, 0);
+    }
+
+    #[test]
+    fn admin_ledger_view_on_corrupt_log_is_err_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = LedgerService::open(dir.path(), NODE).unwrap();
+        service
+            .ensure_account_open(&user("user-a"), ChildKind::User)
+            .unwrap();
+
+        // Corrupt the frame log, then re-read.
+        std::fs::write(
+            crate::ledger_store::entries_path(dir.path()),
+            b"this is not a valid frame log",
+        )
+        .unwrap();
+        let record = NodeRecord::new(NODE);
+        assert!(service.admin_ledger_view(&record).is_err());
     }
 }

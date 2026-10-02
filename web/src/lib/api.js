@@ -2869,12 +2869,73 @@ function withDerivedEquity(accounts) {
 }
 
 /**
+ * Whether the current administered-node capabilities permit a value-scoped
+ * ledger read. Pure, so it is unit-testable.
+ * @param {{ scopes?: { value?: boolean } }|null|undefined} caps
+ * @returns {boolean}
+ */
+export function canReadAdminLedger(caps) {
+  return Boolean(caps?.scopes?.value);
+}
+
+/**
+ * Map a plain admin-ledger snapshot to the account-row shape the Accounts page
+ * renders: one parent-asset row from `parentBalance`, one liability row per
+ * account (with its kind/address when the node reported them), then the
+ * canonical equity row. `equity` comes straight from the node (`Parent −
+ * ΣChild`) and is never re-derived here.
+ *
+ * The returned array carries a `truncated` flag (attached as a property) so a
+ * caller can surface the node's row cap without changing the row shape.
+ *
+ * @param {{ parentBalance?: number, equity?: number, root?: boolean, truncated?: boolean, accounts?: Array<{ id: string, kind?: string|null, slot?: number|null, address?: string|null, balance?: number }> }} snapshot
+ * @returns {Array<object>}
+ */
+export function mapAdminLedgerRows(snapshot) {
+  const rows = [
+    {
+      id: null,
+      address: null,
+      type: 'asset',
+      kind: null,
+      label: snapshot.root ? 'Detached parent balance' : 'Account with parent',
+      balance: Number(snapshot.parentBalance ?? 0),
+    },
+  ];
+  for (const account of snapshot.accounts ?? []) {
+    const address = account.address ?? null;
+    rows.push({
+      id: account.id,
+      address,
+      type: 'liability',
+      kind: account.kind ?? null,
+      slot: account.slot ?? null,
+      label: address ? `Account for ${address}` : `Account for ${account.id}`,
+      balance: Number(account.balance ?? 0),
+    });
+  }
+  rows.push({
+    id: null,
+    address: null,
+    type: 'equity',
+    kind: null,
+    label: 'Node equity',
+    balance: Number(snapshot.equity ?? 0),
+  });
+  rows.truncated = Boolean(snapshot.truncated);
+  return rows;
+}
+
+/**
  * Get accounts for the administered node.
  *
  * - mock: the synthetic accounting rows (with derived equity).
- * - `self`: this browser's verified balance, only once a receipt exists.
- * - a granted node: `[]`. The admin ledger query arrives in a later phase;
- *   returning nothing is the honest answer — balances are never fabricated.
+ * - `self`: this browser's verified balance, only once a receipt exists (the
+ *   cryptographically verified leaf path).
+ * - a value-scoped administered node: the node's own read-only accounting
+ *   snapshot (`AdminLedgerQuery`), mapped to the same row shape. A joins-only
+ *   or topology-only grant cannot read balances and yields `[]`. Balances are
+ *   node-asserted and never fabricated here.
  *
  * @param {string} [nodeId] Target; defaults to the current selection.
  * @returns {Promise<Array>}
@@ -2887,20 +2948,90 @@ export async function getAccounts(nodeId = undefined) {
     return withDerivedEquity(MOCK_DATA.accounts);
   }
 
-  if (target !== SELF && target !== clientState.endpointId) return [];
+  // This browser's own node keeps the cryptographically verified balance path.
+  if (target === SELF || target === clientState.endpointId) {
+    const address = getAddress();
+    if (!address || ledgerState.balance == null) return [];
+    return [
+      {
+        address,
+        type: 'asset',
+        label: 'My account',
+        balance: ledgerState.balance,
+      },
+    ];
+  }
 
-  // Only expose a real account once a cryptographically verified balance
-  // exists; never fabricate a zero balance before the first receipt.
-  const address = getAddress();
-  if (!address || ledgerState.balance == null) return [];
-  return [
-    {
-      address,
-      type: 'asset',
-      label: 'My account',
-      balance: ledgerState.balance,
-    },
-  ];
+  // An administered node: only a value-scoped grant may read its books.
+  if (!canReadAdminLedger(adminCapabilities)) return [];
+
+  try {
+    const snapshot = await _queryAdminLedger(target);
+    const rows = mapAdminLedgerRows(snapshot);
+    const children = snapshot.accounts
+      .filter((row) => row.kind)
+      .map((row) => ({ kind: row.kind }));
+    _recordQueryOutcome(target, {
+      ok: true,
+      kind: inferNodeKind(children),
+      address: adminKeys.findAdminNode(target)?.nodeAddr ?? null,
+    });
+    return rows;
+  } catch (err) {
+    _recordQueryOutcome(target, { ok: false, error: err });
+    _warnOnce(`admin-ledger:${target}`, '[api] admin_ledger_query failed', err);
+    return [];
+  }
+}
+
+/**
+ * Run one value-scoped ledger query (direct first, routed fallback inside the
+ * wasm `admin_ledger_query`) and read the reply into a plain snapshot object.
+ * @param {string} target
+ * @param {object} [grant]
+ * @returns {Promise<object>}
+ */
+async function _queryAdminLedger(target, grant = null) {
+  const entry = grant ?? adminKeys.findAdminNode(target);
+  if (!entry) throw new AdminUnavailableError('admin ledger query');
+  if (entry.expiresAt <= Date.now()) {
+    throw new AdminUnavailableError('admin ledger query (grant expired)');
+  }
+  const node = _ensureAdminKey(target, entry);
+  const snapshot = await node.admin_ledger_query(target, entry.nodeAddr ?? null);
+  return _readAdminLedgerSnapshot(snapshot);
+}
+
+/**
+ * Copy an `AdminLedgerSnapshotDto` to plain data and free every wasm handle it
+ * created (account rows and the snapshot). Handles are read once and freed once.
+ * @param {object} snapshot
+ * @returns {object}
+ */
+function _readAdminLedgerSnapshot(snapshot) {
+  let accounts = [];
+  try {
+    accounts = snapshot.accounts ?? [];
+    return {
+      nodeId: snapshot.node_id ?? null,
+      ledgerId: snapshot.ledger_id ?? null,
+      height: snapshot.height ?? 0,
+      parentBalance: snapshot.parent_balance ?? 0,
+      equity: snapshot.equity ?? 0,
+      root: Boolean(snapshot.root),
+      truncated: Boolean(snapshot.truncated),
+      accounts: accounts.map((row) => ({
+        id: row.id,
+        kind: row.kind ?? null,
+        slot: row.slot ?? null,
+        address: row.address ?? null,
+        balance: row.balance ?? 0,
+      })),
+    };
+  } finally {
+    for (const row of accounts) row.free?.();
+    snapshot.free?.();
+  }
 }
 
 /**

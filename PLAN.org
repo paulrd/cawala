@@ -1038,6 +1038,47 @@
      binary before minting v2; v1 rows and P1 browsers keep working,
      joins-only.
 
+** P3 - delivered 2026-10-02 (read-only ledger view; control 5, reply 3)
+   - Control (`cawala-control`): `ControlRequest::AdminLedgerQuery`
+     (discriminant 16, minted at control format 5; `required_scope -> Value`)
+     and `ControlReply::AdminLedgerSnapshot` (discriminant 7, reply version 3)
+     with `AdminLedgerSnapshot { node_id, ledger_id, height, parent_balance,
+     equity, root, truncated, accounts }` and `AdminLedgerAccount { id, kind,
+     slot, address, balance }`. `CONTROL_FORMAT_VERSION` 4 -> 5 (mint 5, accept
+     4|5; v3 dropped) and `CONTROL_REPLY_VERSION` 2 -> 3. The node-side shape
+     gate is now the monotone `min_control_version` (exit-rights -> 4, ledger
+     query -> 5, else 3), replacing `carries_v4_variant`; `ROUTED_*` stay 1.
+   - Node (`cawala-node`): `LedgerService::admin_ledger_view` takes the shared
+     read lock, refreshes from disk, and builds the union of `node.json`
+     children (slot order) and remaining ledger `Child` accounts (`NodeId`
+     order, `kind: None` for detached), capped at `MAX_ADMIN_LEDGER_ACCOUNTS =
+     64` with `truncated`; `equity` is `Balances::equity()` and
+     `parent_balance` covers all balances. Read-only: never appends, never takes
+     the exclusive lock. Two-phase `Handled`/`PendingLedgerQuery` dispatch: the
+     engine lock is captured and dropped before the ledger lock is taken, and
+     the engine is only re-locked to audit after the ledger guard is released
+     (control -> ledger, never both held). Optional `ledger` handle with
+     `attach_ledger`/`ledger_handle` and
+     `spawn_control_node_live[_on]_with_ledger`; `main.rs` attaches the running
+     ledger before serving.
+   - Browser: wasm `ClientNode::admin_ledger_query(node, node_addr)` (direct
+     first, routed fallback) returning `AdminLedgerSnapshotDto`/
+     `AdminLedgerAccountDto` (explicit `"node"`/`"user"`/`None` kind mapping).
+     `api.getAccounts` uses it for a value-scoped administered target, mapping
+     the parent asset row + one liability row per account + the canonical equity
+     row; it gates on `adminCapabilities.scopes.value` (joins/topology-only ->
+     `[]`), keeps the verified-balance path for `self`, and records unreachable
+     like the other admin reads. `AccountsPage` renders one table for leaf and
+     internal nodes and shows a **Truncated** notice when the node hit its row
+     cap.
+   - Version matrix: `CONTROL_FORMAT_VERSION` 5, `CONTROL_REPLY_VERSION` 3; no
+     ledger/entry/settlement format change (`ENTRY_FORMAT_VERSION` 4,
+     `LEDGER_FORMAT_VERSION` 3, settlement/payload unchanged) and **no
+     `node-data` recreation**. Pre-existing control traffic is unaffected.
+   - Residual (intended): balances are node-asserted (transport-authenticated
+     direct, operator-signed routed) with no independent Merkle/commitment
+     proof; a `value` admin can see user balances.
+
 ** Authority and value-op requirements (essential)
    - *Scope separation*: each admin request declares its required scope; grant
      management stays self-operator/CLI only (a delegated admin must never

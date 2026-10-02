@@ -29,14 +29,14 @@ use tracing::{info, warn};
 
 use cawala_control::{
     AdminApproved, AdminJoinApprove, AdminJoinReject, AdminPendingJoin, AdminRedeliverJoin,
-    AdminRejected, AdminScopes, AdminSnapshot, CONTROL_ALPN, CONTROL_FORMAT_VERSION,
-    CONTROL_REQUEST_MAX_TTL_SECS, CONTROL_REQUEST_TTL_SECS, ChildKind, ChildSnapshot, ControlError,
+    AdminRejected, AdminScopes, AdminSnapshot, CONTROL_ALPN, CONTROL_REQUEST_MAX_TTL_SECS,
+    CONTROL_REQUEST_TTL_SECS, ChildKind, ChildSnapshot, ControlError,
     ControlReply, ControlRequest, CreateChild, DeliveryStatus, DetachChild, DetachNotice,
     ExitRequest, Invite, JoinApproval, JoinRejection, JoinRequest, MAX_CONTROL_FRAME, MoveChild,
     NodeId, NodeSnapshot, OctAddr, OperatorPubKey, OperatorSecretKey, ParentSnapshot,
     ROUTED_REPLY_VERSION, RebaseNotice, RebasePull, RejectCode, RoutedControlV1, RoutedForward,
     RoutedReplyV1, SetAddress, SignedControl, SignedRoutedReply, is_admin_request,
-    is_supported_control_version, senior_child, verify_control,
+    is_supported_control_version, min_control_version, senior_child, verify_control,
 };
 use cawala_ledger::{LedgerPubKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::{MsgId, PeerRef, Seen, SeenConfig};
@@ -44,6 +44,7 @@ use cawala_msg::{MsgId, PeerRef, Seen, SeenConfig};
 use crate::admin_store::{AdminStore, StoredGrant};
 use crate::control_store::ControlStore;
 use crate::ledger_peers;
+use crate::ledger_service::LedgerService;
 use crate::msg::{MSG_ALPN, MsgConfig, MsgHandler, NeighborSource, RoutableSnapshot};
 use crate::record::{NodeRecord, RecordError, RecordStore};
 use crate::seen_store::SeenStore;
@@ -208,6 +209,37 @@ pub struct ControlNode {
     /// Per-node replay guard keyed `origin:controller`, id = request nonce.
     /// Persisted across restarts via [`SeenStore`].
     seen: SeenStore,
+    /// Optional running ledger, attached by a live node so a value-scoped
+    /// `AdminLedgerQuery` can read it. Held behind an `Arc<Mutex>` so the
+    /// control handler can clone the handle, drop the control lock, and then
+    /// take the ledger lock (control -> ledger ordering; never both at once).
+    ledger: Option<Arc<tokio::sync::Mutex<LedgerService>>>,
+}
+
+/// The result of dispatching one control request.
+///
+/// Most requests produce a [`ControlReply`] entirely under the control lock.
+/// An `AdminLedgerQuery` with a ledger handle attached instead yields a
+/// [`PendingLedgerQuery`]: the caller must drop the control lock, read the
+/// ledger, and only then reply (and audit), preserving the lock ordering.
+#[derive(Debug)]
+pub enum Handled {
+    /// A complete reply; the caller can send it as-is.
+    Reply(ControlReply),
+    /// A read-only ledger query to execute after releasing the control lock.
+    Ledger(PendingLedgerQuery),
+}
+
+/// A deferred `AdminLedgerQuery`, carrying the record snapshot to render and
+/// the actor identity needed to audit the eventual reply.
+#[derive(Debug)]
+pub struct PendingLedgerQuery {
+    /// The node record captured under the control lock.
+    pub record: NodeRecord,
+    /// The querying origin (always this node).
+    pub origin: NodeId,
+    /// The authenticated controller key.
+    pub controller: OperatorPubKey,
 }
 
 impl ControlNode {
@@ -241,6 +273,7 @@ impl ControlNode {
             self_kind: ChildKind::Node,
             decisions: VecDeque::new(),
             seen: SeenStore::empty(CONTROL_SEEN_CONFIG),
+            ledger: None,
         }
     }
 
@@ -277,6 +310,7 @@ impl ControlNode {
             self_kind: ChildKind::Node,
             decisions: VecDeque::new(),
             seen,
+            ledger: None,
         })
     }
 
@@ -308,6 +342,21 @@ impl ControlNode {
     /// This node's admin-grant store.
     pub fn admins(&self) -> &AdminStore {
         &self.admins
+    }
+
+    /// Attach a running ledger to this engine, enabling value-scoped
+    /// `AdminLedgerQuery` reads. A hermetic/test engine or an address-less
+    /// `spawn_control_only` node leaves this unset.
+    pub fn attach_ledger(&mut self, ledger: Arc<tokio::sync::Mutex<LedgerService>>) {
+        self.ledger = Some(ledger);
+    }
+
+    /// A clone of the attached ledger handle, if any.
+    ///
+    /// Cloning an `Arc` while the control lock is held is cheap; the caller
+    /// must drop the control guard before locking the returned handle.
+    pub fn ledger_handle(&self) -> Option<Arc<tokio::sync::Mutex<LedgerService>>> {
+        self.ledger.clone()
     }
 
     /// This node's operator public key.
@@ -685,40 +734,64 @@ impl ControlNode {
 
     /// [`ControlNode::receive`] with a caller-supplied clock (unix seconds).
     ///
+    /// This is the non-ledger convenience wrapper: a deferred
+    /// [`Handled::Ledger`] query (which only arises with an attached ledger)
+    /// collapses to `Rejected(Internal)` and is **not** executed or audited
+    /// here. Callers that can execute a ledger read must use
+    /// [`ControlNode::receive_at_handled`] instead.
+    pub async fn receive_at(
+        &mut self,
+        remote: EndpointId,
+        signed: SignedControl,
+        now: u64,
+    ) -> ControlReply {
+        match self.receive_at_handled(remote, signed, now).await {
+            Handled::Reply(reply) => reply,
+            Handled::Ledger(_) => ControlReply::Rejected(RejectCode::Internal),
+        }
+    }
+
+    /// [`ControlNode::receive_at`], returning a [`Handled`] so the caller can
+    /// execute a deferred ledger query after dropping the control lock.
+    ///
     /// The checks run strictly in this order:
-    /// 1. wire version is [`CONTROL_FORMAT_VERSION`];
-    /// 2. the operator signature verifies under `signed.controller`;
-    /// 3. `now <= expiry <= now + CONTROL_REQUEST_MAX_TTL_SECS`;
-    /// 4. the persisted node record is reloaded from disk (warn-and-continue;
-    ///    see [`ControlNode::refresh_control_plane`]);
-    /// 5. the peer registry is reloaded from disk (warn-and-continue; same
-    ///    helper);
+    /// 1. wire version is supported ([`is_supported_control_version`]);
+    /// 2. the declared version can carry the request
+    ///    ([`min_control_version`]);
+    /// 3. the operator signature verifies under `signed.controller`;
+    /// 4. `now <= expiry <= now + CONTROL_REQUEST_MAX_TTL_SECS`;
+    /// 5. the persisted node record/peer registry are reloaded from disk
+    ///    (warn-and-continue; see [`ControlNode::refresh_control_plane`]);
     /// 6. admin grants are reloaded from disk (fail closed to empty);
     /// 7. the `(origin, controller, nonce)` replay guard;
     /// 8. dispatch.
-    pub async fn receive_at(
+    ///
+    /// An `AdminLedgerQuery` that authorizes and has an attached ledger returns
+    /// [`Handled::Ledger`] **without auditing** — the caller audits once it has
+    /// the reply. Every other path audits here (as before).
+    pub async fn receive_at_handled(
         &mut self,
         _remote: EndpointId,
         signed: SignedControl,
         now: u64,
-    ) -> ControlReply {
+    ) -> Handled {
         if !is_supported_control_version(signed.version) {
-            return ControlReply::Rejected(RejectCode::BadVersion);
+            return Handled::Reply(ControlReply::Rejected(RejectCode::BadVersion));
         }
-        // A v3 frame may carry only the pre-existing variants: the four exit
-        // variants are v4-additive, so a v3 declaration over one is malformed
-        // and must not be dispatched.
-        if signed.version != CONTROL_FORMAT_VERSION && carries_v4_variant(&signed.request) {
-            return ControlReply::Rejected(RejectCode::BadVersion);
+        // Shape gate: a declared version below the variant's introduction
+        // version is malformed (e.g. a v5-only `AdminLedgerQuery` on a v4
+        // frame) and must not be dispatched.
+        if signed.version < min_control_version(&signed.request) {
+            return Handled::Reply(ControlReply::Rejected(RejectCode::BadVersion));
         }
         if signed.verify_signature().is_err() {
-            return ControlReply::Rejected(RejectCode::Unauthorized);
+            return Handled::Reply(ControlReply::Rejected(RejectCode::Unauthorized));
         }
         if now > signed.expiry {
-            return ControlReply::Rejected(RejectCode::Expired);
+            return Handled::Reply(ControlReply::Rejected(RejectCode::Expired));
         }
         if signed.expiry > now.saturating_add(CONTROL_REQUEST_MAX_TTL_SECS) {
-            return ControlReply::Rejected(RejectCode::BadRequest);
+            return Handled::Reply(ControlReply::Rejected(RejectCode::BadRequest));
         }
         self.refresh_control_plane();
         // Full reload so a grant/revoke performed by a separate operator CLI
@@ -735,7 +808,7 @@ impl ControlNode {
             Seen::Duplicate => {
                 let reply = ControlReply::Rejected(RejectCode::Replay);
                 self.audit_request(&signed, &reply, now);
-                return reply;
+                return Handled::Reply(reply);
             }
             Seen::Fresh => {
                 // Persist the mark *before* dispatch so a crash cannot reopen
@@ -750,7 +823,7 @@ impl ControlNode {
                     );
                     let reply = ControlReply::Rejected(RejectCode::Internal);
                     self.audit_request(&signed, &reply, now);
-                    return reply;
+                    return Handled::Reply(reply);
                 }
             }
         }
@@ -783,9 +856,25 @@ impl ControlNode {
             ControlRequest::DetachNotice(notice) => self.handle_detach_notice(&signed, notice, now),
             ControlRequest::Rebase(notice) => self.handle_rebase(&signed, notice, now),
             ControlRequest::RebasePull(pull) => self.handle_rebase_pull(&signed, pull, now),
+            ControlRequest::AdminLedgerQuery => {
+                if let Err(code) = self.authorize_admin(&signed, now) {
+                    ControlReply::Rejected(code)
+                } else if self.ledger.is_none() {
+                    // No running ledger attached: fail closed.
+                    ControlReply::Rejected(RejectCode::Internal)
+                } else {
+                    // Deferred: the caller drops the control lock, reads the
+                    // ledger, then audits the eventual reply.
+                    return Handled::Ledger(PendingLedgerQuery {
+                        record: self.record.record().clone(),
+                        origin: signed.origin.clone(),
+                        controller: signed.controller,
+                    });
+                }
+            }
         };
         self.audit_request(&signed, &reply, now);
-        reply
+        Handled::Reply(reply)
     }
 
     /// Handle one routed control request, using the system clock.
@@ -795,7 +884,8 @@ impl ControlNode {
     /// per-index hop match) are enforced by the caller
     /// (`dispatch_control_envelope`) because they need the transport envelope;
     /// everything that is a property of the routed payload plus `remote` is
-    /// enforced here.
+    /// enforced here. Like [`ControlNode::receive_routed_at`], this is a
+    /// non-ledger/test entry point and does not execute a deferred ledger query.
     pub async fn receive_routed(
         &mut self,
         remote: EndpointId,
@@ -836,14 +926,42 @@ impl ControlNode {
     /// controller, but it never authorizes on its own — the
     /// [`AdminStore`](crate::admin_store::AdminStore) is the authority, so a
     /// revoke wins over a still-valid carried grant.
+    ///
+    /// # Non-ledger wrapper
+    ///
+    /// This convenience wrapper is for tests and non-ledger callers. A deferred
+    /// [`Handled::Ledger`] query (only possible with a ledger attached) is
+    /// collapsed to `Rejected(Internal)` and is **not** executed or audited
+    /// here, because doing so requires dropping the control lock. Production
+    /// handlers use [`ControlNode::receive_routed_at_handled`].
     pub async fn receive_routed_at(
         &mut self,
         remote: EndpointId,
         routed: RoutedControlV1,
         now: u64,
     ) -> ControlReply {
+        match self.receive_routed_at_handled(remote, routed, now).await {
+            Handled::Reply(reply) => reply,
+            Handled::Ledger(_) => ControlReply::Rejected(RejectCode::Internal),
+        }
+    }
+
+    /// [`ControlNode::receive_routed_at`], returning a [`Handled`] so the caller
+    /// can execute a deferred ledger query after dropping the control lock.
+    ///
+    /// The class-level dispatch is unchanged: the admin class dispatches the
+    /// end-to-end intent through [`ControlNode::receive_at_handled`] (so the
+    /// grant store, replay, and TTL rules apply verbatim) and propagates a
+    /// [`Handled::Ledger`] to the caller, which must audit the routed line once
+    /// the reply exists. All other paths audit here.
+    pub async fn receive_routed_at_handled(
+        &mut self,
+        remote: EndpointId,
+        routed: RoutedControlV1,
+        now: u64,
+    ) -> Handled {
         if routed.validate().is_err() {
-            return ControlReply::Rejected(RejectCode::Unauthorized);
+            return Handled::Reply(ControlReply::Rejected(RejectCode::Unauthorized));
         }
         // Observe a control-plane mutation made by a *separate process* before
         // any record/registry-dependent check below (the `target.addr` match and
@@ -852,30 +970,30 @@ impl ControlNode {
         // `ledger_peers.json`.
         self.refresh_control_plane();
         if routed.target.node != self.node_id {
-            return ControlReply::Rejected(RejectCode::Unauthorized);
+            return Handled::Reply(ControlReply::Rejected(RejectCode::Unauthorized));
         }
         if self.record.record().address.as_ref() != Some(&routed.target.addr) {
-            return ControlReply::Rejected(RejectCode::Unauthorized);
+            return Handled::Reply(ControlReply::Rejected(RejectCode::Unauthorized));
         }
         if routed.intent.verify_signature().is_err() {
-            return ControlReply::Rejected(RejectCode::Unauthorized);
+            return Handled::Reply(ControlReply::Rejected(RejectCode::Unauthorized));
         }
         if now > routed.intent.expiry {
-            return ControlReply::Rejected(RejectCode::Expired);
+            return Handled::Reply(ControlReply::Rejected(RejectCode::Expired));
         }
         if routed.intent.expiry > now.saturating_add(CONTROL_REQUEST_MAX_TTL_SECS) {
-            return ControlReply::Rejected(RejectCode::BadRequest);
+            return Handled::Reply(ControlReply::Rejected(RejectCode::BadRequest));
         }
 
         // The predecessor is authority; `RoutedForward.hop` alone never is.
         let Some(last) = routed.forwards.last() else {
-            return ControlReply::Rejected(RejectCode::Unauthorized);
+            return Handled::Reply(ControlReply::Rejected(RejectCode::Unauthorized));
         };
         if last.hop.node != remote.to_string() {
-            return ControlReply::Rejected(RejectCode::Unauthorized);
+            return Handled::Reply(ControlReply::Rejected(RejectCode::Unauthorized));
         }
         if self.verify_forward(last).is_err() {
-            return ControlReply::Rejected(RejectCode::Unauthorized);
+            return Handled::Reply(ControlReply::Rejected(RejectCode::Unauthorized));
         }
 
         // Join traffic and exit-rights traffic are direct-only: a routed
@@ -902,7 +1020,7 @@ impl ControlNode {
                 "hops": routed.forwards.len(),
                 "routed": true,
             }));
-            return ControlReply::Rejected(RejectCode::Unauthorized);
+            return Handled::Reply(ControlReply::Rejected(RejectCode::Unauthorized));
         }
 
         // Routing context recorded on every dispatched routed request. `last` is
@@ -923,12 +1041,12 @@ impl ControlNode {
                     && grant.grant.node.as_str() == self.node_id
                     && grant.grant.admin == routed.intent.controller;
                 if !well_formed {
-                    return ControlReply::Rejected(RejectCode::Unauthorized);
+                    return Handled::Reply(ControlReply::Rejected(RejectCode::Unauthorized));
                 }
                 // Refresh the store from disk *before* deriving the evidence,
-                // exactly as `receive_at` will before authorizing: otherwise a
-                // grant/revoke by a separate process leaves the in-memory copy
-                // stale and the audit line disagrees with the decision.
+                // exactly as `receive_at_handled` will before authorizing:
+                // otherwise a grant/revoke by a separate process leaves the
+                // in-memory copy stale and the audit line disagrees.
                 self.reload_admins();
                 // Evidence, not authority: record when the store does not back
                 // the carried grant, then let `authorize_admin` refuse it.
@@ -949,9 +1067,15 @@ impl ControlNode {
                     }));
                 }
             }
-            let reply = self.receive_at(remote, routed.intent, now).await;
-            self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
-            return reply;
+            return match self.receive_at_handled(remote, routed.intent, now).await {
+                Handled::Reply(reply) => {
+                    self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
+                    Handled::Reply(reply)
+                }
+                // A deferred ledger query: the caller audits the routed line
+                // after executing it (the reply is not known yet).
+                Handled::Ledger(pending) => Handled::Ledger(pending),
+            };
         }
 
         // Self-operator class: the intent is addressed to this node and signed
@@ -959,21 +1083,29 @@ impl ControlNode {
         if routed.intent.origin.as_str() == self.node_id
             && routed.intent.controller == self.operator.public()
         {
-            let reply = self.receive_at(remote, routed.intent, now).await;
-            self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
-            return reply;
+            return match self.receive_at_handled(remote, routed.intent, now).await {
+                Handled::Reply(reply) => {
+                    self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
+                    Handled::Reply(reply)
+                }
+                Handled::Ledger(pending) => Handled::Ledger(pending),
+            };
         }
 
         // Topology class: only the immediate predecessor's own signed control
         // is dispatched, and only if it is this node's senior node child.
         match self.authorize(&last.signed, now) {
             Ok(Authority::Peer) => {}
-            _ => return ControlReply::Rejected(RejectCode::Unauthorized),
+            _ => return Handled::Reply(ControlReply::Rejected(RejectCode::Unauthorized)),
         }
         let last_signed = last.signed.clone();
-        let reply = self.receive_at(remote, last_signed, now).await;
-        self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
-        reply
+        match self.receive_at_handled(remote, last_signed, now).await {
+            Handled::Reply(reply) => {
+                self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
+                Handled::Reply(reply)
+            }
+            Handled::Ledger(pending) => Handled::Ledger(pending),
+        }
     }
 
     /// Re-sign `request` as this node's own per-hop routed forward.
@@ -2600,7 +2732,7 @@ impl ControlNode {
     }
 
     /// Audit an admin request outcome (non-admin requests are not audited).
-    fn audit_request(&self, signed: &SignedControl, reply: &ControlReply, now: u64) {
+    pub(crate) fn audit_request(&self, signed: &SignedControl, reply: &ControlReply, now: u64) {
         if !is_admin_request(&signed.request) {
             return;
         }
@@ -2621,7 +2753,7 @@ impl ControlNode {
     /// `hops`. `requester`/`forwarder` are public node ids already carried in
     /// the envelope; no secrets or payloads are logged. The admin surface keeps
     /// its own [`ControlNode::audit_request`] line alongside this one.
-    fn audit_routed(
+    pub(crate) fn audit_routed(
         &self,
         now: u64,
         kind: &str,
@@ -2748,12 +2880,30 @@ impl ProtocolHandler for ControlHandler {
         // Process the request and drain any frames it queued, all under the
         // engine lock. The lock is dropped before any delivery (await) or file
         // I/O; audit writes here happen while the lock is held but are cheap.
-        let (mut reply, outbound, data_dir) = {
+        //
+        // A deferred `AdminLedgerQuery` captures the ledger handle under the
+        // engine lock, drops that guard, and only then takes the ledger lock
+        // (control -> ledger ordering; never both at once). The engine is
+        // re-locked briefly to audit the reply after the ledger guard is free.
+        let now = now_unix_seconds();
+        let (handled, ledger, outbound, data_dir) = {
             let mut engine = self.node.lock().await;
-            let reply = engine.receive(remote, signed).await;
+            let ledger = engine.ledger_handle();
+            let handled = engine.receive_at_handled(remote, signed.clone(), now).await;
             let outbound = engine.take_outbound();
             let data_dir = engine.data_dir().to_path_buf();
-            (reply, outbound, data_dir)
+            (handled, ledger, outbound, data_dir)
+        };
+        let mut reply = match handled {
+            Handled::Reply(reply) => reply,
+            Handled::Ledger(pending) => {
+                let reply = execute_ledger_query(ledger, &pending).await;
+                {
+                    let engine = self.node.lock().await;
+                    engine.audit_request(&signed, &reply, now);
+                }
+                reply
+            }
         };
 
         // Deliver decisions owned by this node and patch the reply with the
@@ -2852,6 +3002,49 @@ pub fn spawn_control_node_live_on(
     config: MsgConfig,
     node: Arc<Mutex<ControlNode>>,
 ) -> (Router, tokio::sync::mpsc::Receiver<cawala_msg::Envelope>) {
+    spawn_control_node_live_on_with_ledger(endpoint, source, config, node, None)
+}
+
+/// Like [`spawn_control_node_live`], but attaching an optional running ledger
+/// (**with ledger**) so a value-scoped `AdminLedgerQuery` can be served.
+///
+/// The engine is freshly built and uncontended here, so the attach uses a
+/// non-blocking lock; on the (unexpected) contention path it warns and serves
+/// without ledger authority rather than blocking.
+pub async fn spawn_control_node_live_with_ledger(
+    secret_key: iroh::SecretKey,
+    source: NeighborSource,
+    config: MsgConfig,
+    node: Arc<Mutex<ControlNode>>,
+    ledger: Option<Arc<tokio::sync::Mutex<LedgerService>>>,
+) -> anyhow::Result<(Router, tokio::sync::mpsc::Receiver<cawala_msg::Envelope>)> {
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(secret_key)
+        .bind()
+        .await?;
+    Ok(spawn_control_node_live_on_with_ledger(
+        endpoint, source, config, node, ledger,
+    ))
+}
+
+/// Like [`spawn_control_node_live_on`], but attaching an optional running
+/// ledger before registering the handlers.
+pub fn spawn_control_node_live_on_with_ledger(
+    endpoint: Endpoint,
+    source: NeighborSource,
+    config: MsgConfig,
+    node: Arc<Mutex<ControlNode>>,
+    ledger: Option<Arc<tokio::sync::Mutex<LedgerService>>>,
+) -> (Router, tokio::sync::mpsc::Receiver<cawala_msg::Envelope>) {
+    if let Some(ledger) = ledger {
+        match node.try_lock() {
+            Ok(mut engine) => engine.attach_ledger(ledger),
+            Err(_) => warn!(
+                "control engine was contended while attaching the ledger; \
+                 serving AdminLedgerQuery as Internal"
+            ),
+        }
+    }
     let (sink, receiver) = tokio::sync::mpsc::channel(SINK_CAPACITY);
     let handler = MsgHandler::with_source_and_control(
         endpoint.clone(),
@@ -2875,11 +3068,54 @@ fn lowest_free_slot(record: &NodeRecord) -> Option<u8> {
 }
 
 /// Current time as unix seconds.
-fn now_unix_seconds() -> u64 {
+pub(crate) fn now_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Execute a deferred [`PendingLedgerQuery`] against an optional attached
+/// ledger handle.
+///
+/// **The caller must have already dropped the control-lock guard.** This locks
+/// only the ledger (the shared read lock inside
+/// [`LedgerService::admin_ledger_view`]) and never re-enters the control
+/// engine, preserving the `control -> ledger` ordering. Any error, a missing
+/// handle, or an over-budget encoded reply collapses to `Rejected(Internal)`.
+pub(crate) async fn execute_ledger_query(
+    ledger: Option<Arc<tokio::sync::Mutex<LedgerService>>>,
+    pending: &PendingLedgerQuery,
+) -> ControlReply {
+    let Some(ledger) = ledger else {
+        return ControlReply::Rejected(RejectCode::Internal);
+    };
+    let reply = {
+        let mut service = ledger.lock().await;
+        match service.admin_ledger_view(&pending.record) {
+            Ok(snapshot) => ControlReply::AdminLedgerSnapshot(snapshot),
+            Err(err) => {
+                warn!(%err, "admin ledger view failed");
+                ControlReply::Rejected(RejectCode::Internal)
+            }
+        }
+    };
+    // Defensive: never emit a reply that exceeds the control frame budget.
+    match postcard::to_allocvec(&reply) {
+        Ok(bytes) if bytes.len() <= MAX_CONTROL_FRAME as usize => reply,
+        Ok(bytes) => {
+            warn!(
+                len = bytes.len(),
+                max = MAX_CONTROL_FRAME,
+                "admin ledger reply over budget; refusing"
+            );
+            ControlReply::Rejected(RejectCode::Internal)
+        }
+        Err(err) => {
+            warn!(%err, "admin ledger reply could not be encoded");
+            ControlReply::Rejected(RejectCode::Internal)
+        }
+    }
 }
 
 /// A fresh request nonce from the OS randomness source.
@@ -2896,20 +3132,6 @@ fn nonce_msg_id(nonce: u64) -> MsgId {
     let mut id = [0u8; 16];
     id[..8].copy_from_slice(&nonce.to_be_bytes());
     MsgId::from_bytes(id)
-}
-
-/// Whether `request` is one of the four variants appended in control format 4.
-///
-/// A v3-declared frame must not carry one of these; the node rejects such a
-/// frame as [`RejectCode::BadVersion`] rather than dispatching it.
-fn carries_v4_variant(request: &ControlRequest) -> bool {
-    matches!(
-        request,
-        ControlRequest::Exit(_)
-            | ControlRequest::DetachNotice(_)
-            | ControlRequest::Rebase(_)
-            | ControlRequest::RebasePull(_)
-    )
 }
 
 /// Stable `"node"`/`"user"` label for a [`ChildKind`], for audit lines.
@@ -2951,6 +3173,7 @@ fn reply_outcome(reply: &ControlReply) -> String {
         ControlReply::AdminSnapshot(_) => "admin-snapshot".to_string(),
         ControlReply::AdminApproved(_) => "admin-approved".to_string(),
         ControlReply::AdminRejected(_) => "admin-rejected".to_string(),
+        ControlReply::AdminLedgerSnapshot(_) => "admin-ledger-snapshot".to_string(),
     }
 }
 
@@ -3194,6 +3417,7 @@ fn signed_kind(reply: &ControlReply) -> &'static str {
         ControlReply::AdminSnapshot(_) => "admin-snapshot",
         ControlReply::AdminApproved(_) => "admin-approved",
         ControlReply::AdminRejected(_) => "admin-rejected",
+        ControlReply::AdminLedgerSnapshot(_) => "admin-ledger-snapshot",
     }
 }
 
@@ -5457,7 +5681,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v3_frame_cannot_carry_exit_but_v4_query_works() {
+    async fn v3_frame_is_bad_version_and_v4_query_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
+        let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &[]);
+
+        // v3 is below the accepted window (4|5).
+        let v3_query = authorize_version("parent", &parent_op, 1, ControlRequest::Query, 3);
+        assert_eq!(
+            engine.receive_at(any_remote(), v3_query, 0).await,
+            ControlReply::Rejected(RejectCode::BadVersion)
+        );
+
+        // A v4 frame over a pre-existing variant is dispatched normally.
+        let v4_query = authorize_version("parent", &parent_op, 2, ControlRequest::Query, 4);
+        assert!(matches!(
+            engine.receive_at(any_remote(), v4_query, 0).await,
+            ControlReply::Snapshot(_)
+        ));
+    }
+
+    /// A v4-declared frame cannot carry the v5-only `AdminLedgerQuery`: the
+    /// shape gate rejects it as `BadVersion` before signature/dispatch.
+    #[tokio::test]
+    async fn v4_frame_cannot_carry_ledger_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
+        let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &[]);
+
+        let v4_query = authorize_version(
+            "parent",
+            &parent_op,
+            1,
+            ControlRequest::AdminLedgerQuery,
+            4,
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), v4_query, 0).await,
+            ControlReply::Rejected(RejectCode::BadVersion)
+        );
+
+        // The v5 form passes the gate; with no ledger attached it fails closed.
+        let v5_query = authorize_at("parent", &parent_op, 2, ControlRequest::AdminLedgerQuery);
+        assert_eq!(
+            engine.receive_at(any_remote(), v5_query, 0).await,
+            ControlReply::Rejected(RejectCode::Internal)
+        );
+    }
+
+    /// A v4 frame carrying one of the four v4-introduced variants clears the
+    /// shape gate (it is not `BadVersion`).
+    #[tokio::test]
+    async fn v4_frame_can_carry_exit_variant() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let child_op = secret(2);
@@ -5469,54 +5746,29 @@ mod tests {
             &[("child", ChildKind::Node, 3, 2)],
         );
         let peers = [node_peer("child", &child_op, 2)];
-        let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &peers);
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
 
-        let v3_exit = authorize_version("child", &child_op, 1, exit_request("child", 1), 3);
-        assert_eq!(
-            engine.receive_at(any_remote(), v3_exit, 0).await,
-            ControlReply::Rejected(RejectCode::BadVersion)
+        let v4_exit = authorize_version("child", &child_op, 1, exit_request("child", 1), 4);
+        assert_ne!(
+            engine.receive_at(any_remote(), v4_exit, 0).await,
+            ControlReply::Rejected(RejectCode::BadVersion),
+            "a v4 frame may carry a v4-introduced variant"
         );
 
-        // A v4 frame over a pre-existing variant is dispatched normally.
-        let query = authorize_at("parent", &parent_op, 2, ControlRequest::Query);
-        assert!(matches!(
-            engine.receive_at(any_remote(), query, 0).await,
-            ControlReply::Snapshot(_)
-        ));
+        // The current (v5) mint also carries a v4-introduced variant: the gate
+        // is `declared >= min_control_version`, so 5 >= 4 holds.
+        let v5_exit = authorize_at("child", &child_op, 2, exit_request("child", 1));
+        assert_ne!(
+            engine.receive_at(any_remote(), v5_exit, 0).await,
+            ControlReply::Rejected(RejectCode::BadVersion),
+            "a v5 frame may carry a v4-introduced variant"
+        );
     }
 
-    /// **A6**: the v3 shape gate covers all four v4 variants, not just `Exit`.
-    #[test]
-    fn carries_v4_variant_covers_all_four_appended_variants() {
-        let v4 = [
-            exit_request("child", 1),
-            ControlRequest::DetachNotice(DetachNotice {
-                node: NodeId::from("child"),
-            }),
-            rebase_request("0.5.2", "0.5", 1),
-            ControlRequest::RebasePull(RebasePull {
-                node: NodeId::from("child"),
-            }),
-        ];
-        for request in v4 {
-            assert!(carries_v4_variant(&request), "{request:?}");
-        }
-        // Pre-existing variants are not covered by the gate.
-        for request in [
-            ControlRequest::Query,
-            ControlRequest::SetAddress(SetAddress { address: None }),
-            ControlRequest::DetachChild(DetachChild {
-                child: NodeId::from("child"),
-            }),
-        ] {
-            assert!(!carries_v4_variant(&request), "{request:?}");
-        }
-    }
-
-    /// **A6**: a v3-declared frame carrying an *old* (pre-v4) variant still
-    /// dispatches under a v4 node; only the four appended variants are gated.
+    /// A v4-declared frame carrying an *old* (pre-v4) variant dispatches
+    /// normally; only the introduction-version gate applies.
     #[tokio::test]
-    async fn v3_frame_carrying_old_variant_still_dispatches() {
+    async fn v4_frame_carrying_old_variant_still_dispatches() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let applicant_op = secret(2);
@@ -5533,17 +5785,17 @@ mod tests {
             nonce: 7,
             expiry: u64::MAX,
         };
-        let v3_join = authorize_version(
+        let v4_join = authorize_version(
             "applicant",
             &applicant_op,
             1,
             ControlRequest::Join(join),
-            3,
+            4,
         );
         assert_eq!(
-            engine.receive_at(any_remote(), v3_join, 0).await,
+            engine.receive_at(any_remote(), v4_join, 0).await,
             ControlReply::Pending,
-            "a v3 frame over a pre-existing variant must dispatch"
+            "a v4 frame over a pre-existing variant must dispatch"
         );
     }
 
