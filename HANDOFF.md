@@ -3,7 +3,7 @@
 Short entry point. This file is deliberately small: it carries **current state,
 how to verify, and conventions**. Detail lives elsewhere:
 
-- **`PLAN.org`** (tracked) — the full design and the per-increment DONE records
+- **`PLAN.md`** (tracked) — the full design and the per-increment DONE records
   with wire versions, residuals, and deferred items. Read the M4/M5 milestones
   for what exists and why.
 - **`.slim/deepwork/*.md`** (gitignored, local-only) — per-effort working notes:
@@ -18,7 +18,7 @@ how to verify, and conventions**. Detail lives elsewhere:
 - Branch `main` is clean and pushed (`origin/main` at `5f39862`). The unified
   administered-node console (P1, `3ba0674`), scoped delegated admin grants +
   the `cawala://admin` bundle (P2, `67b973a`), and the read-only admin ledger
-  view (P3, `5f39862`) are **DONE**. See PLAN.org
+  view (P3, `5f39862`) are **DONE**. See PLAN.md
   "Next Phases - Unified Node Administration" for the delivery notes and the
   P4-P6 plan.
 - Scoped grants + bundle (P2, `67b973a`): `AdminScope` v2
@@ -51,7 +51,7 @@ how to verify, and conventions**. Detail lives elsewhere:
   durable control replay guard + `JoinRejected` nonce staleness, unilateral exit
   rights with topology-true address rebasing and component-aware audit, the
   stranded-claim evidence bundle (automated foster recovery was **cut** by
-  decision), and the exit-rights follow-ups. See `PLAN.org` M4/M5 for the
+  decision), and the exit-rights follow-ups. See `PLAN.md` M4/M5 for the
   authoritative description of each.
 - Browser re-attach stale ledger pin (DONE): a browser re-attached to a new
   parent re-pins its leaf ledger key from the authenticated
@@ -69,7 +69,7 @@ how to verify, and conventions**. Detail lives elsewhere:
   inconsistent pair (low probability).
 
 ## Next (recorded backlog)
-- **Unified node administration P1-P6** - see PLAN.org "Next Phases - Unified
+- **Unified node administration P1-P6** - see PLAN.md "Next Phases - Unified
   Node Administration". P1-P5 DONE (P4 topology admin; P5 value admin with
   end-to-end idempotency and operator caps). **P6 (focused, web-only) DONE**:
   a value-scoped seed **must** be passphrase-wrapped before any value action -
@@ -88,23 +88,23 @@ how to verify, and conventions**. Detail lives elsewhere:
   strength. Deferred (with rationale): grant-embedded limits
   (`ADMIN_GRANT_VERSION` 3), 2-person/time-locks, global config/credit limits,
   persisted node `role`, bundle QR, anomaly dashboard, non-senior routed
-  topology, and an `AdminValuePolicyQuery` (format 8) - see the PLAN.org P6
+  topology, and an `AdminValuePolicyQuery` (format 8) - see the PLAN.md P6
   entry. Migration caveat: a cached P5 bundle that reads only `cawala.admin.v2`
   sees no grants after migration until reload (acceptable in a static PWA).
 - **`OctAddr` depth cap** — deliberately not done (PLAN decision 9: no hard depth
   cap; frames are already bounded by `MAX_CONTROL_FRAME`). The other exit-rights
-  follow-ups are built (see the PLAN.org M5 entry): routed-path control-plane
+  follow-ups are built (see the PLAN.md M5 entry): routed-path control-plane
   freshness, parent-side ledger-rotation reconciliation narrowed to
   self-operator on `CreateChild`, and `ledger net`/`verify-cascade`
   `--primary-root`.
-- **No foster-parent recovery** — cut by decision (see the PLAN.org M5 entry).
+- **No foster-parent recovery** — cut by decision (see the PLAN.md M5 entry).
   Reconnection is **leave (if needed) + invitation**; the shipped stranded-claim
   bundle is out-of-band review evidence only, never authority and never on the
   wire.
 - **`EdgeClose` clean edge settlement** (DONE): `ENTRY_FORMAT_VERSION` 4; the
   operator-only `cawala-node ledger edge-close` writes off the whole (pooled)
   `Parent` balance on a **detached** child, so re-attach no longer surfaces a
-  hard `UnbackedClaim`. See the PLAN.org M5 "EdgeClose - clean edge settlement"
+  hard `UnbackedClaim`. See the PLAN.md M5 "EdgeClose - clean edge settlement"
   entry for semantics, the pre-close-before-prefund caveat, and residuals.
 - **`MoveChild` re-slot rebase** (DONE): a same-parent re-slot of a **node**
   child (v1; browser `ChildKind::User` leaves are refused) now persists the new
@@ -112,7 +112,7 @@ how to verify, and conventions**. Detail lives elsewhere:
   one targeted `Rebase`, so the moved child **and its subtree** settle on the
   new address instead of being stranded; the child's healing pull adopts the
   slot from its entry in the parent's snapshot. No wire/DTO/format change
-  (`CONTROL_FORMAT_VERSION` 4). See the PLAN.org M5 "MoveChild re-slot rebase"
+  (`CONTROL_FORMAT_VERSION` 4). See the PLAN.md M5 "MoveChild re-slot rebase"
   entry and `--test exit_rebase`
   (`move_child_reslots_child_and_heals_subtree_then_pull`); the old address
   still fails `NoSuchChild` by design. Residuals: the stale-address failure
@@ -133,27 +133,27 @@ how to verify, and conventions**. Detail lives elsewhere:
   detected or refused, so those operations degrade/fail silently across a
   version boundary. The independent present-day admin-redelivery bug is fixed
   (fresh nonce/expiry re-sign; see Hard breaks). **Signed
-  topology/registry distribution is rejected** (PLAN.org decision 10): the live
+  topology/registry distribution is rejected** (PLAN.md decision 10): the live
   network topology is the source of truth, so there is no distributed signed
   snapshot to cache/refresh/revoke, and fabricated hops stay detectable rather
   than preventable. **Moved pointers are rejected, not deferred**: a changed
   topology is a material change in trust dynamics (the parent-child
   relationship), so an in-flight transaction must fail and be re-tried with new
   source/destination addresses discovered **out of band** (no redirects, no
-  pointers, no silent re-addressing) — see PLAN.org.
+  pointers, no silent re-addressing) — see PLAN.md.
   Note: a node **with or
   without children can already join any network by invitation** — `Join`
   rewrites the joiner's own address and now pushes the new prefix down its
   subtree immediately, with the periodic `RebasePull` as the healing backstop.
   `RebaseNotice.generation` is enforced via a persisted per-node `address_epoch`
   and a per-link high-water mark, so a stale notice cannot regress an address
-  (a browser leaf guards this in memory only). See the PLAN.org M5 "Rebase
+  (a browser leaf guards this in memory only). See the PLAN.md M5 "Rebase
   promptness + generation ordering" entry for the semantics, the bounded-stall
   argument, and the browser residual.
 - **Carried-prefix Phase 2** (DONE): `SETTLE_PAYLOAD_VERSION` 3; the origin audits
   the echoed intermediate LCA hop (posting-account binding + inclusion proof) and
   degrades forensically on failure; the validated terminal proof stays the funds
-  gate. See the PLAN.org M5 "Carried-prefix Phase 2" entry for the semantics and
+  gate. See the PLAN.md M5 "Carried-prefix Phase 2" entry for the semantics and
   residuals. (The earlier `HopCertV1`/per-hop `PeerKeys` proposal was dropped.)
 
 ## Verify
@@ -242,7 +242,7 @@ how to verify, and conventions**. Detail lives elsewhere:
 - Addresses are network-local and topology-true: an exit rebases the subtree onto
   root `0`, so cached addresses for a whole subtree can be invalidated at once
   (moved pointers are **rejected** — retry with fresh addresses discovered out of
-  band; see PLAN.org). The clean path is `cawala-node control exit` then
+  band; see PLAN.md). The clean path is `cawala-node control exit` then
   `cawala-node ledger edge-close` (detached only). `edge-close` forfeits the
   **entire pooled `Parent` balance** — possibly another former parent's claim and
   any extension a new parent already made — irreversibly, so close **before** a

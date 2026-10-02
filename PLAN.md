@@ -1,61 +1,61 @@
-* Cawala - Project Plan
+# Cawala - Project Plan
 
   Status: Draft v3 (2026-08-21) - decisions resolved. Research sources: Iroh
   docs/crates (2026-07), architecture design memo from technical review.
 
-* What We Are Building
+# What We Are Building
   A community-owned, hierarchical value-transfer network: Rust/Iroh nodes
   forming a geographic tree, browser clients (Iroh WASM) talking only to leaf
   nodes, value created/destroyed/transferred via signed messages between
   "sovereign" nodes. Each node holds accounts for its children/users; senior
   children control their parent.
 
-** Load-Bearing Architecture Decisions
+## Load-Bearing Architecture Decisions
   These two decisions make the rest of the design work:
-  1. *Splits are downward only (subdivision)* - a split never re-parents a
+  1. **Splits are downward only (subdivision)** - a split never re-parents a
      node: the full node keeps its children by inserting one or more new
      intermediate children below itself, so every child stays within the
      geographic region of its parents/grandparents. The exact split shape is
      the admin's decision. Topology changes, addressing, and routing stay
      locally scoped, with no global renumbering.
-  2. *Operator keys != ledger keys* - makes "senior child controls parent"
+  2. **Operator keys != ledger keys** - makes "senior child controls parent"
      survivable: control grants operational power, never the ability to forge
      another node's ledger.
 
-* Tech Stack (verified against Iroh's current state, 2026-07)
-  | Layer           | Choice                                                              |
-  |-----------------+--------------------------------------------------------------------|
-  | Nodes           | Rust + iroh 1.0.3 (stable, API frozen since 1.0.0)                 |
-  | Node<->node msg | Custom QUIC-stream protocol - ALPN + length-prefixed postcard      |
-  |                 | framing (or irpc for RPC). NOT gossip/docs/blobs - wrong fit       |
-  | Web<->node      | Small Rust wasm-bindgen wrapper crate (no npm WASM SDK exists) -   |
-  |                 | same custom protocol over relayed e2e-encrypted connection         |
-  | Web client      | TypeScript PWA on GitHub Pages - no COOP/COEP/SharedArrayBuffer/   |
-  |                 | service worker needed (n0 browser-echo demo proves it)             |
-  | Relay           | Browser clients cannot do direct UDP - need reachable relays.      |
-  |                 | Public N0 relays for dev; self-hosted iroh-relay on VPS for        |
-  |                 | sovereignty                                                        |
-  | Persistence     | Ed25519 SecretKey persisted to file (required, or node ID changes  |
-  |                 | every run); ledger store via redb-backed iroh stores               |
-  | Location DB     | Separate small SQLite service - hint only, never authority; leaf   |
-  |                 | validates and issues final address                                 |
+# Tech Stack (verified against Iroh's current state, 2026-07)
+| Layer | Choice |
+| --- | --- |
+| Nodes | Rust + iroh 1.0.3 (stable, API frozen since 1.0.0) |
+| Node<->node msg | Custom QUIC-stream protocol - ALPN + length-prefixed postcard |
+|  | framing (or irpc for RPC). NOT gossip/docs/blobs - wrong fit |
+| Web<->node | Small Rust wasm-bindgen wrapper crate (no npm WASM SDK exists) - |
+|  | same custom protocol over relayed e2e-encrypted connection |
+| Web client | TypeScript PWA on GitHub Pages - no COOP/COEP/SharedArrayBuffer/ |
+|  | service worker needed (n0 browser-echo demo proves it) |
+| Relay | Browser clients cannot do direct UDP - need reachable relays. |
+|  | Public N0 relays for dev; self-hosted iroh-relay on VPS for |
+|  | sovereignty |
+| Persistence | Ed25519 SecretKey persisted to file (required, or node ID changes |
+|  | every run); ledger store via redb-backed iroh stores |
+| Location DB | Separate small SQLite service - hint only, never authority; leaf |
+|  | validates and issues final address |
 
-* Deployment Model
+# Deployment Model
   A node is a separate process (the cawala-node binary) with its own data
   directory (SecretKey, topology record, ledger). Physical provisioning is
   out-of-band - bare process, systemd, or docker as convenience; multiple
   nodes per server via separate data dirs. "Creating a node" in the network
   sense = control-plane identity + link operations, not a server command.
 
-* Architecture Summary
-** Addresses
+# Architecture Summary
+## Addresses
   - Dot-separated octal digits, one per tree level. Nodes at depth d have
     d+1 digits; users = leaf address + 1 digit.
   - Identity = immutable Iroh NodeId; address is a routable position that may
     change.
   - Routing = longest-prefix match with O(8) routing tables. No hard cap on
     tree depth; depth grows with subdivision.
-** Topology Changes (v1: manual, downward-only)
+## Topology Changes (v1: manual, downward-only)
   - Automatic node splitting is deferred to post-v1 (decision 8). In v1, any
     node administrator can create new nodes and edit the child/parent links of
     both new and existing nodes they control (their own node, and via
@@ -77,7 +77,7 @@
     depth cap; the per-node 8-cap is the only topology limit. The rare
     coordinated renumbering event remains deferred with automatic
     splitting.
-** Trust
+## Trust
   - Seniority = earliest date_joined among children; date_joined is recorded
     per child by its parent, and admins may keep or reset it on moves
     (decision 1).
@@ -86,10 +86,10 @@
   - Every balance mutation is signed + append-only + visible to all children;
     any child can exit/detach.
   - Failed parent replaced via foster parent from signed state commitments.
-** Accounts & Double-Entry
+## Accounts & Double-Entry
   - Each account is a single obligation with two views: the account an
-    internal node holds for a child is a *liability* of that node and an
-    *asset* of the child. Both sides mirror the same signed balance; any
+    internal node holds for a child is a **liability** of that node and an
+    **asset** of the child. Both sides mirror the same signed balance; any
     mismatch is detectable.
   - Ledger shape: an internal node holds at most 8 liability accounts, one per
     child node; a leaf node holds at most 8 accounts for its users; every
@@ -106,13 +106,13 @@
   - Issue/burn is the only exception: an admin increasing or decreasing an
     account posts against the node's own equity, so value enters or leaves the
     closed system only through signed issue/burn entries.
-** Settlement
+## Settlement
   - Cross-subtree payments settle at the least common ancestor (LCA) between
     prefunded settlement accounts - prefunded only, no overdraw (decision 5).
   - Periodic netting reconciles balances.
   - Value creation/destruction = signed issue/burn entries propagated with
     ledger commitments.
-** Accepted Risks (cannot be guaranteed in this model)
+## Accepted Risks (cannot be guaranteed in this model)
   - Payment-time double-spend prevention across subtrees (detectable at
     netting instead).
   - Defense against colluding parent + senior child.
@@ -125,15 +125,15 @@
   - In-flight messages to just-moved addresses may fail during manual
     topology rewires (v1; moved pointers are **rejected** - retry with fresh
     addresses discovered out of band; automatic splitting is deferred).
-** Anonymity
+## Anonymity
   - Transmit only: addresses, NodeIds, amounts, coarse timestamps,
     commitments.
   - Never transmit: names, free-text memos (E2E-encrypted to recipient leaf
     only if needed), full balances, IPs.
   - Accepted tradeoff: subtree-level pseudonymity, not transaction privacy.
 
-* Milestones (risk-sequenced)
-  1. *M0 - WASM spike* (DONE 2026-08-21): wasm-bindgen wrapper crate <-> Rust
+# Milestones (risk-sequenced)
+  1. **M0 - WASM spike** (DONE 2026-08-21): wasm-bindgen wrapper crate <-> Rust
      node message round-trip over relay, hosted on GitHub Pages. De-risks the
      biggest unknown first. Pin all versions.
      - Verified end-to-end: node relay ping/pong test, wasm compile + glue,
@@ -144,7 +144,7 @@
      - To finish: enable GitHub Pages -> "GitHub Actions" in repo settings
        (workflow in .github/workflows/pages.yml); then confirm in a real
        browser (web/README.md has the manual checklist).
-  2. *M1 - Topology & addressing* (DONE 2026-08-21): octal address scheme,
+  2. **M1 - Topology & addressing** (DONE 2026-08-21): octal address scheme,
      node identity/persistence, admin topology-editing primitives (create
      node; set/update parent & child links for nodes the admin controls).
      - OctAddr in proto: dotted one-digit-per-level addresses, root "0",
@@ -163,7 +163,7 @@
        it first joined; CLI attach-child --date-joined keeps a moved child's
        original date or resets to now when omitted.
      - 59 workspace tests green, including the relay ping/pong test.
-   3. *M2 - Ledger & settlement* (DONE 2026-09-10): append-only signed
+   3. **M2 - Ledger & settlement** (DONE 2026-09-10): append-only signed
       Merkle-committed ledgers, operator/ledger key separation, prefunded-only
       LCA settlement + netting, adversarial double-spend harness.
       - New pure, sync, wasm-safe crate `crates/ledger`: double-entry postings
@@ -197,7 +197,7 @@
       - Tests: 177 in `crates/ledger` (138 unit + 12 ledger + 9 netting +
         3 property + 15 settlement) and 27 node lib tests; workspace clippy
         clean. The relay ping/pong test still requires network.
-   4. *M3 - Messaging/routing protocol* (DONE 2026-09-10): ALPN framing,
+   4. **M3 - Messaging/routing protocol** (DONE 2026-09-10): ALPN framing,
       envelope (src, dst, msg_id, type, nonce, payload, hop_chain),
       longest-prefix routing, replay/ordering protection.
       - New pure, wasm-safe crate `crates/msg`: versioned `Envelope` with a
@@ -229,11 +229,11 @@
         check clean. Independently reviewed (routing/replay); the three
         network-reachable findings (decode amplification, unbounded node-id
         retention, retry poisoning) were fixed and re-verified.
-   5. *M4 - Control & web client* (PHASE 1 DONE 2026-09-10; USER-LIVE
+   5. **M4 - Control & web client** (PHASE 1 DONE 2026-09-10; USER-LIVE
       WIRING + BROWSER VALUE MESSAGING V1 DONE 2026-09-13; in progress):
       senior-child control flow, indirect multi-node control, Svelte PWA,
       join flow (parent approves -> leaf issues address). Onboarding is
-      invite-based so nodes stay undiscoverable; the location *suggestion*
+      invite-based so nodes stay undiscoverable; the location **suggestion**
       service is out of scope (an optional, independently hosted companion
       that only suggests an octal address from lat/lon or a map click).
       - New pure, wasm-safe crate `crates/control`: versioned signed control
@@ -408,7 +408,7 @@
         records `degraded` + a `settle-intermediate-degraded` audit line while
         still accepting the verified terminal `Applied` (the terminal proof
         remains the funds-correctness gate). Residuals: a colluding LCA+terminal
-        can still fabricate a self-consistent cascade only when the terminal *is*
+        can still fabricate a self-consistent cascade only when the terminal **is**
         the compromised payee leaf (whose `Descend` must still credit the payee
         user); a legit LCA ledger rotation makes the origin's persisted row stale
         and degrades the audit until re-attach; the audit is forensic-only and
@@ -449,7 +449,7 @@
         credited); control format 4 / settlement payload 3 / browser ledger
         payload 3 / ledger (entry) format 4 (node on-disk meta format 3) are hard
         breaks.
-  6. *M5 - Hardening*: exit rights, foster-parent recovery, compromise-path
+  6. **M5 - Hardening**: exit rights, foster-parent recovery, compromise-path
      docs, audit tooling, governance/regulatory surface (Hawala exposure is
      real - community question, not code).
      - Browser identity portability (increment 1, DONE `58f725e`): the browser
@@ -660,7 +660,7 @@
        therefore **leave (if needed) + invitation** - no grace clock, no health
        store, no `Recover` variant. What shipped instead is an out-of-band
        **stranded-claim evidence bundle** for a prospective new parent's
-       *discretionary* `prefund`/`fund`: `crates/control/src/claim.rs`
+       **discretionary** `prefund`/`fund`: `crates/control/src/claim.rs`
        (`STRANDED_CLAIM_VERSION` 1, domain `cawala-control/stranded-claim/v1`)
        defines a signed dated `StrandedClaim` plus
        `StrandedClaimBundle { version, child, child_operator, child_ledger,
@@ -776,7 +776,7 @@
        notice is now **terminal** (`should_requeue_notice`), so a rolled-back
        parent no longer redials a refusing child every 5 s; `Unreachable`/
        `TimedOut` stay retryable. A parent whose persisted epoch regresses (a
-       restored or rolled-back record) can only *degrade push promptness*: the
+       restored or rolled-back record) can only **degrade push promptness**: the
        generation-agnostic healing pull still applies the parent's current
        address and re-propagates, so any stall is bounded to one probe interval
        (pinned by `rolled_back_parent_stalls_child_until_pull_heals`). A browser
@@ -787,7 +787,7 @@
        (`address_epoch`, `parent.generation`), so old files load unchanged; no
        `CONTROL_FORMAT_VERSION`, `RebaseNotice`, `NodeSnapshot`/`ControlReply` or
        `LOCAL_STATE_VERSION` change, and no reply/DTO change. Residual: a stale
-       browser notice arriving only *after* a reload is theoretically possible and
+       browser notice arriving only **after** a reload is theoretically possible and
        is corrected by the parent's next push. Verified: node lib 214,
        `exit_rebase` 11, client 86, workspace tests, clippy and the wasm32 check
         all green.
@@ -843,7 +843,7 @@
         inner request, and a valid signature), workspace tests, clippy, and the
         wasm32 check.
 
-* Top Risks
+# Top Risks
   1. Iroh WASM maturity -> M0 spike before any other work.
   2. Cross-subtree double-spend/inflation -> prefunded LCA + Merkle ledgers +
      adversarial harness in M2.
@@ -861,7 +861,7 @@
   7. Scope creep (no DHTs/ZK/consensus) -> freeze v1: one credit message type,
      one ledger format, 8-entry routing tables.
 
-* Decisions (resolved 2026-08-21)
+# Decisions (resolved 2026-08-21)
   1. Seniority rule: the child with the earliest date_joined is the most
      senior (date_joined = when the child first joined the network, recorded
      by its parent). When children are moved/split, the new node's admin may
@@ -911,7 +911,7 @@
      `NodeId -> current address` resolution moved-pointers would have relied on
      (moved-pointers are rejected too - decision 8).
 
-* Next Phases - Unified Node Administration (planned 2026-10-02)
+# Next Phases - Unified Node Administration (planned 2026-10-02)
   Status: P1 delivered (client-only, 2026-10-02); P2-P6 not started. Goal: the
   browser console
   looks and functions identically whether the administered node is a leaf or an
@@ -920,17 +920,17 @@
   recon (`exp-1` UI branching, `exp-2` admin surface), design proposal
   (`des-4`), and architecture/phasing review (`ora-1`).
 
-** Boundary rule: the browser commands, the node executes
+## Boundary rule: the browser commands, the node executes
    The browser never holds a node operator key or a ledger key. A delegated
-   admin key (`K_admin`) authorizes *intent* only; the node re-signs with its
+   admin key (`K_admin`) authorizes **intent** only; the node re-signs with its
    own operator key and is the sole holder of the ledger key. This is the
    existing `AdminApproveJoin` pattern extended to topology/value ops. Browser
    operator-key custody is **rejected** (would let XSS forge ledger entries and
    violates "operator keys != ledger keys"). No browser-supplied field may ever
    be used as a ledger signature, operator key, posting, or ledger key.
 
-** Phase plan
-   - *P1 - Unified shell + node selector* (client-only, no wire change; uses
+## Phase plan
+   - **P1 - Unified shell + node selector** (client-only, no wire change; uses
      the existing `AdminQuery`). One layout for the selected administered node;
      sticky selector listing "This browser (self)" plus every granted node;
      node kind inferred from `AdminQuery` children (`internal` if any child is a
@@ -938,36 +938,36 @@
      `getChildren(nodeId)`/`getJoinRequests(nodeId)`; remove the `isLive` layout
      forks; fold the Settings admin-node list into the selector. Deliverable
      parity: shell, children, joins. Accounts/Activity full parity needs P3.
-   - *P2 - Scoped grants + signed bundle*. `AdminScope` set
+   - **P2 - Scoped grants + signed bundle**. `AdminScope` set
      `{joins, topology, value}`; v1 `admin` grants are interpreted as
      **joins-only** (never silently widened); truthful TTL enforced node-side;
      `cawala://admin?node=<id>&grant=<base64 SignedAdminGrant>` so the browser
      verifies the operator-signed grant instead of inventing its own TTL.
      `ADMIN_GRANT_VERSION` 2; browser `cawala.admin` v1 -> v2 with read-migration.
-   - *P3 - Read-only ledger view*. New `AdminLedgerQuery` ->
+   - **P3 - Read-only ledger view**. New `AdminLedgerQuery` ->
      `AdminLedgerSnapshot { node_id, height, ledger_id, accounts[], parent_balance,
      equity }`; inject an optional ledger handle into the control path; unified
      Accounts table for both kinds (leaf user accounts; internal child-node
      accounts + parent asset; derived equity `parent - sum(children)`).
      `CONTROL_FORMAT_VERSION` 5, `CONTROL_REPLY_VERSION` 3. Read-only.
-   - *P4 - Topology administration*. New `AdminDetachChild`, `AdminMoveChild`
+   - **P4 - Topology administration**. New `AdminDetachChild`, `AdminMoveChild`
      (same-parent re-slot), reusing the existing record mutations and queuing
      `DetachNotice`/`Rebase` exactly as the senior/self handlers do. Browser
      **create-child is deferred** (needs the child's operator+ledger pubkeys and
      a running process; provisioning stays invite/CLI). `AdminSetAddress`
      deferred (routing identity; not topology scope).
-   - *P5 - Value administration* (highest bar). New `AdminIssue`, `AdminBurn`;
+   - **P5 - Value administration** (highest bar). New `AdminIssue`, `AdminBurn`;
      add `LedgerService::burn` (the ledger crate already has `BurnRequest`/
      `verify_burn`; reuse unchanged, no entry-format bump). Stable client
      `request_id` + node-persisted dedupe map returning the prior
      `(seq, hash)`; per-request cap + rolling window budget + per-account
      ceiling configured operator-side; mandatory reason; fail-closed audit.
      This is the only phase with monetary blast radius.
-   - *P6 - Polish/optional*. Persisted node `role` (`#[serde(default)]`
+   - **P6 - Polish/optional**. Persisted node `role` (`#[serde(default)]`
      additive), grant-bundle QR, config/credit limits (no config model exists
      yet), non-senior routed topology, quorum/time-lock hardening.
 
-** P1 - delivered 2026-10-02 (client-only, no wire change)
+## P1 - delivered 2026-10-02 (client-only, no wire change)
    - Admin key store moved to `cawala.admin.v2` with read-migration from
      `cawala.admin.v1`: the seed survives, v1 grants read as `scopes: ['joins']`
      (never widened), a corrupt v2 payload falls back to the legacy key, and a
@@ -1001,7 +1001,7 @@
       nodeKind derivation, adminView selector model, identity bundle, parent
       liveness).
 
-** P2 - delivered 2026-10-02 (scoped grants + signed bundle; control stays v4, reply v2)
+## P2 - delivered 2026-10-02 (scoped grants + signed bundle; control stays v4, reply v2)
    - Control (`cawala-control`): `AdminScope` gained `Joins`/`Topology`/`Value`
      (append-only discriminants) and a fixed three-byte `AdminScopes` set
      (`joins`/`topology`/`value`, >=1 true, cannot represent legacy `Admin`);
@@ -1038,7 +1038,7 @@
      binary before minting v2; v1 rows and P1 browsers keep working,
      joins-only.
 
-** P3 - delivered 2026-10-02 (read-only ledger view; control 5, reply 3)
+## P3 - delivered 2026-10-02 (read-only ledger view; control 5, reply 3)
    - Control (`cawala-control`): `ControlRequest::AdminLedgerQuery`
      (discriminant 16, minted at control format 5; `required_scope -> Value`)
      and `ControlReply::AdminLedgerSnapshot` (discriminant 7, reply version 3)
@@ -1079,7 +1079,7 @@
      direct, operator-signed routed) with no independent Merkle/commitment
      proof; a `value` admin can see user balances.
 
-** P4 - delivered 2026-10-02 (delegated topology administration; control 6, reply 3)
+## P4 - delivered 2026-10-02 (delegated topology administration; control 6, reply 3)
    - Control (`cawala-control`): `AdminDetachChild { child }` and
      `AdminMoveChild { child, slot }` (no `new_parent`, so a cross-parent move is
      structurally inexpressible) as `ControlRequest` discriminants 17/18, with
@@ -1117,7 +1117,7 @@
      removed from the record, so it learns of the detach on its next
      interaction (the P2 retry sweep cannot help a detached target).
 
-** P5 - delivered 2026-10-02 (delegated value administration; control 7, reply 4)
+## P5 - delivered 2026-10-02 (delegated value administration; control 7, reply 4)
    - Control (`cawala-control`): `AdminIssue`/`AdminBurn` (discriminants 19/20)
      carry `AdminValueRequest { request_id: ValueRequestId, account, amount,
      reason }` with `required_scope -> Value`; `ControlReply::AdminValueApplied`
@@ -1160,7 +1160,7 @@
      time** (post-op for a fresh apply, current for a duplicate), not the
      original application's post-op balance.
 
-** P6 (focused) - delivered 2026-10-02 (web-only seed hardening)
+## P6 (focused) - delivered 2026-10-02 (web-only seed hardening)
    - Web-only; no Rust/control-format change and no `node-data` recreation.
    - **Required wrap**: a value-scoped key must be passphrase-wrapped before
      **any** value action (not opt-in). A plain value key is refused with a
@@ -1206,25 +1206,25 @@
      threat model). `AdminValuePolicyQuery`/format 8 was explicitly deferred in
      favour of zero-wire reject copy.
 
-** Authority and value-op requirements (essential)
-   - *Scope separation*: each admin request declares its required scope; grant
+## Authority and value-op requirements (essential)
+   - **Scope separation**: each admin request declares its required scope; grant
      management stays self-operator/CLI only (a delegated admin must never
      mutate `admins.json`, self-approve, or touch operator/ledger keys).
-   - *End-to-end idempotency* (essential for value): the control replay guard is
+   - **End-to-end idempotency** (essential for value): the control replay guard is
      keyed `(origin, controller, nonce)` and retries mint a fresh nonce, so it
      stops replay but not double-execution. A value request must carry a stable
      `request_id` and the node must persist `(controller, request_id) ->
      (seq, hash)`, returning the prior result on retry. Rebuild the map at open.
-   - *Value TTL*: <= 24 h recommended; short and explicit. Value scope reached
+   - **Value TTL**: <= 24 h recommended; short and explicit. Value scope reached
      only via an explicit `control admin grant --scope value`.
-   - *Amount bounds*: the ledger has no global supply anchor and `fund` has no
+   - **Amount bounds**: the ledger has no global supply anchor and `fund` has no
      ledger-level replay guard, so the control plane is the only cap.
-   - *Audit*: additive `control_audit.jsonl` value events with actor pubkey,
+   - **Audit**: additive `control_audit.jsonl` value events with actor pubkey,
      scope, account, amount, `request_id`, entry `seq`/`hash`, outcome.
    - Value-scoped seed at rest should be encrypted (or re-entered per session);
      a value key in plaintext localStorage is an XSS-away mint.
 
-** Administered-node + node-kind model
+## Administered-node + node-kind model
    - Introduce one browser-side `AdministeredNode { nodeId, address, label,
      kind, scopes, grantExpiresAt, status, lastSeenAt, childrenCount }`; every
      admin page reads from it instead of the implicit first-grant
@@ -1237,7 +1237,7 @@
      live `AdminQuery` probe for active/revoked/unreachable + kind (P1/P2) ->
      signed grant bundle (P2).
 
-** Version / format impacts
+## Version / format impacts
    - `CONTROL_FORMAT_VERSION` 4 -> 5 (mint 5; accept 4+5; add a
      v5-variant gate mirroring the v4 gate). `CONTROL_REPLY_VERSION` 2 -> 3.
      `ADMIN_GRANT_VERSION` 1 -> 2 (store dual-accepts; v1 = joins-only).
@@ -1250,7 +1250,7 @@
      consistent with the existing control-negotiation deferral). Rebuild the
      wasm bundle and recreate `node-data` on the format bump.
 
-** Verification per phase
+## Verification per phase
    - P1: `web npm test` (adminKeys v2 migration, selection, kind derivation) +
      `npx vite build`; manual browser checklist.
    - P3-P5: extend `crates/node/tests/control_admin.rs` (per-scope allow/deny,
@@ -1266,7 +1266,7 @@
    - Not hermetic: N0 relay/address lookup, real wasm glue, Web Locks,
      localStorage quota/private mode, clock skew, XSS resilience.
 
-** Open decisions (defaults chosen; revisit before each phase)
+## Open decisions (defaults chosen; revisit before each phase)
    1. Scope taxonomy: `joins` -> `topology` -> `value`; `value` implies read;
       `joins` grants pending-join read only. (chosen)
    2. v1 admin grant = joins-only, never silently widened. (chosen)

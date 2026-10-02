@@ -1,63 +1,63 @@
-* Project Overview
-  *Cawala* is a modernized Hawala alternative. Value is transmitted, created and
+# Project Overview
+  **Cawala** is a modernized Hawala alternative. Value is transmitted, created and
    destroyed by sending messages to other sovereign nodes that are organized
    into a hierarchical network based primarily on geographical region.
 
-* Terminology
-  Cawala separates a node's *identity* from its *location*. "Address" is
+# Terminology
+  Cawala separates a node's **identity** from its **location**. "Address" is
   overloaded across the stack, so it is always qualified when it matters.
-  - *Node*: a running `cawala-node` process with its own data directory,
+  - **Node**: a running `cawala-node` process with its own data directory,
     identity key, topology links, and ledger.
-  - *User*: a leaf account holder (a browser client); a `ChildKind::User`
+  - **User**: a leaf account holder (a browser client); a `ChildKind::User`
     with an operator key but no ledger of its own.
-  - *EndpointId* (Iroh): the node's Ed25519 public identity key rendered as a
+  - **EndpointId** (Iroh): the node's Ed25519 public identity key rendered as a
     string. Stable and immutable; used to authenticate the peer.
-  - *NodeId*: Cawala/ledger name for that same identity string (an
+  - **NodeId**: Cawala/ledger name for that same identity string (an
     EndpointId). The key in the peer registry (`PeerKeys.node_id`).
-  - *EndpointAddr* (Iroh): how to dial a peer *now* - an EndpointId plus
+  - **EndpointAddr** (Iroh): how to dial a peer **now** - an EndpointId plus
     transport addresses (relay URL and/or direct IP:port). Changes over time;
     it is not an identity.
-  - *Octal address* (`OctAddr`): the node's position in the tree - dotted
+  - **Octal address** (`OctAddr`): the node's position in the tree - dotted
     octal digits, e.g. `0.3.5.2`; root is `0`; one digit per level. Used for
     routing, and changes when a node is moved or re-slotted.
-  - *Slot*: the last octal digit of an address; a node's position among its
+  - **Slot**: the last octal digit of an address; a node's position among its
     parent's children (`0..=7`).
-  - *Depth*: number of digits (tree levels). The root has depth 1; there is no
+  - **Depth**: number of digits (tree levels). The root has depth 1; there is no
     hard depth cap.
-  - *Parent / child*: topology links. A node holds one parent link and up to 8
+  - **Parent / child**: topology links. A node holds one parent link and up to 8
     child links; users are always leaves.
-  - *LCA*: least common ancestor - the longest shared address prefix, and the
+  - **LCA**: least common ancestor - the longest shared address prefix, and the
     settlement point for cross-subtree payments.
-  - *Envelope*: the M3 wire message - `src: PeerRef { node, addr }`,
+  - **Envelope**: the M3 wire message - `src: PeerRef { node, addr }`,
     `dst: OctAddr`, `msg_id`, `msg_type`, `nonce`, `ttl`, `payload`,
     `hop_chain`.
-  - *Operator key*: Ed25519 key that authorises control and intent; distinct
+  - **Operator key**: Ed25519 key that authorises control and intent; distinct
     from the ledger key.
-  - *Ledger key*: Ed25519 key that signs ledger entries and commitments; it
+  - **Ledger key**: Ed25519 key that signs ledger entries and commitments; it
     never leaves the node.
-  - *Control message*: an M4 operator-signed request (join, topology edit,
+  - **Control message**: an M4 operator-signed request (join, topology edit,
     query) carried over the `cawala/control/0` ALPN.
-  - *Address lookup* (Iroh discovery): given only an EndpointId, Iroh
+  - **Address lookup** (Iroh discovery): given only an EndpointId, Iroh
     resolves it to an EndpointAddr through the configured lookup service
     (pkarr/DNS under the N0 preset). An invite's optional `relay`/`ip`
     transport hints supply the address directly, so no lookup service is
     needed.
-  - *Invite*: out-of-band onboarding code -
+  - **Invite**: out-of-band onboarding code -
     `cawala://join?parent=<EndpointId>&op=<operator>[&slot&exp&label][&relay&ip]`.
     `relay`/`ip` are transport hints that let the joiner dial the parent
     without an address-lookup service.
-  - *Location service*: optional, non-authoritative hint service (lat/lon or
+  - **Location service**: optional, non-authoritative hint service (lat/lon or
     map click -> suggested octal address). Out of scope for M4; it never
     issues the final address.
 
   Protocol ALPNs: `cawala/ping/0` (M0 health check), `cawala/msg/0` (M3
   envelope routing), `cawala/control/0` (M4 direct signed control).
 
-  Key rule: *identity is immutable; address is mutable.* Both travel together
+  Key rule: **identity is immutable; address is mutable.** Both travel together
   in an M3 envelope (`node` = EndpointId, `addr` = octal address).
 
-* Goals and Non-Goals
-** Goals
+# Goals and Non-Goals
+## Goals
   - Use decentralized technology (Iroh) to allow users to easily deploy their
     own nodes and to allow web clients and nodes to communicate securely.
   - Mitigate risks by only communicating with a small number of connected nodes
@@ -71,14 +71,14 @@
   - Users will interact with node primarily through web clients that has Iroh
     WASM modules.
   - Nodes will be regular Iroh nodes written in the rust language.
-** Non-Goals
+## Non-Goals
   - Cawala nodes do not provide Zero Trust computing and as such each node can
     see data that it holds.
   - Cawala doesn't support running nodes on phones.
-* Target Users
+# Target Users
   Cawala replaces the private for-profit banking system with an community-owned
   alternative. Use this software if you want to be your own bank.
-* Features / Functional Requirements
+# Features / Functional Requirements
   - deploy a web client with WASM Iroh module as a static PWA on github pages
   - nodes are built using the Rust language and Iroh.
   - project is open-source MIT License.
@@ -96,7 +96,7 @@
   - a separate SQLITE database can be queried that can suggest the appropriate
     octal address for a given user's location.
   - Accounts are double-entry: the account a node holds for a child is a
-    *liability* of that node and simultaneously an *asset* of the child - one
+    **liability** of that node and simultaneously an **asset** of the child - one
     signed obligation with two viewpoints, mirrored on both ledgers.
   - An internal node holds up to 8 accounts, one for each of its child nodes; a
     leaf node holds up to 8 accounts for its users. Every non-root node also
@@ -107,9 +107,9 @@
     node's equity.
   - A node administrator can arbitrarily increase or decrease the value of an
     account (an issue/burn posted against the node's equity).
-* Constraints
+# Constraints
   - tech stack is Iroh, Rust, Typescript, Virtual Private Servers
-* Open Questions
+# Open Questions
   - What javascript frontend framework should I use (Vue, Svelt, etc).
   - How do new users join the network?
   - How do new users query the SQLITE database to get their ideal octal address?

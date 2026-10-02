@@ -1,7 +1,7 @@
 //! Periodic netting and double-spend reconciliation (Phase D).
 //!
 //! Payment-time double-spend prevention across subtrees is an accepted risk in
-//! Cawala's model (see `PLAN.org`): a registered but dishonest routing node can
+//! Cawala's model (see `PLAN.md`): a registered but dishonest routing node can
 //! sign a locally-valid hop that routes a payment somewhere other than the
 //! order's payee, and the same authorisation can be replayed onto more than one
 //! cascade. Neither is caught by [`crate::log::Ledger::append`] or
