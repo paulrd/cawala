@@ -1,23 +1,35 @@
 <script>
   import Card from '../shared/Card.svelte';
+  import StatCard from '../shared/StatCard.svelte';
   import Address from '../shared/Address.svelte';
   import EndpointId from '../shared/EndpointId.svelte';
   import Badge from '../shared/Badge.svelte';
   import Balance from '../shared/Balance.svelte';
-  import DataTable from '../shared/DataTable.svelte';
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
-  import EmptyState from '../shared/EmptyState.svelte';
   import ErrorState from '../shared/ErrorState.svelte';
-  import { clientState, ledgerState, nodeState, loadingState, errorState, apiCapabilities, showToast } from '../../lib/stores.svelte.js';
-  import { getChildren, getAccounts, getJoinRequests, isMockMode, requestBalance, getLastControlEvent } from '../../lib/api.js';
+  import ChildrenTable from '../shared/ChildrenTable.svelte';
+  import {
+    clientState,
+    ledgerState,
+    nodeState,
+    loadingState,
+    errorState,
+    apiCapabilities,
+    administeredNode,
+    targetEpoch,
+    showToast,
+  } from '../../lib/stores.svelte.js';
+  import { getChildren, getAccounts, getJoinRequests, requestBalance, getLastControlEvent } from '../../lib/api.js';
   import { ROUTES, CONTROL_EVENT } from '../../lib/constants.js';
   import { navigate } from '../../lib/router.svelte.js';
-  import { formatDate, timeAgo } from '../../lib/utils.js';
+  import { timeAgo } from '../../lib/utils.js';
 
   let loaded = $state(false);
+  let view = administeredNode;
 
   $effect(() => {
-    if (!loaded) loadData();
+    void targetEpoch.value;
+    void loadData();
   });
 
   async function loadData() {
@@ -49,22 +61,38 @@
     }
   }
 
+  let totalAssets = $derived(
+    nodeState.accounts
+      .filter((a) => a.type === 'asset')
+      .reduce((sum, a) => sum + a.balance, 0),
+  );
   let totalLiability = $derived(
     nodeState.accounts
       .filter((a) => a.type === 'liability')
       .reduce((sum, a) => sum + a.balance, 0),
   );
+  // Match AccountsPage: use an explicit equity row when the node publishes one,
+  // else derive assets - liabilities (the no-Equity ledger model). A `?? 0`
+  // fallback here would misreport a leaf's balance as 0 equity.
   let equity = $derived(
-    nodeState.accounts.find((a) => a.type === 'equity')?.balance ?? 0,
+    nodeState.accounts.find((a) => a.type === 'equity')?.balance ??
+      totalAssets - totalLiability,
   );
   let pendingJoins = $derived(
     nodeState.joinRequests.filter((r) => r.status === 'pending').length,
   );
+  let hasAccounting = $derived(nodeState.accounts.length > 0);
+  let balanceReady = $derived(ledgerState.balance != null);
+  let balanceFresh = $derived(
+    ledgerState.verifiedAt != null && (Date.now() - ledgerState.verifiedAt) < 30000
+  );
+  let balanceStale = $derived(
+    ledgerState.verifiedAt != null && (Date.now() - ledgerState.verifiedAt) >= 30000
+  );
 
-  let isLive = $derived(!isMockMode());
-
-  // Show join CTA when live and not yet joined (no address assigned).
-  let showJoinCta = $derived(isLive && clientState.address == null);
+  // Show the join CTA whenever this browser has no address yet (in mock mode
+  // an address always exists, so the same condition never fires there).
+  let showJoinCta = $derived(clientState.address == null);
 
   // Detect the "detached" event from the control drain so the Dashboard can
   // show "Left the network" instead of the generic "not connected" copy.
@@ -75,7 +103,7 @@
   let _detachedPoller = null;
 
   $effect(() => {
-    if (showJoinCta && isLive) {
+    if (showJoinCta) {
       _startDetachedPoller();
     } else {
       _stopDetachedPoller();
@@ -106,38 +134,10 @@
     }
   }
 
-  // Live mode: balance availability
-  let balanceReady = $derived(isLive && ledgerState.balance != null);
-  let balanceFresh = $derived(
-    ledgerState.verifiedAt != null && (Date.now() - ledgerState.verifiedAt) < 30000
-  );
-  let balanceStale = $derived(
-    ledgerState.verifiedAt != null && (Date.now() - ledgerState.verifiedAt) >= 30000
-  );
-  let balanceUnverified = $derived(ledgerState.balance == null);
-
   async function handleBalanceRequest() {
     await requestBalance();
     showToast('Balance refresh requested', 'info', 2000);
   }
-
-  const childColumns = [
-    { key: 'address', label: 'Address', mono: true, sortable: true },
-    { key: 'balance', label: 'Balance', align: 'right', mono: true, sortable: true,
-      render: (v) => {
-        if (v == null) return '<span style="color:var(--muted)">&mdash;</span>';
-        return `<span style="color: ${v > 0 ? 'var(--ok)' : v < 0 ? 'var(--danger)' : 'var(--muted)'}">${v.toLocaleString()}</span>`;
-      } },
-    { key: 'seniority', label: 'Joined', sortable: true,
-      render: (v) => `<span class="text-sm">${formatDate(v)}</span>` },
-    { key: 'online', label: 'Status',
-      render: (v, row) => {
-        const label = isLive && !v ? 'Unknown' : v ? 'Online' : 'Offline';
-        const color = v ? 'var(--ok)' : 'var(--muted)';
-        const bg = v ? 'var(--ok-dim)' : 'var(--bg-hover)';
-        return `<span style="display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:600;background:${bg};color:${color}">${label}</span>`;
-      } },
-  ];
 </script>
 
 <div class="dashboard">
@@ -146,241 +146,180 @@
   {:else if errorState.children}
     <ErrorState message="Failed to load node data" onRetry={loadData} />
   {:else}
-    <!-- Identity persistence warning (subtle) -->
-    {#if isLive && !apiCapabilities.identityPersistent}
+    <!-- Identity persistence warning (live mode only: nothing to lose in mock) -->
+    {#if !apiCapabilities.mock && !apiCapabilities.identityPersistent}
       <div class="persistence-warning">
         <Badge variant="warn" label="Session only" />
         <span class="text-sm muted">Identity won't persist on this device. If you close this tab, your identity will be lost.</span>
       </div>
     {/if}
 
-    {#if isLive}
-      <!-- ── Live mode: user-leaf dashboard ──────────── -->
-
-      {#if showJoinCta}
-        <div class="join-cta">
-          <div class="join-cta-body">
-            {#if hasLeft}
-              <h3 class="join-cta-title">Not connected to a network</h3>
-              <p class="join-cta-text">You have left your previous network. You can join a new one or re-join using a fresh invitation from a node operator.</p>
-            {:else}
-              <h3 class="join-cta-title">Join the network</h3>
-              <p class="join-cta-text">You are not connected to a node yet. Paste an invite from a node operator to join.</p>
-            {/if}
-            <button
-              type="button"
-              class="btn btn--primary"
-              onclick={() => navigate(ROUTES.JOIN_FLOW)}
-            >
-              Go to Join
-            </button>
-          </div>
+    {#if showJoinCta}
+      <div class="join-cta">
+        <div class="join-cta-body">
+          {#if hasLeft}
+            <h3 class="join-cta-title">Not connected to a network</h3>
+            <p class="join-cta-text">You have left your previous network. You can join a new one or re-join using a fresh invitation from a node operator.</p>
+          {:else}
+            <h3 class="join-cta-title">Join the network</h3>
+            <p class="join-cta-text">You are not connected to a node yet. Paste an invite from a node operator to join.</p>
+          {/if}
+          <button
+            type="button"
+            class="btn btn--primary"
+            onclick={() => navigate(ROUTES.JOIN_FLOW)}
+          >
+            Go to Join
+          </button>
         </div>
-      {/if}
+      </div>
+    {/if}
 
-      <div class="summary-grid">
-        <Card title="My Balance">
-          <div class="summary-value">
-            {#if balanceReady}
-              <Balance amount={ledgerState.balance} size="lg" showSign={false} />
-            {:else}
-              <span class="muted">&mdash;</span>
-            {/if}
-          </div>
-          <div class="summary-meta">
-            {#if balanceReady}
-              <div class="meta-row">
-                {#if balanceFresh}
-                  <Badge variant="ok" label="Verified" />
-                {:else if balanceStale}
-                  <Badge variant="warn" label="Stale — re-verifying" />
-                {/if}
-                {#if ledgerState.height != null}
-                  <span class="text-sm muted">Height {ledgerState.height}</span>
-                {/if}
-              </div>
-              {#if ledgerState.verifiedAt}
-                <span class="text-xs muted">Last verified: {timeAgo(new Date(ledgerState.verifiedAt))}</span>
+    <!-- ── One summary grid for every target ─────────────── -->
+    <div class="summary-grid">
+      <StatCard title="Balance">
+        {#if balanceReady}
+          <Balance amount={ledgerState.balance} size="lg" showSign={false} />
+        {:else if hasAccounting}
+          <Balance amount={equity} size="lg" showSign={false} />
+        {:else}
+          <span class="muted">&mdash;</span>
+        {/if}
+
+        {#snippet meta()}
+          {#if balanceReady}
+            <div class="meta-row">
+              {#if balanceFresh}
+                <Badge variant="ok" label="Verified" />
+              {:else if balanceStale}
+                <Badge variant="warn" label="Stale — re-verifying" />
               {/if}
-              <button
-                type="button"
-                class="btn btn--ghost btn--sm"
-                onclick={handleBalanceRequest}
-              >
-                Refresh balance
-              </button>
-            {:else}
-              <span class="text-sm muted">Balance not yet verified. Waiting for a receipt from your leaf.</span>
-              <button
-                type="button"
-                class="btn btn--ghost btn--sm"
-                onclick={handleBalanceRequest}
-              >
-                Request balance
-              </button>
+              {#if ledgerState.height != null}
+                <span class="text-sm muted">Height {ledgerState.height}</span>
+              {/if}
+            </div>
+            {#if ledgerState.verifiedAt}
+              <span class="text-xs muted">Last verified: {timeAgo(new Date(ledgerState.verifiedAt))}</span>
             {/if}
-          </div>
-        </Card>
+            <button type="button" class="btn btn--ghost btn--sm" onclick={handleBalanceRequest}>
+              Refresh balance
+            </button>
+          {:else if hasAccounting}
+            <span class="text-sm muted">Node equity (assets &minus; liabilities)</span>
+          {:else if apiCapabilities.mock}
+            <span class="text-sm muted">Mock mode keeps no ledger balance.</span>
+          {:else}
+            <span class="text-sm muted">Balance not yet verified. Waiting for a receipt from your leaf.</span>
+            <button type="button" class="btn btn--ghost btn--sm" onclick={handleBalanceRequest}>
+              Request balance
+            </button>
+          {/if}
+        {/snippet}
+      </StatCard>
 
-        <Card title="My Address">
-          <div class="summary-value">
-            <Address address={clientState.address} size="lg" />
-          </div>
-          <div class="summary-meta">
-            <EndpointId id={clientState.endpointId} />
-          </div>
-        </Card>
+      <StatCard title="Address">
+        <Address address={clientState.address} size="lg" />
 
-        <Card title="Pending">
-          <div class="summary-value">
-            <span class="children-count">{ledgerState.pending}</span>
-          </div>
-          <div class="summary-meta muted text-sm">
+        {#snippet meta()}
+          <EndpointId id={clientState.endpointId} />
+        {/snippet}
+      </StatCard>
+
+      <StatCard title="Pending">
+        <span class="children-count">{ledgerState.pending}</span>
+
+        {#snippet meta()}
+          <span class="text-sm muted">
             {#if ledgerState.pending > 0}
               Orders awaiting confirmation
             {:else}
               No pending orders
             {/if}
-          </div>
-        </Card>
+          </span>
+        {/snippet}
+      </StatCard>
 
-        <Card title="Children">
+      <StatCard title="Children">
+        <span class="children-count">{nodeState.children.length}<span class="children-max">/8</span></span>
+
+        {#snippet meta()}
+          {#if pendingJoins > 0}
+            <button type="button" class="link-btn" onclick={() => navigate(ROUTES.JOINS)}>
+              {pendingJoins} pending join{pendingJoins !== 1 ? 's' : ''}
+            </button>
+          {:else}
+            <span class="text-sm muted">No pending joins</span>
+          {/if}
+        {/snippet}
+      </StatCard>
+    </div>
+
+    <!-- Quick actions -->
+    <div class="quick-actions">
+      <button
+        type="button"
+        class="btn btn--primary"
+        onclick={() => navigate(ROUTES.MY_ACCOUNT)}
+      >
+        Go to My Account
+      </button>
+      <button
+        type="button"
+        class="btn btn--ghost"
+        onclick={() => navigate(ROUTES.ACTIVITY)}
+      >
+        View Activity
+      </button>
+    </div>
+
+    <Card title="Children">
+      {#snippet actions()}
+        <button
+          type="button"
+          class="btn btn--ghost btn--sm"
+          onclick={loadData}
+          disabled={loadingState.children}
+        >
+          {loadingState.children ? 'Loading…' : 'Refresh'}
+        </button>
+      {/snippet}
+      <ChildrenTable
+        rows={nodeState.children}
+        emptyTitle="No children yet"
+        emptyMessage={view.isSelf
+          ? 'This node has no children in its local topology snapshot.'
+          : 'The administered node reports no children in its topology snapshot.'}
+        actionLabel={view.isSelf ? 'View Join Requests' : ''}
+        onAction={view.isSelf ? () => navigate(ROUTES.JOINS) : undefined}
+      />
+    </Card>
+
+    <!-- Node accounting: real figures when the node shares them, honest text otherwise -->
+    <Card title="Node Accounting" compact>
+      {#if hasAccounting}
+        <div class="summary-grid summary-grid--accounting">
           <div class="summary-value">
-            <span class="children-count">{nodeState.children.length}<span class="children-max">/8</span></span>
+            <Balance amount={equity} size="lg" />
           </div>
-          <div class="summary-meta muted text-sm">
-            {#if pendingJoins > 0}
-              <button type="button" class="link-btn" onclick={() => navigate(ROUTES.JOINS)}>
-                {pendingJoins} pending join{pendingJoins !== 1 ? 's' : ''}
-              </button>
-            {:else if isLive}
-              Pending joins not available in the web client
-            {:else}
-              No pending joins
-            {/if}
+          <div class="summary-meta muted text-sm">Node equity (assets &minus; liabilities)</div>
+          <div class="summary-value">
+            <Balance amount={totalLiability} size="lg" />
           </div>
-        </Card>
-      </div>
-
-      <!-- Quick actions -->
-      <div class="quick-actions">
-        <button
-          type="button"
-          class="btn btn--primary"
-          onclick={() => navigate(ROUTES.MY_ACCOUNT)}
-        >
-          Go to My Account
-        </button>
-        <button
-          type="button"
-          class="btn btn--ghost"
-          onclick={() => navigate(ROUTES.ACTIVITY)}
-        >
-          View Activity
-        </button>
-      </div>
-
-      <Card title="Children">
-        {#if nodeState.children.length === 0}
-          <EmptyState
-            title="No children yet"
-            message="This node has no children in its local topology snapshot."
-          />
-        {:else}
-          <DataTable
-            columns={childColumns}
-            rows={nodeState.children}
-            emptyMessage="No children"
-          />
-        {/if}
-      </Card>
-
-      <!-- Node accounting info (collapsed) -->
-      <Card title="Node Accounting" compact>
+          <div class="summary-meta muted text-sm">Owed to children</div>
+        </div>
+      {:else}
         <p class="text-sm muted">
-          The node accounting equation (assets &minus; liabilities = equity) applies to node operators. As a leaf user, your balance is managed by your parent node and shown above.
+          The node accounting equation (assets &minus; liabilities = equity) applies to node
+          operators. As a leaf user your balance comes from your parent node and is shown above.
+          {#if !view.isSelf}
+            Balances stay with the node operator: this console reads topology and joins for an
+            administered node, never its ledger.
+          {/if}
         </p>
-      </Card>
+      {/if}
+    </Card>
 
-    {:else}
-      <!-- ── Mock mode: original dashboard ───────────── -->
-      <div class="summary-grid">
-        <Card title="Node Address">
-          <div class="summary-value">
-            <Address address={clientState.address} size="lg" />
-          </div>
-          <div class="summary-meta">
-            <EndpointId id={clientState.endpointId} />
-          </div>
-        </Card>
-
-        <Card title="Equity">
-          <div class="summary-value">
-            {#if nodeState.accounts.length === 0}
-              <span class="muted">&mdash;</span>
-            {:else}
-              <Balance amount={equity} size="lg" />
-            {/if}
-          </div>
-          <div class="summary-meta muted text-sm">
-            {#if nodeState.accounts.length === 0}
-              No accounting data from this node
-            {:else}
-              Node equity (assets &minus; liabilities)
-            {/if}
-          </div>
-        </Card>
-
-        <Card title="Children">
-          <div class="summary-value">
-            <span class="children-count">{nodeState.children.length}<span class="children-max">/8</span></span>
-          </div>
-          <div class="summary-meta muted text-sm">
-            {#if pendingJoins > 0}
-              <button type="button" class="link-btn" onclick={() => navigate(ROUTES.JOINS)}>
-                {pendingJoins} pending join{pendingJoins !== 1 ? 's' : ''}
-              </button>
-            {:else}
-              No pending joins
-            {/if}
-          </div>
-        </Card>
-
-        <Card title="Total Liability">
-          <div class="summary-value">
-            {#if nodeState.accounts.length === 0}
-              <span class="muted">&mdash;</span>
-            {:else}
-              <Balance amount={totalLiability} size="lg" />
-            {/if}
-          </div>
-          <div class="summary-meta muted text-sm">
-            {#if nodeState.accounts.length === 0}
-              No accounting data from this node
-            {:else}
-              Owed to children
-            {/if}
-          </div>
-        </Card>
-      </div>
-
-      <Card title="Children">
-        {#if nodeState.children.length === 0}
-          <EmptyState
-            title="No children yet"
-            message="Create a child node or approve a pending join request."
-            actionLabel="View Join Requests"
-            onAction={() => navigate(ROUTES.JOINS)}
-          />
-        {:else}
-          <DataTable
-            columns={childColumns}
-            rows={nodeState.children}
-            emptyMessage="No children"
-          />
-        {/if}
-      </Card>
-
+    {#if apiCapabilities.mock}
       <div class="mock-banner">
         <Badge variant="info" label="Mock mode" />
         <span>Showing sample data. Connect a node for live data.</span>
@@ -399,6 +338,10 @@
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
     gap: var(--sp-4);
+  }
+  .summary-grid--accounting {
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    align-items: end;
   }
   .summary-value {
     font-size: var(--text-xl);
@@ -497,6 +440,10 @@
     cursor: pointer;
     transition: background var(--duration-fast) var(--ease);
   }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
   .btn--primary {
     background: var(--accent);
     color: var(--fg);
@@ -509,7 +456,7 @@
     color: var(--accent);
     border: 1px solid var(--border);
   }
-  .btn--ghost:hover {
+  .btn--ghost:hover:not(:disabled) {
     background: var(--bg-hover);
   }
   .btn--sm {

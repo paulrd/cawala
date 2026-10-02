@@ -27,8 +27,12 @@ const {
   listAdminNodes,
   findAdminNode,
   activeAdminNode,
+  getSelectedAdminNode,
+  selectedNodeId,
+  selectAdminNode,
   adminSeedBytes,
   addAdminEntry,
+  updateLastSeen,
   removeAdminNode,
   clearAllAdminEntries,
 } = await import('../src/lib/adminKeys.js');
@@ -41,13 +45,25 @@ const SEED_A = 'c3'.repeat(32);
 const SEED_B = 'd4'.repeat(32);
 const PUB_A = 'e5'.repeat(32);
 const PUB_B = 'f6'.repeat(32);
-const ADMIN_KEY = 'cawala.admin.v1';
+const NODE_C = 'ab'.repeat(32);
+const SEED_C = 'cd'.repeat(32);
+const PUB_C = 'ef'.repeat(32);
+const NODE_D = '12'.repeat(32);
+const SEED_D = '34'.repeat(32);
+const PUB_D = '56'.repeat(32);
+const ADMIN_KEY = 'cawala.admin.v2';   // current store
+const LEGACY_KEY = 'cawala.admin.v1';  // pre-scoped store, migrated on read
 
 function reset() {
   memory.clear();
 }
 
-function entry(nodeId, seedHex, pubHex, { grantedAt, expiresAt, label = null, nodeAddr = null } = {}) {
+function entry(
+  nodeId,
+  seedHex,
+  pubHex,
+  { grantedAt, expiresAt, label = null, nodeAddr = null, scopes = null } = {},
+) {
   return {
     nodeId,
     adminSeedHex: seedHex,
@@ -56,6 +72,8 @@ function entry(nodeId, seedHex, pubHex, { grantedAt, expiresAt, label = null, no
     expiresAt,
     label,
     nodeAddr,
+    // `null` = "not stated" -> the store falls back to joins-only.
+    scopes,
   };
 }
 
@@ -78,10 +96,15 @@ test('add/load round-trip (seed-free view)', () => {
     nodeId: NODE_A,
     adminPubHex: PUB_A,
     scope: 'admin',
+    scopes: ['joins'],
     grantedAt: now,
     expiresAt: now + 1000,
     label: 'parent A',
     nodeAddr: null,
+    lastSeenStatus: null,
+    lastSeenKind: null,
+    lastSeenAddress: null,
+    lastSeenAt: null,
   });
 
   const loaded = loadAdminEntries();
@@ -159,27 +182,62 @@ test('invalid hex / lifetime is rejected', () => {
   );
 });
 
-test('activeAdminNode returns active entries and skips expired ones', () => {
+test('the selection is explicit: activeAdminNode never falls back to another grant', () => {
   reset();
-  const now = 1_700_000_000_000;
-  addAdminEntry(entry(NODE_B, SEED_B, PUB_B, { grantedAt: now - 10_000, expiresAt: now - 1 }));
+  const now = Date.now();
+  addAdminEntry(entry(NODE_B, SEED_B, PUB_B, { grantedAt: now - 10_000, expiresAt: now + 60_000 }));
   addAdminEntry(entry(NODE_A, SEED_A, PUB_A, { grantedAt: now - 1000, expiresAt: now + 1000 }));
 
-  const active = activeAdminNode(now);
-  assert.equal(active.nodeId, NODE_A);
-  assert.equal(JSON.stringify(active).includes(SEED_A), false);
+  // The first stored grant becomes the selection once, and only then.
+  assert.equal(selectedNodeId(), NODE_B);
+  assert.equal(activeAdminNode(now).nodeId, NODE_B);
+  assert.equal(JSON.stringify(activeAdminNode(now)).includes(SEED_B), false);
 
-  // Once NODE_A expires, there is no active admin.
-  assert.equal(activeAdminNode(now + 2000), null);
+  // `self` is a real selection: no implicit "use some other valid grant".
+  selectAdminNode('self');
+  assert.equal(selectedNodeId(), 'self');
+  assert.equal(activeAdminNode(now), null);
+  assert.equal(getSelectedAdminNode(now), null);
+  assert.equal(activeAdminNode(now + 60_000), null);
+
+  // Selecting an expired grant yields null rather than silently re-picking one.
+  addAdminEntry(entry(NODE_C, SEED_C, PUB_C, { grantedAt: now - 10_000, expiresAt: now - 1 }));
+  selectAdminNode(NODE_C);
+  assert.equal(selectedNodeId(), NODE_C);
+  assert.equal(activeAdminNode(now), null);
+  assert.ok(getSelectedAdminNode(now), 'the expired grant is still listed, just inactive');
 
   const list = listAdminNodes(now);
   assert.deepEqual(
-    list.map((e) => ({ nodeId: e.nodeId, active: e.active })),
+    list.map((e) => ({ nodeId: e.nodeId, active: e.active, selected: e.selected })),
     [
-      { nodeId: NODE_B, active: false },
-      { nodeId: NODE_A, active: true },
+      { nodeId: NODE_B, active: true, selected: false },
+      { nodeId: NODE_A, active: true, selected: false },
+      { nodeId: NODE_C, active: false, selected: true },
     ],
   );
+});
+
+test('selectAdminNode validates its argument and persists the choice', () => {
+  reset();
+  const now = Date.now();
+  addAdminEntry(entry(NODE_A, SEED_A, PUB_A, { grantedAt: now, expiresAt: now + 1000 }));
+
+  assert.equal(selectAdminNode('self'), 'self');
+  assert.equal(selectedNodeId(), 'self');
+
+  assert.equal(selectAdminNode(NODE_A.toUpperCase()), NODE_A.toLowerCase());
+  assert.equal(selectedNodeId(), NODE_A);
+  // Persisted: a fresh read sees the same selection.
+  assert.equal(selectedNodeId(), NODE_A);
+  assert.equal(activeAdminNode(now).nodeId, NODE_A);
+
+  assert.throws(() => selectAdminNode('not-a-node-id'), /64 hex characters/);
+  assert.throws(
+    () => selectAdminNode('b'.repeat(64)),
+    /no stored admin key for that node id/,
+  );
+  assert.equal(selectedNodeId(), NODE_A, 'a rejected selection leaves the old one in place');
 });
 
 test('findAdminNode matches case-insensitively and is seed-free', () => {
@@ -257,10 +315,10 @@ test('invalid nodeAddr values are rejected', () => {
 
 test('pre-existing stored entries without nodeAddr read back as null', () => {
   reset();
-  const now = 1_700_000_000_000;
+  const now = Date.now();
   // Simulate a v1 record written before nodeAddr existed (no key at all).
   memory.setItem(
-    ADMIN_KEY,
+    LEGACY_KEY,
     JSON.stringify({
       v: 1,
       entries: [
@@ -290,7 +348,7 @@ test('a malformed stored nodeAddr normalizes to null without dropping the entry'
   reset();
   const now = 1_700_000_000_000;
   memory.setItem(
-    ADMIN_KEY,
+    LEGACY_KEY,
     JSON.stringify({
       v: 1,
       entries: [
@@ -332,9 +390,15 @@ test('getAdminNodes-equivalent public surface never exposes seed material', () =
     'expiresAt',
     'grantedAt',
     'label',
+    'lastSeenAddress',
+    'lastSeenAt',
+    'lastSeenKind',
+    'lastSeenStatus',
     'nodeAddr',
     'nodeId',
     'scope',
+    'scopes',
+    'selected',
   ]);
 });
 
@@ -373,4 +437,186 @@ test('clearAllAdminEntries empties the store', () => {
   assert.deepEqual(listAdminNodes(), []);
   assert.equal(adminSeedBytes(NODE_A), null);
   assert.equal(memory.getItem(ADMIN_KEY), null);
+});
+
+// ── v1 → v2 migration ───────────────────────────────────────────────────────
+
+test('a stored v1 envelope migrates to v2 on first read', () => {
+  reset();
+  const now = Date.now();
+  memory.setItem(
+    LEGACY_KEY,
+    JSON.stringify({
+      v: 1,
+      entries: [
+        {
+          nodeId: NODE_A,
+          adminSeedHex: SEED_A,
+          adminPubHex: PUB_A,
+          scope: 'admin',
+          grantedAt: now - 1000,
+          expiresAt: now + 1000,
+          label: 'legacy parent',
+        },
+      ],
+    }),
+  );
+  assert.equal(memory.getItem(ADMIN_KEY), null, 'nothing stored at the v2 key yet');
+
+  const loaded = loadAdminEntries(now);
+  assert.equal(loaded.length, 1);
+
+  // Migrated envelope: v2, seed intact, v1 key retired.
+  const raw = JSON.parse(memory.getItem(ADMIN_KEY));
+  assert.equal(raw.v, 2);
+  assert.equal(raw.entries.length, 1);
+  assert.equal(raw.entries[0].adminSeedHex, SEED_A);
+  assert.equal(memory.getItem(LEGACY_KEY), null);
+  assert.equal(loaded[0].label, 'legacy parent');
+  assert.equal(Buffer.from(adminSeedBytes(NODE_A)).toString('hex'), SEED_A);
+
+  // Migration records an explicit selection instead of leaving it implicit.
+  assert.equal(selectedNodeId(), NODE_A);
+  assert.equal(activeAdminNode(now).nodeId, NODE_A);
+});
+
+test('a migrated v1 grant stays joins-only and is never silently widened', () => {
+  reset();
+  const now = Date.now();
+  memory.setItem(
+    LEGACY_KEY,
+    JSON.stringify({
+      v: 1,
+      entries: [
+        {
+          nodeId: NODE_A,
+          adminSeedHex: SEED_A,
+          adminPubHex: PUB_A,
+          scope: 'admin',
+          grantedAt: now,
+          expiresAt: now + 1000,
+        },
+      ],
+    }),
+  );
+
+  assert.deepEqual(loadAdminEntries(now)[0].scopes, ['joins']);
+  assert.deepEqual(
+    JSON.parse(memory.getItem(ADMIN_KEY)).entries[0].scopes,
+    ['joins'],
+    'the migrated record itself is joins-only',
+  );
+
+  // A v1 record is never widened on read, even by a later v2 writer.
+  addAdminEntry(entry(NODE_B, SEED_B, PUB_B, { grantedAt: now, expiresAt: now + 1000 }));
+  assert.deepEqual(findAdminNode(NODE_B).scopes, ['joins'], 'omitted scopes default to joins');
+
+  // Unknown scope names fall back to joins-only rather than being dropped
+  // into a broader grant; known ones are kept as given.
+  addAdminEntry(entry(NODE_C, SEED_C, PUB_C, {
+    grantedAt: now,
+    expiresAt: now + 1000,
+    scopes: ['bogus', 'also-bogus'],
+  }));
+  addAdminEntry(entry(NODE_D, SEED_D, PUB_D, {
+    grantedAt: now,
+    expiresAt: now + 1000,
+    scopes: ['joins', 'topology'],
+  }));
+  assert.deepEqual(findAdminNode(NODE_C).scopes, ['joins']);
+  assert.deepEqual(findAdminNode(NODE_D).scopes, ['joins', 'topology']);
+  // Seed still never leaves the store through any public view.
+  for (const id of [NODE_B, NODE_C, NODE_D]) {
+    assert.equal(findAdminNode(id).adminSeedHex, undefined);
+  }
+});
+
+test('a corrupt v2 store falls back to the v1 key instead of losing the grants', () => {
+  reset();
+  const now = Date.now();
+  memory.setItem(ADMIN_KEY, '{not json');
+  memory.setItem(
+    LEGACY_KEY,
+    JSON.stringify({
+      v: 1,
+      entries: [
+        {
+          nodeId: NODE_A,
+          adminSeedHex: SEED_A,
+          adminPubHex: PUB_A,
+          scope: 'admin',
+          grantedAt: now,
+          expiresAt: now + 1000,
+        },
+      ],
+    }),
+  );
+
+  assert.equal(loadAdminEntries(now).length, 1);
+  const repaired = JSON.parse(memory.getItem(ADMIN_KEY));
+  assert.equal(repaired.v, 2, 'the corrupt payload is replaced with a valid one');
+  assert.equal(repaired.entries[0].nodeId, NODE_A);
+  assert.equal(memory.getItem(LEGACY_KEY), null, 'the legacy key is retired');
+});
+
+// ── Probe memory ────────────────────────────────────────────────────────────
+
+test('updateLastSeen records probe results and leaves other rows alone', () => {
+  reset();
+  const now = Date.now();
+  addAdminEntry(entry(NODE_A, SEED_A, PUB_A, { grantedAt: now, expiresAt: now + 1000 }));
+  addAdminEntry(entry(NODE_B, SEED_B, PUB_B, { grantedAt: now, expiresAt: now + 1000 }));
+
+  assert.equal(findAdminNode(NODE_A).lastSeenAt, null, 'never probed');
+
+  updateLastSeen(NODE_A, { status: 'active', kind: 'internal', address: '0.3.1', at: now + 5 });
+  const seen = findAdminNode(NODE_A);
+  assert.equal(seen.lastSeenStatus, 'active');
+  assert.equal(seen.lastSeenKind, 'internal');
+  assert.equal(seen.lastSeenAddress, '0.3.1');
+  assert.equal(seen.lastSeenAt, now + 5);
+  assert.equal(findAdminNode(NODE_B).lastSeenAt, null, 'other rows untouched');
+
+  // A partial update never erases what a better probe already saw.
+  updateLastSeen(NODE_A, { status: 'unreachable' });
+  assert.equal(findAdminNode(NODE_A).lastSeenKind, 'internal');
+  assert.equal(findAdminNode(NODE_A).lastSeenStatus, 'unreachable');
+  assert.equal(findAdminNode(NODE_A).lastSeenAt, now + 5);
+
+  // A `null` timestamp stays null rather than collapsing to 0 (1970).
+  updateLastSeen(NODE_B, { at: null });
+  assert.equal(findAdminNode(NODE_B).lastSeenAt, null);
+  assert.equal(loadAdminEntries()[1].lastSeenAt, null);
+});
+
+// ── Selection follow-through ────────────────────────────────────────────────
+
+test('removing the selected node re-points the selection instead of stranding it', () => {
+  reset();
+  const now = Date.now();
+  addAdminEntry(entry(NODE_A, SEED_A, PUB_A, { grantedAt: now - 1000, expiresAt: now + 1000 }));
+  addAdminEntry(entry(NODE_B, SEED_B, PUB_B, { grantedAt: now - 500, expiresAt: now + 60_000 }));
+  assert.equal(selectedNodeId(), NODE_A);
+
+  removeAdminNode(NODE_A);
+  assert.equal(selectedNodeId(), NODE_B, 'falls back to the other active grant');
+  assert.equal(activeAdminNode(now).nodeId, NODE_B);
+
+  removeAdminNode(NODE_B);
+  assert.equal(selectedNodeId(), 'self', 'no grants left: this browser is the target');
+  assert.equal(activeAdminNode(now), null);
+});
+
+test('clearing every grant leaves no selection, which the API resolves to self', () => {
+  reset();
+  const now = Date.now();
+  addAdminEntry(entry(NODE_A, SEED_A, PUB_A, { grantedAt: now, expiresAt: now + 1000 }));
+  assert.equal(selectedNodeId(), NODE_A);
+
+  clearAllAdminEntries();
+  // No envelope at all: `selectedNodeId()` is null and api.js falls back to
+  // `selectedNodeId() ?? SELF`, i.e. this browser is the target again.
+  assert.equal(selectedNodeId(), null);
+  assert.equal(activeAdminNode(now), null);
+  assert.deepEqual(loadAdminEntries(), []);
 });

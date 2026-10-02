@@ -910,3 +910,166 @@
      ("nodes are intentionally not zero-trust"). This also removes the general
      `NodeId -> current address` resolution moved-pointers would have relied on
      (moved-pointers are rejected too - decision 8).
+
+* Next Phases - Unified Node Administration (planned 2026-10-02)
+  Status: P1 delivered (client-only, 2026-10-02); P2-P6 not started. Goal: the
+  browser console
+  looks and functions identically whether the administered node is a leaf or an
+  internal node, with a persistent selector showing which node is administered
+  and easy switching between administered nodes. Reconciled from the 2026-10-02
+  recon (`exp-1` UI branching, `exp-2` admin surface), design proposal
+  (`des-4`), and architecture/phasing review (`ora-1`).
+
+** Boundary rule: the browser commands, the node executes
+   The browser never holds a node operator key or a ledger key. A delegated
+   admin key (`K_admin`) authorizes *intent* only; the node re-signs with its
+   own operator key and is the sole holder of the ledger key. This is the
+   existing `AdminApproveJoin` pattern extended to topology/value ops. Browser
+   operator-key custody is **rejected** (would let XSS forge ledger entries and
+   violates "operator keys != ledger keys"). No browser-supplied field may ever
+   be used as a ledger signature, operator key, posting, or ledger key.
+
+** Phase plan
+   - *P1 - Unified shell + node selector* (client-only, no wire change; uses
+     the existing `AdminQuery`). One layout for the selected administered node;
+     sticky selector listing "This browser (self)" plus every granted node;
+     node kind inferred from `AdminQuery` children (`internal` if any child is a
+     node, `leaf` if all are users, `unknown` if empty); target-parameterized
+     `getChildren(nodeId)`/`getJoinRequests(nodeId)`; remove the `isLive` layout
+     forks; fold the Settings admin-node list into the selector. Deliverable
+     parity: shell, children, joins. Accounts/Activity full parity needs P3.
+   - *P2 - Scoped grants + signed bundle*. `AdminScope` set
+     `{joins, topology, value}`; v1 `admin` grants are interpreted as
+     **joins-only** (never silently widened); truthful TTL enforced node-side;
+     `cawala://admin?node=<id>&grant=<base64 SignedAdminGrant>` so the browser
+     verifies the operator-signed grant instead of inventing its own TTL.
+     `ADMIN_GRANT_VERSION` 2; browser `cawala.admin` v1 -> v2 with read-migration.
+   - *P3 - Read-only ledger view*. New `AdminLedgerQuery` ->
+     `AdminLedgerSnapshot { node_id, height, ledger_id, accounts[], parent_balance,
+     equity }`; inject an optional ledger handle into the control path; unified
+     Accounts table for both kinds (leaf user accounts; internal child-node
+     accounts + parent asset; derived equity `parent - sum(children)`).
+     `CONTROL_FORMAT_VERSION` 5, `CONTROL_REPLY_VERSION` 3. Read-only.
+   - *P4 - Topology administration*. New `AdminDetachChild`, `AdminMoveChild`
+     (same-parent re-slot), reusing the existing record mutations and queuing
+     `DetachNotice`/`Rebase` exactly as the senior/self handlers do. Browser
+     **create-child is deferred** (needs the child's operator+ledger pubkeys and
+     a running process; provisioning stays invite/CLI). `AdminSetAddress`
+     deferred (routing identity; not topology scope).
+   - *P5 - Value administration* (highest bar). New `AdminIssue`, `AdminBurn`;
+     add `LedgerService::burn` (the ledger crate already has `BurnRequest`/
+     `verify_burn`; reuse unchanged, no entry-format bump). Stable client
+     `request_id` + node-persisted dedupe map returning the prior
+     `(seq, hash)`; per-request cap + rolling window budget + per-account
+     ceiling configured operator-side; mandatory reason; fail-closed audit.
+     This is the only phase with monetary blast radius.
+   - *P6 - Polish/optional*. Persisted node `role` (`#[serde(default)]`
+     additive), grant-bundle QR, config/credit limits (no config model exists
+     yet), non-senior routed topology, quorum/time-lock hardening.
+
+** P1 - delivered 2026-10-02 (client-only, no wire change)
+   - Admin key store moved to `cawala.admin.v2` with read-migration from
+     `cawala.admin.v1`: the seed survives, v1 grants read as `scopes: ['joins']`
+     (never widened), a corrupt v2 payload falls back to the legacy key, and a
+     corrupt payload is replaced by the repaired one.
+   - Selection is explicit, never "first non-expired grant": the first stored
+     grant becomes the selection once; `selectAdminNode()` validates (`self`,
+     `mock`, or a stored id) and persists; `activeAdminNode()` returns the
+     selected grant only while it is valid; removing the selection falls back to
+     another active grant or `self`; clearing everything leaves no envelope, and
+     `api._normalizeTarget` maps that to `self`.
+   - Probe memory per node (`lastSeenStatus/Kind/Address/At`) written by
+     `probeAdminNode`; partial updates never erase better data, and a null
+     timestamp stays null instead of collapsing to 0 (1970).
+   - One reactive target: `administeredNode` store + `targetEpoch`; a target
+     change resets page state and bumps the epoch, and pages reload off the
+     epoch so no page data lingers under a new target. `getChildren`,
+     `getJoinRequests`, `getAccounts`, `getActivityLog` are target-parameterized.
+   - Node kind is derived only from observed children (`nodeKind.inferNodeKind`:
+     any child node -> internal, all users -> leaf, empty/unknown -> unknown) and
+     only shown after a probe recorded it.
+   - Shared surfaces: `components/admin/{AdminNodeRow,NodeSelector,
+     GrantStatusBanner,GrantEmptyState}` + `layout/NodeContextBar` under a
+     sticky shell header; Settings' admin-node list folds into the same row
+     component; `adminView.buildSelectorItems` groups this browser, mock,
+     granted, expired for both the selector and Settings.
+   - `isLive` layout forks removed from Dashboard, Node, Joins, Accounts,
+     Activity and My Account: one layout driven by `adminCapabilities`/mock
+     flags, with the Mode chip the only remaining live/mock distinction.
+   - Verified: `cd web && npx vite build` (186 modules, no Svelte warnings) and
+     `cd web && npm test` (67 tests pass: adminKeys v2/selection/migration,
+     nodeKind derivation, adminView selector model, identity bundle, parent
+     liveness).
+
+** Authority and value-op requirements (essential)
+   - *Scope separation*: each admin request declares its required scope; grant
+     management stays self-operator/CLI only (a delegated admin must never
+     mutate `admins.json`, self-approve, or touch operator/ledger keys).
+   - *End-to-end idempotency* (essential for value): the control replay guard is
+     keyed `(origin, controller, nonce)` and retries mint a fresh nonce, so it
+     stops replay but not double-execution. A value request must carry a stable
+     `request_id` and the node must persist `(controller, request_id) ->
+     (seq, hash)`, returning the prior result on retry. Rebuild the map at open.
+   - *Value TTL*: <= 24 h recommended; short and explicit. Value scope reached
+     only via an explicit `control admin grant --scope value`.
+   - *Amount bounds*: the ledger has no global supply anchor and `fund` has no
+     ledger-level replay guard, so the control plane is the only cap.
+   - *Audit*: additive `control_audit.jsonl` value events with actor pubkey,
+     scope, account, amount, `request_id`, entry `seq`/`hash`, outcome.
+   - Value-scoped seed at rest should be encrypted (or re-entered per session);
+     a value key in plaintext localStorage is an XSS-away mint.
+
+** Administered-node + node-kind model
+   - Introduce one browser-side `AdministeredNode { nodeId, address, label,
+     kind, scopes, grantExpiresAt, status, lastSeenAt, childrenCount }`; every
+     admin page reads from it instead of the implicit first-grant
+     `activeAdminNode()`.
+   - The wasm admin key stays a **singleton**; the web layer re-installs it on
+     switch (`_ensureAdminKey(nodeId)`) rather than adding multi-key wasm state.
+   - Node-kind in P1 is inferred from the `AdminQuery` snapshot; an
+     authoritative `role` field on `NodeRecord`/`NodeSnapshot` is a P6 additive.
+   - Discovery of administered nodes: persisted `cawala.admin` entries (P1) ->
+     live `AdminQuery` probe for active/revoked/unreachable + kind (P1/P2) ->
+     signed grant bundle (P2).
+
+** Version / format impacts
+   - `CONTROL_FORMAT_VERSION` 4 -> 5 (mint 5; accept 4+5; add a
+     v5-variant gate mirroring the v4 gate). `CONTROL_REPLY_VERSION` 2 -> 3.
+     `ADMIN_GRANT_VERSION` 1 -> 2 (store dual-accepts; v1 = joins-only).
+   - **No ledger format changes**: `ENTRY_FORMAT_VERSION` stays 4,
+     `LEDGER_FORMAT_VERSION` stays 3, `SETTLE_PAYLOAD_VERSION`/
+     `LEDGER_PAYLOAD_V3_VERSION` stay 3, browser `LEDGER_STATE_VERSION` stays 4,
+     `LOCAL_STATE_VERSION` stays 1 (selection lives in web localStorage, not
+     wasm state). New `ADMIN_BUNDLE_VERSION` 1 if the grant URI is adopted.
+   - Hard break: v3 control peers cannot receive v5 variants (lockstep,
+     consistent with the existing control-negotiation deferral). Rebuild the
+     wasm bundle and recreate `node-data` on the format bump.
+
+** Verification per phase
+   - P1: `web npm test` (adminKeys v2 migration, selection, kind derivation) +
+     `npx vite build`; manual browser checklist.
+   - P3-P5: extend `crates/node/tests/control_admin.rs` (per-scope allow/deny,
+     revoke-wins, expiry, replay, routed); new `crates/node/tests/admin_value.rs`
+     (issue/burn appended + `verify_issue`/`verify_burn` pass, caps, duplicate
+     `request_id` returns the same `(seq, hash)` and appends nothing - including
+     after reopen, no ledger handle => refused, audit line present);
+     `crates/client-wasm` native tests for new DTO/grant parsing; routed v5;
+     `cargo check -p cawala-client --target wasm32-unknown-unknown`;
+     `cargo test --workspace` / `clippy -D warnings`; extended
+     `web/scripts/smoke-admin.mjs` (grant -> switch -> query -> issue -> burn ->
+     revoke -> denied).
+   - Not hermetic: N0 relay/address lookup, real wasm glue, Web Locks,
+     localStorage quota/private mode, clock skew, XSS resilience.
+
+** Open decisions (defaults chosen; revisit before each phase)
+   1. Scope taxonomy: `joins` -> `topology` -> `value`; `value` implies read;
+      `joins` grants pending-join read only. (chosen)
+   2. v1 admin grant = joins-only, never silently widened. (chosen)
+   3. Value TTL <= 24 h, per-request cap, rolling window, per-account ceiling,
+      configured operator-side. (chosen)
+   4. Retry contract: stable `request_id` + persisted dedupe returning the prior
+      result. (chosen)
+   5. Browser creates child nodes: no; topology = detach/move only. (chosen)
+   6. `AdminSetAddress`: deferred. (chosen)
+   7. Value-scoped seed at rest: encrypted / re-entry. (chosen)
+   8. Grant delivery: `cawala://admin` bundle (fallback: manual pubkey paste).

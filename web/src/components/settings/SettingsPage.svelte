@@ -1,11 +1,12 @@
 <script>
   import Card from '../shared/Card.svelte';
+  import AdminNodeRow from '../admin/AdminNodeRow.svelte';
   import Address from '../shared/Address.svelte';
   import EndpointId from '../shared/EndpointId.svelte';
   import Badge from '../shared/Badge.svelte';
   import ConfirmDialog from '../shared/ConfirmDialog.svelte';
   import ConnectionIndicator from '../shared/ConnectionIndicator.svelte';
-  import { clientState, ledgerState, apiCapabilities, showToast } from '../../lib/stores.svelte.js';
+  import { clientState, ledgerState, apiCapabilities, administeredNode, showToast } from '../../lib/stores.svelte.js';
   import {
     isMockMode,
     isIdentityPersistent,
@@ -14,12 +15,14 @@
     inspectIdentityBundle,
     importIdentityBundle,
     wipeIdentity,
-    getAdminNodes,
+    listAdministeredNodes,
+    setAdministeredNode,
     configureAdminNode,
     removeAdminNode,
   } from '../../lib/api.js';
   import { copyToClipboard } from '../../lib/utils.js';
   import { isValidNodeAddr } from '../../lib/adminKeys.js';
+  import { buildSelectorItems } from '../../lib/adminView.js';
 
   let caps = $derived(getCapabilities());
   let mock = $derived(isMockMode());
@@ -152,7 +155,7 @@
   async function loadAdminNodes() {
     if (mock) return;
     try {
-      adminNodes = getAdminNodes();
+      adminNodes = listAdministeredNodes();
     } catch {
       adminNodes = [];
     }
@@ -161,6 +164,29 @@
   $effect(() => {
     if (!mock) loadAdminNodes();
   });
+
+  /**
+   * The exact rows the header selector shows (self + granted nodes), so the
+   * Settings list can never drift from the selector it feeds.
+   */
+  let selectorGroups = $derived(
+    buildSelectorItems({
+      self: { endpointId: clientState.endpointId },
+      mock,
+      nodes: adminNodes,
+      selected: administeredNode.nodeId,
+    }).groups,
+  );
+
+  /** Switch the whole console to this node (same action as the selector). */
+  function handleSelectAdmin(item) {
+    try {
+      setAdministeredNode(item.id);
+      showToast(`Now administering ${item.label}.`, 'ok');
+    } catch (err) {
+      showToast(err?.message || 'Could not switch the administered node.', 'danger');
+    }
+  }
 
   function validateNodeId(id) {
     return /^[0-9a-fA-F]{64}$/.test(id);
@@ -228,14 +254,6 @@
     removeTarget = null;
   }
 
-  function formatTs(ms) {
-    if (!ms) return '--';
-    return new Date(ms).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-  }
-
-  function isExpired(expiresAt) {
-    return typeof expiresAt === 'number' && expiresAt < Date.now();
-  }
 </script>
 
 <div class="settings-page">
@@ -475,16 +493,40 @@
   <!-- ── Node Administration ──────────────────────────────────── -->
   <Card title="Node Administration">
     <div class="settings-section">
+      <p class="muted text-sm">
+        This browser holds a delegated admin key &mdash; never the node operator key or the ledger
+        key. Pick which node every admin page is pointed at, then generate a key for any node that
+        has not granted you one yet.
+      </p>
+
+      <!-- Administered nodes: the same rows as the header selector -->
+      <div class="admin-nodes">
+        <h4 class="admin-heading">Administered nodes</h4>
+        <p class="muted text-xs">
+          These are the entries behind the selector at the top of the window. Selecting one
+          retargets every admin page.
+        </p>
+        {#each selectorGroups as group (group.id)}
+          {#if group.id !== 'context'}
+            <span class="admin-group-label text-xs muted">{group.label}</span>
+          {/if}
+          {#each group.items as item (item.id)}
+            <AdminNodeRow
+              {item}
+              variant="full"
+              onSelect={handleSelectAdmin}
+              onRemove={item.isSelf || item.id === 'mock' ? undefined : handleRemoveAdmin}
+            />
+          {/each}
+        {/each}
+      </div>
+
       {#if mock}
         <div class="muted text-sm">
-          Node administration is not available in mock mode.
+          Generating an admin key needs a live node, so that step is unavailable in mock mode.
+          The selection above works either way &mdash; the layout does not change.
         </div>
       {:else}
-        <p class="muted text-sm">
-          Generate a delegated admin key to approve or reject join requests from this browser.
-          The operator must grant this key on the target node before it can be used.
-        </p>
-
         <!-- Configure form -->
         <div class="admin-block">
           <h4 class="admin-heading">Generate admin key</h4>
@@ -579,52 +621,6 @@
                 or reject join requests for the configured node until the key expires or is revoked.
               </span>
             </div>
-          </div>
-        {/if}
-
-        <!-- Configured admin nodes -->
-        {#if adminNodes.length > 0}
-          <div class="admin-nodes">
-            <h4 class="admin-heading">Configured admin nodes</h4>
-            {#each adminNodes as node}
-              <div class="admin-node-row" class:admin-node--expired={isExpired(node.expiresAt)}>
-                <div class="admin-node-info">
-                  <div class="admin-node-id">
-                    <code class="text-sm mono">{node.nodeId}</code>
-                    {#if node.active}
-                      <Badge variant="ok" label="Active" />
-                    {:else if isExpired(node.expiresAt)}
-                      <Badge variant="danger" label="Expired" />
-                    {:else}
-                      <Badge variant="muted" label="Inactive" />
-                    {/if}
-                    {#if node.label}
-                      <Badge variant="info" label={node.label} />
-                    {/if}
-                    {#if node.nodeAddr}
-                      <Badge variant="ok" label="Tree-routed" />
-                    {:else}
-                      <Badge variant="muted" label="Direct only" />
-                    {/if}
-                  </div>
-                  <span class="text-xs muted">
-                    Granted: {formatTs(node.grantedAt)} | Expires: {formatTs(node.expiresAt)}
-                  </span>
-                  {#if node.nodeAddr}
-                    <span class="text-xs muted">
-                      Address: <code>{node.nodeAddr}</code>
-                    </span>
-                  {/if}
-                </div>
-                <button
-                  type="button"
-                  class="btn btn--danger-outline btn--sm"
-                  onclick={() => handleRemoveAdmin(node.nodeId)}
-                >
-                  Remove
-                </button>
-              </div>
-            {/each}
           </div>
         {/if}
       {/if}
@@ -957,32 +953,9 @@
     flex-direction: column;
     gap: var(--sp-3);
   }
-  .admin-node-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: var(--sp-3) var(--sp-4);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    background: var(--bg);
-    gap: var(--sp-3);
-  }
-  .admin-node--expired {
-    opacity: 0.6;
-  }
-  .admin-node-info {
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-1);
-    min-width: 0;
-  }
-  .admin-node-id {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-2);
-    flex-wrap: wrap;
-  }
-  .admin-node-id code {
-    word-break: break-all;
+  .admin-group-label {
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 600;
   }
 </style>

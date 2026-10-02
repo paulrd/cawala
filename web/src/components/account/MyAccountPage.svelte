@@ -6,9 +6,10 @@
   import Balance from '../shared/Balance.svelte';
   import Badge from '../shared/Badge.svelte';
   import EmptyState from '../shared/EmptyState.svelte';
-  import { clientState, ledgerState, showToast } from '../../lib/stores.svelte.js';
+  import { clientState, ledgerState, nodeState, targetEpoch, showToast } from '../../lib/stores.svelte.js';
   import {
     isMockMode,
+    getActivityLog,
     sendPayment,
     getPendingPayments,
     requestBalance,
@@ -18,7 +19,7 @@
     getLastControlEvent,
     parentStatus,
   } from '../../lib/api.js';
-  import { ORDER_REJECT, ORDER_STATUS, ORDER_STATUS_LABELS, ORDER_STATUS_DESCRIPTIONS, CONTROL_EVENT, ROUTES } from '../../lib/constants.js';
+  import { ORDER_REJECT, ORDER_STATUS, ORDER_STATUS_LABELS, ORDER_STATUS_DESCRIPTIONS, ACTIVITY_LABELS, CONTROL_EVENT, ROUTES } from '../../lib/constants.js';
   import { truncateMiddle, timeAgo, formatTime, copyToClipboard } from '../../lib/utils.js';
   import { navigate } from '../../lib/router.svelte.js';
   import ConfirmDialog from '../shared/ConfirmDialog.svelte';
@@ -340,7 +341,6 @@
   }
 
   let parentUnreachable = $derived(
-    isLive &&
     _parentStatusData != null &&
     _parentStatusData.parent != null &&
     !_parentStatusData.reachable &&
@@ -380,10 +380,45 @@
   }
 
   // ── Mock transaction history ──────────────────────────────
-  let mockTransactions = $state([
-    { id: 1, type: 'transfer', to: '0.3.2', amount: 150, timestamp: new Date(Date.now() - 3600000).toISOString() },
-    { id: 2, type: 'transfer', to: '0.3.3', amount: 75, timestamp: new Date(Date.now() - 86400000).toISOString() },
-  ]);
+  // One source for recent transactions in both modes: `getActivityLog()`
+  // returns the synthetic log under mock and the leaf-reported history for
+  // this browser, so the list below never branches on mode.
+  let recentError = $state(null);
+
+  async function loadRecent() {
+    try {
+      nodeState.activity = await getActivityLog();
+      recentError = null;
+    } catch (err) {
+      recentError = err?.message || 'Failed to load transactions';
+    }
+  }
+
+  $effect(() => {
+    void targetEpoch.value;
+    // The ledger poller appends in live mode: refetch so the list stays fresh.
+    void ledgerState.activity.length;
+    void loadRecent();
+  });
+
+  let recentRows = $derived(
+    [...nodeState.activity].sort(
+      (a, b) => new Date(b.timestamp ?? 0) - new Date(a.timestamp ?? 0),
+    ),
+  );
+
+  const typeBadgeVariant = {
+    transfer: 'info',
+    settlement: 'info',
+    issue: 'ok',
+    burn: 'danger',
+    join_approved: 'ok',
+    join_rejected: 'danger',
+    topo_create: 'info',
+    topo_move: 'warn',
+    topo_detach: 'danger',
+    balance_update: 'ok',
+  };
 
   // ── Cleanup ───────────────────────────────────────────────
   // Reload the receive URI whenever this client becomes joined (its assigned
@@ -443,402 +478,372 @@
 
   <!-- ── Balance Card ───────────────────────────────────── -->
   <Card title="Verified Balance">
-    {#if isLive}
-      <div class="balance-section">
-        {#if balanceUnverified}
-          <div class="balance-loading">
-            <div class="balance-value">
-              <span class="balance-placeholder">&mdash;</span>
-            </div>
-            <p class="balance-status muted">
-              Balance not yet verified. Waiting for a receipt from your leaf.
-            </p>
-            <button
-              type="button"
-              class="btn btn--ghost btn--sm"
-              onclick={handleRefreshBalance}
-            >
-              Request balance
-            </button>
+    <div class="balance-section">
+      {#if balanceUnverified}
+        <div class="balance-loading">
+          <div class="balance-value">
+            <span class="balance-placeholder">&mdash;</span>
           </div>
-        {:else}
-          <div class="balance-section">
-            <div class="balance-value">
-              <Balance amount={ledgerState.balance} size="lg" showSign={false} />
-            </div>
+          <p class="balance-status muted">
+            Balance not yet verified. Waiting for a receipt from your leaf.
+          </p>
+          <button
+            type="button"
+            class="btn btn--ghost btn--sm"
+            onclick={handleRefreshBalance}
+          >
+            Request balance
+          </button>
+        </div>
+      {:else}
+        <div class="balance-section">
+          <div class="balance-value">
+            <Balance amount={ledgerState.balance} size="lg" showSign={false} />
+          </div>
 
-            <div class="balance-meta">
-              {#if balanceFresh}
-                <Badge variant="ok" label="Verified" />
-              {:else if balanceStale}
-                <Badge variant="warn" label="Stale — re-verifying" />
-              {/if}
-
-              {#if ledgerState.height != null}
-                <span class="meta-item text-sm muted">
-                  Height: {ledgerState.height}
-                </span>
-              {/if}
-
-              {#if ledgerState.verifiedAt}
-                <span class="meta-item text-sm muted">
-                  Last verified: {timeAgo(new Date(ledgerState.verifiedAt))}
-                </span>
-              {/if}
-            </div>
-
-            {#if ledgerState.error}
-              <div class="balance-error">
-                <Badge variant="danger" label="Error" />
-                <span class="text-sm">{ledgerState.error}</span>
-              </div>
+          <div class="balance-meta">
+            {#if balanceFresh}
+              <Badge variant="ok" label="Verified" />
+            {:else if balanceStale}
+              <Badge variant="warn" label="Stale — re-verifying" />
             {/if}
 
-            {#if ledgerState.pending > 0}
-              <div class="pending-indicator">
-                <Badge variant="info" label="{ledgerState.pending} pending" />
-                <span class="text-sm muted">Orders awaiting confirmation.</span>
-              </div>
+            {#if ledgerState.height != null}
+              <span class="meta-item text-sm muted">
+                Height: {ledgerState.height}
+              </span>
             {/if}
 
-            <button
-              type="button"
-              class="btn btn--ghost btn--sm"
-              onclick={handleRefreshBalance}
-            >
-              Refresh balance
-            </button>
+            {#if ledgerState.verifiedAt}
+              <span class="meta-item text-sm muted">
+                Last verified: {timeAgo(new Date(ledgerState.verifiedAt))}
+              </span>
+            {/if}
           </div>
-        {/if}
-      </div>
-    {:else}
-      <!-- Mock mode: show a sample balance -->
-      <div class="balance-section">
-        <div class="balance-value">
-          <Balance amount={1200} size="lg" showSign={false} />
+
+          {#if ledgerState.error}
+            <div class="balance-error">
+              <Badge variant="danger" label="Error" />
+              <span class="text-sm">{ledgerState.error}</span>
+            </div>
+          {/if}
+
+          {#if ledgerState.pending > 0}
+            <div class="pending-indicator">
+              <Badge variant="info" label="{ledgerState.pending} pending" />
+              <span class="text-sm muted">Orders awaiting confirmation.</span>
+            </div>
+          {/if}
+
+          <button
+            type="button"
+            class="btn btn--ghost btn--sm"
+            onclick={handleRefreshBalance}
+          >
+            Refresh balance
+          </button>
         </div>
-        <div class="balance-meta">
-          <Badge variant="ok" label="Verified" />
-          <span class="meta-item text-sm muted">Height: 42</span>
-        </div>
-      </div>
-    {/if}
+      {/if}
+    </div>
   </Card>
 
   <!-- ── My Receive URI Card ────────────────────────────── -->
-  {#if isLive}
-    <Card title="Receive payments">
-      <div class="receive-section">
-        {#if receiveUriLoading}
-          <p class="text-sm muted">Loading receive URI&hellip;</p>
-        {:else if receiveUri}
-          <p class="text-sm">
-            Share this link so others can pay you. They paste it into their send form, which resolves your node id and address automatically.
-          </p>
-          <div class="uri-row">
-            <code class="uri-text">{receiveUri}</code>
-            <button
-              type="button"
-              class="btn btn--ghost btn--sm"
-              onclick={handleCopyUri}
-            >
-              {receiveUriCopied ? 'Copied' : 'Copy'}
-            </button>
-          </div>
-        {:else}
-          <p class="text-sm muted">
-            Receive URI unavailable — join a leaf to get one.
-          </p>
-        {/if}
-      </div>
-    </Card>
-  {/if}
-
-  <!-- ── Send Payment Card ──────────────────────────────── -->
-  {#if isLive}
-    <Card title="Send payment">
-      {#if sendResult}
-        <div class="send-result" role="status" aria-live="polite">
-          {#if sendResult.status === 'pending'}
-            <div class="result-row result-pending">
-              <Badge variant="info" label="Pending" />
-              <span class="text-sm">Order submitted. Waiting for confirmation&hellip;</span>
-            </div>
-            <div class="result-detail">
-              <span class="detail-label muted">Order hash</span>
-              <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
-            </div>
-          {:else if sendResult.status === 'applied'}
-            <div class="result-row result-success">
-              <Badge variant="ok" label="Applied" />
-              <span class="text-sm">
-                The leaf reports this payment applied. Your signed balance receipt is the confirmation.
-              </span>
-            </div>
-            <div class="result-detail">
-              <span class="detail-label muted">Order hash</span>
-              <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
-            </div>
-            <button
-              type="button"
-              class="btn btn--ghost btn--sm"
-              onclick={resetSendForm}
-            >
-              Send another payment
-            </button>
-          {:else if sendResult.status === 'duplicate'}
-            <div class="result-row result-success">
-              <Badge variant="ok" label="Duplicate" />
-              <span class="text-sm">This order was already applied. No double charge.</span>
-            </div>
-            <div class="result-detail">
-              <span class="detail-label muted">Order hash</span>
-              <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
-            </div>
-            <button
-              type="button"
-              class="btn btn--ghost btn--sm"
-              onclick={resetSendForm}
-            >
-              Send another payment
-            </button>
-          {:else if sendResult.status === 'unverified'}
-            <div class="result-row result-unverified">
-              <Badge variant="warn" label={ORDER_STATUS_LABELS[ORDER_STATUS.UNVERIFIED]} />
-              <span class="text-sm">{ORDER_STATUS_DESCRIPTIONS[ORDER_STATUS.UNVERIFIED]}</span>
-            </div>
-            <div class="result-detail">
-              <span class="detail-label muted">Order hash</span>
-              <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
-            </div>
-            <button
-              type="button"
-              class="btn btn--ghost btn--sm"
-              onclick={resetSendForm}
-            >
-              Send another payment
-            </button>
-          {:else if sendResult.status === 'partial'}
-            <div class="result-row result-partial">
-              <Badge variant="warn" label="Sent, not confirmed" />
-              <span class="text-sm">
-                Your debit is committed but the payee was not credited. Reconciliation is in progress.
-              </span>
-            </div>
-            <div class="result-detail">
-              <span class="detail-label muted">Order hash</span>
-              <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
-              {#if sendResult.failedAt}
-                <span class="detail-hint text-xs muted">
-                  Stopped at: {truncateMiddle(sendResult.failedAt, 8)}
-                </span>
-              {/if}
-            </div>
-            <button
-              type="button"
-              class="btn btn--ghost btn--sm"
-              onclick={resetSendForm}
-            >
-              Send another payment
-            </button>
-          {:else if sendResult.status === 'indeterminate'}
-            <div class="result-row result-partial">
-              <Badge variant="warn" label="Outcome unknown" />
-              <span class="text-sm">
-                Outcome unknown &mdash; your debit is committed; do not resend.
-              </span>
-            </div>
-            <div class="result-detail">
-              <span class="detail-label muted">Order hash</span>
-              <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
-            </div>
-            <button
-              type="button"
-              class="btn btn--ghost btn--sm"
-              onclick={resetSendForm}
-            >
-              Send another payment
-            </button>
-          {:else if sendResult.status === 'rejected'}
-            <div class="result-row result-rejected">
-              <Badge variant="danger" label="Rejected" />
-              <span class="text-sm">
-                Payment was rejected: {rejectionReasonText(sendResult.reason)}.
-              </span>
-            </div>
-            <div class="result-detail">
-              <span class="detail-label muted">Order hash</span>
-              <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
-              <span class="detail-hint text-xs muted">Provide this hash if you need support.</span>
-            </div>
-            <button
-              type="button"
-              class="btn btn--primary btn--sm"
-              onclick={handleRetry}
-            >
-              Retry payment
-            </button>
-          {:else}
-            <!-- Still pending after timeout -->
-            <div class="result-row result-pending">
-              <Badge variant="warn" label="Still pending" />
-              <span class="text-sm">{sendResult.reason || 'Status check timed out.'}</span>
-            </div>
-            <div class="result-detail">
-              <span class="detail-label muted">Order hash</span>
-              <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
-            </div>
-            <button
-              type="button"
-              class="btn btn--ghost btn--sm"
-              onclick={resetSendForm}
-            >
-              Send another payment
-            </button>
-          {/if}
+  <Card title="Receive payments">
+    <div class="receive-section">
+      {#if receiveUriLoading}
+        <p class="text-sm muted">Loading receive URI&hellip;</p>
+      {:else if receiveUri}
+        <p class="text-sm">
+          Share this link so others can pay you. They paste it into their send form, which resolves your node id and address automatically.
+        </p>
+        <div class="uri-row">
+          <code class="uri-text">{receiveUri}</code>
+          <button
+            type="button"
+            class="btn btn--ghost btn--sm"
+            onclick={handleCopyUri}
+          >
+            {receiveUriCopied ? 'Copied' : 'Copy'}
+          </button>
         </div>
       {:else}
-        <form class="send-form" onsubmit={(e) => { e.preventDefault(); handleSubmit(); }} aria-label="Send payment form">
-          <div class="form-field">
-            <label class="field-label" for="send-uri">Payee receive URI</label>
-            <input
-              id="send-uri"
-              type="text"
-              class="field-input"
-              placeholder="cawala://pay?to=...&addr=..."
-              value={sendUriInput}
-              oninput={(e) => { sendUriInput = e.target.value; _onUriInputChange(); }}
-              disabled={sending}
-              autocomplete="off"
-              spellcheck="false"
-            />
-            <span class="field-hint text-xs muted">
-              Paste the link the payee shared with you.
+        <p class="text-sm muted">
+          Receive URI unavailable — join a leaf to get one.
+        </p>
+      {/if}
+    </div>
+  </Card>
+
+  <!-- ── Send Payment Card ──────────────────────────────── -->
+  <Card title="Send payment">
+    {#if sendResult}
+      <div class="send-result" role="status" aria-live="polite">
+        {#if sendResult.status === 'pending'}
+          <div class="result-row result-pending">
+            <Badge variant="info" label="Pending" />
+            <span class="text-sm">Order submitted. Waiting for confirmation&hellip;</span>
+          </div>
+          <div class="result-detail">
+            <span class="detail-label muted">Order hash</span>
+            <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
+          </div>
+        {:else if sendResult.status === 'applied'}
+          <div class="result-row result-success">
+            <Badge variant="ok" label="Applied" />
+            <span class="text-sm">
+              The leaf reports this payment applied. Your signed balance receipt is the confirmation.
             </span>
           </div>
-
-          {#if parsingUri}
-            <div class="parse-status text-xs muted">Resolving&hellip;</div>
-          {/if}
-
-          {#if parseError}
-            <div class="form-error" role="alert" aria-live="assertive">
-              {parseError}
-            </div>
-          {/if}
-
-          {#if parsedPayee}
-            <div class="parsed-recipient">
-              <div class="parsed-row">
-                <span class="detail-label muted">Payee node</span>
-                <div class="detail-value">
-                  <EndpointId id={parsedPayee.nodeId} full={true} />
-                </div>
-              </div>
-              <div class="parsed-row">
-                <span class="detail-label muted">Payee address</span>
-                <Address address={parsedPayee.address} size="sm" />
-              </div>
-              <div class="pin-signal">
-                {#if parsedPayee.leafNodeId && parsedPayee.ledgerKeyHex}
-                  <Badge variant="ok" label="Pinned" />
-                  <span class="text-xs muted">Settlement will be verified against the payee leaf key.</span>
-                {:else}
-                  <Badge variant="muted" label="No pin" />
-                  <span class="text-xs muted">Trust-on-first-use — no leaf key in the URI.</span>
-                {/if}
-              </div>
-            </div>
-          {/if}
-
-          <div class="form-field">
-            <label class="field-label" for="send-amount">Amount (whole units)</label>
-            <input
-              id="send-amount"
-              type="text"
-              class="field-input field-input--narrow"
-              placeholder="0"
-              bind:value={sendAmount}
-              disabled={sending || !parsedPayee}
-              inputmode="numeric"
-              autocomplete="off"
-            />
+          <div class="result-detail">
+            <span class="detail-label muted">Order hash</span>
+            <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
           </div>
+          <button
+            type="button"
+            class="btn btn--ghost btn--sm"
+            onclick={resetSendForm}
+          >
+            Send another payment
+          </button>
+        {:else if sendResult.status === 'duplicate'}
+          <div class="result-row result-success">
+            <Badge variant="ok" label="Duplicate" />
+            <span class="text-sm">This order was already applied. No double charge.</span>
+          </div>
+          <div class="result-detail">
+            <span class="detail-label muted">Order hash</span>
+            <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
+          </div>
+          <button
+            type="button"
+            class="btn btn--ghost btn--sm"
+            onclick={resetSendForm}
+          >
+            Send another payment
+          </button>
+        {:else if sendResult.status === 'unverified'}
+          <div class="result-row result-unverified">
+            <Badge variant="warn" label={ORDER_STATUS_LABELS[ORDER_STATUS.UNVERIFIED]} />
+            <span class="text-sm">{ORDER_STATUS_DESCRIPTIONS[ORDER_STATUS.UNVERIFIED]}</span>
+          </div>
+          <div class="result-detail">
+            <span class="detail-label muted">Order hash</span>
+            <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
+          </div>
+          <button
+            type="button"
+            class="btn btn--ghost btn--sm"
+            onclick={resetSendForm}
+          >
+            Send another payment
+          </button>
+        {:else if sendResult.status === 'partial'}
+          <div class="result-row result-partial">
+            <Badge variant="warn" label="Sent, not confirmed" />
+            <span class="text-sm">
+              Your debit is committed but the payee was not credited. Reconciliation is in progress.
+            </span>
+          </div>
+          <div class="result-detail">
+            <span class="detail-label muted">Order hash</span>
+            <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
+            {#if sendResult.failedAt}
+              <span class="detail-hint text-xs muted">
+                Stopped at: {truncateMiddle(sendResult.failedAt, 8)}
+              </span>
+            {/if}
+          </div>
+          <button
+            type="button"
+            class="btn btn--ghost btn--sm"
+            onclick={resetSendForm}
+          >
+            Send another payment
+          </button>
+        {:else if sendResult.status === 'indeterminate'}
+          <div class="result-row result-partial">
+            <Badge variant="warn" label="Outcome unknown" />
+            <span class="text-sm">
+              Outcome unknown &mdash; your debit is committed; do not resend.
+            </span>
+          </div>
+          <div class="result-detail">
+            <span class="detail-label muted">Order hash</span>
+            <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
+          </div>
+          <button
+            type="button"
+            class="btn btn--ghost btn--sm"
+            onclick={resetSendForm}
+          >
+            Send another payment
+          </button>
+        {:else if sendResult.status === 'rejected'}
+          <div class="result-row result-rejected">
+            <Badge variant="danger" label="Rejected" />
+            <span class="text-sm">
+              Payment was rejected: {rejectionReasonText(sendResult.reason)}.
+            </span>
+          </div>
+          <div class="result-detail">
+            <span class="detail-label muted">Order hash</span>
+            <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
+            <span class="detail-hint text-xs muted">Provide this hash if you need support.</span>
+          </div>
+          <button
+            type="button"
+            class="btn btn--primary btn--sm"
+            onclick={handleRetry}
+          >
+            Retry payment
+          </button>
+        {:else}
+          <!-- Still pending after timeout -->
+          <div class="result-row result-pending">
+            <Badge variant="warn" label="Still pending" />
+            <span class="text-sm">{sendResult.reason || 'Status check timed out.'}</span>
+          </div>
+          <div class="result-detail">
+            <span class="detail-label muted">Order hash</span>
+            <code class="detail-value">{truncateMiddle(sendResult.orderHash, 12)}</code>
+          </div>
+          <button
+            type="button"
+            class="btn btn--ghost btn--sm"
+            onclick={resetSendForm}
+          >
+            Send another payment
+          </button>
+        {/if}
+      </div>
+    {:else}
+      <form class="send-form" onsubmit={(e) => { e.preventDefault(); handleSubmit(); }} aria-label="Send payment form">
+        <div class="form-field">
+          <label class="field-label" for="send-uri">Payee receive URI</label>
+          <input
+            id="send-uri"
+            type="text"
+            class="field-input"
+            placeholder="cawala://pay?to=...&addr=..."
+            value={sendUriInput}
+            oninput={(e) => { sendUriInput = e.target.value; _onUriInputChange(); }}
+            disabled={sending}
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <span class="field-hint text-xs muted">
+            Paste the link the payee shared with you.
+          </span>
+        </div>
 
-          {#if sendError}
-            <div class="form-error" role="alert" aria-live="assertive">
-              {sendError}
+        {#if parsingUri}
+          <div class="parse-status text-xs muted">Resolving&hellip;</div>
+        {/if}
+
+        {#if parseError}
+          <div class="form-error" role="alert" aria-live="assertive">
+            {parseError}
+          </div>
+        {/if}
+
+        {#if parsedPayee}
+          <div class="parsed-recipient">
+            <div class="parsed-row">
+              <span class="detail-label muted">Payee node</span>
+              <div class="detail-value">
+                <EndpointId id={parsedPayee.nodeId} full={true} />
+              </div>
             </div>
-          {/if}
-
-          <div class="form-actions">
-            <button
-              type="submit"
-              class="btn btn--primary"
-              disabled={sending || !parsedPayee || !sendAmount.trim()}
-            >
-              {#if sending}
-                Sending&hellip;
+            <div class="parsed-row">
+              <span class="detail-label muted">Payee address</span>
+              <Address address={parsedPayee.address} size="sm" />
+            </div>
+            <div class="pin-signal">
+              {#if parsedPayee.leafNodeId && parsedPayee.ledgerKeyHex}
+                <Badge variant="ok" label="Pinned" />
+                <span class="text-xs muted">Settlement will be verified against the payee leaf key.</span>
               {:else}
-                Send payment
+                <Badge variant="muted" label="No pin" />
+                <span class="text-xs muted">Trust-on-first-use — no leaf key in the URI.</span>
               {/if}
-            </button>
+            </div>
           </div>
-        </form>
-      {/if}
-    </Card>
-  {/if}
+        {/if}
+
+        <div class="form-field">
+          <label class="field-label" for="send-amount">Amount (whole units)</label>
+          <input
+            id="send-amount"
+            type="text"
+            class="field-input field-input--narrow"
+            placeholder="0"
+            bind:value={sendAmount}
+            disabled={sending || !parsedPayee}
+            inputmode="numeric"
+            autocomplete="off"
+          />
+        </div>
+
+        {#if sendError}
+          <div class="form-error" role="alert" aria-live="assertive">
+            {sendError}
+          </div>
+        {/if}
+
+        <div class="form-actions">
+          <button
+            type="submit"
+            class="btn btn--primary"
+            disabled={sending || !parsedPayee || !sendAmount.trim()}
+          >
+            {#if sending}
+              Sending&hellip;
+            {:else}
+              Send payment
+            {/if}
+          </button>
+        </div>
+      </form>
+    {/if}
+  </Card>
 
   <!-- ── Recent Activity Card ───────────────────────────── -->
   <Card title="Recent Transactions">
-    {#if isLive}
-      {#if ledgerState.activity.length === 0 && ledgerState.pending === 0}
-        <EmptyState
-          title="No transactions yet"
-          message="Only payments sent from this browser are listed here. Incoming value updates your balance but is not listed as a separate row."
-        />
-      {:else}
-        <div class="activity-list">
-          {#each ledgerState.activity as entry (entry.id)}
-            <div class="activity-row">
-              <div class="activity-type">
-                <Badge variant="info" label="Transfer" />
-              </div>
-              <div class="activity-detail">
+    {#if recentError}
+      <p class="text-sm muted">Could not load transactions: {recentError}</p>
+    {:else if recentRows.length === 0 && ledgerState.pending > 0}
+      <p class="text-sm muted">
+        Waiting for confirmation of {ledgerState.pending} in-flight order{ledgerState.pending === 1 ? '' : 's'}&hellip;
+      </p>
+    {:else if recentRows.length === 0}
+      <EmptyState
+        title="No transactions yet"
+        message="Only payments sent from this browser are listed here. Incoming value updates your balance but is not listed as a separate row."
+      />
+    {:else}
+      <div class="activity-list">
+        {#each recentRows as entry (entry.id)}
+          <div class="activity-row">
+            <div class="activity-type">
+              <Badge
+                variant={typeBadgeVariant[entry.type] || 'info'}
+                label={ACTIVITY_LABELS[entry.type] || entry.type || 'Transfer'}
+              />
+            </div>
+            <div class="activity-detail">
+              {#if entry.amount != null}
                 <span class="activity-amount">
                   <Balance amount={entry.amount} size="sm" />
                 </span>
-                {#if entry.to}
-                  <span class="activity-to text-sm muted">
-                    to {truncateMiddle(entry.to, 8)}
-                  </span>
-                {/if}
-              </div>
-              <div class="activity-time text-xs muted">
-                {formatTime(entry.timestamp)}
-              </div>
-            </div>
-          {/each}
-        </div>
-      {/if}
-    {:else}
-      <!-- Mock mode: show sample transactions -->
-      <div class="activity-list">
-        {#each mockTransactions as tx (tx.id)}
-          <div class="activity-row">
-            <div class="activity-type">
-              <Badge variant="info" label="Transfer" />
-            </div>
-            <div class="activity-detail">
-              <span class="activity-amount">
-                <Balance amount={tx.amount} size="sm" />
-              </span>
-              <span class="activity-to text-sm muted">
-                to {tx.to}
-              </span>
+              {/if}
+              {#if entry.to}
+                <span class="activity-to text-sm muted">
+                  to {truncateMiddle(entry.to, 8)}
+                </span>
+              {/if}
             </div>
             <div class="activity-time text-xs muted">
-              {formatTime(tx.timestamp)}
+              {formatTime(entry.timestamp)}
             </div>
           </div>
         {/each}
@@ -870,70 +875,68 @@
   {/if}
 
   <!-- ── Leave Network Card ─────────────────────────────── -->
-  {#if isLive}
-    {#if isJoined && !hasLeft}
-      <Card title="Network">
-        <div class="leave-section">
-          <div class="leave-info">
-            <p class="text-sm">
-              You are connected to a parent node.
-              Address: <Address address={clientState.address} size="sm" />
-            </p>
-          </div>
-
-          <div class="leave-danger-block">
-            <h4 class="leave-heading">Leave the network</h4>
-            <p class="leave-desc muted text-sm">
-              This will disconnect you from your parent node. It cannot be undone.
-            </p>
-            <button
-              type="button"
-              class="btn btn--danger-outline"
-              disabled={leaving}
-              onclick={handleLeave}
-            >
-              {#if leaving}Leaving...{:else}Leave network{/if}
-            </button>
-          </div>
-
-          {#if leaveError}
-            <div class="leave-error" role="alert">
-              {leaveError}
-            </div>
-          {/if}
+  {#if isJoined && !hasLeft}
+    <Card title="Network">
+      <div class="leave-section">
+        <div class="leave-info">
+          <p class="text-sm">
+            You are connected to a parent node.
+            Address: <Address address={clientState.address} size="sm" />
+          </p>
         </div>
-      </Card>
-    {:else if hasLeft || (!isJoined && leaveResult?.status === 'detached')}
-      <!-- Aftermath: user has left the network -->
-      <Card title="Network">
-        <div class="left-network-state">
-          <div class="left-network-body">
-            <h4 class="left-network-title">Not connected to a network</h4>
-            <p class="text-sm muted">
-              You are no longer part of a network. Your address has been cleared.
-            </p>
-            <div class="warn-box">
-              <span class="warn-icon">!</span>
-              <span>
-                Any balance you still held with your former parent node stays on
-                their books until you re-join and settle it.
-              </span>
-            </div>
-            <p class="text-sm muted">
-              You can join a different network, or re-join this one, using a new
-              invitation from a node operator.
-            </p>
-            <button
-              type="button"
-              class="btn btn--primary"
-              onclick={() => navigate(ROUTES.JOIN_FLOW)}
-            >
-              Join a network
-            </button>
-          </div>
+
+        <div class="leave-danger-block">
+          <h4 class="leave-heading">Leave the network</h4>
+          <p class="leave-desc muted text-sm">
+            This will disconnect you from your parent node. It cannot be undone.
+          </p>
+          <button
+            type="button"
+            class="btn btn--danger-outline"
+            disabled={leaving}
+            onclick={handleLeave}
+          >
+            {#if leaving}Leaving...{:else}Leave network{/if}
+          </button>
         </div>
-      </Card>
-    {/if}
+
+        {#if leaveError}
+          <div class="leave-error" role="alert">
+            {leaveError}
+          </div>
+        {/if}
+      </div>
+    </Card>
+  {:else if hasLeft || (!isJoined && leaveResult?.status === 'detached')}
+    <!-- Aftermath: user has left the network -->
+    <Card title="Network">
+      <div class="left-network-state">
+        <div class="left-network-body">
+          <h4 class="left-network-title">Not connected to a network</h4>
+          <p class="text-sm muted">
+            You are no longer part of a network. Your address has been cleared.
+          </p>
+          <div class="warn-box">
+            <span class="warn-icon">!</span>
+            <span>
+              Any balance you still held with your former parent node stays on
+              their books until you re-join and settle it.
+            </span>
+          </div>
+          <p class="text-sm muted">
+            You can join a different network, or re-join this one, using a new
+            invitation from a node operator.
+          </p>
+          <button
+            type="button"
+            class="btn btn--primary"
+            onclick={() => navigate(ROUTES.JOIN_FLOW)}
+          >
+            Join a network
+          </button>
+        </div>
+      </div>
+    </Card>
   {/if}
 
   <!-- Leave network confirm dialog -->

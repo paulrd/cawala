@@ -1,31 +1,46 @@
 <script>
   import Card from '../shared/Card.svelte';
   import Badge from '../shared/Badge.svelte';
-  import DataTable from '../shared/DataTable.svelte';
-  import Address from '../shared/Address.svelte';
-  import Balance from '../shared/Balance.svelte';
   import EmptyState from '../shared/EmptyState.svelte';
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
   import ErrorState from '../shared/ErrorState.svelte';
-  import { nodeState, loadingState, errorState, ledgerState } from '../../lib/stores.svelte.js';
-  import { getActivityLog, isMockMode } from '../../lib/api.js';
+  import GrantEmptyState from '../admin/GrantEmptyState.svelte';
+  import {
+    nodeState,
+    loadingState,
+    errorState,
+    ledgerState,
+    apiCapabilities,
+    administeredNode,
+    adminCapabilities,
+    targetEpoch,
+  } from '../../lib/stores.svelte.js';
+  import { getActivityLog } from '../../lib/api.js';
   import { ACTIVITY_TYPES, ACTIVITY_LABELS, ORDER_STATUS_LABELS, ORDER_STATUS_DESCRIPTIONS } from '../../lib/constants.js';
-  import { formatDate, formatTime } from '../../lib/utils.js';
+  import { formatDate } from '../../lib/utils.js';
 
   let loaded = $state(false);
   let filterType = $state('');
+  let view = administeredNode;
+  let canQuery = $derived(adminCapabilities.canQueryNode);
 
   $effect(() => {
-    if (!loaded) loadData();
+    void targetEpoch.value;
+    // The ledger poller appends entries in live mode: refetch so the table
+    // stays current instead of only updating on a manual refresh.
+    void ledgerState.activity.length;
+    if (!canQuery) return;
+    void loadData();
   });
 
   async function loadData() {
     loadingState.activity = true;
+    errorState.activity = null;
     try {
       nodeState.activity = await getActivityLog(filterType ? { type: filterType } : undefined);
       loaded = true;
     } catch (err) {
-      errorState.activity = err.message;
+      errorState.activity = err?.message || 'Failed to load activity';
     } finally {
       loadingState.activity = false;
     }
@@ -36,37 +51,25 @@
     loadData();
   }
 
-  let isLive = $derived(!isMockMode());
-
-  // ── Derived activity for live mode ────────────────────────
-  // Merge the leaf-reported outbound transfers with any derived
-  // balance-change entries from balance_receipt events.
-  let liveActivity = $derived.by(() => {
-    const rows = [];
-
-    for (const entry of ledgerState.activity) {
-      const isSettlement = entry.type === ACTIVITY_TYPES.SETTLEMENT;
-      rows.push({
-        id: entry.id,
-        type: entry.type,
+  // One row shape for both sources (mock log and leaf-reported history), so
+  // the table never branches on mode.
+  let rows = $derived(
+    nodeState.activity
+      .map((entry) => ({
+        ...entry,
         label: ACTIVITY_LABELS[entry.type] || entry.type,
-        from: entry.from,
-        to: entry.to,
-        amount: entry.amount,
-        timestamp: entry.timestamp,
-        reported: true,
-        // Settlement-specific fields
-        status: isSettlement ? entry.status : null,
-        reason: isSettlement ? entry.reason : null,
-        orderHash: isSettlement ? entry.orderHash : null,
-      });
-    }
+        status: entry.status ?? null,
+        reason: entry.reason ?? null,
+        orderHash: entry.orderHash ?? null,
+      }))
+      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)),
+  );
 
-    // Sort by timestamp descending (newest first)
-    rows.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-
-    return rows;
-  });
+  let emptyMessage = $derived(
+    view.isSelf
+      ? 'Your outbound payments will appear here once they are confirmed.'
+      : "This node's own activity log is not shared with delegated keys, and this browser's payments are never listed under another node's name.",
+  );
 
   const typeBadgeVariant = {
     transfer: 'info',
@@ -89,118 +92,102 @@
     unverified: 'warn',
     rejected: 'danger',
   };
-
-  const columns = [
-    { key: 'type', label: 'Type',
-      render: (v) => {
-        const variant = typeBadgeVariant[v] || 'muted';
-        const label = ACTIVITY_LABELS[v] || v;
-        const colors = { ok: 'var(--ok)', danger: 'var(--danger)', warn: 'var(--warn)', info: 'var(--accent)', muted: 'var(--muted)' };
-        const bgs = { ok: 'var(--ok-dim)', danger: 'var(--danger-dim)', warn: 'var(--warn-dim)', info: 'var(--accent-dim)', muted: 'var(--bg-hover)' };
-        return `<span style="display:inline-flex;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:600;background:${bgs[variant]};color:${colors[variant]}">${label}</span>`;
-      }
-    },
-    { key: 'from', label: 'From', mono: true,
-      render: (v) => v
-        ? `<span style="font-family:var(--mono);font-size:0.875rem">${v}</span>`
-        : '<span style="color:var(--muted);font-size:0.75rem">system</span>' },
-    { key: 'to', label: 'To', mono: true,
-      render: (v) => `<span style="font-family:var(--mono);font-size:0.875rem">${v}</span>` },
-    { key: 'amount', label: 'Amount', align: 'right', mono: true,
-      render: (v) => v != null
-        ? `<span style="font-family:var(--mono);font-weight:600;color:${v > 0 ? 'var(--ok)' : v < 0 ? 'var(--danger)' : 'var(--muted)'}">${v > 0 ? '+' : ''}${v.toLocaleString()}</span>`
-        : '<span style="color:var(--muted);font-size:0.75rem">\u2014</span>' },
-    { key: 'timestamp', label: 'Time',
-      render: (v) => `<span class="text-sm">${formatDate(v)}</span>` },
-  ];
 </script>
 
 <div class="activity-page">
   <Card title="Activity Log">
-    {#if isLive}
-      <div class="live-notice">
-        <p class="text-sm muted">
-          Only payments sent from this browser are listed here. Incoming value updates your balance but is not shown as a separate activity row.
-        </p>
-      </div>
+    {#snippet actions()}
+      <button
+        type="button"
+        class="btn btn--ghost btn--sm"
+        onclick={() => { loaded = false; loadData(); }}
+        disabled={loadingState.activity || !canQuery}
+      >
+        {loadingState.activity ? 'Loading…' : 'Refresh'}
+      </button>
+    {/snippet}
 
-      {#if liveActivity.length === 0}
-        <EmptyState
-          title="No activity yet"
-          message="Your outbound payments will appear here once they are confirmed."
-        />
-      {:else}
-        <div class="activity-table">
-          {#each liveActivity as entry (entry.id)}
-            <div class="activity-row">
-              <div class="activity-cell activity-cell--type">
-                <Badge variant={typeBadgeVariant[entry.type] || 'muted'} label={entry.label} />
-                {#if entry.status}
-                  <span title={ORDER_STATUS_DESCRIPTIONS[entry.status] || ''}>
-                    <Badge
-                      variant={settlementStatusVariant[entry.status] || 'muted'}
-                      label={ORDER_STATUS_LABELS[entry.status] || entry.status}
-                    />
-                  </span>
-                {/if}
-              </div>
-              <div class="activity-cell activity-cell--from">
-                {#if entry.from}
-                  <span class="mono-text text-sm">{entry.from}</span>
-                {:else}
-                  <span class="text-xs muted">system</span>
-                {/if}
-              </div>
-              <div class="activity-cell activity-cell--to">
-                <span class="mono-text text-sm">{entry.to ?? '\u2014'}</span>
-              </div>
-              <div class="activity-cell activity-cell--amount">
-                {#if entry.amount != null}
-                  <span class="mono-text text-sm" style="font-weight:600;color:{entry.amount > 0 ? 'var(--ok)' : entry.amount < 0 ? 'var(--danger)' : 'var(--muted)'}">
-                    {entry.amount > 0 ? '+' : ''}{entry.amount.toLocaleString()}
-                  </span>
-                {:else}
-                  <span class="text-xs muted">\u2014</span>
-                {/if}
-              </div>
-              <div class="activity-cell activity-cell--time">
-                <span class="text-sm">{formatDate(entry.timestamp)}</span>
-              </div>
-            </div>
-          {/each}
-        </div>
-      {/if}
-
-      <div class="activity-footnote">
-        <Badge variant="muted" label="Reported by your leaf" />
-        <span class="text-xs muted">
-          Activity data comes from the leaf process and is not independently attested.
+    <div class="toolbar">
+      <select bind:value={filterType} onchange={handleFilter} aria-label="Filter by type" disabled={!canQuery}>
+        <option value="">All types</option>
+        <option value="transfer">Transfers</option>
+        <option value="issue">Issues</option>
+        <option value="burn">Burns</option>
+        <option value="join_approved">Join Approved</option>
+        <option value="topo_create">Child Created</option>
+        <option value="topo_move">Child Moved</option>
+        <option value="topo_detach">Child Detached</option>
+      </select>
+      {#if view.isSelf}
+        <span class="text-sm muted">
+          Only payments sent from this browser are listed. Incoming value updates your balance but
+          is not shown as a separate row.
         </span>
-      </div>
-    {:else}
-      <!-- Mock mode: original filter + table -->
-      <div class="toolbar">
-        <select bind:value={filterType} onchange={handleFilter} aria-label="Filter by type">
-          <option value="">All types</option>
-          <option value="transfer">Transfers</option>
-          <option value="issue">Issues</option>
-          <option value="burn">Burns</option>
-          <option value="join_approved">Join Approved</option>
-          <option value="topo_create">Child Created</option>
-          <option value="topo_move">Child Moved</option>
-          <option value="topo_detach">Child Detached</option>
-        </select>
-      </div>
-
-      {#if loadingState.activity && !loaded}
-        <LoadingSkeleton rows={5} />
-      {:else if errorState.activity}
-        <ErrorState message="Failed to load activity" onRetry={loadData} />
-      {:else if nodeState.activity.length === 0}
-        <EmptyState title="No activity yet" message="Activity will appear here as operations are performed." />
-      {:else}
-        <DataTable columns={columns} rows={nodeState.activity} />
       {/if}
+    </div>
+
+    {#if !canQuery}
+      <GrantEmptyState
+        title="Activity needs a delegated admin key"
+        message="This browser cannot query the selected node yet. Generate an admin key in Settings and ask the operator to grant it."
+      />
+    {:else if loadingState.activity && !loaded}
+      <LoadingSkeleton rows={5} />
+    {:else if errorState.activity}
+      <ErrorState message={errorState.activity} onRetry={loadData} />
+    {:else if rows.length === 0}
+      <EmptyState title="No activity yet" message={emptyMessage} />
+    {:else}
+      <div class="activity-table">
+        {#each rows as entry (entry.id)}
+          <div class="activity-row">
+            <div class="activity-cell activity-cell--type">
+              <Badge variant={typeBadgeVariant[entry.type] || 'muted'} label={entry.label} />
+              {#if entry.status}
+                <span title={ORDER_STATUS_DESCRIPTIONS[entry.status] || ''}>
+                  <Badge
+                    variant={settlementStatusVariant[entry.status] || 'muted'}
+                    label={ORDER_STATUS_LABELS[entry.status] || entry.status}
+                  />
+                </span>
+              {/if}
+            </div>
+            <div class="activity-cell activity-cell--from">
+              {#if entry.from}
+                <span class="mono-text text-sm">{entry.from}</span>
+              {:else}
+                <span class="text-xs muted">system</span>
+              {/if}
+            </div>
+            <div class="activity-cell activity-cell--to">
+              <span class="mono-text text-sm">{entry.to ?? '\u2014'}</span>
+            </div>
+            <div class="activity-cell activity-cell--amount">
+              {#if entry.amount != null}
+                <span class="mono-text text-sm" style="font-weight:600;color:{entry.amount > 0 ? 'var(--ok)' : entry.amount < 0 ? 'var(--danger)' : 'var(--muted)'}">
+                  {entry.amount > 0 ? '+' : ''}{entry.amount.toLocaleString()}
+                </span>
+              {:else}
+                <span class="text-xs muted">&mdash;</span>
+              {/if}
+            </div>
+            <div class="activity-cell activity-cell--time">
+              <span class="text-sm">{formatDate(entry.timestamp)}</span>
+            </div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+
+    {#if canQuery}
+    <div class="activity-footnote">
+      <Badge variant="muted" label={apiCapabilities.mock ? 'Sample data' : 'Reported by your leaf'} />
+      <span class="text-xs muted">
+        {apiCapabilities.mock
+          ? 'Synthetic entries used while the console runs without a node.'
+          : 'Activity data comes from the leaf process and is not independently attested.'}
+      </span>
+    </div>
     {/if}
   </Card>
 </div>
@@ -216,6 +203,7 @@
     align-items: center;
     gap: var(--sp-3);
     margin-bottom: var(--sp-4);
+    flex-wrap: wrap;
   }
   select {
     padding: var(--sp-2) var(--sp-3);
@@ -226,13 +214,10 @@
     font: inherit;
     font-size: var(--text-sm);
   }
-
-  /* Live activity */
-  .live-notice {
-    padding-bottom: var(--sp-3);
-    border-bottom: 1px solid var(--border);
-    margin-bottom: var(--sp-3);
+  select:disabled {
+    opacity: 0.5;
   }
+
   .activity-table {
     display: flex;
     flex-direction: column;
@@ -256,6 +241,7 @@
     flex-shrink: 0;
     min-width: 80px;
     gap: var(--sp-2);
+    flex-wrap: wrap;
   }
   .activity-cell--from {
     flex: 1;
@@ -293,5 +279,33 @@
     padding-top: var(--sp-3);
     border-top: 1px solid var(--border);
     margin-top: var(--sp-3);
+    flex-wrap: wrap;
+  }
+
+  .btn {
+    padding: var(--sp-2) var(--sp-3);
+    border: none;
+    border-radius: var(--radius-md);
+    font: inherit;
+    font-weight: 600;
+    font-size: var(--text-sm);
+    cursor: pointer;
+    transition: background var(--duration-fast) var(--ease);
+  }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .btn--ghost {
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--border);
+  }
+  .btn--ghost:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
+  .btn--sm {
+    font-size: var(--text-xs);
+    padding: var(--sp-1) var(--sp-3);
   }
 </style>

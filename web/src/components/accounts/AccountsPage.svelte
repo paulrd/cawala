@@ -6,36 +6,43 @@
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
   import ErrorState from '../shared/ErrorState.svelte';
   import Badge from '../shared/Badge.svelte';
-  import { nodeState, loadingState, errorState, ledgerState } from '../../lib/stores.svelte.js';
-  import { getAccounts, isMockMode } from '../../lib/api.js';
+  import GrantEmptyState from '../admin/GrantEmptyState.svelte';
+  import {
+    nodeState,
+    loadingState,
+    errorState,
+    ledgerState,
+    administeredNode,
+    adminCapabilities,
+    targetEpoch,
+  } from '../../lib/stores.svelte.js';
+  import { getAccounts } from '../../lib/api.js';
   import { navigate } from '../../lib/router.svelte.js';
   import { ROUTES } from '../../lib/constants.js';
 
   let loaded = $state(false);
+  let view = administeredNode;
+  let canQuery = $derived(adminCapabilities.canQueryNode);
 
   $effect(() => {
-    if (!loaded) loadData();
+    void targetEpoch.value;
+    if (!canQuery) return;
+    void loadData();
   });
 
   async function loadData() {
     loadingState.accounts = true;
+    errorState.accounts = null;
     try {
       nodeState.accounts = await getAccounts();
       loaded = true;
     } catch (err) {
-      errorState.accounts = err.message;
+      errorState.accounts = err?.message || 'Failed to load accounts';
     } finally {
       loadingState.accounts = false;
     }
   }
 
-  let isLive = $derived(!isMockMode());
-
-  // ── Live mode: show the verified balance as the headline ──
-  let liveAccountReady = $derived(isLive && ledgerState.balance != null);
-  let liveAccountLoading = $derived(isLive && ledgerState.balance == null);
-
-  // ── Mock mode: accounting equation ────────────────────────
   const columns = [
     { key: 'label', label: 'Account' },
     { key: 'type', label: 'Type',
@@ -59,91 +66,117 @@
       .filter((a) => a.type === 'liability')
       .reduce((sum, a) => sum + a.balance, 0),
   );
+  // Equity is a row when the node publishes one, otherwise assets − liabilities
+  // (the same derivation the mock data applies), so the equation is honest in
+  // both modes.
   let equity = $derived(
-    nodeState.accounts.find((a) => a.type === 'equity')?.balance ?? 0,
+    nodeState.accounts.find((a) => a.type === 'equity')?.balance ??
+      totalAssets - totalLiability,
   );
+  let hasRows = $derived(nodeState.accounts.length > 0);
+  let balanceReady = $derived(ledgerState.balance != null);
+
+  let emptyMessage = $derived.by(() => {
+    if (view.isSelf) {
+      return 'Your verified balance will appear here once a receipt arrives from your leaf process.';
+    }
+    return 'Balances stay with the node operator. This console reads topology and joins for an administered node, never its ledger.';
+  });
 </script>
 
 <div class="accounts-page">
-  {#if isLive}
-    <!-- ── Live mode: "My account" semantics ──────────── -->
-    {#if liveAccountReady}
-      <Card title="My Account">
-        <div class="my-account">
-          <div class="account-balance">
-            <Balance amount={ledgerState.balance} size="lg" showSign={false} />
-          </div>
-          <p class="account-note text-sm muted">
-            This is your verified balance from the leaf process. It is updated when a balance receipt arrives.
-          </p>
-          <div class="account-meta">
-            <Badge variant="ok" label="Verified" />
-            {#if ledgerState.height != null}
-              <span class="text-sm muted">Height {ledgerState.height}</span>
-            {/if}
-          </div>
-        </div>
-      </Card>
+  <Card title="Balance">
+    {#snippet actions()}
+      <button
+        type="button"
+        class="btn btn--ghost btn--sm"
+        onclick={loadData}
+        disabled={loadingState.accounts}
+      >
+        {loadingState.accounts ? 'Loading…' : 'Refresh'}
+      </button>
+    {/snippet}
 
-      <div class="live-guidance">
-        <p class="text-sm muted">
-          The node accounting equation (assets &minus; liabilities = equity) applies to node operators, not leaf users. Your account balance is managed by your parent node.
+    {#if !canQuery}
+      <GrantEmptyState
+        title="Account data needs a delegated admin key"
+        message="This browser cannot query the selected node yet. Generate an admin key in Settings and ask the operator to grant it."
+      />
+    {:else if loadingState.accounts && !loaded}
+      <LoadingSkeleton rows={2} />
+    {:else if errorState.accounts}
+      <ErrorState message={errorState.accounts} onRetry={loadData} />
+    {:else if balanceReady}
+      <div class="my-account">
+        <div class="account-balance">
+          <Balance amount={ledgerState.balance} size="lg" showSign={false} />
+        </div>
+        <p class="account-note text-sm muted">
+          Your verified balance from the leaf process, updated when a balance receipt arrives.
         </p>
-        <button
-          type="button"
-          class="link-btn"
-          onclick={() => navigate(ROUTES.MY_ACCOUNT)}
-        >
+        <div class="account-meta">
+          <Badge variant="ok" label="Verified" />
+          {#if ledgerState.height != null}
+            <span class="text-sm muted">Height {ledgerState.height}</span>
+          {/if}
+        </div>
+        <button type="button" class="link-btn" onclick={() => navigate(ROUTES.MY_ACCOUNT)}>
           Go to My Account to send payments
         </button>
       </div>
-    {:else if liveAccountLoading}
-      <Card title="My Account">
-        <LoadingSkeleton rows={2} />
-        <p class="text-sm muted" style="margin-top: var(--sp-3);">
-          Balance not yet verified. Waiting for a receipt from your leaf.
+    {:else if hasRows}
+      <div class="my-account">
+        <div class="account-balance">
+          <Balance amount={equity} size="lg" showSign={false} />
+        </div>
+        <p class="account-note text-sm muted">
+          Node equity (assets &minus; liabilities) from this node's accounting snapshot.
         </p>
-      </Card>
+      </div>
     {:else}
-      <Card title="Accounts">
-        <EmptyState
-          title="No account data yet"
-          message="Your verified balance will appear here once a receipt arrives from your leaf process."
-        />
-      </Card>
+      <EmptyState title="No account data yet" message={emptyMessage} />
     {/if}
+  </Card>
 
-  {:else}
-    <!-- ── Mock mode: original accounting-equation UI ──── -->
-    {#if loadingState.accounts && !loaded}
+  <Card title="Accounting Equation">
+    {#if hasRows}
+      <div class="equation">
+        <div class="eq-item">
+          <span class="eq-label muted">Assets</span>
+          <Balance amount={totalAssets} size="lg" />
+        </div>
+        <span class="eq-op muted">&minus;</span>
+        <div class="eq-item">
+          <span class="eq-label muted">Liabilities</span>
+          <Balance amount={totalLiability} size="lg" />
+        </div>
+        <span class="eq-op muted">=</span>
+        <div class="eq-item">
+          <span class="eq-label muted">Equity</span>
+          <Balance amount={equity} size="lg" />
+        </div>
+      </div>
+    {:else}
+      <p class="text-sm muted">
+        The node accounting equation (assets &minus; liabilities = equity) applies to node
+        operators. As a leaf user your balance comes from your parent node and is shown above.
+      </p>
+    {/if}
+  </Card>
+
+  <Card title="All Accounts">
+    {#if !canQuery}
+      <p class="text-sm muted">No rows to show for this selection.</p>
+    {:else if loadingState.accounts && !loaded}
       <LoadingSkeleton rows={3} />
     {:else if errorState.accounts}
       <ErrorState message="Failed to load accounts" onRetry={loadData} />
+    {:else if !hasRows}
+      <EmptyState title="No accounts" message={emptyMessage} />
     {:else}
-      <Card title="Accounting Equation">
-        <div class="equation">
-          <div class="eq-item">
-            <span class="eq-label muted">Assets</span>
-            <Balance amount={totalAssets} size="lg" />
-          </div>
-          <span class="eq-op muted">&minus;</span>
-          <div class="eq-item">
-            <span class="eq-label muted">Liabilities</span>
-            <Balance amount={totalLiability} size="lg" />
-          </div>
-          <span class="eq-op muted">=</span>
-          <div class="eq-item">
-            <span class="eq-label muted">Equity</span>
-            <Balance amount={equity} size="lg" />
-          </div>
-        </div>
-      </Card>
-
-      <Card title="All Accounts">
-        <DataTable columns={columns} rows={nodeState.accounts} />
-      </Card>
+      <DataTable {columns} rows={nodeState.accounts} />
     {/if}
-  {/if}
+  </Card>
 </div>
 
 <style>
@@ -153,7 +186,6 @@
     gap: var(--sp-5);
   }
 
-  /* Live mode */
   .my-account {
     display: flex;
     flex-direction: column;
@@ -172,11 +204,6 @@
     align-items: center;
     gap: var(--sp-3);
   }
-  .live-guidance {
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-2);
-  }
   .link-btn {
     background: none;
     border: none;
@@ -187,12 +214,12 @@
     padding: 0;
     text-decoration: underline;
     text-align: left;
+    align-self: flex-start;
   }
   .link-btn:hover {
     color: var(--accent-hover);
   }
 
-  /* Mock mode */
   .equation {
     display: flex;
     align-items: center;
@@ -212,5 +239,32 @@
     font-size: var(--text-2xl);
     font-weight: 300;
     line-height: 1;
+  }
+
+  .btn {
+    padding: var(--sp-2) var(--sp-3);
+    border: none;
+    border-radius: var(--radius-md);
+    font: inherit;
+    font-weight: 600;
+    font-size: var(--text-sm);
+    cursor: pointer;
+    transition: background var(--duration-fast) var(--ease);
+  }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .btn--ghost {
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--border);
+  }
+  .btn--ghost:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
+  .btn--sm {
+    font-size: var(--text-xs);
+    padding: var(--sp-1) var(--sp-3);
   }
 </style>

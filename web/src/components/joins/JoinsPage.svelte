@@ -1,18 +1,28 @@
 <script>
   import Card from '../shared/Card.svelte';
+  import PageHeader from '../shared/PageHeader.svelte';
   import EndpointId from '../shared/EndpointId.svelte';
   import ConfirmDialog from '../shared/ConfirmDialog.svelte';
   import EmptyState from '../shared/EmptyState.svelte';
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
   import ErrorState from '../shared/ErrorState.svelte';
-  import Badge from '../shared/Badge.svelte';
-  import { nodeState, loadingState, errorState, showToast } from '../../lib/stores.svelte.js';
-  import { getJoinRequests, approveJoin, rejectJoin, redeliverJoin, isMockMode, getAdminNodes, AdminUnavailableError } from '../../lib/api.js';
+  import GrantEmptyState from '../admin/GrantEmptyState.svelte';
+  import {
+    nodeState,
+    loadingState,
+    errorState,
+    administeredNode,
+    adminCapabilities,
+    targetEpoch,
+    showToast,
+  } from '../../lib/stores.svelte.js';
+  import { getJoinRequests, approveJoin, rejectJoin, redeliverJoin, AdminUnavailableError } from '../../lib/api.js';
   import { formatDate } from '../../lib/utils.js';
   import { ROUTES } from '../../lib/constants.js';
   import { navigate } from '../../lib/router.svelte.js';
 
   let loaded = $state(false);
+  let view = administeredNode;
 
   // Confirm dialog state
   let confirmOpen = $state(false);
@@ -21,35 +31,33 @@
   let confirmSlot = $state('');
   let confirmReason = $state('');
 
-  // Live admin grant
-  let adminNodes = $state([]);
-  let activeGrant = $derived(adminNodes.find((n) => n.active && !isExpiredTs(n.expiresAt)));
-
-  function isExpiredTs(ts) {
-    return typeof ts === 'number' && ts < Date.now();
-  }
-
-  async function loadAdminInfo() {
-    if (isMockMode()) return;
-    try {
-      adminNodes = getAdminNodes();
-    } catch {
-      adminNodes = [];
-    }
-  }
+  // One gate for both modes: can admin reads run for the current selection?
+  let canQuery = $derived(adminCapabilities.canQueryNode);
+  let emptyMessage = $derived(
+    view.isSelf
+      ? 'Share your endpoint ID with nodes that want to join under you.'
+      : 'This node has no pending join requests right now.',
+  );
+  let scopeLabel = $derived(
+    view.isSelf
+      ? 'your own node on this device'
+      : view.label || view.nodeId || 'the selected node',
+  );
 
   $effect(() => {
-    if (!loaded) loadData();
+    void targetEpoch.value;
+    if (!canQuery) return;
+    void loadData();
   });
 
   async function loadData() {
     loadingState.joinRequests = true;
+    errorState.joinRequests = null;
     try {
-      await loadAdminInfo();
       nodeState.joinRequests = await getJoinRequests();
       loaded = true;
     } catch (err) {
-      errorState.joinRequests = err.message;
+      errorState.joinRequests = err?.message || 'Failed to load join requests';
     } finally {
       loadingState.joinRequests = false;
     }
@@ -147,72 +155,38 @@
   }
 
   let pending = $derived(nodeState.joinRequests.filter((r) => r.status === 'pending'));
-  let isLive = $derived(!isMockMode());
 </script>
 
 <div class="joins-page">
-  <Card title="Pending Join Requests">
-    {#if isLive}
-      {#if !activeGrant}
-        <!-- No active admin grant — setup card -->
-        <div class="live-setup">
-          <div class="live-setup-header">
-            <Badge variant="info" label="Live mode" />
-          </div>
-          <p class="unavailable-desc">
-            Approving join requests requires a delegated admin key. Generate one
-            in Settings, then ask the node operator to grant it.
-          </p>
-          <button
-            type="button"
-            class="btn btn--primary"
-            onclick={() => navigate(ROUTES.SETTINGS)}
-          >
-            Open Settings
-          </button>
-          <p class="unavailable-cli muted text-sm">
-            Operator command:
-          </p>
-          <code class="unavailable-code">
-            cawala-node control admin grant --key &lt;pubkey&gt; --label browser-admin
-          </code>
-        </div>
-      {:else}
-        <!-- Active grant — join requests -->
-        <div class="live-header">
-          <div class="live-header-left">
-            <span class="text-sm muted">Administering:</span>
-            <EndpointId id={activeGrant.nodeId} />
-            {#if activeGrant.nodeAddr}
-              <span class="text-xs muted header-address">
-                <code>{activeGrant.nodeAddr}</code>
-              </span>
-              <Badge variant="ok" label="Tree-routed" />
-            {:else}
-              <Badge variant="muted" label="Direct only" />
-            {/if}
-          </div>
-          <button
-            type="button"
-            class="btn btn--ghost btn--sm"
-            onclick={handleRefresh}
-            disabled={loadingState.joinRequests}
-          >
-            Refresh
-          </button>
-        </div>
+  <PageHeader
+    description="Join requests waiting on {scopeLabel}. Approving assigns an address and makes the requester a permanent child — identical for a leaf and an internal node."
+  />
 
-        {#if loadingState.joinRequests && !loaded}
-          <LoadingSkeleton rows={2} />
-        {:else if errorState.joinRequests}
-          <ErrorState message="Failed to load join requests" onRetry={handleRefresh} />
-        {:else if pending.length === 0}
-          <EmptyState
-            title="No pending requests"
-            message="Share your endpoint ID with nodes that want to join under you."
-          />
-        {:else}
-          <div class="request-list">
+  <Card title="Pending Join Requests">
+    {#snippet actions()}
+      <button
+        type="button"
+        class="btn btn--ghost btn--sm"
+        onclick={handleRefresh}
+        disabled={loadingState.joinRequests || !canQuery}
+      >
+        {loadingState.joinRequests ? 'Loading…' : 'Refresh'}
+      </button>
+    {/snippet}
+
+    {#if !canQuery}
+      <GrantEmptyState
+        title="Join approval needs a delegated admin key"
+        message="This browser cannot read join requests for the selected node yet. Generate an admin key in Settings, then ask the node operator to grant it — this browser only ever holds the delegated key."
+      />
+    {:else if loadingState.joinRequests && !loaded}
+      <LoadingSkeleton rows={2} />
+    {:else if errorState.joinRequests}
+      <ErrorState message={errorState.joinRequests} onRetry={loadData} />
+    {:else if pending.length === 0}
+      <EmptyState title="No pending requests" message={emptyMessage} />
+    {:else}
+      <div class="request-list">
             {#each pending as request}
               <div class="request-row">
                 <div class="request-info">
@@ -251,43 +225,6 @@
                 </div>
               </div>
             {/each}
-          </div>
-        {/if}
-      {/if}
-    {:else if loadingState.joinRequests && !loaded}
-      <LoadingSkeleton rows={2} />
-    {:else if errorState.joinRequests}
-      <ErrorState message="Failed to load join requests" onRetry={loadData} />
-    {:else if pending.length === 0}
-      <EmptyState
-        title="No pending requests"
-        message="Share your endpoint ID with nodes that want to join under you."
-      />
-    {:else}
-      <div class="request-list">
-        {#each pending as request}
-          <div class="request-row">
-            <div class="request-info">
-              <EndpointId id={request.endpointId} />
-              <span class="request-time muted text-sm">
-                {formatDate(request.timestamp)}
-              </span>
-              {#if request.requestedAddress}
-                <span class="text-xs muted">
-                  Requested: <code>{request.requestedAddress}</code>
-                </span>
-              {/if}
-            </div>
-            <div class="request-actions">
-              <button type="button" class="btn btn--ghost" onclick={() => handleReject(request)}>
-                Reject
-              </button>
-              <button type="button" class="btn btn--primary" onclick={() => handleApprove(request)}>
-                Approve
-              </button>
-            </div>
-          </div>
-        {/each}
       </div>
     {/if}
   </Card>
@@ -368,55 +305,9 @@
     color: var(--fg);
   }
 
-  /* ── Live unavailable state ── */
-  .live-setup {
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-3);
-    padding: var(--sp-4) 0;
-  }
-  .live-setup-header {
-    margin-bottom: var(--sp-1);
-  }
-  .live-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: var(--sp-3) 0;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: var(--sp-2);
-  }
-  .live-header-left {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-2);
-    flex-wrap: wrap;
-  }
-  .header-address {
-    display: inline-flex;
-    align-items: center;
-  }
   .btn--sm {
     padding: var(--sp-1) var(--sp-2);
     font-size: var(--text-xs);
-  }
-  .unavailable-desc {
-    font-size: var(--text-sm);
-    line-height: var(--leading-normal);
-  }
-  .unavailable-cli {
-    font-size: var(--text-sm);
-  }
-  .unavailable-code {
-    display: block;
-    padding: var(--sp-3) var(--sp-4);
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    font-family: var(--mono);
-    font-size: var(--text-sm);
-    color: var(--fg);
-    overflow-x: auto;
   }
 
   @media (max-width: 480px) {
