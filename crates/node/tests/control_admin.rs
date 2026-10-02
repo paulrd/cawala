@@ -849,3 +849,4 @@ async fn v2_multi_scope_grant_reaches_joins() {
     fixture.admin_endpoint.close().await;
     fixture.parent.shutdown().await;
 }
+

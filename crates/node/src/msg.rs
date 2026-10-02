@@ -1738,7 +1738,16 @@ pub async fn dispatch_control_envelope(
     };
     // Reverse-dial any queued join decision, patch `delivery`, then sign the
     // reply. The engine lock is not held across the dials.
-    deliver_outbound_decisions(endpoint, &data_dir, outbound, &mut reply).await;
+    //
+    // A failed `DetachNotice`/`Rebase` (a routed admin detach/move whose child
+    // dial fails) is retained in the bounded retry sweep, exactly as the direct
+    // handler does; without this the notice would be dropped.
+    let failed_notices =
+        deliver_outbound_decisions(endpoint, &data_dir, outbound, &mut reply).await;
+    if !failed_notices.is_empty() {
+        let mut engine = control.lock().await;
+        engine.requeue_pending_rebase(failed_notices);
+    }
     tracing::info!(%remote, "routed control reply");
 
     send_control_reply(endpoint, source, config, control, &env, requester, reply).await;

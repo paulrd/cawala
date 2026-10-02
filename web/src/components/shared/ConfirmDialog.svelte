@@ -13,6 +13,7 @@
    * @param {string} [variant='default'] - 'default' | 'danger'
    * @param {function} onConfirm
    * @param {function} onCancel
+   * @param {import('svelte').Snippet} [children] optional extra content below the message
    */
   let {
     open = false,
@@ -23,6 +24,7 @@
     variant = 'default',
     onConfirm,
     onCancel,
+    children,
   } = $props();
 
   let dialogEl = $state(null);
@@ -89,6 +91,7 @@
     >
       <h3 id="confirm-title" class="dialog-title">{title}</h3>
       <p id="confirm-message" class="dialog-message">{message}</p>
+      {@render children?.()}
       <div class="dialog-actions">
         <button type="button" class="btn btn--ghost" onclick={onCancel}>
           {cancelLabel}

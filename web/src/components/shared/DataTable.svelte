@@ -14,6 +14,7 @@
    * @param {string} [sortKey]
    * @param {string} [sortDir='asc']
    * @param {function} [onSort] - (key, dir) => void
+   * @param {string|null} [selectedId] - row id (`row.id ?? row.endpointId`) to highlight
    */
   let {
     columns = [],
@@ -23,7 +24,13 @@
     sortKey = '',
     sortDir = 'asc',
     onSort,
+    selectedId = null,
   } = $props();
+
+  /** Stable per-row identity for keying and selection. */
+  function rowId(row, i) {
+    return row.id ?? row.endpointId ?? i;
+  }
 
   function handleSort(key) {
     if (!onSort) return;
@@ -68,9 +75,10 @@
       </tr>
     </thead>
     <tbody>
-      {#each rows as row, i (row.id ?? i)}
+      {#each rows as row, i (rowId(row, i))}
         <tr
           class:clickable={!!onRowClick}
+          class:row--selected={selectedId != null && rowId(row, i) === selectedId}
           onclick={(e) => handleRowClick(row, e)}
           onkeydown={(e) => handleKeydown(row, e)}
           tabindex={onRowClick ? 0 : undefined}
@@ -125,6 +133,12 @@
   tr.clickable:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: -2px;
+  }
+  tr.row--selected {
+    background: var(--accent-dim);
+  }
+  tr.row--selected td {
+    color: var(--fg);
   }
   .empty-cell {
     text-align: center;

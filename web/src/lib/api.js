@@ -2525,19 +2525,103 @@ export async function createChild(slot) {
   throw new Error('Not implemented: real createChild');
 }
 
+/** Stable reject code → honest user-facing topology error copy. */
+const TOPOLOGY_REJECT_MESSAGES = {
+  unauthorized:
+    'Topology grant expired or revoked. Ask the node operator to grant topology scope.',
+  slot_taken: 'That slot is taken. Pick another slot.',
+  slot_out_of_range: 'That slot is out of range (must be 0-7).',
+  not_found: 'That child is no longer attached to this node. Refresh and try again.',
+  bad_request:
+    'The node refused this topology change (browser leaves cannot be re-slotted).',
+  expired: 'The request expired before it reached the node. Try again.',
+  replay: 'A duplicate request was refused. Refresh and try again.',
+  internal: 'The node could not apply the change (internal error).',
+};
+
 /**
- * Move a child to a new slot/parent.
- * @param {string} childAddress
- * @param {string} newParentAddress
- * @param {number} newSlot
- * @returns {Promise<{ status: string, newAddress: string }>}
+ * Map a wasm `admin request rejected: <code>` error to honest topology copy.
+ * @param {any} err
+ * @returns {Error}
  */
-export async function moveChild(childAddress, newParentAddress, newSlot) {
+function _topologyError(err) {
+  const message = String(err?.message ?? err ?? '');
+  const marker = 'admin request rejected: ';
+  const index = message.indexOf(marker);
+  const code = index >= 0 ? message.slice(index + marker.length).trim() : '';
+  const friendly = TOPOLOGY_REJECT_MESSAGES[code];
+  if (friendly) return new Error(friendly);
+  return new Error(
+    message && !message.startsWith('admin request rejected:')
+      ? message
+      : 'Topology action failed. Refresh and try again.',
+  );
+}
+
+/** Resolve the selected grant for a topology action, or throw. */
+function _requireTopologyTarget(target) {
+  const entry = adminKeys.findAdminNode(target);
+  if (!entry || entry.expiresAt <= Date.now()) {
+    throw new AdminUnavailableError('topology action (grant expired or missing)');
+  }
+  return entry;
+}
+
+/**
+ * Detach a child from the administered node (topology scope).
+ *
+ * The browser never holds operator/ledger keys: the node applies the change via
+ * the shared senior mutation engine. Refusals map to honest errors.
+ *
+ * @param {string} childEndpointId
+ * @param {string} [nodeId] Target; defaults to the current selection.
+ * @returns {Promise<{ status: 'detached', child: string }>}
+ */
+export async function adminDetachChild(childEndpointId, nodeId = undefined) {
+  const target = _normalizeTarget(nodeId);
+  if (_useMock) {
+    await mockDelay(400);
+    return { status: 'detached', child: childEndpointId };
+  }
+  if (!canAdministerTopology(administeredNode, adminCapabilities)) {
+    throw new AdminUnavailableError('admin detach child (topology)');
+  }
+  const entry = _requireTopologyTarget(target);
+  const node = _ensureAdminKey(target, entry);
+  try {
+    await node.admin_detach_child(target, childEndpointId, entry.nodeAddr ?? null);
+  } catch (err) {
+    throw _topologyError(err);
+  }
+  return { status: 'detached', child: childEndpointId };
+}
+
+/**
+ * Re-slot a `node` child of the administered node (topology scope). `slot` of
+ * `null` lets the node pick the lowest free slot.
+ *
+ * @param {string} childEndpointId
+ * @param {number|null} slot
+ * @param {string} [nodeId] Target; defaults to the current selection.
+ * @returns {Promise<{ status: 'moved', child: string, slot: number|null }>}
+ */
+export async function adminMoveChild(childEndpointId, slot = null, nodeId = undefined) {
+  const target = _normalizeTarget(nodeId);
   if (_useMock) {
     await mockDelay(500);
-    return { status: 'moved', newAddress: `${newParentAddress}.${newSlot}` };
+    return { status: 'moved', child: childEndpointId, slot: slot ?? null };
   }
-  throw new Error('Not implemented: real moveChild');
+  if (!canAdministerTopology(administeredNode, adminCapabilities)) {
+    throw new AdminUnavailableError('admin move child (topology)');
+  }
+  const entry = _requireTopologyTarget(target);
+  const node = _ensureAdminKey(target, entry);
+  try {
+    await node.admin_move_child(target, childEndpointId, slot ?? null, entry.nodeAddr ?? null);
+  } catch (err) {
+    throw _topologyError(err);
+  }
+  return { status: 'moved', child: childEndpointId, slot: slot ?? null };
 }
 
 /**
@@ -2876,6 +2960,28 @@ function withDerivedEquity(accounts) {
  */
 export function canReadAdminLedger(caps) {
   return Boolean(caps?.scopes?.value);
+}
+
+/**
+ * Whether the delegated-admin surface permits topology actions: a topology
+ * scope on a **non-self** target. Pure, so it is unit-testable.
+ * @param {{ isSelf?: boolean }|null|undefined} view
+ * @param {{ scopes?: { topology?: boolean } }|null|undefined} caps
+ * @returns {boolean}
+ */
+export function canAdministerTopology(view, caps) {
+  return Boolean(view != null && !view.isSelf && caps?.scopes?.topology);
+}
+
+/**
+ * Whether a child of the given `kind` can be re-slotted: only a `node` child
+ * has a healing pull. A `user` (browser leaf) child cannot be re-slotted.
+ * Pure, so it is unit-testable.
+ * @param {string|null|undefined} kind
+ * @returns {boolean}
+ */
+export function canMoveChild(kind) {
+  return kind === 'node';
 }
 
 /**

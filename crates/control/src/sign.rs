@@ -41,36 +41,38 @@ use crate::request::ControlRequest;
 /// [`ControlRequest::DetachNotice`], [`ControlRequest::Rebase`],
 /// [`ControlRequest::RebasePull`]) were appended.
 ///
-/// Bumped to 5 when [`ControlRequest::AdminLedgerQuery`] was appended. Variants
-/// are only *additive*, so a v4 verifier parses every pre-existing variant
-/// identically; [`is_supported_control_version`] therefore accepts both 4 and 5
-/// for rolling upgrades, and [`min_control_version`] is the per-request shape
-/// gate (a v5-only variant on a v4 declaration is `BadVersion`).
+/// Bumped to 5 when [`ControlRequest::AdminLedgerQuery`] was appended, and to 6
+/// when [`ControlRequest::AdminDetachChild`] / [`ControlRequest::AdminMoveChild`]
+/// were appended. Variants are only *additive*, so a v5 verifier parses every
+/// pre-existing variant identically; [`is_supported_control_version`] therefore
+/// accepts both 5 and 6 for rolling upgrades, and [`min_control_version`] is the
+/// per-request shape gate (a v6-only variant on a v5 declaration is
+/// `BadVersion`).
 ///
 /// # Dual-accept is inbound-only
 ///
-/// This build always **mints** frames at [`CONTROL_FORMAT_VERSION`] (5):
+/// This build always **mints** frames at [`CONTROL_FORMAT_VERSION`] (6):
 /// `sign_decision`/`sign_forward` in the node and
-/// [`SignedControl::authorize`] everywhere stamp v5. A v4 peer therefore cannot
-/// consume a v5 `AdminLedgerQuery` (unknown postcard discriminant) or a routed
-/// forward carrying it, and a v5 node emits only v5. The upgrade is effectively
-/// **lockstep for node-to-child and routed frames**; version negotiation is a
-/// v2 item. Accepting v4 here keeps a v4 peer's *pre-existing* requests
-/// readable during a rolling upgrade, nothing more.
-pub const CONTROL_FORMAT_VERSION: u8 = 5;
+/// [`SignedControl::authorize`] everywhere stamp v6. A v5 peer therefore cannot
+/// consume a v6 topology-admin variant (unknown postcard discriminant) or a
+/// routed forward carrying it, and a v6 node emits only v6. The upgrade is
+/// effectively **lockstep for node-to-child and routed frames**; version
+/// negotiation is a v2 item. Accepting v5 here keeps a v5 peer's *pre-existing*
+/// requests readable during a rolling upgrade, nothing more.
+pub const CONTROL_FORMAT_VERSION: u8 = 6;
 
 /// Whether `version` is a [`SignedControl`] wire version this build accepts
 /// **inbound**.
 ///
-/// Accepts [`CONTROL_FORMAT_VERSION`] (5) and the immediately preceding
-/// version 4. Versions only *appended* request variants, so every pre-existing
+/// Accepts [`CONTROL_FORMAT_VERSION`] (6) and the immediately preceding
+/// version 5. Versions only *appended* request variants, so every pre-existing
 /// variant is byte-identical in both; [`min_control_version`] is the per-request
-/// shape gate. Anything else (including v3) is rejected up front.
+/// shape gate. Anything else (including v4) is rejected up front.
 ///
-/// This does **not** mean minted frames are ever v4: see the inbound-only note
+/// This does **not** mean minted frames are ever v5: see the inbound-only note
 /// on [`CONTROL_FORMAT_VERSION`].
 pub fn is_supported_control_version(version: u8) -> bool {
-    matches!(version, 4 | CONTROL_FORMAT_VERSION)
+    matches!(version, 5 | CONTROL_FORMAT_VERSION)
 }
 
 /// The minimum [`SignedControl`] wire version that can carry `request`.
@@ -106,6 +108,8 @@ pub fn min_control_version(request: &ControlRequest) -> u8 {
         | ControlRequest::RebasePull(_) => 4,
         // Appended in control format 5.
         ControlRequest::AdminLedgerQuery => 5,
+        // Appended in control format 6.
+        ControlRequest::AdminDetachChild(_) | ControlRequest::AdminMoveChild(_) => 6,
     }
 }
 
@@ -551,16 +555,34 @@ mod tests {
     }
 
     #[test]
-    fn is_supported_control_version_accepts_4_and_5_only() {
-        assert!(is_supported_control_version(4));
+    fn is_supported_control_version_accepts_5_and_6_only() {
         assert!(is_supported_control_version(5));
-        assert_eq!(CONTROL_FORMAT_VERSION, 5);
-        for version in [0, 1, 2, 3, 6, u8::MAX] {
+        assert!(is_supported_control_version(6));
+        assert_eq!(CONTROL_FORMAT_VERSION, 6);
+        for version in [0, 1, 2, 3, 4, 7, u8::MAX] {
             assert!(
                 !is_supported_control_version(version),
                 "version {version} must be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn verify_control_rejects_v4_version() {
+        // v4 is below the accepted window (5|6) after the P4 bump.
+        assert_ne!(CONTROL_FORMAT_VERSION, 4);
+        let op = operator(1);
+        let registry = registry_with(&[("origin", &op, &ledger(11))]);
+        let mut signed = signed_with(&op);
+        signed.version = 4;
+        assert_eq!(
+            verify_control(&signed, &registry),
+            Err(ControlError::UnsupportedVersion(4))
+        );
+        assert_eq!(
+            verify_control(&signed, &PeerRegistry::new()),
+            Err(ControlError::UnsupportedVersion(4))
+        );
     }
 
     /// Build a frame that declares `version`, re-signing so the version byte is
@@ -573,24 +595,24 @@ mod tests {
     }
 
     #[test]
-    fn verify_control_accepts_v4_and_v5_frames() {
+    fn verify_control_accepts_v5_and_v6_frames() {
         let op = operator(1);
         let registry = registry_with(&[("origin", &op, &ledger(11))]);
 
-        // The current (v5) frame.
-        let v5 = signed_version(&op, CONTROL_FORMAT_VERSION);
+        // The current (v6) frame.
+        let v6 = signed_version(&op, CONTROL_FORMAT_VERSION);
+        assert_eq!(v6.verify_signature(), Ok(()));
+        assert!(verify_control(&v6, &registry).is_ok());
+
+        // A real v5 frame: the version byte is covered by the signature, so it
+        // must be re-signed after the downgrade.
+        let v5 = signed_version(&op, 5);
         assert_eq!(v5.verify_signature(), Ok(()));
         assert!(verify_control(&v5, &registry).is_ok());
 
-        // A real v4 frame: the version byte is covered by the signature, so it
-        // must be re-signed after the downgrade.
-        let v4 = signed_version(&op, 4);
-        assert_eq!(v4.verify_signature(), Ok(()));
-        assert!(verify_control(&v4, &registry).is_ok());
-
-        // A v4 frame whose signature was produced over the v5 preimage fails.
+        // A v5 frame whose signature was produced over the v6 preimage fails.
         let mut tampered = signed_with(&op);
-        tampered.version = 4;
+        tampered.version = 5;
         assert_eq!(
             verify_control(&tampered, &registry),
             Err(ControlError::InvalidSignature)
@@ -709,6 +731,19 @@ mod tests {
 
         // The ledger view was introduced in v5.
         request(ControlRequest::AdminLedgerQuery, 5);
+
+        // The topology-admin variants were introduced in v6.
+        request(
+            ControlRequest::AdminDetachChild(crate::request::AdminDetachChild { child: child() }),
+            6,
+        );
+        request(
+            ControlRequest::AdminMoveChild(crate::request::AdminMoveChild {
+                child: child(),
+                slot: None,
+            }),
+            6,
+        );
     }
 
     #[test]
@@ -720,12 +755,13 @@ mod tests {
         // bump. It changed at version 2 when `JoinApproval` gained
         // `parent_ledger`, at version 3 when `SignedControl` gained
         // `nonce` and `expiry`, at version 4 when the exit-rights variants were
-        // appended, and at version 5 when `AdminLedgerQuery` was appended (the
-        // version byte is inside the preimage).
+        // appended, at version 5 when `AdminLedgerQuery` was appended, and at
+        // version 6 when the topology-admin variants were appended (the version
+        // byte is inside the preimage).
         let signed = signed_with(&operator(7));
         assert_eq!(
             signed.signing_hash().to_hex(),
-            "fdda7180c8e09f3f7b349d8bd533f3305e190e5d2229786912462f6ba26d3314"
+            "21918ae08f53d0475b0a0d46d2d41f3293c78937f5675329ba000270c13c76c2"
         );
     }
 

@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(bytes.len(), 253);
         assert_eq!(
             blake3::hash(&bytes).to_hex().as_str(),
-            "65fc50e49136321c623d610350f193aa2e7a96d2c775b38002031f6883cc0573"
+            "b1261d87644259904d8eaa50342b2901442325da1044e4edc7b44e5a95d60bf2"
         );
     }
 
@@ -641,14 +641,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_v4_intent_and_forward() {
-        // A rolling-upgrade peer may still stamp v4: every pre-existing variant
+    fn validate_accepts_v5_intent_and_forward() {
+        // A rolling-upgrade peer may still stamp v5: every pre-existing variant
         // is wire-compatible, so `validate` must accept it. The version byte is
         // inside the signed preimage, so re-sign after downgrading.
         let mut control = sample_control();
-        control.intent.version = 4;
+        control.intent.version = 5;
         control.intent.signature = operator(1).sign(control.intent.signing_hash().as_bytes());
-        control.forwards[0].signed.version = 4;
+        control.forwards[0].signed.version = 5;
         control.forwards[0].signed.signature =
             operator(1).sign(control.forwards[0].signed.signing_hash().as_bytes());
         assert_eq!(control.validate(), Ok(()));

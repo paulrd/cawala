@@ -1079,6 +1079,44 @@
      direct, operator-signed routed) with no independent Merkle/commitment
      proof; a `value` admin can see user balances.
 
+** P4 - delivered 2026-10-02 (delegated topology administration; control 6, reply 3)
+   - Control (`cawala-control`): `AdminDetachChild { child }` and
+     `AdminMoveChild { child, slot }` (no `new_parent`, so a cross-parent move is
+     structurally inexpressible) as `ControlRequest` discriminants 17/18, with
+     `kind()` `"admin-detach-child"`/`"admin-move-child"`,
+     `required_scope -> Topology`, and `validate()` (node-id bound; move slot
+     range -> `SlotOutOfRange`). `CONTROL_FORMAT_VERSION` 5 -> 6 (mint 6, accept
+     5|6); the exhaustive `min_control_version` grew two -> 6 arms. Reply is
+     unchanged: `ControlReply::Accepted`, `CONTROL_REPLY_VERSION` stays 3.
+   - Node (`cawala-node`): authority-free `apply_detach_child`/`apply_move_child`
+     helpers shared by the senior and admin paths, so validation parity is
+     structural (a `User`-child move is `BadRequest`, a non-child `NotFound`,
+     occupied slot `SlotTaken`). `handle_admin_detach_child`/
+     `handle_admin_move_child` gate on `authorize_admin` (Topology) only, never
+     the senior `authorize`, and emit an additive `admin-topology` audit line.
+     Notices use the existing outbound path; the routed `dispatch_control_envelope`
+     now requeues failed outbound notices (prerequisite bug fix) so a routed
+     admin detach/move whose child dial fails is retained by the bounded sweep.
+   - Browser: wasm `ClientNode::admin_detach_child`/`admin_move_child`
+     (direct-first, routed fallback) matching `Accepted`;
+     `api.adminDetachChild`/`adminMoveChild` gated on a non-self target with
+     `adminCapabilities.scopes.topology`; NodePage's Children card gains
+     row selection and a Move/Detach actions panel with confirmations (a `user`
+     child cannot be moved). `createChild` stays stubbed and un-surfaced.
+   - Version matrix: `CONTROL_FORMAT_VERSION` 6, `CONTROL_REPLY_VERSION` 3,
+     `ROUTED_*` 1; no ledger/entry/settlement change and **no `node-data`
+     recreation**. Hard break: a v5 node cannot decode the new discriminants, so
+     rebuild the wasm bundle with the node; old browsers simply cannot use
+     topology actions.
+   - Residual (intended): a topology admin can detach a child with a non-zero
+     balance, stranding value without a `value` scope (parity with the senior
+     path; the UI warns). Mitigated by audit and revocation.
+   - Residual (review-noted): detaching the current senior child changes
+     seniority, promoting the next `Node` child (identical to the senior path);
+     and a failed `DetachNotice` is not retriable because the child has been
+     removed from the record, so it learns of the detach on its next
+     interaction (the P2 retry sweep cannot help a detached target).
+
 ** Authority and value-op requirements (essential)
    - *Scope separation*: each admin request declares its required scope; grant
      management stays self-operator/CLI only (a delegated admin must never

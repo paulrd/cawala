@@ -481,6 +481,57 @@ impl AdminRedeliverJoin {
     }
 }
 
+/// An admin's request to detach a direct child (topology scope).
+///
+/// Detaching a child with a non-zero ledger balance is allowed (parity with the
+/// senior path); the child self-re-homes via its own exit/healing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminDetachChild {
+    /// The direct child to detach.
+    pub child: NodeId,
+}
+
+impl AdminDetachChild {
+    /// Check the child-id length bound.
+    ///
+    /// `child` must be at most [`MAX_NODE_ID_LEN`] bytes; whether it is actually
+    /// a direct child is the node's concern.
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_node_id("child", self.child.as_str())
+    }
+}
+
+/// An admin's request to re-slot a direct `Node` child under this node
+/// (topology scope).
+///
+/// There is deliberately **no `new_parent`**: a cross-parent move is
+/// structurally inexpressible, and a `User` (browser leaf) child is refused by
+/// the shared mutation helper because it has no healing pull.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminMoveChild {
+    /// The direct child to re-slot.
+    pub child: NodeId,
+    /// New slot (`0..=7`), or `None` to pick the lowest free slot.
+    pub slot: Option<u8>,
+}
+
+impl AdminMoveChild {
+    /// Check the child-id length bound and, when present, the slot range.
+    ///
+    /// `child` must be at most [`MAX_NODE_ID_LEN`] bytes and `slot`, when
+    /// present, must be in `0..=7`; whether the child is a movable direct child
+    /// is the node's concern.
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_node_id("child", self.child.as_str())?;
+        if let Some(slot) = self.slot
+            && slot > MAX_SLOT
+        {
+            return Err(ControlError::SlotOutOfRange(slot));
+        }
+        Ok(())
+    }
+}
+
 /// The v1 control-request payload.
 ///
 /// Variant order is frozen: postcard encodes the discriminant positionally.
@@ -521,6 +572,12 @@ pub enum ControlRequest {
     /// Read-only value-scoped admin view of the node's ledger (discriminant 16,
     /// format 5).
     AdminLedgerQuery,
+    /// Topology-scoped admin detach of a direct child (discriminant 17,
+    /// format 6).
+    AdminDetachChild(AdminDetachChild),
+    /// Topology-scoped admin re-slot of a direct `Node` child (discriminant 18,
+    /// format 6).
+    AdminMoveChild(AdminMoveChild),
 }
 
 impl ControlRequest {
@@ -544,6 +601,8 @@ impl ControlRequest {
             ControlRequest::Rebase(_) => "rebase",
             ControlRequest::RebasePull(_) => "rebase-pull",
             ControlRequest::AdminLedgerQuery => "admin-ledger-query",
+            ControlRequest::AdminDetachChild(_) => "admin-detach-child",
+            ControlRequest::AdminMoveChild(_) => "admin-move-child",
         }
     }
 
@@ -560,9 +619,8 @@ impl ControlRequest {
     /// - `AdminApproveJoin` / `AdminRejectJoin` / `AdminRedeliverJoin` ->
     ///   [`RequiredScope::Joins`];
     /// - `AdminLedgerQuery` -> [`RequiredScope::Value`];
+    /// - `AdminDetachChild` / `AdminMoveChild` -> [`RequiredScope::Topology`];
     /// - every non-admin variant -> `None`.
-    ///
-    /// Future topology (P4) variants will extend this map.
     pub fn required_scope(&self) -> Option<RequiredScope> {
         match self {
             ControlRequest::AdminQuery => Some(RequiredScope::AnyActive),
@@ -570,6 +628,9 @@ impl ControlRequest {
             | ControlRequest::AdminRejectJoin(_)
             | ControlRequest::AdminRedeliverJoin(_) => Some(RequiredScope::Joins),
             ControlRequest::AdminLedgerQuery => Some(RequiredScope::Value),
+            ControlRequest::AdminDetachChild(_) | ControlRequest::AdminMoveChild(_) => {
+                Some(RequiredScope::Topology)
+            }
             _ => None,
         }
     }
@@ -682,6 +743,13 @@ mod tests {
                 node: node("applicant"),
             }),
             ControlRequest::AdminLedgerQuery,
+            ControlRequest::AdminDetachChild(AdminDetachChild {
+                child: node("applicant"),
+            }),
+            ControlRequest::AdminMoveChild(AdminMoveChild {
+                child: node("applicant"),
+                slot: Some(3),
+            }),
         ]
     }
 
@@ -708,6 +776,8 @@ mod tests {
                 "rebase",
                 "rebase-pull",
                 "admin-ledger-query",
+                "admin-detach-child",
+                "admin-move-child",
             ]
         );
     }
@@ -902,6 +972,37 @@ mod tests {
     }
 
     #[test]
+    fn admin_topology_variants_frozen_field_order() {
+        let detach = AdminDetachChild {
+            child: node("child"),
+        };
+        assert_postcard_field_order(&detach, &[postcard::to_allocvec(&detach.child).unwrap()]);
+
+        let move_child = AdminMoveChild {
+            child: node("child"),
+            slot: Some(3),
+        };
+        assert_postcard_field_order(
+            &move_child,
+            &[
+                postcard::to_allocvec(&move_child.child).unwrap(),
+                postcard::to_allocvec(&move_child.slot).unwrap(),
+            ],
+        );
+
+        // `Some(slot)` and `None` encode differently: `slot` is a real frozen
+        // field, not a skipped default.
+        let auto = AdminMoveChild {
+            child: node("child"),
+            slot: None,
+        };
+        assert_ne!(
+            postcard::to_allocvec(&move_child).unwrap(),
+            postcard::to_allocvec(&auto).unwrap()
+        );
+    }
+
+    #[test]
     fn is_admin_only_matches_admin_variants() {
         for request in sample_requests() {
             let expected = matches!(
@@ -911,6 +1012,8 @@ mod tests {
                     | ControlRequest::AdminRejectJoin(_)
                     | ControlRequest::AdminRedeliverJoin(_)
                     | ControlRequest::AdminLedgerQuery
+                    | ControlRequest::AdminDetachChild(_)
+                    | ControlRequest::AdminMoveChild(_)
             );
             assert_eq!(request.is_admin(), expected, "{request:?}");
             assert_eq!(is_admin_request(&request), expected, "{request:?}");
@@ -918,13 +1021,22 @@ mod tests {
     }
 
     #[test]
-    fn admin_ledger_query_discriminant_is_frozen() {
-        // Variant 16 (0-based), appended after `RebasePull` (15). An insert or
-        // reorder would shift every later discriminant and change this byte.
-        assert_eq!(
-            postcard::to_allocvec(&ControlRequest::AdminLedgerQuery).unwrap(),
-            vec![16]
-        );
+    fn new_admin_discriminants_are_frozen() {
+        // Variants 16/17/18 (0-based), appended after `RebasePull` (15). An
+        // insert or reorder would shift every later discriminant.
+        let ledger = postcard::to_allocvec(&ControlRequest::AdminLedgerQuery).unwrap();
+        let detach = postcard::to_allocvec(&ControlRequest::AdminDetachChild(AdminDetachChild {
+            child: node("c"),
+        }))
+        .unwrap();
+        let move_child = postcard::to_allocvec(&ControlRequest::AdminMoveChild(AdminMoveChild {
+            child: node("c"),
+            slot: Some(3),
+        }))
+        .unwrap();
+        assert_eq!(ledger, vec![16]);
+        assert_eq!(detach[0], 17);
+        assert_eq!(move_child[0], 18);
     }
 
     #[test]
@@ -953,12 +1065,82 @@ mod tests {
             Some(RequiredScope::Value)
         );
         for request in [
+            ControlRequest::AdminDetachChild(AdminDetachChild { child: node("c") }),
+            ControlRequest::AdminMoveChild(AdminMoveChild {
+                child: node("c"),
+                slot: None,
+            }),
+        ] {
+            assert_eq!(request.required_scope(), Some(RequiredScope::Topology));
+        }
+        for request in [
             ControlRequest::Query,
             ControlRequest::SetAddress(SetAddress { address: None }),
             ControlRequest::RebasePull(RebasePull { node: node("c") }),
         ] {
             assert_eq!(request.required_scope(), None);
         }
+    }
+
+    #[test]
+    fn admin_topology_validate_enforces_bounds() {
+        // Detach: only the child-id bound.
+        assert_eq!(
+            AdminDetachChild {
+                child: node("applicant"),
+            }
+            .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            AdminDetachChild {
+                child: node(&"n".repeat(MAX_NODE_ID_LEN + 1)),
+            }
+            .validate(),
+            Err(ControlError::FieldTooLong {
+                field: "child",
+                len: MAX_NODE_ID_LEN + 1,
+                max: MAX_NODE_ID_LEN,
+            })
+        );
+
+        // Move: child-id bound and the slot range.
+        assert_eq!(
+            AdminMoveChild {
+                child: node("applicant"),
+                slot: None,
+            }
+            .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            AdminMoveChild {
+                child: node("applicant"),
+                slot: Some(MAX_SLOT),
+            }
+            .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            AdminMoveChild {
+                child: node("applicant"),
+                slot: Some(MAX_SLOT + 1),
+            }
+            .validate(),
+            Err(ControlError::SlotOutOfRange(MAX_SLOT + 1))
+        );
+        assert_eq!(
+            AdminMoveChild {
+                child: node(&"n".repeat(MAX_NODE_ID_LEN + 1)),
+                slot: None,
+            }
+            .validate(),
+            Err(ControlError::FieldTooLong {
+                field: "child",
+                len: MAX_NODE_ID_LEN + 1,
+                max: MAX_NODE_ID_LEN,
+            })
+        );
     }
 
     #[test]

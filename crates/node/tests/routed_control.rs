@@ -18,12 +18,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cawala_control::{
-    ADMIN_GRANT_V1_VERSION, ADMIN_GRANT_VERSION, AdminGrant, AdminGrantV2, AdminJoinApprove,
-    AdminScope, AdminScopes, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest,
-    DEFAULT_ADMIN_TTL_SECS, DeliveryStatus, JoinApproval, JoinRejection, JoinRequest,
-    MAX_CONTROL_FRAME, MAX_VALUE_ADMIN_TTL_SECS, NodeId, OperatorSecretKey,
-    ROUTED_CONTROL_VERSION, RejectCode, RoutedControlV1, RoutedForward, SignedAdminGrant,
-    SignedAdminGrantV2, SignedControl, SignedRoutedReply,
+    ADMIN_GRANT_V1_VERSION, ADMIN_GRANT_VERSION, AdminDetachChild, AdminGrant, AdminGrantV2,
+    AdminJoinApprove, AdminMoveChild, AdminScope, AdminScopes, CONTROL_REQUEST_TTL_SECS, ChildKind,
+    ControlReply,
+    ControlRequest, DEFAULT_ADMIN_TTL_SECS, DeliveryStatus, JoinApproval, JoinRejection, JoinRequest,
+    MAX_CONTROL_FRAME, MAX_VALUE_ADMIN_TTL_SECS, NodeId, OperatorSecretKey, ROUTED_CONTROL_VERSION,
+    RejectCode, RoutedControlV1, RoutedForward, SignedAdminGrant, SignedAdminGrantV2,
+    SignedControl, SignedRoutedReply,
 };
 use cawala_ledger::{LedgerPubKey, LedgerSecretKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::{AckStatus, Envelope, MSG_CONTROL_V1, MsgId, PeerRef, RejectReason};
@@ -35,7 +36,7 @@ use cawala_node::msg::{
 };
 use cawala_node::admin_store::{ADMINS_FILE, StoredGrant};
 use cawala_node::record::RecordStore;
-use cawala_node::{AdminStore, LedgerService};
+use cawala_node::{AdminStore, LedgerService, OutboundKind};
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
@@ -859,6 +860,55 @@ async fn routed_joins_only_grant_cannot_read_ledger() {
     );
 }
 
+/// (P4) A joins-only grant cannot use the topology-admin variants on the routed
+/// path either: `AdminDetachChild`/`AdminMoveChild` require the `topology` scope.
+#[tokio::test]
+async fn routed_joins_only_grant_cannot_use_topology_admin() {
+    let w = world();
+    let lookup = MemoryLookup::new();
+    let mut nodes = build_world(&w, &lookup).await;
+    let [root, _a, _b, u] = &mut nodes[..] else {
+        panic!("world shape")
+    };
+
+    root.control
+        .lock()
+        .await
+        .grant_admin(admin_grant_v2(
+            &w.root_id,
+            &w.root_op,
+            &w.admin_op,
+            AdminScopes::v1(),
+        ))
+        .expect("grant joins-only admin");
+
+    for request in [
+        ControlRequest::AdminDetachChild(AdminDetachChild {
+            child: node(&w.a_id),
+        }),
+        ControlRequest::AdminMoveChild(AdminMoveChild {
+            child: node(&w.a_id),
+            slot: Some(0),
+        }),
+    ] {
+        let intent = admin_intent(&w.root_id, &w.admin_op, request);
+        let forward = own_forward(u, &intent.request).await;
+        let envelope = routed(
+            peer("0", &w.root_id),
+            peer("0.1.3", &w.u_id),
+            intent,
+            None,
+            vec![forward],
+        );
+        assert_eq!(send_routed(u, "0", envelope).await.1, AckStatus::Delivered);
+        assert_eq!(
+            recv_reply(u).await,
+            ControlReply::Rejected(RejectCode::Unauthorized),
+            "a joins-only grant must not use topology admin on the routed path"
+        );
+    }
+}
+
 /// (3c) A grant revoked *out of process* (only `admins.json` rewritten) must
 /// still be reflected in the `grant_store_missing` evidence line: the audit is
 /// derived from the reloaded on-disk store, not a stale in-memory copy.
@@ -987,6 +1037,136 @@ async fn routed_value_query_returns_verified_snapshot() {
         .expect("record child row");
     assert_eq!(child.kind, Some(ChildKind::Node));
     assert_eq!(child.balance, 0);
+}
+
+/// (P4) A routed topology move returns a verified `Accepted` and the `Rebase`
+/// reaches the moving child.
+#[tokio::test]
+async fn routed_admin_move_returns_verified_accepted_and_delivers_rebase() {
+    let w = world();
+    let lookup = MemoryLookup::new();
+    let mut nodes = build_world(&w, &lookup).await;
+    let [root, a, _b, u] = &mut nodes[..] else {
+        panic!("world shape")
+    };
+
+    root.control
+        .lock()
+        .await
+        .grant_admin(admin_grant_v2(
+            &w.root_id,
+            &w.root_op,
+            &w.admin_op,
+            AdminScopes {
+                joins: false,
+                topology: true,
+                value: false,
+            },
+        ))
+        .expect("grant topology admin");
+
+    let intent = admin_intent(
+        &w.root_id,
+        &w.admin_op,
+        ControlRequest::AdminMoveChild(AdminMoveChild {
+            child: node(&w.a_id),
+            slot: Some(0),
+        }),
+    );
+    let forward = own_forward(u, &intent.request).await;
+    let request = routed(
+        peer("0", &w.root_id),
+        peer("0.1.3", &w.u_id),
+        intent,
+        None,
+        vec![forward],
+    );
+    assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
+
+    let signed = recv_signed_reply(u).await;
+    signed
+        .verify(&w.root_op.public())
+        .expect("reply must verify under the root operator key");
+    assert_eq!(signed.reply.reply, ControlReply::Accepted);
+
+    // The delivered Rebase re-slotted `a` to `0.0`.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let address = a.control.lock().await.record().address.clone();
+        if address.as_ref().map(|addr| addr.to_string()).as_deref() == Some("0.0") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("child never applied the Rebase; address={address:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// (P4) Regression: a routed admin move whose child dial fails must retain the
+/// `Rebase` in the destination's bounded retry sweep (the msg-layer requeue fix)
+/// rather than dropping it.
+#[tokio::test]
+async fn routed_admin_move_failed_notice_is_requeued() {
+    let w = world();
+    let lookup = MemoryLookup::new();
+    let mut nodes = build_world(&w, &lookup).await;
+    let [root, _a, _b, u] = &mut nodes[..] else {
+        panic!("world shape")
+    };
+
+    // A synthetic child that is not a bound endpoint: its Rebase dial cannot
+    // succeed. Written to disk so the next routed receive reloads it.
+    let dir = root.control.lock().await.data_dir().to_path_buf();
+    {
+        let mut store = RecordStore::open(&dir, &w.root_id).unwrap();
+        store
+            .attach_child("ghost-node", ChildKind::Node, Some(7), 0)
+            .unwrap();
+        store.save().unwrap();
+    }
+
+    root.control
+        .lock()
+        .await
+        .grant_admin(admin_grant_v2(
+            &w.root_id,
+            &w.root_op,
+            &w.admin_op,
+            AdminScopes {
+                joins: false,
+                topology: true,
+                value: false,
+            },
+        ))
+        .expect("grant topology admin");
+
+    let intent = admin_intent(
+        &w.root_id,
+        &w.admin_op,
+        ControlRequest::AdminMoveChild(AdminMoveChild {
+            child: node("ghost-node"),
+            slot: Some(0),
+        }),
+    );
+    let forward = own_forward(u, &intent.request).await;
+    let request = routed(
+        peer("0", &w.root_id),
+        peer("0.1.3", &w.u_id),
+        intent,
+        None,
+        vec![forward],
+    );
+    assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
+
+    let signed = recv_signed_reply(u).await;
+    signed.verify(&w.root_op.public()).unwrap();
+    assert_eq!(signed.reply.reply, ControlReply::Accepted);
+
+    let pending = root.control.lock().await.take_pending_rebase();
+    assert_eq!(pending.len(), 1, "the failed routed notice must be requeued");
+    assert_eq!(pending[0].kind, OutboundKind::Rebase);
+    assert_eq!(pending[0].target, node("ghost-node"));
 }
 
 /// (4) A request whose `target.node` or `requester` disagrees with the envelope

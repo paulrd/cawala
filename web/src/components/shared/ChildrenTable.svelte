@@ -18,6 +18,8 @@
    * @param {string} [emptyMessage]
    * @param {string} [actionLabel]
    * @param {function} [onAction]
+   * @param {string|null} [selectedId] child `endpointId` to highlight
+   * @param {function} [onSelect] called with the clicked row (for an actions panel)
    */
   let {
     rows = [],
@@ -25,7 +27,13 @@
     emptyMessage = 'This node has no children in its topology snapshot.',
     actionLabel = '',
     onAction = undefined,
+    selectedId = null,
+    onSelect = undefined,
   } = $props();
+
+  function handleRowClick(row) {
+    onSelect?.(row);
+  }
 
   let sortKey = $state('address');
   let sortDir = $state('asc');
@@ -119,5 +127,13 @@
 {#if rows.length === 0}
   <EmptyState title={emptyTitle} message={emptyMessage} {actionLabel} {onAction} />
 {:else}
-  <DataTable {columns} rows={sorted} {sortKey} {sortDir} onSort={handleSort} />
+  <DataTable
+    {columns}
+    rows={sorted}
+    {sortKey}
+    {sortDir}
+    onSort={handleSort}
+    {selectedId}
+    onRowClick={onSelect ? handleRowClick : undefined}
+  />
 {/if}

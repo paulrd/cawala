@@ -22,9 +22,9 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use cawala_control::{
-    AdminJoinApprove, AdminJoinReject, AdminRedeliverJoin, CONTROL_ALPN, CONTROL_REQUEST_TTL_SECS,
-    ChildKind, ControlReply, ControlRequest, ExitRequest, Invite, JoinRequest, NodeId,
-    OperatorSecretKey, RejectCode, SignedControl,
+    AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminMoveChild, AdminRedeliverJoin,
+    CONTROL_ALPN, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest, ExitRequest,
+    Invite, JoinRequest, NodeId, OperatorSecretKey, RejectCode, SignedControl,
 };
 use cawala_msg::{
     Ack, AckStatus, BalanceQueryV1, Envelope, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
@@ -1038,6 +1038,52 @@ impl ClientNode {
             ControlReply::AdminRejected(rejected) => Ok(AdminActionDto::from_rejected(&rejected)),
             ControlReply::Rejected(code) => Err(admin_rejected(code)),
             _ => Err(unexpected_admin_reply("an admin redelivery")),
+        }
+    }
+
+    /// Detach `child` from `node` (topology scope).
+    ///
+    /// `node_addr` optionally names `node`'s asserted address for the routed
+    /// fallback; see [`ClientNode::admin_query`]. Returns `Ok(())` on
+    /// [`ControlReply::Accepted`]; a refusal maps to the stable
+    /// `"admin request rejected: <code>"` error.
+    pub async fn admin_detach_child(
+        &self,
+        node: String,
+        child: String,
+        node_addr: Option<String>,
+    ) -> Result<(), JsError> {
+        let child = parse_child(&child)?;
+        let request = ControlRequest::AdminDetachChild(AdminDetachChild { child });
+        let reply = self.admin_exchange(&node, request, node_addr).await?;
+        match reply {
+            ControlReply::Accepted => Ok(()),
+            ControlReply::Rejected(code) => Err(admin_rejected(code)),
+            _ => Err(unexpected_admin_reply("an admin detach")),
+        }
+    }
+
+    /// Re-slot `child` under `node` (topology scope). `slot` of `None` asks the
+    /// node to pick the lowest free slot.
+    ///
+    /// `node_addr` optionally names `node`'s asserted address for the routed
+    /// fallback; see [`ClientNode::admin_query`]. Returns `Ok(())` on
+    /// [`ControlReply::Accepted`]; a refusal maps to the stable
+    /// `"admin request rejected: <code>"` error.
+    pub async fn admin_move_child(
+        &self,
+        node: String,
+        child: String,
+        slot: Option<u8>,
+        node_addr: Option<String>,
+    ) -> Result<(), JsError> {
+        let child = parse_child(&child)?;
+        let request = ControlRequest::AdminMoveChild(AdminMoveChild { child, slot });
+        let reply = self.admin_exchange(&node, request, node_addr).await?;
+        match reply {
+            ControlReply::Accepted => Ok(()),
+            ControlReply::Rejected(code) => Err(admin_rejected(code)),
+            _ => Err(unexpected_admin_reply("an admin move")),
         }
     }
 

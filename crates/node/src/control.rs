@@ -28,9 +28,9 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use cawala_control::{
-    AdminApproved, AdminJoinApprove, AdminJoinReject, AdminPendingJoin, AdminRedeliverJoin,
-    AdminRejected, AdminScopes, AdminSnapshot, CONTROL_ALPN, CONTROL_REQUEST_MAX_TTL_SECS,
-    CONTROL_REQUEST_TTL_SECS, ChildKind, ChildSnapshot, ControlError,
+    AdminApproved, AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminMoveChild,
+    AdminPendingJoin, AdminRedeliverJoin, AdminRejected, AdminScopes, AdminSnapshot, CONTROL_ALPN,
+    CONTROL_REQUEST_MAX_TTL_SECS, CONTROL_REQUEST_TTL_SECS, ChildKind, ChildSnapshot, ControlError,
     ControlReply, ControlRequest, CreateChild, DeliveryStatus, DetachChild, DetachNotice,
     ExitRequest, Invite, JoinApproval, JoinRejection, JoinRequest, MAX_CONTROL_FRAME, MoveChild,
     NodeId, NodeSnapshot, OctAddr, OperatorPubKey, OperatorSecretKey, ParentSnapshot,
@@ -871,6 +871,12 @@ impl ControlNode {
                         controller: signed.controller,
                     });
                 }
+            }
+            ControlRequest::AdminDetachChild(detach) => {
+                self.handle_admin_detach_child(&signed, detach, now)
+            }
+            ControlRequest::AdminMoveChild(move_child) => {
+                self.handle_admin_move_child(&signed, move_child, now)
             }
         };
         self.audit_request(&signed, &reply, now);
@@ -1887,18 +1893,27 @@ impl ControlNode {
         if let Err(code) = self.authorize(signed, now) {
             return ControlReply::Rejected(code);
         }
-        if let Err(err) = self.record.detach_child(detach.child.as_str()) {
+        self.apply_detach_child(&detach.child, now)
+    }
+
+    /// Authority-free detach mutation shared by the senior and admin paths.
+    ///
+    /// **The caller must have authorized first**; this helper performs no
+    /// authority check and takes no [`Authority`] (the actor is recorded by the
+    /// wrapper's audit). Removes the child link, persists, and queues a
+    /// best-effort `DetachNotice`; the peer registry row is intentionally left
+    /// in place so the child can re-attach.
+    fn apply_detach_child(&mut self, child: &NodeId, now: u64) -> ControlReply {
+        if let Err(err) = self.record.detach_child(child.as_str()) {
             return ControlReply::Rejected(map_record_error(&err));
         }
-        // The peer registry entry is intentionally left in place: a detached
-        // child may be re-attached, and stale peer rows are harmless.
         if self.record.save().is_err() {
             return ControlReply::Rejected(RejectCode::Internal);
         }
         // Best-effort: tell the child it has been detached so it flips to an
         // independent root. A failed dial is audited by the delivery plumbing,
         // never surfaced to the requester.
-        self.queue_notice(&detach.child, OutboundKind::DetachNotice, |node| {
+        self.queue_notice(child, OutboundKind::DetachNotice, |node| {
             ControlRequest::DetachNotice(DetachNotice { node })
         }, now);
         ControlReply::Accepted
@@ -2297,20 +2312,35 @@ impl ControlNode {
         if let Err(code) = self.authorize(signed, now) {
             return ControlReply::Rejected(code);
         }
-        // v1 supports only re-slotting a direct child under this node.
+        // v1 supports only re-slotting a direct child under this node; the
+        // admin request has no `new_parent` at all, so this is senior-only.
         if move_child.new_parent.as_str() != self.node_id {
             return ControlReply::Rejected(RejectCode::BadRequest);
         }
+        self.apply_move_child(&move_child.child, move_child.slot, now)
+    }
+
+    /// Authority-free re-slot mutation shared by the senior and admin paths.
+    ///
+    /// **The caller must have authorized first**; this helper performs no
+    /// authority check and takes no [`Authority`]. It is node-child only (a
+    /// browser leaf has no healing pull, so it is refused with `BadRequest`), a
+    /// missing child is `NotFound`, and `slot: None` picks the lowest slot free
+    /// for this child (its own slot counts). A same-slot move is an idempotent
+    /// `Accepted` no-op with no notice; otherwise the atomic
+    /// `move_child_slot` persists and a `Rebase` notice is queued when this node
+    /// has an asserted address.
+    fn apply_move_child(&mut self, child: &NodeId, slot: Option<u8>, now: u64) -> ControlReply {
         // v1 is node-child only: a browser leaf is re-slotted by this same
-        // handler but has no healing pull, so it must be refused rather than
+        // helper but has no healing pull, so it must be refused rather than
         // silently stranded at a slot it cannot learn about.
         let Some(kind) = self
             .record
             .record()
             .children
             .iter()
-            .find(|child| child.child_id == move_child.child.as_str())
-            .map(|child| child.kind)
+            .find(|entry| entry.child_id == child.as_str())
+            .map(|entry| entry.kind)
         else {
             return ControlReply::Rejected(RejectCode::NotFound);
         };
@@ -2322,12 +2352,13 @@ impl ControlNode {
         // already at the lowest available slot is a no-op.
         let target_slot = {
             let record = self.record.record();
-            match move_child.slot {
+            match slot {
                 Some(slot) => Some(slot),
-                None => (0..=cawala_topology::MAX_SLOT).find(|slot| {
-                    !record.children.iter().any(|child| {
-                        child.slot == *slot && child.child_id != move_child.child.as_str()
-                    })
+                None => (0..=cawala_topology::MAX_SLOT).find(|candidate| {
+                    !record
+                        .children
+                        .iter()
+                        .any(|entry| entry.slot == *candidate && entry.child_id != child.as_str())
                 }),
             }
         };
@@ -2338,7 +2369,7 @@ impl ControlNode {
         // the store untouched; the backup preserves the previous behaviour of
         // restoring the record if a mutation ever leaves it partially applied.
         let backup = self.record.clone();
-        match self.record.move_child_slot(move_child.child.as_str(), target_slot) {
+        match self.record.move_child_slot(child.as_str(), target_slot) {
             Ok(None) => {
                 // Same effective slot: an idempotent no-op, so nothing changed
                 // and no notice is warranted.
@@ -2362,7 +2393,7 @@ impl ControlNode {
         // subtree is unroutable until this node has an address, at which point
         // a later pull heals it.
         if let Some(parent_address) = self.record.record().address.clone() {
-            self.queue_rebase_notice(move_child.child.clone(), target_slot, &parent_address, now);
+            self.queue_rebase_notice(child.clone(), target_slot, &parent_address, now);
         }
         ControlReply::Accepted
     }
@@ -2594,6 +2625,89 @@ impl ControlNode {
                 ControlReply::Rejected(RejectCode::Internal)
             }
         }
+    }
+
+    /// Admin: detach a direct child (topology scope).
+    ///
+    /// Authority is [`ControlNode::authorize_admin`] only (never the strict
+    /// senior `authorize`); the mutation itself is the authority-free
+    /// [`ControlNode::apply_detach_child`], so parity with the senior path is
+    /// structural. An additive `admin-topology` audit line records the actor.
+    fn handle_admin_detach_child(
+        &mut self,
+        signed: &SignedControl,
+        detach: &AdminDetachChild,
+        now: u64,
+    ) -> ControlReply {
+        if let Err(code) = self.authorize_admin(signed, now) {
+            return ControlReply::Rejected(code);
+        }
+        if detach.validate().is_err() {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        let reply = self.apply_detach_child(&detach.child, now);
+        self.audit(serde_json::json!({
+            "ts": now,
+            "event": "admin-topology",
+            "action": "detach",
+            "actor": signed.controller.to_string(),
+            "child": detach.child.to_string(),
+            // Shape-uniform with the move line (a detach has no requested slot).
+            "requested_slot": serde_json::Value::Null,
+            "outcome": reply_outcome(&reply),
+        }));
+        reply
+    }
+
+    /// Admin: re-slot a direct `Node` child (topology scope).
+    ///
+    /// Authority is [`ControlNode::authorize_admin`] only; the mutation is the
+    /// shared [`ControlNode::apply_move_child`]. A declared `slot > 7` maps to
+    /// the wire [`RejectCode::SlotOutOfRange`] (parity with the senior path's
+    /// record-level error). The additive `admin-topology` audit line records the
+    /// requested slot and, for a real move, the old/new slots.
+    fn handle_admin_move_child(
+        &mut self,
+        signed: &SignedControl,
+        move_child: &AdminMoveChild,
+        now: u64,
+    ) -> ControlReply {
+        if let Err(code) = self.authorize_admin(signed, now) {
+            return ControlReply::Rejected(code);
+        }
+        if let Err(err) = move_child.validate() {
+            return ControlReply::Rejected(match err {
+                ControlError::SlotOutOfRange(_) => RejectCode::SlotOutOfRange,
+                _ => RejectCode::BadRequest,
+            });
+        }
+        let old_slot = self
+            .record
+            .record()
+            .children
+            .iter()
+            .find(|entry| entry.child_id == move_child.child.as_str())
+            .map(|entry| entry.slot);
+        let reply = self.apply_move_child(&move_child.child, move_child.slot, now);
+        let new_slot = self
+            .record
+            .record()
+            .children
+            .iter()
+            .find(|entry| entry.child_id == move_child.child.as_str())
+            .map(|entry| entry.slot);
+        self.audit(serde_json::json!({
+            "ts": now,
+            "event": "admin-topology",
+            "action": "move",
+            "actor": signed.controller.to_string(),
+            "child": move_child.child.to_string(),
+            "requested_slot": move_child.slot,
+            "outcome": reply_outcome(&reply),
+            "old_slot": old_slot,
+            "new_slot": new_slot,
+        }));
+        reply
     }
 
     /// Validate an admin approval against current state, returning the precise
@@ -5681,60 +5795,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v3_frame_is_bad_version_and_v4_query_works() {
+    async fn v4_frame_is_bad_version_and_v5_query_works() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
         let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &[]);
 
-        // v3 is below the accepted window (4|5).
-        let v3_query = authorize_version("parent", &parent_op, 1, ControlRequest::Query, 3);
+        // v4 is below the accepted window (5|6).
+        let v4_query = authorize_version("parent", &parent_op, 1, ControlRequest::Query, 4);
         assert_eq!(
-            engine.receive_at(any_remote(), v3_query, 0).await,
+            engine.receive_at(any_remote(), v4_query, 0).await,
             ControlReply::Rejected(RejectCode::BadVersion)
         );
 
-        // A v4 frame over a pre-existing variant is dispatched normally.
-        let v4_query = authorize_version("parent", &parent_op, 2, ControlRequest::Query, 4);
+        // A v5 frame over a pre-existing variant is dispatched normally.
+        let v5_query = authorize_version("parent", &parent_op, 2, ControlRequest::Query, 5);
         assert!(matches!(
-            engine.receive_at(any_remote(), v4_query, 0).await,
+            engine.receive_at(any_remote(), v5_query, 0).await,
             ControlReply::Snapshot(_)
         ));
     }
 
-    /// A v4-declared frame cannot carry the v5-only `AdminLedgerQuery`: the
-    /// shape gate rejects it as `BadVersion` before signature/dispatch.
+    /// A v5-declared frame cannot carry a v6-only topology-admin variant: the
+    /// shape gate rejects it as `BadVersion` before signature/dispatch. The v6
+    /// form passes the gate.
     #[tokio::test]
-    async fn v4_frame_cannot_carry_ledger_query() {
+    async fn v5_frame_cannot_carry_topology_variant_but_v6_can() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
         let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &[]);
 
-        let v4_query = authorize_version(
+        let v5_detach = authorize_version(
             "parent",
             &parent_op,
             1,
-            ControlRequest::AdminLedgerQuery,
-            4,
+            ControlRequest::AdminDetachChild(AdminDetachChild {
+                child: NodeId::from("ghost"),
+            }),
+            5,
         );
         assert_eq!(
-            engine.receive_at(any_remote(), v4_query, 0).await,
+            engine.receive_at(any_remote(), v5_detach, 0).await,
             ControlReply::Rejected(RejectCode::BadVersion)
         );
 
-        // The v5 form passes the gate; with no ledger attached it fails closed.
-        let v5_query = authorize_at("parent", &parent_op, 2, ControlRequest::AdminLedgerQuery);
+        // The v6 form passes the gate; the self-operator is authorized and the
+        // unknown child is `NotFound` (not `BadVersion`).
+        let v6_detach = authorize_at(
+            "parent",
+            &parent_op,
+            2,
+            ControlRequest::AdminDetachChild(AdminDetachChild {
+                child: NodeId::from("ghost"),
+            }),
+        );
         assert_eq!(
-            engine.receive_at(any_remote(), v5_query, 0).await,
+            engine.receive_at(any_remote(), v6_detach, 0).await,
+            ControlReply::Rejected(RejectCode::NotFound)
+        );
+
+        // `AdminLedgerQuery` (introduced in v5) still passes a v5 declaration;
+        // with no ledger attached it fails closed as `Internal`.
+        let v5_ledger = authorize_version(
+            "parent",
+            &parent_op,
+            3,
+            ControlRequest::AdminLedgerQuery,
+            5,
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), v5_ledger, 0).await,
             ControlReply::Rejected(RejectCode::Internal)
         );
     }
 
-    /// A v4 frame carrying one of the four v4-introduced variants clears the
-    /// shape gate (it is not `BadVersion`).
+    /// A v4 frame is below the accepted window; v5 and v6 frames may carry the
+    /// v4-introduced exit variant (`declared >= min_control_version`).
     #[tokio::test]
-    async fn v4_frame_can_carry_exit_variant() {
+    async fn v5_and_v6_frames_can_carry_exit_variant() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let child_op = secret(2);
@@ -5748,27 +5887,34 @@ mod tests {
         let peers = [node_peer("child", &child_op, 2)];
         let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
 
+        // v4 is rejected wholesale (not just the shape gate).
         let v4_exit = authorize_version("child", &child_op, 1, exit_request("child", 1), 4);
-        assert_ne!(
+        assert_eq!(
             engine.receive_at(any_remote(), v4_exit, 0).await,
-            ControlReply::Rejected(RejectCode::BadVersion),
-            "a v4 frame may carry a v4-introduced variant"
+            ControlReply::Rejected(RejectCode::BadVersion)
         );
 
-        // The current (v5) mint also carries a v4-introduced variant: the gate
-        // is `declared >= min_control_version`, so 5 >= 4 holds.
-        let v5_exit = authorize_at("child", &child_op, 2, exit_request("child", 1));
+        // v5 carries the v4-introduced variant (5 >= 4).
+        let v5_exit = authorize_version("child", &child_op, 2, exit_request("child", 1), 5);
         assert_ne!(
             engine.receive_at(any_remote(), v5_exit, 0).await,
             ControlReply::Rejected(RejectCode::BadVersion),
             "a v5 frame may carry a v4-introduced variant"
         );
+
+        // The current (v6) mint also carries it.
+        let v6_exit = authorize_at("child", &child_op, 3, exit_request("child", 1));
+        assert_ne!(
+            engine.receive_at(any_remote(), v6_exit, 0).await,
+            ControlReply::Rejected(RejectCode::BadVersion),
+            "a v6 frame may carry a v4-introduced variant"
+        );
     }
 
-    /// A v4-declared frame carrying an *old* (pre-v4) variant dispatches
+    /// A v5-declared frame carrying an *old* (pre-v4) variant dispatches
     /// normally; only the introduction-version gate applies.
     #[tokio::test]
-    async fn v4_frame_carrying_old_variant_still_dispatches() {
+    async fn v5_frame_carrying_old_variant_still_dispatches() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let applicant_op = secret(2);
@@ -5785,17 +5931,17 @@ mod tests {
             nonce: 7,
             expiry: u64::MAX,
         };
-        let v4_join = authorize_version(
+        let v5_join = authorize_version(
             "applicant",
             &applicant_op,
             1,
             ControlRequest::Join(join),
-            4,
+            5,
         );
         assert_eq!(
-            engine.receive_at(any_remote(), v4_join, 0).await,
+            engine.receive_at(any_remote(), v5_join, 0).await,
             ControlReply::Pending,
-            "a v4 frame over a pre-existing variant must dispatch"
+            "a v5 frame over a pre-existing variant must dispatch"
         );
     }
 
