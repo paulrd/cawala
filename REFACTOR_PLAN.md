@@ -170,9 +170,18 @@ A browser administers its parent directly, and its parent's ancestors
 transitively: the browser's request travels `browser → parent → … → target`; each
 hop re-signs a `RoutedForward` (existing `prepare_control_forward`,
 `crates/node/src/msg.rs:474`); the target applies it because its last hop (the
-browser's parent, or deeper) is the target's current administrator. No new
-routing is needed — the existing ascend/descend and `MSG_CONTROL_V1` per-hop
+browser's parent, or deeper) is one of the target's current administrators. No
+new routing is needed — the existing ascend/descend and `MSG_CONTROL_V1` per-hop
 machinery covers it.
+
+**Reach is bounded by each ancestor's own admin set.** The chain only continues
+while every hop's node child is that ancestor's current administrator (R5). If
+an intermediate ancestor has its own **browser** children, R4 makes those
+browsers its only administrators, so a node child on the path is *not* an
+administrator there and the upward chain terminates at that ancestor. Equivalently:
+transitive browser reach requires the chain of node children to be explicit
+priority admins at every level. This also bounds the §3.5 blast radius. (Correction
+recorded from the P1 spec, 2026-10-03.)
 
 **The one unresolved transport gap: identifying an ancestor target.** The browser
 knows its own assigned address and its direct parent's node id (from
