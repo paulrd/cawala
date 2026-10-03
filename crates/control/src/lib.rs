@@ -72,11 +72,11 @@ pub use reply::{
     RejectCode,
 };
 pub use request::{
-    AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminMoveChild, AdminRedeliverJoin,
-    AdminValueDirection, AdminValueRequest, ControlRequest, CreateChild, DetachChild, DetachNotice,
-    ExitRequest, JoinApproval, JoinRejection, JoinRequest, MAX_LOCATION_HINT_LEN, MAX_NODE_ID_LEN,
-    MAX_REASON_LEN, MoveChild, RebaseNotice, RebasePull, SetAddress, ValueRequestId,
-    is_admin_request,
+    AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminLeaseProbe, AdminLeaseRequest,
+    AdminMoveChild, AdminRedeliverJoin, AdminValueDirection, AdminValueRequest, ControlRequest,
+    CreateChild, DetachChild, DetachNotice, ExitRequest, JoinApproval, JoinRejection, JoinRequest,
+    MAX_LOCATION_HINT_LEN, MAX_NODE_ID_LEN, MAX_REASON_LEN, MoveChild, RebaseNotice, RebasePull,
+    SetAddress, ValueRequestId, is_admin_request,
 };
 pub use routed::{
     MAX_ROUTED_FORWARDS, ROUTED_CONTROL_VERSION, ROUTED_REPLY_CONTEXT, ROUTED_REPLY_VERSION,

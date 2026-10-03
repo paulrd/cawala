@@ -951,6 +951,12 @@ impl ControlNode {
                     Err(code) => ControlReply::Rejected(code),
                 }
             }
+            // Lease traffic is inherently direct child<->parent and is
+            // authenticated by the priority/lease check, not by a grant. The
+            // handlers land with the authority core; until then fail closed.
+            ControlRequest::AdminLease(_) | ControlRequest::AdminLeaseProbe(_) => {
+                ControlReply::Rejected(RejectCode::Unauthorized)
+            }
         };
         self.audit_request(&signed, &reply, now);
         Handled::Reply(reply)

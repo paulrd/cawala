@@ -43,38 +43,39 @@ use crate::request::ControlRequest;
 ///
 /// Bumped to 5 when [`ControlRequest::AdminLedgerQuery`] was appended, to 6
 /// when [`ControlRequest::AdminDetachChild`] /
-/// [`ControlRequest::AdminMoveChild`] were appended, and to 7 when
+/// [`ControlRequest::AdminMoveChild`] were appended, to 7 when
 /// [`ControlRequest::AdminIssue`] / [`ControlRequest::AdminBurn`] were
-/// appended. Variants are only *additive*, so a v6 verifier parses every
-/// pre-existing variant identically; [`is_supported_control_version`] therefore
-/// accepts both 6 and 7 for rolling upgrades, and [`min_control_version`] is the
-/// per-request shape gate (a v7-only variant on a v6 declaration is
-/// `BadVersion`).
+/// appended, and to 8 when [`ControlRequest::AdminLease`] /
+/// [`ControlRequest::AdminLeaseProbe`] were appended. Variants are only
+/// *additive*, so a v7 verifier parses every pre-existing variant identically;
+/// [`is_supported_control_version`] therefore accepts both 7 and 8 for rolling
+/// upgrades, and [`min_control_version`] is the per-request shape gate (a
+/// v8-only variant on a v7 declaration is `BadVersion`).
 ///
 /// # Dual-accept is inbound-only
 ///
-/// This build always **mints** frames at [`CONTROL_FORMAT_VERSION`] (7):
+/// This build always **mints** frames at [`CONTROL_FORMAT_VERSION`] (8):
 /// `sign_decision`/`sign_forward` in the node and
-/// [`SignedControl::authorize`] everywhere stamp v7. A v6 peer therefore cannot
-/// consume a v7 value variant (unknown postcard discriminant) or a routed
-/// forward carrying it, and a v7 node emits only v7. The upgrade is effectively
+/// [`SignedControl::authorize`] everywhere stamp v8. A v7 peer therefore cannot
+/// consume a v8 lease variant (unknown postcard discriminant) or a routed
+/// forward carrying it, and a v8 node emits only v8. The upgrade is effectively
 /// **lockstep for node-to-child and routed frames**; version negotiation is a
-/// v2 item. Accepting v6 here keeps a v6 peer's *pre-existing* requests readable
+/// v2 item. Accepting v7 here keeps a v7 peer's *pre-existing* requests readable
 /// during a rolling upgrade, nothing more.
-pub const CONTROL_FORMAT_VERSION: u8 = 7;
+pub const CONTROL_FORMAT_VERSION: u8 = 8;
 
 /// Whether `version` is a [`SignedControl`] wire version this build accepts
 /// **inbound**.
 ///
-/// Accepts [`CONTROL_FORMAT_VERSION`] (7) and the immediately preceding
-/// version 6. Versions only *appended* request variants, so every pre-existing
+/// Accepts [`CONTROL_FORMAT_VERSION`] (8) and the immediately preceding
+/// version 7. Versions only *appended* request variants, so every pre-existing
 /// variant is byte-identical in both; [`min_control_version`] is the per-request
-/// shape gate. Anything else (including v5) is rejected up front.
+/// shape gate. Anything else (including v6) is rejected up front.
 ///
-/// This does **not** mean minted frames are ever v6: see the inbound-only note
+/// This does **not** mean minted frames are ever v7: see the inbound-only note
 /// on [`CONTROL_FORMAT_VERSION`].
 pub fn is_supported_control_version(version: u8) -> bool {
-    matches!(version, 6 | CONTROL_FORMAT_VERSION)
+    matches!(version, 7 | CONTROL_FORMAT_VERSION)
 }
 
 /// The minimum [`SignedControl`] wire version that can carry `request`.
@@ -114,6 +115,8 @@ pub fn min_control_version(request: &ControlRequest) -> u8 {
         ControlRequest::AdminDetachChild(_) | ControlRequest::AdminMoveChild(_) => 6,
         // Appended in control format 7.
         ControlRequest::AdminIssue(_) | ControlRequest::AdminBurn(_) => 7,
+        // Appended in control format 8.
+        ControlRequest::AdminLease(_) | ControlRequest::AdminLeaseProbe(_) => 8,
     }
 }
 
@@ -547,7 +550,7 @@ mod tests {
 
     #[test]
     fn verify_control_rejects_v3_version() {
-        // v3 is now below the accepted window (4|5); a v3 envelope must be
+        // v3 is now below the accepted window (7|8); a v3 envelope must be
         // rejected up front rather than parsed with a newer shape.
         assert_ne!(CONTROL_FORMAT_VERSION, 3);
         let op = operator(1);
@@ -565,11 +568,11 @@ mod tests {
     }
 
     #[test]
-    fn is_supported_control_version_accepts_6_and_7_only() {
-        assert!(is_supported_control_version(6));
+    fn is_supported_control_version_accepts_7_and_8_only() {
         assert!(is_supported_control_version(7));
-        assert_eq!(CONTROL_FORMAT_VERSION, 7);
-        for version in [0, 1, 2, 3, 4, 5, 8, u8::MAX] {
+        assert!(is_supported_control_version(8));
+        assert_eq!(CONTROL_FORMAT_VERSION, 8);
+        for version in [0, 1, 2, 3, 4, 5, 6, 9, u8::MAX] {
             assert!(
                 !is_supported_control_version(version),
                 "version {version} must be unsupported"
@@ -579,7 +582,7 @@ mod tests {
 
     #[test]
     fn verify_control_rejects_v5_version() {
-        // v5 is below the accepted window (6|7) after the P5 bump.
+        // v5 is below the accepted window (7|8) after the format-8 bump.
         assert_ne!(CONTROL_FORMAT_VERSION, 5);
         let op = operator(1);
         let registry = registry_with(&[("origin", &op, &ledger(11))]);
@@ -605,24 +608,24 @@ mod tests {
     }
 
     #[test]
-    fn verify_control_accepts_v6_and_v7_frames() {
+    fn verify_control_accepts_v7_and_v8_frames() {
         let op = operator(1);
         let registry = registry_with(&[("origin", &op, &ledger(11))]);
 
-        // The current (v7) frame.
-        let v7 = signed_version(&op, CONTROL_FORMAT_VERSION);
+        // The current (v8) frame.
+        let v8 = signed_version(&op, CONTROL_FORMAT_VERSION);
+        assert_eq!(v8.verify_signature(), Ok(()));
+        assert!(verify_control(&v8, &registry).is_ok());
+
+        // A real v7 frame: the version byte is covered by the signature, so it
+        // must be re-signed after the downgrade.
+        let v7 = signed_version(&op, 7);
         assert_eq!(v7.verify_signature(), Ok(()));
         assert!(verify_control(&v7, &registry).is_ok());
 
-        // A real v6 frame: the version byte is covered by the signature, so it
-        // must be re-signed after the downgrade.
-        let v6 = signed_version(&op, 6);
-        assert_eq!(v6.verify_signature(), Ok(()));
-        assert!(verify_control(&v6, &registry).is_ok());
-
-        // A v6 frame whose signature was produced over the v7 preimage fails.
+        // A v7 frame whose signature was produced over the v8 preimage fails.
         let mut tampered = signed_with(&op);
-        tampered.version = 6;
+        tampered.version = 7;
         assert_eq!(
             verify_control(&tampered, &registry),
             Err(ControlError::InvalidSignature)
@@ -764,6 +767,22 @@ mod tests {
         };
         request(ControlRequest::AdminIssue(value()), 7);
         request(ControlRequest::AdminBurn(value()), 7);
+
+        // The lease variants were introduced in v8.
+        request(
+            ControlRequest::AdminLease(crate::request::AdminLeaseRequest {
+                epoch: 42,
+                ttl_secs: 300,
+            }),
+            8,
+        );
+        request(
+            ControlRequest::AdminLeaseProbe(crate::request::AdminLeaseProbe {
+                epoch: 42,
+                index: 1,
+            }),
+            8,
+        );
     }
 
     #[test]
@@ -776,13 +795,14 @@ mod tests {
         // `parent_ledger`, at version 3 when `SignedControl` gained
         // `nonce` and `expiry`, at version 4 when the exit-rights variants were
         // appended, at version 5 when `AdminLedgerQuery` was appended, at
-        // version 6 when the topology-admin variants were appended, and at
-        // version 7 when the value-admin variants were appended (the version
-        // byte is inside the preimage).
+        // version 6 when the topology-admin variants were appended, at
+        // version 7 when the value-admin variants were appended, and at
+        // version 8 when the lease variants were appended (the version byte is
+        // inside the preimage).
         let signed = signed_with(&operator(7));
         assert_eq!(
             signed.signing_hash().to_hex(),
-            "310b5498d403a97ced10b832015c4d64df835cabf4360bcbe24b6b58b8db73d3"
+            "d50cb082c786e84229eb377f026f215b5db0163cecf85ee8e52395f7f48f5784"
         );
     }
 
