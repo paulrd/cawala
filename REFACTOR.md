@@ -100,8 +100,6 @@ only path.
   parent) for payments and the join handshake? (Presumably yes — it is a direct
   neighbour link.)
 
----
-
 ### R2 — Documentation consolidation (simplify and de-duplicate the project docs)
 
 **Statement.** Consolidate the project docs so each has one job and no stale or
@@ -137,6 +135,147 @@ evaluate.
 - Q3: When the refactor is done, does `REFACTOR.md` become the new `PLAN.md`, or
   stay a separate requirements doc?
 
+### R3 — Remove delegated admin grants; authority comes from topology
+
+**Statement.** Remove the entire delegated-admin-grant concept: the node-signed
+`AdminGrant`/`AdminGrantV2` types, on-node `admins.json` and grant verification,
+the `cawala://admin` bundle, the `control admin grant|revoke|list` CLI, the
+browser admin-key store (`cawala.admin.v*`) and its selection/protection
+machinery, and the `AdminScope`/scoped-grant model. A node's administrator is
+determined by its topology (R4/R5), not by an operator-issued key.
+
+**Rationale.** Grants exist to delegate authority to an arbitrary external key.
+If authority is inherent in the parent-child relationship, grants add a parallel
+trust system plus extra wire formats, a browser key store, passphrase-protection
+complexity (P6), and UI surfaces. Removing them deletes a whole subsystem and
+simplifies both the control plane and the UI.
+
+**Scope (to confirm).**
+- Delete grant storage/verification and the grant wire types; drop the admin-key
+  CLI and the browser key store.
+- Replace the node's grant check (`authorize_admin` → `admins.active_scope`) with
+  a topology-authority check (R4/R5).
+- Decide the fate of value-seed passphrase protection (P6) once no admin keys
+  live in the browser.
+- Wire/hard-break fallout: `admins.json`, admin-grant format 2, and the admin
+  variants of `CONTROL_FORMAT_VERSION` must be re-planned.
+
+**Open questions.**
+- Q1: Does removing grants also remove the per-request scope set
+  (joins/topology/value), or does topology authority still distinguish action
+  classes?
+- Q2: Keep the existing admin request/reply wire variants with a
+  topology-authority check, or replace them?
+
+### R4 — "Leaf node" means the user/browser; leaf children have full admin over their parent
+
+**Statement.** Disambiguate the term: a **leaf node** is *only* a user/browser
+client. Any leaf (browser) that is a child of a node has **complete** admin
+rights over that parent node.
+
+**Rationale.** "Leaf" is currently overloaded (a node whose children are all
+users vs. a browser user leaf), which is confusing. Making "leaf" == browser
+removes the ambiguity and gives each browser a guaranteed, zero-setup path to
+administer its own parent — no grant required.
+
+**Scope (to confirm).**
+- Update the kind/terminology model so "leaf" is only the browser/user.
+- A node with leaf (browser) children is administered by them, with full rights.
+- Supersedes the delegating-grant model and, for such nodes, seniority.
+
+**Open questions.**
+- Q1: If a node has several browser children, do all hold equal, full rights?
+- Q2: What authority, if any, does a browser have over nodes above its parent
+  (ancestors)? See R5 transitivity.
+
+### R5 — Priority-ordered child administration with TTL failover
+
+**Statement.** A node that does **not** have leaf (browser) children keeps a
+**priority-ordered list of its child nodes**. Priority defaults to the order the
+children joined the network (earlier join = higher priority), and the node's
+current admin may reorder it at any time. A configurable TTL (e.g. 5 minutes)
+governs failover: if the node cannot connect to the current admin child within
+the TTL, the next child in priority order is permitted to administer it. By
+transitivity, every node always has an administrator, hop-by-hop.
+
+**Rationale.** Browser leaf nodes are frequently offline, so control must not
+depend on them. A priority list plus a liveness TTL guarantees a reachable
+administrator among a node's children.
+
+**Scope (to confirm).**
+- Persist the priority list per node (default = join order); admin-reorderable.
+- TTL is configurable (default 5 min) and acts as a liveness/lease window before
+  failover to the next child.
+- Failover: the next child in priority order becomes admin when the current admin
+  child is unreachable past the TTL.
+- Administration is transitive so the entire tree is coverable.
+
+**Open questions.**
+- Q1: Does a node **with** leaf children also fall back to the priority list
+  when all its leaf children are offline? (The text applies the priority list to
+  "all other nodes", i.e. those without leaf children.)
+- Q2: Who may reorder — only the current admin? Can a newly-failed-over admin
+  reorder immediately?
+- Q3: What does "cannot connect to the child" mean concretely (control-probe
+  timeout? envelope reachability?), and does the TTL reset on each successful
+  contact (lease semantics)?
+- Q4: How does this relate to the existing "senior child" concept — does
+  priority replace seniority, with the senior child simply priority #1?
+- Q5: Is failover automatic (authority passes on timeout) or a
+  permitted-but-explicit takeover?
+
+### R6 — Admin mode separated behind a lock gate
+
+**Statement.** Administrative actions — issue, burn, invite creation,
+accepting/rejecting pending join requests, and leaving/joining the network as a
+non-browser node — move to a dedicated **admin tab/page**. Entering it requires
+unlocking admin mode via a lock button, which warns that the user must have read
+the policy document and know what they are doing.
+
+**Rationale.** Normal use should be safe and minimal; admin actions are powerful
+and should be deliberate. A single explicit unlock establishes intent and
+surfaces the policy.
+
+**Scope (to confirm).**
+- A dedicated admin page holding the listed actions.
+- A lock/unlock control with an explicit policy acknowledgement.
+- Locked by default; whether the unlocked state persists across reloads is TBC.
+- Regular (non-admin) mode exposes none of these actions.
+
+**Open questions.**
+- Q1: What is "the policy document", and where does it live?
+- Q2: On lock, do we merely hide actions, or also drop any cached authority?
+- Q3: "leaving/joining the network as a non-browser node" — is this about
+  provisioning node children, not the browser's own join/leave?
+
+### R7 — Admin target switching via up/down buttons
+
+**Statement.** While admin mode is unlocked, the node being administered is
+changed with simple **up/down buttons**, replacing the current node
+selector/dropdown.
+
+**Open questions.**
+- Q1: What does up/down traverse — the ancestor chain, the priority list, the
+  browser's siblings, or a flat list of administrable nodes?
+- Q2: Does it show the node's path/address, and is there a "current node"
+  indicator?
+
+### R8 — Simplify the UI; minimize sidebar tabs in both modes
+
+**Statement.** Greatly simplify the UI, especially regular (non-admin) mode. In
+particular, reduce the number of sidebar tabs as far as possible in **both**
+non-admin and admin modes.
+
+**Scope (to confirm).**
+- Define a minimal tab set for user mode and for admin mode.
+- Move all admin surfaces behind the admin lock (R6).
+- Remove the node selector, grant management, and grant-scoped surfaces
+  (R3/R7).
+
+**Open questions.**
+- Q1: What is the target tab set for user mode (e.g. a single combined page?) and
+  for admin mode?
+
 ---
 
 ## Further requirements
@@ -144,8 +283,7 @@ evaluate.
 _To be added. Suggested shape: `### Rn — <title>`, then Statement / Rationale /
 Scope / Open questions._
 
-- R3 — _(pending)_
-- R4 — _(pending)_
+- Rn — _(next)_
 
 ---
 
