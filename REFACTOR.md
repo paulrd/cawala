@@ -324,6 +324,37 @@ Scope / Open questions._
 
 ---
 
+## Decisions pending (human)
+
+Resolve these before the phases noted. Rationale and recommended defaults are in
+`REFACTOR_PLAN.md` §5; **[REC]** marks the recommended default already proposed.
+
+**Before P1 (authority core / wire):**
+- **R5 seeding** (`REFACTOR_PLAN.md` §3.1) — the top risk. Auto-seed the priority
+  list from join order (the earliest child automatically becomes admin) vs.
+  require explicit operator/current-admin authorization, with join order as
+  tie-break only **[REC]**.
+- **Transitive scope + ancestor-id discovery** (§1.5/§3.5) — strict ancestor chain
+  with a node-id discovery walk **[REC]**, vs. v1 = direct parent only.
+- **Scope model** (R3-Q1) — drop scopes entirely, every admin full-power, value
+  bounded by `value_policy.json` **[REC]**, vs. a stronger value gate.
+- **Accept the format-8 hard break + lockstep release** (R3-Q2) **[REC]**.
+- **Value-policy keying** (§3.9) — key on the end-to-end requester **[REC]** vs.
+  the signing controller.
+
+**Before P4 (web UI):**
+- **Policy doc** (R6-Q1) — content + location (`ADMIN_POLICY.md` in-repo **[REC]**).
+- **Unlock persistence** (R6-Q2) — locked by default **[REC]** vs. persist across reload.
+- **Up/down traversal** (R7-Q1) — ancestor chain **[REC]** vs. flat list.
+- **Tab sets** (R8-Q1) — see §5 **[REC]**; decide labels and Admin tab vs mode.
+
+**Before P5 (docs) / optional:**
+- **Docs archive vs delete** (R2-Q1) — archive to `PLAN-ARCHIVE.md`/`CHANGELOG.md`
+  **[REC]**.
+- **R9 offline "plan and apply on next start" mode** (R9-Q2) — optional.
+
+---
+
 ## Cross-cutting open questions
 
 - _(pending)_
