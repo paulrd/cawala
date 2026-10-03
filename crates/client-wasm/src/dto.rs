@@ -1760,8 +1760,9 @@ pub(crate) fn parse_receive_uri_inner(uri: &str) -> Result<ParsedReceiveUri, Str
 mod tests {
     use super::*;
     use cawala_control::{
-        ADMIN_BUNDLE_VERSION, ADMIN_GRANT_VERSION, AdminGrantBundleV1, AdminGrantV2, ChildKind,
-        DEFAULT_ADMIN_TTL_SECS, Invite, NodeId, OctAddr, OperatorSecretKey, SignedAdminGrantV2,
+        ADMIN_BUNDLE_VERSION, ADMIN_GRANT_VERSION, AdminGrantBundleV1, AdminGrantV2, AdminMode,
+        ChildKind, DEFAULT_ADMIN_TTL_SECS, Invite, LeaseState, NodeId, OctAddr, OperatorSecretKey,
+        SignedAdminGrantV2,
     };
 
     use crate::ledger_state::{ActivityEntryV1, SettlementRecordV1, SettlementStateV1};
@@ -2082,6 +2083,13 @@ mod tests {
                 desired_slot: Some(2),
                 expiry: 1_700_000_000,
             }],
+            lease: LeaseState {
+                epoch: 0,
+                lease_until: 0,
+                current: -1,
+                priority_len: 0,
+                mode: AdminMode::BrowserChildren,
+            },
         };
 
         let dto = AdminSnapshotDto::from_snapshot(&snapshot);

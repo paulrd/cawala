@@ -465,11 +465,14 @@ fn admin_intent(
 }
 
 /// A routed control request payload with the frozen version.
+///
+/// `_grant` is retained in the signature for now: routed control v2 dropped the
+/// carried-grant field, and these tests are rewritten in C6.
 fn routed(
     target: PeerRef,
     requester: PeerRef,
     intent: SignedControl,
-    grant: Option<SignedAdminGrant>,
+    _grant: Option<SignedAdminGrant>,
     forwards: Vec<RoutedForward>,
 ) -> RoutedControlV1 {
     RoutedControlV1 {
@@ -477,7 +480,6 @@ fn routed(
         target,
         requester,
         intent,
-        grant,
         forwards,
     }
 }

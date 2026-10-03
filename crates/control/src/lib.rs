@@ -66,10 +66,10 @@ pub use claim::{
 };
 pub use invite::{INVITE_SCHEME, Invite, InviteError};
 pub use reply::{
-    AdminApproved, AdminLedgerAccount, AdminLedgerSnapshot, AdminPendingJoin, AdminRejected,
-    AdminSnapshot, AdminValueApplied, CONTROL_ALPN, CONTROL_REPLY_VERSION, ChildSnapshot,
-    ControlReply, DeliveryStatus, MAX_ADMIN_LEDGER_ACCOUNTS, NodeSnapshot, ParentSnapshot,
-    RejectCode,
+    AdminApproved, AdminLedgerAccount, AdminLedgerSnapshot, AdminMode, AdminPendingJoin,
+    AdminRejected, AdminSnapshot, AdminValueApplied, CONTROL_ALPN, CONTROL_REPLY_VERSION,
+    ChildSnapshot, ControlReply, DeliveryStatus, LeaseState, MAX_ADMIN_LEDGER_ACCOUNTS,
+    NodeSnapshot, ParentSnapshot, RejectCode,
 };
 pub use request::{
     AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminLeaseProbe, AdminLeaseRequest,

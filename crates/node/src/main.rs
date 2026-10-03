@@ -2119,6 +2119,10 @@ fn print_reply(reply: &ControlReply) {
             applied.entry_hash.to_hex(),
             applied.duplicate
         ),
+        ControlReply::LeaseState(state) => println!(
+            "lease-state: epoch={} lease_until={} current={} priority_len={} mode={:?}",
+            state.epoch, state.lease_until, state.current, state.priority_len, state.mode
+        ),
     }
 }
 

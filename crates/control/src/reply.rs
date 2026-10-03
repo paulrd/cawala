@@ -33,11 +33,13 @@ pub const CONTROL_ALPN: &[u8] = b"cawala/control/0";
 /// Bumped to 2 when the admin reply variants ([`ControlReply::AdminSnapshot`],
 /// [`ControlReply::AdminApproved`], [`ControlReply::AdminRejected`]) were
 /// appended, to 3 when [`ControlReply::AdminLedgerSnapshot`] was appended
-/// (read-only ledger view), and to 4 when
-/// [`ControlReply::AdminValueApplied`] was appended (delegated value ops). There
-/// is no on-wire reader pinned to this constant yet; it exists so a future
-/// reader can reject a mismatched frame up front.
-pub const CONTROL_REPLY_VERSION: u8 = 4;
+/// (read-only ledger view), to 4 when
+/// [`ControlReply::AdminValueApplied`] was appended (delegated value ops), and
+/// to 5 when [`ControlReply::LeaseState`] was appended and
+/// [`AdminSnapshot`] gained `lease`. There is no on-wire reader pinned to this
+/// constant yet; it exists so a future reader can reject a mismatched frame up
+/// front.
+pub const CONTROL_REPLY_VERSION: u8 = 5;
 
 /// The node's answer to one direct control request.
 ///
@@ -72,6 +74,43 @@ pub enum ControlReply {
     /// [`ControlRequest::AdminBurn`](crate::ControlRequest::AdminBurn): the
     /// applied (or duplicate) value operation (variant 8, reply version 4).
     AdminValueApplied(AdminValueApplied),
+    /// The node's current lease/priority state, sent in reply to an
+    /// [`AdminLease`](crate::ControlRequest::AdminLease) renewal or an
+    /// [`AdminLeaseProbe`](crate::ControlRequest::AdminLeaseProbe), and (with a
+    /// stale/future epoch) instead of a rejection so the sender resyncs
+    /// (variant 9, reply version 5).
+    LeaseState(LeaseState),
+}
+
+/// The node's current priority-administrator lease state.
+///
+/// Field order is frozen: postcard encodes positionally. A `lease_until` of `0`
+/// means no lease is held; `current == -1` means no priority entry is current;
+/// `priority_len` is the total number of priority entries ("i of n").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseState {
+    /// The node's monotone lease epoch.
+    pub epoch: u64,
+    /// Unix seconds until which a lease is held; `0` means none.
+    pub lease_until: u64,
+    /// Index of the current priority entry, or `-1` for none.
+    pub current: i32,
+    /// Total number of priority entries.
+    pub priority_len: u8,
+    /// Which authority mode the node is in.
+    pub mode: AdminMode,
+}
+
+/// Which topology authority mode a node is currently in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminMode {
+    /// The node has one or more `User` (browser) children; those are the
+    /// administrators and priority is not consulted.
+    BrowserChildren,
+    /// The node has no `User` children; the current leased priority entry is
+    /// the administrator.
+    Priority,
 }
 
 /// The outcome of a delegated issue/burn, for idempotent retries.
@@ -240,6 +279,8 @@ pub struct AdminSnapshot {
     pub node: NodeSnapshot,
     /// Joins queued for admin approval.
     pub pending: Vec<AdminPendingJoin>,
+    /// The node's current lease/priority state.
+    pub lease: LeaseState,
 }
 
 /// One join awaiting admin approval.
@@ -336,7 +377,18 @@ mod tests {
             }),
             ControlReply::AdminLedgerSnapshot(admin_ledger_snapshot()),
             ControlReply::AdminValueApplied(admin_value_applied()),
+            ControlReply::LeaseState(lease_state()),
         ]
+    }
+
+    fn lease_state() -> LeaseState {
+        LeaseState {
+            epoch: 7,
+            lease_until: 1_730_000_300,
+            current: 1,
+            priority_len: 3,
+            mode: AdminMode::Priority,
+        }
     }
 
     fn admin_value_applied() -> AdminValueApplied {
@@ -412,6 +464,7 @@ mod tests {
                     expiry: 2_000,
                 },
             ],
+            lease: lease_state(),
         }
     }
 
@@ -495,6 +548,64 @@ mod tests {
                 postcard::to_allocvec(&applied.entry_hash).unwrap(),
                 postcard::to_allocvec(&applied.duplicate).unwrap(),
             ],
+        );
+    }
+
+    #[test]
+    fn lease_state_reply_discriminant_is_frozen() {
+        let reply = ControlReply::LeaseState(lease_state());
+        let bytes = postcard::to_allocvec(&reply).unwrap();
+        assert_eq!(bytes[0], 9, "LeaseState must stay discriminant 9");
+    }
+
+    #[test]
+    fn reply_lease_state_field_order() {
+        let state = lease_state();
+        assert_postcard_field_order(
+            &state,
+            &[
+                postcard::to_allocvec(&state.epoch).unwrap(),
+                postcard::to_allocvec(&state.lease_until).unwrap(),
+                postcard::to_allocvec(&state.current).unwrap(),
+                postcard::to_allocvec(&state.priority_len).unwrap(),
+                postcard::to_allocvec(&state.mode).unwrap(),
+            ],
+        );
+        // `current` is signed: a negative "none" value must round-trip and must
+        // not collapse to zero.
+        let none = LeaseState {
+            epoch: 0,
+            lease_until: 0,
+            current: -1,
+            priority_len: 0,
+            mode: AdminMode::BrowserChildren,
+        };
+        assert_eq!(none.current, -1);
+        let bytes = postcard::to_allocvec(&none).unwrap();
+        let back: LeaseState = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, none);
+    }
+
+    #[test]
+    fn admin_snapshot_carries_lease() {
+        let snapshot = admin_snapshot();
+        assert_eq!(snapshot.lease, lease_state());
+        let bytes = postcard::to_allocvec(&snapshot).unwrap();
+        let back: AdminSnapshot = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, snapshot);
+    }
+
+    #[test]
+    fn admin_mode_discriminants_are_frozen() {
+        // Postcard encodes unit-variant enums by index; the `serde`
+        // `rename_all` only affects human-readable formats.
+        assert_eq!(
+            postcard::to_allocvec(&AdminMode::BrowserChildren).unwrap(),
+            postcard::to_allocvec(&0u8).unwrap()
+        );
+        assert_eq!(
+            postcard::to_allocvec(&AdminMode::Priority).unwrap(),
+            postcard::to_allocvec(&1u8).unwrap()
         );
     }
 

@@ -28,13 +28,13 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use cawala_control::{
-    AdminApproved, AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminMoveChild,
+    AdminApproved, AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminMode, AdminMoveChild,
     AdminPendingJoin, AdminRedeliverJoin, AdminRejected, AdminScopes, AdminSnapshot, AdminValueApplied,
     AdminValueDirection, AdminValueRequest, CONTROL_ALPN, CONTROL_REQUEST_MAX_TTL_SECS,
     CONTROL_REQUEST_TTL_SECS, ChildKind, ChildSnapshot, ControlError, ControlReply, ControlRequest,
     CreateChild, DeliveryStatus, DetachChild, DetachNotice, ExitRequest, Invite, JoinApproval,
-    JoinRejection, JoinRequest, MAX_CONTROL_FRAME, MoveChild, NodeId, NodeSnapshot, OctAddr,
-    OperatorPubKey, OperatorSecretKey, ParentSnapshot, ROUTED_REPLY_VERSION, RebaseNotice,
+    JoinRejection, JoinRequest, LeaseState, MAX_CONTROL_FRAME, MoveChild, NodeId, NodeSnapshot,
+    OctAddr, OperatorPubKey, OperatorSecretKey, ParentSnapshot, ROUTED_REPLY_VERSION, RebaseNotice,
     RebasePull, RejectCode, RoutedControlV1, RoutedForward, RoutedReplyV1, SetAddress, SignedControl,
     SignedRoutedReply, ValueRequestId, is_admin_request, is_supported_control_version,
     min_control_version, senior_child, verify_control,
@@ -1177,38 +1177,8 @@ impl ControlNode {
         // this node, so the untouched `authorize_admin` path (store + replay +
         // TTL) decides.
         if is_admin_request(&routed.intent.request) {
-            if let Some(grant) = &routed.grant {
-                let well_formed = grant.grant.validate().is_ok()
-                    && grant.verify(&self.operator.public()).is_ok()
-                    && grant.grant.node.as_str() == self.node_id
-                    && grant.grant.admin == routed.intent.controller;
-                if !well_formed {
-                    return Handled::Reply(ControlReply::Rejected(RejectCode::Unauthorized));
-                }
-                // Refresh the store from disk *before* deriving the evidence,
-                // exactly as `receive_at_handled` will before authorizing:
-                // otherwise a grant/revoke by a separate process leaves the
-                // in-memory copy stale and the audit line disagrees.
-                self.reload_admins();
-                // Evidence, not authority: record when the store does not back
-                // the carried grant, then let `authorize_admin` refuse it.
-                if self
-                    .admins
-                    .active_scopes(&routed.intent.controller, now)
-                    .is_none()
-                {
-                    self.audit(serde_json::json!({
-                        "ts": now,
-                        "event": "grant_store_missing",
-                        "admin": routed.intent.controller.to_string(),
-                        "node": self.node_id,
-                        "requester": routed.requester.node,
-                        "forwarder": last.hop.node,
-                        "hops": routed.forwards.len(),
-                        "routed": true,
-                    }));
-                }
-            }
+            // Routed control v2 dropped the carried-grant evidence field; the
+            // destination authorizes the intent on its own (store/replay/TTL).
             return match self.receive_at_handled(remote, routed.intent, now).await {
                 Handled::Reply(reply) => {
                     self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
@@ -2591,6 +2561,14 @@ impl ControlNode {
         ControlReply::AdminSnapshot(AdminSnapshot {
             node: self.snapshot(),
             pending,
+            // Placeholder until the authority core wires `admin_state` (C4).
+            lease: LeaseState {
+                epoch: 0,
+                lease_until: 0,
+                current: -1,
+                priority_len: 0,
+                mode: AdminMode::Priority,
+            },
         })
     }
 
@@ -3558,6 +3536,7 @@ fn reply_outcome(reply: &ControlReply) -> String {
         ControlReply::AdminRejected(_) => "admin-rejected".to_string(),
         ControlReply::AdminLedgerSnapshot(_) => "admin-ledger-snapshot".to_string(),
         ControlReply::AdminValueApplied(_) => "admin-value-applied".to_string(),
+        ControlReply::LeaseState(_) => "lease-state".to_string(),
     }
 }
 
@@ -3803,6 +3782,7 @@ fn signed_kind(reply: &ControlReply) -> &'static str {
         ControlReply::AdminRejected(_) => "admin-rejected",
         ControlReply::AdminLedgerSnapshot(_) => "admin-ledger-snapshot",
         ControlReply::AdminValueApplied(_) => "admin-value-applied",
+        ControlReply::LeaseState(_) => "lease-state",
     }
 }
 
@@ -7019,7 +6999,6 @@ mod tests {
                     node: fwd_id.clone(),
                 },
                 intent,
-                grant: None,
                 forwards: vec![RoutedForward::new(
                     PeerRef {
                         addr: "0.1".parse().unwrap(),

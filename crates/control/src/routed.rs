@@ -45,12 +45,11 @@ use serde::{Deserialize, Serialize};
 use cawala_ledger::{Hash, OperatorPubKey, OperatorSecretKey, Signature};
 use cawala_msg::{MAX_HOPS, MsgId, PeerRef};
 
-use crate::admin::SignedAdminGrant;
 use crate::reply::ControlReply;
 use crate::sign::{SignedControl, is_supported_control_version};
 
 /// Wire format version for [`RoutedControlV1`].
-pub const ROUTED_CONTROL_VERSION: u8 = 1;
+pub const ROUTED_CONTROL_VERSION: u8 = 2;
 
 /// Wire format version for [`RoutedReplyV1`].
 pub const ROUTED_REPLY_VERSION: u8 = 1;
@@ -85,9 +84,6 @@ pub struct RoutedControlV1 {
     /// The end-to-end human request (a v3/v4 [`SignedControl`], advisory for
     /// non-admin classes).
     pub intent: SignedControl,
-    /// Carried admin evidence, if any. It is audit evidence only: a
-    /// carried-but-unstored grant never authorises at the destination.
-    pub grant: Option<SignedAdminGrant>,
     /// One entry per transmitting hop, in path order.
     ///
     /// Deserialization is bounded to [`MAX_ROUTED_FORWARDS`] entries (see
@@ -475,9 +471,7 @@ mod tests {
     use cawala_ledger::{NodeId, OperatorSecretKey};
     use cawala_msg::OctAddr;
 
-    use crate::admin::{
-        ADMIN_GRANT_CONTEXT, ADMIN_GRANT_V1_VERSION, AdminGrant, AdminScope,
-    };
+    use crate::admin::ADMIN_GRANT_CONTEXT;
     use crate::request::ControlRequest;
     use crate::sign::{CONTROL_CONTEXT, CONTROL_FORMAT_VERSION};
 
@@ -509,7 +503,6 @@ mod tests {
             target: peer("0.3", "node-d"),
             requester: peer("0.1", "browser"),
             intent,
-            grant: None,
             forwards: vec![RoutedForward::new(peer("0.3", "node-d"), signed)],
         }
     }
@@ -521,18 +514,6 @@ mod tests {
             requester: peer("0.1", "browser"),
             responder: peer("0.3", "node-d"),
             reply: ControlReply::Accepted,
-        }
-    }
-
-    fn sample_grant() -> AdminGrant {
-        AdminGrant {
-            version: ADMIN_GRANT_V1_VERSION,
-            node: node("node-d"),
-            admin: operator(3).public(),
-            scope: AdminScope::Admin,
-            granted_at: 1_000,
-            expiry: 1_000 + crate::DEFAULT_ADMIN_TTL_SECS,
-            label: Some("lab".to_string()),
         }
     }
 
@@ -548,9 +529,8 @@ mod tests {
     }
 
     #[test]
-    fn routed_control_round_trips_with_grant_and_forwards() {
+    fn routed_control_round_trips_with_multiple_forwards() {
         let mut control = sample_control();
-        control.grant = Some(SignedAdminGrant::authorize(sample_grant(), &operator(1)).unwrap());
         control.forwards.push(RoutedForward::new(
             peer("0.3.7", "mid-c"),
             SignedControl::authorize(
@@ -594,10 +574,10 @@ mod tests {
         // value must only change as part of a deliberate protocol version bump.
         let control = sample_control();
         let bytes = control.to_bytes().unwrap();
-        assert_eq!(bytes.len(), 253);
+        assert_eq!(bytes.len(), 252);
         assert_eq!(
             blake3::hash(&bytes).to_hex().as_str(),
-            "dd35670d7940e44a534136a01559463f8b4dee17e1e0fddac3cbef65de161d41"
+            "ba61348f39ee65627c299a2af6a4521eae78a8687946dcf264461075b9e474de"
         );
     }
 
@@ -652,6 +632,23 @@ mod tests {
         control.forwards[0].signed.signature =
             operator(1).sign(control.forwards[0].signed.signing_hash().as_bytes());
         assert_eq!(control.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_v1() {
+        // The v1 layout carried a `grant` field and is not wire-compatible
+        // with v2 (which dropped it). A v1 frame must be rejected up front.
+        let mut control = sample_control();
+        control.version = 1;
+        assert_eq!(control.validate(), Err(RoutedError::UnsupportedVersion(1)));
+
+        // Likewise `from_bytes` rejects the v1 leading byte before decoding.
+        let mut bytes = sample_control().to_bytes().unwrap();
+        bytes[0] = 1;
+        assert_eq!(
+            RoutedControlV1::from_bytes(&bytes),
+            Err(RoutedError::UnsupportedVersion(1))
+        );
     }
 
     #[test]
@@ -713,7 +710,6 @@ mod tests {
             postcard::to_allocvec(&control.target).unwrap(),
             postcard::to_allocvec(&control.requester).unwrap(),
             postcard::to_allocvec(&control.intent).unwrap(),
-            postcard::to_allocvec(&control.grant).unwrap(),
         ] {
             bytes.extend_from_slice(&field);
         }
@@ -823,21 +819,20 @@ mod tests {
     }
 
     #[test]
-    fn reply_bytes_do_not_decode_as_routed_control() {
-        // Both payloads share the same leading version byte
-        // (`ROUTED_CONTROL_VERSION == ROUTED_REPLY_VERSION == 1`), so the
-        // leading byte alone cannot tell them apart. Disambiguation must be by
-        // full decode: the reply body does not parse as a `RoutedControlV1`
-        // (P2 selects the type by `msg_type`/direction, not by this byte).
+    fn reply_bytes_are_not_decoded_as_routed_control() {
+        // `ROUTED_CONTROL_VERSION` (2) and `ROUTED_REPLY_VERSION` (1) now
+        // differ, so a reply's leading byte is rejected as an unsupported
+        // *routed-control* version before any body decode. The type is still
+        // selected by `msg_type`/direction, not by this byte.
         let reply_bytes = SignedRoutedReply::authorize(sample_reply(), &operator(7))
             .unwrap()
             .to_bytes()
             .unwrap();
-        assert_eq!(reply_bytes[0], ROUTED_CONTROL_VERSION);
-        assert!(matches!(
+        assert_eq!(reply_bytes[0], ROUTED_REPLY_VERSION);
+        assert_eq!(
             RoutedControlV1::from_bytes(&reply_bytes),
-            Err(RoutedError::Codec(_))
-        ));
+            Err(RoutedError::UnsupportedVersion(ROUTED_REPLY_VERSION))
+        );
     }
 
     #[test]

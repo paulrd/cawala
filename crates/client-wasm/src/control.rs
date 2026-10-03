@@ -545,11 +545,6 @@ pub(crate) async fn exchange_admin(
 /// operator key; the delegated `K_admin` travels inside `intent.controller`
 /// and is checked end-to-end by the target.
 ///
-/// `grant` is always `None`: a browser never holds a
-/// [`SignedAdminGrant`](cawala_control::SignedAdminGrant), and a carried grant
-/// is audit evidence only (a carried-but-unstored grant never authorises at
-/// the destination), so omitting it loses nothing.
-///
 /// Returns a plain [`String`] error (not [`wasm_bindgen::JsError`]) so every
 /// error path is testable on native targets; the wasm boundary wraps it with
 /// [`to_js_err`].
@@ -575,7 +570,6 @@ pub(crate) fn build_routed_control(
         target,
         requester: requester.clone(),
         intent,
-        grant: None,
         forwards: vec![RoutedForward::new(requester, forward)],
     };
     routed.validate().map_err(|err| err.to_string())?;
@@ -685,6 +679,9 @@ fn reply_kind(reply: &ControlReply) -> &'static str {
         // P5 reply variant: the wasm DTO/mapping is P5c; this label arm only
         // keeps the match exhaustive after the control reply version bump.
         ControlReply::AdminValueApplied(_) => "admin-value-applied",
+        // LeaseState: the wasm DTO/mapping is P3; this label arm only keeps the
+        // match exhaustive after the control reply version bump.
+        ControlReply::LeaseState(_) => "lease-state",
     }
 }
 
@@ -816,10 +813,9 @@ mod tests {
         )
         .expect("routed control builds");
 
-        // One forward, no carried grant, and the forward is signed by the
-        // browser's operator key (not the delegated admin key in `intent`).
+        // One forward and the forward is signed by the browser's operator key
+        // (not the delegated admin key in `intent`).
         assert_eq!(routed.forwards.len(), 1);
-        assert_eq!(routed.grant, None);
         assert_eq!(routed.forwards[0].hop, requester);
         assert_eq!(
             routed.forwards[0].signed.origin,
