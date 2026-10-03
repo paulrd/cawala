@@ -393,10 +393,11 @@ const SELF = adminKeys.SELF_SELECTION;
 const MOCK_NODE_ID = 'mock';
 
 /**
- * Last node kind inferred for this browser's own node from its local
- * topology snapshot. Session-only: a local snapshot read, not a persisted claim.
+ * This browser's own kind. The web client is always a user leaf, so its kind is
+ * known directly rather than inferred from a local child list it never has
+ * (inference over an empty child list is `unknown`). Session-only.
  */
-let _selfKind = NODE_KIND.UNKNOWN;
+let _selfKind = NODE_KIND.USER;
 
 /**
  * Resolve the target of an admin call: an explicit id, else the persisted
@@ -707,7 +708,7 @@ export async function probeAdminNode(nodeId = undefined) {
     const view = {
       nodeId: target,
       ok: true,
-      kind: inferNodeKind(children),
+      kind: target === SELF ? NODE_KIND.USER : inferNodeKind(children),
       address: target === SELF ? clientState.address ?? null : '0.3',
       childrenCount: children.length,
       pendingCount: MOCK_DATA.joinRequests.length,
@@ -724,7 +725,9 @@ export async function probeAdminNode(nodeId = undefined) {
     // Our own topology is local state: no grant and no network round-trip.
     try {
       const rows = _readLocalChildren();
-      _selfKind = inferNodeKind(rows);
+      // The browser client is always a user leaf: its kind is known directly,
+      // not inferred from its children (a user leaf has none).
+      _selfKind = NODE_KIND.USER;
       _syncAdministeredNode();
       return {
         nodeId: target,

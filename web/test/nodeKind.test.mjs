@@ -57,6 +57,7 @@ test('malformed child entries never crash the inference', () => {
 test('every kind has an explicit, non-guessing label', () => {
   assert.equal(kindLabel('internal'), 'Internal node');
   assert.equal(kindLabel('leaf'), 'Leaf node');
+  assert.equal(kindLabel('user'), 'User leaf');
   assert.equal(kindLabel('unknown'), 'Unknown kind');
   // Anything unrecognised (including empty) falls back to the honest label.
   assert.equal(kindLabel(null), 'Unknown kind');
@@ -75,6 +76,7 @@ test('child rows label their own kind', () => {
 test('badge variants follow the kind palette', () => {
   assert.equal(kindBadgeVariant('internal'), 'info');
   assert.equal(kindBadgeVariant('leaf'), 'ok');
+  assert.equal(kindBadgeVariant('user'), 'ok');
   assert.equal(kindBadgeVariant('unknown'), 'muted');
   assert.equal(kindBadgeVariant(null), 'muted');
   assert.equal(kindBadgeVariant('bridge'), 'muted');

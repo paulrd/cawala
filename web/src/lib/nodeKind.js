@@ -9,6 +9,10 @@
  *   - every child of kind `user`-> the target only holds user accounts: leaf
  *   - no children / unknown kinds -> unknown (never guessed)
  *
+ * `user` is not produced by that inference: it is this client's own role (a
+ * browser user leaf), which is known directly rather than read from a child
+ * list it does not have. See `api.js` `_selfKind`.
+ *
  * An authoritative `role` field on the node record is a later, additive
  * change; P1 inference is deliberately one-way and never invents a kind.
  */
@@ -17,6 +21,8 @@
 export const NODE_KIND = {
   INTERNAL: 'internal',
   LEAF: 'leaf',
+  /** This client's own role: a browser user leaf (never inferred). */
+  USER: 'user',
   UNKNOWN: 'unknown',
 };
 
@@ -24,6 +30,7 @@ export const NODE_KIND = {
 const NODE_KIND_LABELS = {
   internal: 'Internal node',
   leaf: 'Leaf node',
+  user: 'User leaf',
   unknown: 'Unknown kind',
 };
 
@@ -72,6 +79,6 @@ export function childRoleLabel(childKind) {
  */
 export function kindBadgeVariant(kind) {
   if (kind === NODE_KIND.INTERNAL) return 'info';
-  if (kind === NODE_KIND.LEAF) return 'ok';
+  if (kind === NODE_KIND.LEAF || kind === NODE_KIND.USER) return 'ok';
   return 'muted';
 }
