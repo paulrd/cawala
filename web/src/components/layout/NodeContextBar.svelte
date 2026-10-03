@@ -1,4 +1,5 @@
 <script>
+  import { untrack } from 'svelte';
   import NodeSelector from '../admin/NodeSelector.svelte';
   import GrantStatusBanner from '../admin/GrantStatusBanner.svelte';
   import Badge from '../shared/Badge.svelte';
@@ -36,7 +37,11 @@
 
   /** Probe the selected node once (never throws). */
   async function runProbe(target) {
-    if (!target || probing) return;
+    // Read the re-entrancy guard untracked: when this runs inside the
+    // selection $effect below, a tracked read of `probing` would make the
+    // effect depend on a value the probe writes, self-invalidating on every
+    // flush and hanging the tab in Svelte's update loop.
+    if (!target || untrack(() => probing)) return;
     probing = true;
     try {
       await probeAdminNode(target);
