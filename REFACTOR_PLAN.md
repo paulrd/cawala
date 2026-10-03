@@ -16,10 +16,15 @@ drift.
   its parent. A node with browser children is administered **only** by those
   browsers — no child fallback; local CLI is the fallback when they are offline.
 - **R5**: nodes **without** browser children keep a priority-ordered **child-node**
-  list (default = join order, earlier = higher; current admin may reorder). A
-  configurable TTL (default 5 min) governs failover: if the node cannot reach the
-  current admin child within the TTL, the next child in priority order may
-  administer it. Administration is transitive.
+  list, **explicitly seeded** (empty by default; a child gains admin only when the
+  operator/current admin authorizes it, first admin via local CLI; join order is
+  tie-break only). The current admin may reorder. A configurable TTL (default
+  5 min) governs failover: if the node cannot reach the current admin child within
+  the TTL, the next child in priority order may administer it. Administration is
+  transitive.
+- **Ancestor reach (frozen)**: browser upward reach is the strict ancestor chain
+  with a node-id discovery walk over the direct parent link (see §1.5); authority
+  remains hop-by-hop.
 - **R9**: local CLI on the host is the universal fallback (operator key on the
   machine; self-authority, not a grant). It is the only fallback for a node whose
   browser children are offline.
@@ -106,10 +111,11 @@ Replace `<data-dir>/admins.json` with `<data-dir>/admin_state.json`:
 }
 ```
 
-- Default on first open / missing file: `priority` = node children sorted by
-  `(date_joined, id)` (join order), `current = 0` if any, `lease_until = 0`,
-  `epoch = 0`. **See risk 3.1 — recommend requiring explicit operator seeding
-  instead.**
+- Default on first open / missing file: `priority = []`, `current = -1`,
+  `lease_until = 0`, `epoch = 0`. **Seeding is explicit** (decided 2026-10-03):
+  a child enters the list only via explicit operator/current-admin authorization;
+  the first admin is bootstrapped by local CLI. Join order only orders
+  already-authorized admins. See risk 3.1.
 - Loaded/validated per request (mirroring `refresh_control_plane`); a corrupt
   file fails closed to "no remote admin" (local CLI still works).
 - Browser children are **not** listed here; R4 is derived from `node.json`.
@@ -305,13 +311,11 @@ operator explicitly issued a grant; here, joining as the earliest child is enoug
 to gain full admin, including the power to reorder the list and lock out everyone
 else. The operator's only demotion path is local CLI.
 
-**Mitigation (recommended)**: do **not** auto-seed the priority list from join
-order. Require the operator (or the current admin) to explicitly add each child
-as an administrator; use join order only as the tie-break/stability order among
-already-authorized admins. Bootstrap the first admin via local CLI. If the team
-insists on auto-default, add a mandatory "provision/auth" step before a child
-gains admin. **This may need a requirement change (R5 wording) and is flagged as
-a human decision.**
+**Decision (frozen 2026-10-03)**: do **not** auto-seed the priority list from
+join order. A child becomes an administrator only when the operator (or the
+current admin) explicitly adds it; join order is used only as the tie-break /
+stability order among already-authorized admins. The first admin is bootstrapped
+via local CLI. This closes the "first joiner is permanent admin" lockout risk.
 
 ### 3.2 TTL / replay abuse
 

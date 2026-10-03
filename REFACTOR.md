@@ -195,42 +195,58 @@ administer its own parent — no grant required.
 ### R5 — Priority-ordered child administration with TTL failover
 
 **Statement.** A node that does **not** have leaf (browser) children keeps a
-**priority-ordered list of its child nodes**. Priority defaults to the order the
-children joined the network (earlier join = higher priority), and the node's
-current admin may reorder it at any time. A configurable TTL (e.g. 5 minutes)
-governs failover: if the node cannot connect to the current admin child within
-the TTL, the next child in priority order is permitted to administer it. By
-transitivity, every node always has an administrator, hop-by-hop.
+**priority-ordered list of its child nodes**. The list is **seeded explicitly**:
+a child gains administration only when the operator (or the current admin)
+explicitly authorizes it — the first admin is bootstrapped via local CLI
+(R9). Join order is used only as a tie-break/stability order among
+already-authorized admins, never as an automatic grant. The node's current
+admin may reorder it at any time. A configurable TTL (e.g. 5 minutes) governs
+failover: if the node cannot connect to the current admin child within the TTL,
+the next child in priority order is permitted to administer it. By transitivity,
+every node always has an administrator, hop-by-hop.
 
 **Rationale.** Browser leaf nodes are frequently offline, so control must not
 depend on them. A priority list plus a liveness TTL guarantees a reachable
 administrator among a node's children.
+
+**Seeding decision (frozen 2026-10-03).** Auto-seeding from join order was
+rejected: it would make the first child ever approved the parent's permanent
+admin (reorder rights, lockout), recoverable only via local CLI. Authority is
+explicitly granted; join order only orders admins that already hold authority.
+See `REFACTOR_PLAN.md` §3.1.
 
 **Applicability.** Only for nodes that do **not** have leaf (browser) children.
 A node with leaf children uses R4 (those browsers only) and falls back to local
 CLI administration (R9) when they are offline.
 
 **Scope (to confirm).**
-- Persist the priority list per node (default = join order); admin-reorderable.
+- Persist the priority list per node; **explicitly seeded** (empty by default),
+  join order only ordering already-authorized admins; admin-reorderable.
 - TTL is configurable (default 5 min) and acts as a liveness/lease window before
   failover to the next child.
 - Failover: the next child in priority order becomes admin when the current admin
   child is unreachable past the TTL.
-- Administration is transitive so the entire tree is coverable.
+- Administration is transitive so the entire tree is coverable. **Frozen
+  2026-10-03:** browser upward reach is the strict ancestor chain, with a
+  discovery walk that learns ancestor node ids over the direct parent link so
+  replies are bound to real ancestor keys (authority stays hop-by-hop).
 
 **Open questions.**
 - Q1: *Resolved:* the priority list is exclusively for nodes **without** leaf
   children. A node with leaf children is administered only by those browsers
   (R4), and falls back to local CLI administration (R9) when they are offline.
-- Q2: Who may reorder — only the current admin? Can a newly-failed-over admin
-  reorder immediately?
-- Q3: What does "cannot connect to the child" mean concretely (control-probe
-  timeout? envelope reachability?), and does the TTL reset on each successful
-  contact (lease semantics)?
-- Q4: How does this relate to the existing "senior child" concept — does
-  priority replace seniority, with the senior child simply priority #1?
-- Q5: Is failover automatic (authority passes on timeout) or a
-  permitted-but-explicit takeover?
+- Q2: *Resolved (default):* only the current admin may reorder; a newly
+  failed-over admin may reorder immediately (audited); local CLI may always
+  override.
+- Q3: *Resolved (default):* "cannot connect" = no fresh valid renewal/admin
+  contact from `priority[current]` for `ttl`, then a priority-ordered probe of
+  candidates; every successful contact resets the lease (lease semantics).
+- Q4: *Resolved (default):* priority replaces seniority for authority; the
+  default list is `(date_joined, id)` order among authorized admins, so the
+  senior child is just `priority[0]`. `senior.rs` remains only an ordering
+  helper, with no authority role.
+- Q5: *Resolved (default):* failover is automatic, server-side, on TTL expiry
+  (`epoch += 1`, audited), not a self-claimed takeover.
 
 ### R6 — Admin mode separated behind a lock gate
 
@@ -324,31 +340,29 @@ Scope / Open questions._
 
 ---
 
-## Decisions pending (human)
+## Decisions (human)
 
-Resolve these before the phases noted. Rationale and recommended defaults are in
-`REFACTOR_PLAN.md` §5; **[REC]** marks the recommended default already proposed.
+Rationale and recommended defaults are in `REFACTOR_PLAN.md` §5; **[REC]** marks
+the recommended default already proposed.
 
-**Before P1 (authority core / wire):**
-- **R5 seeding** (`REFACTOR_PLAN.md` §3.1) — the top risk. Auto-seed the priority
-  list from join order (the earliest child automatically becomes admin) vs.
-  require explicit operator/current-admin authorization, with join order as
-  tie-break only **[REC]**.
-- **Transitive scope + ancestor-id discovery** (§1.5/§3.5) — strict ancestor chain
-  with a node-id discovery walk **[REC]**, vs. v1 = direct parent only.
-- **Scope model** (R3-Q1) — drop scopes entirely, every admin full-power, value
-  bounded by `value_policy.json` **[REC]**, vs. a stronger value gate.
-- **Accept the format-8 hard break + lockstep release** (R3-Q2) **[REC]**.
-- **Value-policy keying** (§3.9) — key on the end-to-end requester **[REC]** vs.
-  the signing controller.
+**Resolved 2026-10-03 (before P1):**
+- **R5 seeding** — **explicit operator/current-admin authorization**; first admin
+  bootstrapped via local CLI; join order is tie-break only. Auto-seed from join
+  order **rejected**. (R5 statement reworded; `REFACTOR_PLAN.md` §3.1.)
+- **Transitive scope + ancestor-id discovery** — **strict ancestor chain with a
+  node-id discovery walk**; authority stays hop-by-hop. (§1.5/§3.5.)
+- **Scope model** — drop scopes entirely; every admin full-power; value bounded
+  by `value_policy.json` **[REC]**.
+- **Format-8 hard break + lockstep release** — accepted **[REC]**.
+- **Value-policy keying** — end-to-end requester **[REC]**.
 
-**Before P4 (web UI):**
-- **Policy doc** (R6-Q1) — content + location (`ADMIN_POLICY.md` in-repo **[REC]**).
+**Pending before P4 (web UI):**
+- **Policy doc** (R6-Q1) — content + location; `ADMIN_POLICY.md` stub exists.
 - **Unlock persistence** (R6-Q2) — locked by default **[REC]** vs. persist across reload.
 - **Up/down traversal** (R7-Q1) — ancestor chain **[REC]** vs. flat list.
 - **Tab sets** (R8-Q1) — see §5 **[REC]**; decide labels and Admin tab vs mode.
 
-**Before P5 (docs) / optional:**
+**Pending before P5 (docs) / optional:**
 - **Docs archive vs delete** (R2-Q1) — archive to `PLAN-ARCHIVE.md`/`CHANGELOG.md`
   **[REC]**.
 - **R9 offline "plan and apply on next start" mode** (R9-Q2) — optional.
