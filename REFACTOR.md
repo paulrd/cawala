@@ -180,7 +180,10 @@ administer its own parent — no grant required.
 
 **Scope (to confirm).**
 - Update the kind/terminology model so "leaf" is only the browser/user.
-- A node with leaf (browser) children is administered by them, with full rights.
+- A node with leaf (browser) children is administered **only** by those
+  browsers, with full rights. There is **no child-based fallback** for such a
+  node — if its browsers are offline, local CLI administration (R9) is the only
+  path.
 - Supersedes the delegating-grant model and, for such nodes, seniority.
 
 **Open questions.**
@@ -202,6 +205,10 @@ transitivity, every node always has an administrator, hop-by-hop.
 depend on them. A priority list plus a liveness TTL guarantees a reachable
 administrator among a node's children.
 
+**Applicability.** Only for nodes that do **not** have leaf (browser) children.
+A node with leaf children uses R4 (those browsers only) and falls back to local
+CLI administration (R9) when they are offline.
+
 **Scope (to confirm).**
 - Persist the priority list per node (default = join order); admin-reorderable.
 - TTL is configurable (default 5 min) and acts as a liveness/lease window before
@@ -211,9 +218,9 @@ administrator among a node's children.
 - Administration is transitive so the entire tree is coverable.
 
 **Open questions.**
-- Q1: Does a node **with** leaf children also fall back to the priority list
-  when all its leaf children are offline? (The text applies the priority list to
-  "all other nodes", i.e. those without leaf children.)
+- Q1: *Resolved:* the priority list is exclusively for nodes **without** leaf
+  children. A node with leaf children is administered only by those browsers
+  (R4), and falls back to local CLI administration (R9) when they are offline.
 - Q2: Who may reorder — only the current admin? Can a newly-failed-over admin
   reorder immediately?
 - Q3: What does "cannot connect to the child" mean concretely (control-probe
@@ -275,6 +282,35 @@ non-admin and admin modes.
 **Open questions.**
 - Q1: What is the target tab set for user mode (e.g. a single combined page?) and
   for admin mode?
+
+### R9 — Local CLI administration is the universal fallback
+
+**Statement.** The operator, running the CLI on the machine that hosts a node
+(with filesystem access to that node's data dir and operator key), can always
+administer that node locally. This is the guaranteed fallback for **every**
+node — in particular a node whose only administrators are offline leaf
+(browser) children (R4/R5).
+
+**Rationale.** It guarantees control without depending on network reachability
+or on any child being online, and it is the one authority that cannot be lost to
+a disconnect. The operator key already lives on the host, so this is inherent
+local authority rather than a delegated grant.
+
+**Scope (to confirm).**
+- Local CLI admin covers the same action set as R6 (issue, burn, invite
+  creation, pending-join approval, topology, join/leave as a non-browser node).
+- Requires local filesystem access to the node's `<data-dir>`; not reachable
+  remotely.
+- Authority derives from the node's own operator key on the host
+  (self-authority, not a grant).
+
+**Open questions.**
+- Q1: Does local CLI administration need a separate audit marker to distinguish
+  it from network administration?
+- Q2: Should it work while the node is stopped (offline local edits), or only
+  through a running process against the live node?
+- Q3: Is any admin capability intentionally *unavailable* locally (e.g. actions
+  that require a peer's signature)?
 
 ---
 
