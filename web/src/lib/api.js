@@ -1277,6 +1277,12 @@ function _recordActivity(entry) {
  */
 function _activityKey(entry) {
   if (!entry || typeof entry !== 'object') return String(entry);
+  // A settlement carries both the resolving ledger `entrySeq` and its order
+  // hash, and must always key by the order hash. Checking `entrySeq` first
+  // would seed an existing settlement under `v:<seq>` while the persisted
+  // record is re-inserted under `s:<hash>`, yielding two entries with the same
+  // `id` (a duplicate keyed-each key that freezes the Activity table).
+  if (entry.type === ACTIVITY_TYPES.SETTLEMENT) return `s:${entry.orderHash}`;
   if (entry.entrySeq != null) return `v:${entry.entrySeq}`;
   if (entry.orderHash != null) return `s:${entry.orderHash}`;
   return entry.id != null ? String(entry.id) : `unknown:${Math.random()}`;
