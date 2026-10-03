@@ -1,6 +1,6 @@
 <script>
   import { NAV_ITEMS, ROUTES } from '../../lib/constants.js';
-  import { isActive } from '../../lib/router.svelte.js';
+  import { activeNavRoute } from '../../lib/router.svelte.js';
   import { clientState } from '../../lib/stores.svelte.js';
   import ConnectionIndicator from '../shared/ConnectionIndicator.svelte';
 
@@ -10,7 +10,8 @@
   let { route = '/' } = $props();
 
   let pageTitle = $derived.by(() => {
-    const item = NAV_ITEMS.find((n) => isActive(n.route, route, n.route === '/'));
+    const active = activeNavRoute(NAV_ITEMS.map((n) => n.route), route);
+    const item = NAV_ITEMS.find((n) => n.route === active);
     return item?.label ?? 'Cawala';
   });
 </script>

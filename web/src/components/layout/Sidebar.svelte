@@ -1,6 +1,6 @@
 <script>
   import { NAV_ITEMS, ROUTES } from '../../lib/constants.js';
-  import { navigate, isActive } from '../../lib/router.svelte.js';
+  import { navigate, activeNavRoute } from '../../lib/router.svelte.js';
   import { clientState, nodeState, apiCapabilities } from '../../lib/stores.svelte.js';
   import ConnectionIndicator from '../shared/ConnectionIndicator.svelte';
   import EndpointId from '../shared/EndpointId.svelte';
@@ -12,6 +12,9 @@
   let { route = '/' } = $props();
 
   let pendingCount = $derived(nodeState.joinRequests.filter((r) => r.status === 'pending').length);
+
+  // Exactly one nav item is active: the most specific route matching `route`.
+  let activeRoute = $derived(activeNavRoute(NAV_ITEMS.map((item) => item.route), route));
 
   const icons = {
     grid: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>',
@@ -36,7 +39,7 @@
 
   <nav class="sidebar-nav" aria-label="Main navigation">
     {#each NAV_ITEMS as item}
-      {@const active = isActive(item.route, route)}
+      {@const active = item.route === activeRoute}
       <button
         type="button"
         class="nav-item"

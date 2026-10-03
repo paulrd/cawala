@@ -53,16 +53,26 @@ export function navigate(path) {
 }
 
 /**
- * Check if a route is active (exact or prefix match).
- * @param {string} route - The nav item's route.
- * @param {string} current - The current route.
- * @param {boolean} [exact=false]
- * @returns {boolean}
+ * The single route from `routes` that best matches `current`, or null.
+ *
+ * A route matches on an exact hit or when it is a path-prefix ancestor
+ * (`/node` matches `/node/children`). `/` only matches exactly. When both a
+ * parent and a more specific item match, the longest route wins, so the parent
+ * section is not also shown as active (e.g. `/node/joins` selects
+ * `/node/joins`, not `/node`).
+ *
+ * @param {ReadonlyArray<string>} routes
+ * @param {string} current
+ * @returns {string|null}
  */
-export function isActive(route, current, exact = false) {
-  if (exact) return current === route;
-  if (route === '/') return current === '/';
-  return current === route || current.startsWith(route + '/');
+export function activeNavRoute(routes, current) {
+  let best = null;
+  for (const route of routes) {
+    const matches =
+      route === current || (route !== '/' && current.startsWith(route + '/'));
+    if (matches && (best === null || route.length > best.length)) best = route;
+  }
+  return best;
 }
 
 /**

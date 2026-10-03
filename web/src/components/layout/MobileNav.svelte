@@ -1,6 +1,6 @@
 <script>
   import { NAV_ITEMS, ROUTES } from '../../lib/constants.js';
-  import { navigate, isActive } from '../../lib/router.svelte.js';
+  import { navigate, activeNavRoute } from '../../lib/router.svelte.js';
   import { nodeState } from '../../lib/stores.svelte.js';
 
   /**
@@ -19,6 +19,9 @@
     { route: ROUTES.SETTINGS, label: 'More', icon: 'settings' },
   ];
 
+  // Exactly one item is active: the most specific route matching `route`.
+  let activeRoute = $derived(activeNavRoute(bottomNavItems.map((item) => item.route), route));
+
   const icons = {
     grid: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>',
     server: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><path d="M6 6h.01M6 18h.01"/></svg>',
@@ -34,7 +37,7 @@
 
 <nav class="mobile-nav" aria-label="Main navigation">
   {#each bottomNavItems as item}
-    {@const active = isActive(item.route, route)}
+    {@const active = item.route === activeRoute}
     <button
       type="button"
       class="mobile-nav-item"
