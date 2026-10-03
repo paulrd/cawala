@@ -105,4 +105,6 @@ how to verify, and conventions**. Detail lives elsewhere:
   self-signed join vouches for the new key) or by the node's own operator on
   `CreateChild`. The browser re-pins on re-attach; a browser same-parent rotation
   without re-approval still hard-rejects until a re-join.
-- Only commit when explicitly asked.
+- **Commit and push as you deem fit.** Prefer small, focused, verified commits;
+  match the existing message style (`M4 web:`, `docs:`, …); never commit secrets
+  or unrelated changes. A clean, pushed tree is the default.
