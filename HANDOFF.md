@@ -25,7 +25,7 @@ failover, local CLI fallback) with the wire bumps `CONTROL_FORMAT_VERSION` 7→8
 and `ROUTED_CONTROL_VERSION` 1→2 and the grant subsystem deleted. P1–P4 must ship
 as one lockstep release (the wire changes do not interoperate with the old
 wasm/web); develop on a branch, keep each commit compiling, and merge together.
-Baseline `main` @ `d2d16fd`.
+Baseline: current `main` (clean). Rebuild `web/src/wasm/` in lockstep.
 
 ## Current state
 - `main` is clean and pushed. **M0–M5 are built.**
