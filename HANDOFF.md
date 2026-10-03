@@ -15,12 +15,14 @@ how to verify, and conventions**. Detail lives elsewhere:
   `p2-scoped-grants.md`, `p3-ledger-view.md`.
 
 ## Current state
-- Branch `main` is clean and pushed (`origin/main` at `5f39862`). The unified
-  administered-node console (P1, `3ba0674`), scoped delegated admin grants +
-  the `cawala://admin` bundle (P2, `67b973a`), and the read-only admin ledger
-  view (P3, `5f39862`) are **DONE**. See PLAN.md
-  "Next Phases - Unified Node Administration" for the delivery notes and the
-  P4-P6 plan.
+- Branch `main` is clean and pushed (`origin/main` at `fc07811`). The unified
+  administered-node console **P1-P6 are all DONE** (2026-10-02): unified shell +
+  node selector (P1, `3ba0674`), scoped delegated admin grants + the
+  `cawala://admin` bundle (P2, `67b973a`), read-only admin ledger view (P3,
+  `5f39862`), delegated topology administration (P4, `3940fbd`), delegated value
+  administration with end-to-end idempotency + operator caps (P5, `f620ed1`),
+  and web-only value-seed passphrase hardening (P6, `7f7fe65`). See PLAN.md
+  "Next Phases - Unified Node Administration" for the delivery notes.
 - Scoped grants + bundle (P2, `67b973a`): `AdminScope` v2
   `{joins,topology,value}` with a per-request `required_scope` enforced on both
   direct and routed admin paths; `AdminGrantV2` under a distinct signing domain;

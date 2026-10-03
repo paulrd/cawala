@@ -229,8 +229,9 @@
         check clean. Independently reviewed (routing/replay); the three
         network-reachable findings (decode amplification, unbounded node-id
         retention, retry poisoning) were fixed and re-verified.
-   5. **M4 - Control & web client** (PHASE 1 DONE 2026-09-10; USER-LIVE
-      WIRING + BROWSER VALUE MESSAGING V1 DONE 2026-09-13; in progress):
+   5. **M4 - Control & web client** (DONE; PHASE 1 DONE 2026-09-10; USER-LIVE
+      WIRING + BROWSER VALUE MESSAGING V1 DONE 2026-09-13; remaining increments
+      DONE):
       senior-child control flow, indirect multi-node control, Svelte PWA,
       join flow (parent approves -> leaf issues address). Onboarding is
       invite-based so nodes stay undiscoverable; the location **suggestion**
@@ -912,7 +913,7 @@
      (moved-pointers are rejected too - decision 8).
 
 # Next Phases - Unified Node Administration (planned 2026-10-02)
-  Status: P1 delivered (client-only, 2026-10-02); P2-P6 not started. Goal: the
+  Status: P1-P6 delivered (2026-10-02). Goal: the
   browser console
   looks and functions identically whether the administered node is a leaf or an
   internal node, with a persistent selector showing which node is administered
