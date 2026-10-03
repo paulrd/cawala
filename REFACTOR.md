@@ -10,6 +10,7 @@ paths, one communication rule, less special-casing.
 
 Status: **Draft — gathering requirements**
 Last updated: 2026-10-03
+Design + phased plan: **`REFACTOR_PLAN.md`** (draft, derived from R1–R9)
 
 ---
 
