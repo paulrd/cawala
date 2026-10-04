@@ -153,11 +153,15 @@ pub fn priority_remove(
             }
             None => {
                 // The current node was removed: promote the next priority
-                // entry at the vacated index.
+                // entry at the vacated index. Emptying the list leaves
+                // `current = -1` and `lease_until = 0` (no administrator), so
+                // only a surviving entry gets a lease window.
                 let promote = removed_at.min(state.priority().len().saturating_sub(1));
                 state.bump_epoch();
                 state.set_current(promote as i32);
-                state.record_lease(now);
+                if state.current_index() >= 0 {
+                    state.record_lease(now);
+                }
             }
         },
     }
