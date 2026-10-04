@@ -4347,11 +4347,7 @@ fn map_ledger_error(err: &cawala_ledger::LedgerError) -> RejectCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin_store::StoredGrant;
     use crate::record::ChildEntry;
-    use cawala_control::{
-        ADMIN_GRANT_VERSION, AdminGrantV2, AdminScopes, DEFAULT_ADMIN_TTL_SECS, SignedAdminGrantV2,
-    };
     use cawala_ledger::{LedgerPubKey, LedgerSecretKey};
     use iroh::SecretKey;
 
@@ -5256,51 +5252,85 @@ mod tests {
         );
     }
 
+    /// Authority is topology-derived: the current, leased priority child may
+    /// use the (non-admin) topology surface directly, while a direct *admin*
+    /// request from a child is refused on the direct path (remote admin is
+    /// routed, R1). Demoting the priority entry revokes the authority.
     #[tokio::test]
-    async fn delegated_admin_is_scoped_and_cannot_use_topology_surface() {
+    async fn priority_child_is_the_topology_administrator() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut engine, operator) = admin_engine(dir.path());
-        let admin_op = OperatorSecretKey::from_bytes([5u8; 32]);
-        let grant = AdminGrantV2 {
-            version: ADMIN_GRANT_VERSION,
-            node: NodeId::from("parent"),
-            admin: admin_op.public(),
-            scopes: AdminScopes {
-                joins: true,
-                topology: false,
-                value: false,
-            },
-            granted_at: 10,
-            expiry: 10 + DEFAULT_ADMIN_TTL_SECS,
-            label: None,
-        };
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[("child", ChildKind::Node, 0, 1)],
+        );
+        let peers = [node_peer("child", &child_op, 3)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+
+        // Seed the explicit R5 priority list: `child` is current and leased.
+        // `receive_at` reloads `admin_state.json` per request, so the seed must
+        // be persisted (not just in memory).
         engine
-            .grant_admin(StoredGrant::V2(
-                SignedAdminGrantV2::authorize(grant, &operator).unwrap(),
-            ))
-            .unwrap();
+            .admin_state
+            .set_priority(vec!["child".to_string()]);
+        engine.admin_state.set_current(0);
+        engine.admin_state.bump_epoch();
+        engine.admin_state.record_lease(0);
+        engine.admin_state.save(dir.path()).unwrap();
 
-        let remote = EndpointId::from(SecretKey::generate().public());
+        let remote = any_remote();
 
-        // A delegated admin may use the admin surface...
-        let admin_query = authorize_at("parent", &admin_op, 400, ControlRequest::AdminQuery);
-        assert!(matches!(
-            engine.receive_at(remote, admin_query, 0).await,
-            ControlReply::AdminSnapshot(_)
-        ));
-
-        // ...but never the topology surface (`Query` etc.).
-        let topology_query = authorize_at("parent", &admin_op, 401, ControlRequest::Query);
+        // A direct *admin* request from a child is refused: remote admin must
+        // be routed (R1), only the topology surface is directly reachable.
+        let admin_query = authorize_at("child", &child_op, 400, ControlRequest::AdminQuery);
         assert_eq!(
-            engine.receive_at(remote, topology_query, 0).await,
+            engine.receive_at(remote, admin_query, 0).await,
             ControlReply::Rejected(RejectCode::Unauthorized)
         );
 
-        // Revoking removes the delegated authority (and the reload is from disk).
-        assert!(engine.revoke_admin(&admin_op.public()).unwrap());
-        let after_revoke = authorize_at("parent", &admin_op, 402, ControlRequest::AdminQuery);
+        // The same child may use the legacy (non-admin) topology surface.
+        let create = authorize_at(
+            "child",
+            &child_op,
+            401,
+            ControlRequest::CreateChild(CreateChild {
+                child: NodeId::from("grandchild"),
+                operator: secret(9).public(),
+                ledger: Some(ledger(9)),
+                kind: ChildKind::Node,
+                slot: Some(1),
+                date_joined: 2,
+            }),
+        );
         assert_eq!(
-            engine.receive_at(remote, after_revoke, 0).await,
+            engine.receive_at(remote, create, 0).await,
+            ControlReply::Accepted
+        );
+
+        // Once the priority entry is no longer current, the same request is
+        // denied (topology-derived authority, not seniority).
+        engine.admin_state.set_current(-1);
+        engine.admin_state.set_lease_until(0);
+        engine.admin_state.save(dir.path()).unwrap();
+        let create = authorize_at(
+            "child",
+            &child_op,
+            402,
+            ControlRequest::CreateChild(CreateChild {
+                child: NodeId::from("grandchild-2"),
+                operator: secret(9).public(),
+                ledger: Some(ledger(9)),
+                kind: ChildKind::Node,
+                slot: Some(2),
+                date_joined: 3,
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(remote, create, 0).await,
             ControlReply::Rejected(RejectCode::Unauthorized)
         );
     }
@@ -6615,75 +6645,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v5_frame_is_bad_version_and_v6_query_works() {
+    async fn v6_is_bad_version_and_v7_query_works() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
         let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &[]);
 
-        // v5 is below the accepted window (6|7).
-        let v5_query = authorize_version("parent", &parent_op, 1, ControlRequest::Query, 5);
-        assert_eq!(
-            engine.receive_at(any_remote(), v5_query, 0).await,
-            ControlReply::Rejected(RejectCode::BadVersion)
-        );
+        // v5 and v6 are below the accepted window (7|8).
+        for (nonce, version) in [(1u64, 5u8), (2, 6)] {
+            let query =
+                authorize_version("parent", &parent_op, nonce, ControlRequest::Query, version);
+            assert_eq!(
+                engine.receive_at(any_remote(), query, 0).await,
+                ControlReply::Rejected(RejectCode::BadVersion),
+                "v{version} is below the accepted window"
+            );
+        }
 
-        // A v6 frame over a pre-existing variant is dispatched normally.
-        let v6_query = authorize_version("parent", &parent_op, 2, ControlRequest::Query, 6);
+        // A v7 frame over a pre-existing variant is dispatched normally.
+        let v7_query = authorize_version("parent", &parent_op, 3, ControlRequest::Query, 7);
         assert!(matches!(
-            engine.receive_at(any_remote(), v6_query, 0).await,
+            engine.receive_at(any_remote(), v7_query, 0).await,
             ControlReply::Snapshot(_)
         ));
     }
 
-    /// A v6-declared frame cannot carry a v7-only value variant (the shape gate
-    /// rejects it `BadVersion`), while v6 topology variants still pass.
+    /// A v7-declared frame cannot carry an 8-only lease variant (the shape gate
+    /// rejects it `BadVersion`), while v7 topology/value variants still pass.
     #[tokio::test]
-    async fn v6_frame_cannot_carry_value_variant_but_v7_can() {
+    async fn v7_frame_cannot_carry_lease_variant_but_v8_can() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
         let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &[]);
-        let value = |nonce| {
+        let lease = |nonce| {
             authorize_version(
                 "parent",
                 &parent_op,
                 nonce,
-                ControlRequest::AdminIssue(cawala_control::AdminValueRequest {
-                    request_id: cawala_control::ValueRequestId::from_bytes([4u8; 16]),
-                    account: NodeId::from("ghost"),
-                    amount: 1,
-                    reason: "test".to_string(),
+                ControlRequest::AdminLease(AdminLeaseRequest {
+                    epoch: 0,
+                    ttl_secs: 300,
                 }),
-                6,
+                7,
             )
         };
 
-        // v6 cannot carry the v7-introduced issue variant.
+        // v7 cannot carry the 8-introduced lease variant.
         assert_eq!(
-            engine.receive_at(any_remote(), value(1), 0).await,
+            engine.receive_at(any_remote(), lease(1), 0).await,
             ControlReply::Rejected(RejectCode::BadVersion)
         );
 
-        // The v6 topology variant still passes (min 6); self-operator +
+        // The v7 topology variant still passes (min 6); self-operator +
         // unknown child -> NotFound.
-        let v6_detach = authorize_version(
+        let v7_detach = authorize_version(
             "parent",
             &parent_op,
             2,
             ControlRequest::AdminDetachChild(AdminDetachChild {
                 child: NodeId::from("ghost"),
             }),
-            6,
+            7,
         );
         assert_eq!(
-            engine.receive_at(any_remote(), v6_detach, 0).await,
+            engine.receive_at(any_remote(), v7_detach, 0).await,
             ControlReply::Rejected(RejectCode::NotFound)
         );
 
         // The v7 form of the value variant passes the gate; self-operator +
         // unknown child -> NotFound.
-        let v7_issue = authorize_at(
+        let v7_issue = authorize_version(
             "parent",
             &parent_op,
             3,
@@ -6693,17 +6725,34 @@ mod tests {
                 amount: 1,
                 reason: "test".to_string(),
             }),
+            7,
         );
         assert_eq!(
             engine.receive_at(any_remote(), v7_issue, 0).await,
             ControlReply::Rejected(RejectCode::NotFound)
         );
+
+        // The v8 form of the lease variant passes the gate and then fails the
+        // priority/registry check (not the version gate).
+        let v8_lease = authorize_at(
+            "parent",
+            &parent_op,
+            4,
+            ControlRequest::AdminLease(AdminLeaseRequest {
+                epoch: 0,
+                ttl_secs: 300,
+            }),
+        );
+        assert_ne!(
+            engine.receive_at(any_remote(), v8_lease, 0).await,
+            ControlReply::Rejected(RejectCode::BadVersion)
+        );
     }
 
-    /// A v5 frame is below the accepted window; v6 and v7 frames may carry the
+    /// v6 is below the accepted window; v7 and v8 frames may carry the
     /// v4-introduced exit variant (`declared >= min_control_version`).
     #[tokio::test]
-    async fn v6_and_v7_frames_can_carry_exit_variant() {
+    async fn v7_and_v8_frames_can_carry_exit_variant() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let child_op = secret(2);
@@ -6717,34 +6766,34 @@ mod tests {
         let peers = [node_peer("child", &child_op, 2)];
         let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
 
-        // v5 is rejected wholesale (not just the shape gate).
-        let v5_exit = authorize_version("child", &child_op, 1, exit_request("child", 1), 5);
+        // v6 is rejected wholesale (not just the shape gate).
+        let v6_exit = authorize_version("child", &child_op, 1, exit_request("child", 1), 6);
         assert_eq!(
-            engine.receive_at(any_remote(), v5_exit, 0).await,
+            engine.receive_at(any_remote(), v6_exit, 0).await,
             ControlReply::Rejected(RejectCode::BadVersion)
         );
 
-        // v6 carries the v4-introduced variant (6 >= 4).
-        let v6_exit = authorize_version("child", &child_op, 2, exit_request("child", 1), 6);
-        assert_ne!(
-            engine.receive_at(any_remote(), v6_exit, 0).await,
-            ControlReply::Rejected(RejectCode::BadVersion),
-            "a v6 frame may carry a v4-introduced variant"
-        );
-
-        // The current (v7) mint also carries it.
-        let v7_exit = authorize_at("child", &child_op, 3, exit_request("child", 1));
+        // v7 carries the v4-introduced variant (7 >= 4).
+        let v7_exit = authorize_version("child", &child_op, 2, exit_request("child", 1), 7);
         assert_ne!(
             engine.receive_at(any_remote(), v7_exit, 0).await,
             ControlReply::Rejected(RejectCode::BadVersion),
             "a v7 frame may carry a v4-introduced variant"
         );
+
+        // The current (v8) mint also carries it.
+        let v8_exit = authorize_at("child", &child_op, 3, exit_request("child", 1));
+        assert_ne!(
+            engine.receive_at(any_remote(), v8_exit, 0).await,
+            ControlReply::Rejected(RejectCode::BadVersion),
+            "a v8 frame may carry a v4-introduced variant"
+        );
     }
 
-    /// A v6-declared frame carrying an *old* (pre-v4) variant dispatches
+    /// A v7-declared frame carrying an *old* (pre-v4) variant dispatches
     /// normally; only the introduction-version gate applies.
     #[tokio::test]
-    async fn v6_frame_carrying_old_variant_still_dispatches() {
+    async fn v7_frame_carrying_old_variant_still_dispatches() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let applicant_op = secret(2);
@@ -6761,17 +6810,17 @@ mod tests {
             nonce: 7,
             expiry: u64::MAX,
         };
-        let v6_join = authorize_version(
+        let v7_join = authorize_version(
             "applicant",
             &applicant_op,
             1,
             ControlRequest::Join(join),
-            6,
+            7,
         );
         assert_eq!(
-            engine.receive_at(any_remote(), v6_join, 0).await,
+            engine.receive_at(any_remote(), v7_join, 0).await,
             ControlReply::Pending,
-            "a v6 frame over a pre-existing variant must dispatch"
+            "a v7 frame over a pre-existing variant must dispatch"
         );
     }
 

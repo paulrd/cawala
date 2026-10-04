@@ -12,14 +12,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cawala_control::{
-    ADMIN_GRANT_V1_VERSION, ADMIN_GRANT_VERSION, AdminGrant, AdminGrantV2, AdminScope, AdminScopes,
     AdminValueDirection, AdminValueRequest, CONTROL_REQUEST_MAX_TTL_SECS, CONTROL_REQUEST_TTL_SECS,
-    ChildKind, ControlReply, ControlRequest, DEFAULT_ADMIN_TTL_SECS, MAX_VALUE_ADMIN_TTL_SECS,
-    NodeId, OperatorSecretKey, RejectCode, SignedAdminGrant, SignedAdminGrantV2, SignedControl,
+    ChildKind, ControlReply, ControlRequest, NodeId, OperatorSecretKey, RejectCode, SignedControl,
     ValueRequestId,
 };
 use cawala_ledger::PeerRegistry;
-use cawala_node::admin_store::StoredGrant;
 use cawala_node::control::{ControlNode, spawn_control_only_on};
 use cawala_node::control_store::ControlStore;
 use cawala_node::ledger_service::LedgerService;
@@ -67,14 +64,6 @@ async fn bind(secret: &SecretKey) -> Endpoint {
         .expect("bind endpoint")
 }
 
-#[derive(Clone, Copy, Debug)]
-enum GrantForm {
-    Value,
-    JoinsOnly,
-    TopologyOnly,
-    LegacyV1,
-}
-
 fn generous_limits() -> ValueLimits {
     ValueLimits {
         per_request_max: 1_000_000,
@@ -101,35 +90,18 @@ struct Fixture {
     dir: tempfile::TempDir,
     node_id: String,
     node_op: OperatorSecretKey,
-    admin_op: OperatorSecretKey,
     admin_endpoint: Endpoint,
 }
 
-fn v2_grant(node_id: &str, admin: cawala_ledger::OperatorPubKey, scopes: AdminScopes, now: u64) -> AdminGrantV2 {
-    let ttl = if scopes.value {
-        DEFAULT_ADMIN_TTL_SECS.min(MAX_VALUE_ADMIN_TTL_SECS)
-    } else {
-        DEFAULT_ADMIN_TTL_SECS
-    };
-    AdminGrantV2 {
-        version: ADMIN_GRANT_VERSION,
-        node: node(node_id),
-        admin,
-        scopes,
-        granted_at: now,
-        expiry: now + ttl,
-        label: Some("p5-hermetic".to_string()),
-    }
-}
-
 /// Build a node with a running ledger, a policy (unless `policy` is `None`),
-/// a record that lists `user-a`, and the given grant form.
-async fn fixture(form: GrantForm, policy: Option<ValueLimits>) -> Fixture {
+/// and a record that lists `user-a`/`user-b`. Value operations are driven by
+/// the node's own operator (`SelfOperator`); remote child-admin authority is
+/// proven in `admin_authority.rs`.
+async fn fixture(policy: Option<ValueLimits>) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let secret = cawala_node::identity::load_or_create_secret_key(dir.path()).unwrap();
     let node_id = secret.public().to_string();
     let node_op = operator(&secret);
-    let admin_op = OperatorSecretKey::from_bytes([0x5a; 32]);
     let now = now_unix_seconds();
 
     if let Some(limits) = policy {
@@ -163,61 +135,6 @@ async fn fixture(form: GrantForm, policy: Option<ValueLimits>) -> Fixture {
     engine.attach_ledger(Arc::new(Mutex::new(ledger)));
     let engine = Arc::new(Mutex::new(engine));
 
-    {
-        let mut e = engine.lock().await;
-        let grant = match form {
-            GrantForm::Value => StoredGrant::V2(SignedAdminGrantV2::authorize(
-                v2_grant(
-                    &node_id,
-                    admin_op.public(),
-                    AdminScopes {
-                        joins: false,
-                        topology: false,
-                        value: true,
-                    },
-                    now,
-                ),
-                &node_op,
-            )
-            .unwrap()),
-            GrantForm::JoinsOnly => StoredGrant::V2(SignedAdminGrantV2::authorize(
-                v2_grant(&node_id, admin_op.public(), AdminScopes::v1(), now),
-                &node_op,
-            )
-            .unwrap()),
-            GrantForm::TopologyOnly => StoredGrant::V2(SignedAdminGrantV2::authorize(
-                v2_grant(
-                    &node_id,
-                    admin_op.public(),
-                    AdminScopes {
-                        joins: false,
-                        topology: true,
-                        value: false,
-                    },
-                    now,
-                ),
-                &node_op,
-            )
-            .unwrap()),
-            GrantForm::LegacyV1 => StoredGrant::V1(
-                SignedAdminGrant::authorize(
-                    AdminGrant {
-                        version: ADMIN_GRANT_V1_VERSION,
-                        node: node(&node_id),
-                        admin: admin_op.public(),
-                        scope: AdminScope::Admin,
-                        granted_at: now,
-                        expiry: now + DEFAULT_ADMIN_TTL_SECS,
-                        label: Some("p5-v1".to_string()),
-                    },
-                    &node_op,
-                )
-                .unwrap(),
-            ),
-        };
-        e.grant_admin(grant).unwrap();
-    }
-
     let endpoint = bind(&secret).await;
     let addr = endpoint.addr();
     let router = spawn_control_only_on(endpoint.clone(), Arc::clone(&engine));
@@ -230,7 +147,6 @@ async fn fixture(form: GrantForm, policy: Option<ValueLimits>) -> Fixture {
         dir,
         node_id,
         node_op,
-        admin_op,
         admin_endpoint,
     }
 }
@@ -244,7 +160,7 @@ impl Fixture {
     async fn send(&self, request: ControlRequest) -> ControlReply {
         let signed = SignedControl::authorize(
             node(&self.node_id),
-            &self.admin_op,
+            &self.node_op,
             fresh_nonce(),
             now_unix_seconds() + CONTROL_REQUEST_TTL_SECS,
             request,
@@ -295,8 +211,8 @@ fn request_id(seed: u8) -> ValueRequestId {
 }
 
 #[tokio::test]
-async fn value_grant_issues_burns_and_snapshot_reflects_it() {
-    let f = fixture(GrantForm::Value, Some(generous_limits())).await;
+async fn self_operator_issues_burns_and_snapshot_reflects_it() {
+    let f = fixture(Some(generous_limits())).await;
 
     let reply = f
         .send(issue_request(request_id(1), "user-a", 25))
@@ -346,7 +262,7 @@ async fn value_grant_issues_burns_and_snapshot_reflects_it() {
 
 #[tokio::test]
 async fn duplicate_request_id_dedupes_including_after_reopen() {
-    let f = fixture(GrantForm::Value, Some(generous_limits())).await;
+    let f = fixture(Some(generous_limits())).await;
     let id = request_id(7);
 
     let first = f.send(issue_request(id, "user-a", 40)).await;
@@ -382,7 +298,7 @@ async fn duplicate_request_id_dedupes_including_after_reopen() {
                 &node("user-a"),
                 ChildKind::User,
                 40,
-                &f.admin_op.public(),
+                &f.node_op.public(),
                 id,
                 generous_limits(),
                 now_unix_seconds(),
@@ -405,7 +321,7 @@ async fn duplicate_request_id_dedupes_including_after_reopen() {
 #[tokio::test]
 async fn absent_and_corrupt_policy_fail_closed_internal() {
     // No policy file at all: every value op is Internal.
-    let f = fixture(GrantForm::Value, None).await;
+    let f = fixture(None).await;
     assert_eq!(
         f.send(issue_request(request_id(1), "user-a", 1)).await,
         ControlReply::Rejected(RejectCode::Internal)
@@ -414,7 +330,7 @@ async fn absent_and_corrupt_policy_fail_closed_internal() {
     f.shutdown().await;
 
     // Corrupt policy file: same refusal.
-    let f = fixture(GrantForm::Value, Some(generous_limits())).await;
+    let f = fixture(Some(generous_limits())).await;
     std::fs::write(f.dir.path().join(cawala_node::VALUE_POLICY_FILE), b"{ not json").unwrap();
     assert_eq!(
         f.send(issue_request(request_id(2), "user-a", 1)).await,
@@ -427,15 +343,12 @@ async fn absent_and_corrupt_policy_fail_closed_internal() {
 #[tokio::test]
 async fn caps_and_overdraw_are_mapped() {
     // per_request_max 10, issue 11 -> LimitExceeded.
-    let f = fixture(
-        GrantForm::Value,
-        Some(ValueLimits {
-            per_request_max: 10,
-            window_secs: 86_400,
-            window_max: 1_000,
-            per_account_max: 1_000,
-        }),
-    )
+    let f = fixture(Some(ValueLimits {
+        per_request_max: 10,
+        window_secs: 86_400,
+        window_max: 1_000,
+        per_account_max: 1_000,
+    }))
     .await;
     assert_eq!(
         f.send(issue_request(request_id(1), "user-a", 11)).await,
@@ -445,7 +358,7 @@ async fn caps_and_overdraw_are_mapped() {
     f.shutdown().await;
 
     // Burn over balance -> InsufficientBalance (unopened user-b -> 0).
-    let f = fixture(GrantForm::Value, Some(generous_limits())).await;
+    let f = fixture(Some(generous_limits())).await;
     assert_eq!(
         f.send(burn_request(request_id(2), "user-b", 1)).await,
         ControlReply::Rejected(RejectCode::InsufficientBalance)
@@ -454,43 +367,8 @@ async fn caps_and_overdraw_are_mapped() {
 }
 
 #[tokio::test]
-async fn non_value_grants_are_unauthorized_and_self_operator_works() {
-    for form in [GrantForm::JoinsOnly, GrantForm::TopologyOnly, GrantForm::LegacyV1] {
-        let f = fixture(form, Some(generous_limits())).await;
-        assert_eq!(
-            f.send(issue_request(request_id(1), "user-a", 1)).await,
-            ControlReply::Rejected(RejectCode::Unauthorized),
-            "{form:?} must not issue"
-        );
-        assert_eq!(
-            f.send(burn_request(request_id(2), "user-a", 1)).await,
-            ControlReply::Rejected(RejectCode::Unauthorized),
-            "{form:?} must not burn"
-        );
-        f.shutdown().await;
-    }
-
-    // The node's own operator bypasses the grant requirement.
-    let f = fixture(GrantForm::JoinsOnly, Some(generous_limits())).await;
-    let signed = SignedControl::authorize(
-        node(&f.node_id),
-        &f.node_op.clone(),
-        fresh_nonce(),
-        now_unix_seconds() + CONTROL_REQUEST_TTL_SECS,
-        issue_request(request_id(3), "user-a", 5),
-    )
-    .unwrap();
-    let reply = f.send_signed(&signed).await;
-    assert!(
-        matches!(reply, ControlReply::AdminValueApplied(_)),
-        "self-operator must issue, got {reply:?}"
-    );
-    f.shutdown().await;
-}
-
-#[tokio::test]
 async fn not_a_child_is_not_found_and_bad_request_bounds() {
-    let f = fixture(GrantForm::Value, Some(generous_limits())).await;
+    let f = fixture(Some(generous_limits())).await;
     assert_eq!(
         f.send(issue_request(request_id(1), "ghost", 1)).await,
         ControlReply::Rejected(RejectCode::NotFound)
@@ -522,13 +400,13 @@ async fn not_a_child_is_not_found_and_bad_request_bounds() {
 }
 
 #[tokio::test]
-async fn replay_expiry_and_revoke_are_unchanged() {
-    let f = fixture(GrantForm::Value, Some(generous_limits())).await;
+async fn replay_and_expiry_are_enforced() {
+    let f = fixture(Some(generous_limits())).await;
 
     // Frame replay: the byte-identical control frame.
     let signed = SignedControl::authorize(
         node(&f.node_id),
-        &f.admin_op,
+        &f.node_op,
         fresh_nonce(),
         now_unix_seconds() + CONTROL_REQUEST_TTL_SECS,
         issue_request(request_id(1), "user-a", 5),
@@ -557,24 +435,12 @@ async fn replay_expiry_and_revoke_are_unchanged() {
         ControlReply::Rejected(RejectCode::BadRequest)
     );
 
-    // Revoke: the delegated authority is gone.
-    assert!(
-        f.engine
-            .lock()
-            .await
-            .revoke_admin(&f.admin_op.public())
-            .unwrap()
-    );
-    assert_eq!(
-        f.send(issue_request(request_id(3), "user-a", 5)).await,
-        ControlReply::Rejected(RejectCode::Unauthorized)
-    );
     f.shutdown().await;
 }
 
 #[tokio::test]
 async fn audit_intent_failure_refuses_without_appending() {
-    let f = fixture(GrantForm::Value, Some(generous_limits())).await;
+    let f = fixture(Some(generous_limits())).await;
     // Make the audit path unwritable: replace the file with a directory so the
     // fail-closed intent append cannot open it.
     let audit_path = f.dir.path().join("control_audit.jsonl");

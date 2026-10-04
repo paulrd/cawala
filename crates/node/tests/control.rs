@@ -500,21 +500,45 @@ async fn join_idempotent() {
     applicant.shutdown().await;
 }
 
+/// Persist an explicit R5 priority lease naming `priority[current]` as this
+/// node's current administrator. `receive` reloads `admin_state.json` per
+/// request, so the seed must be written to disk.
+fn seed_priority(dir: &Path, priority: &[&str], current: i32, now: u64) {
+    let mut state = cawala_node::AdminState::empty();
+    state.set_priority(priority.iter().map(|id| id.to_string()).collect());
+    state.set_current(current);
+    state.bump_epoch();
+    state.record_lease(now);
+    state.save(dir).expect("save admin state");
+}
+
+/// A `CreateChild` request signed by `origin`, for direct topology tests.
+fn create_child_request(child: &str, slot: u8) -> ControlRequest {
+    ControlRequest::CreateChild(CreateChild {
+        child: node(child),
+        operator: OperatorSecretKey::from_bytes([0x77; 32]).public(),
+        ledger: Some(ledger(0x42).public()),
+        kind: ChildKind::Node,
+        slot: Some(slot),
+        date_joined: 30,
+    })
+}
+
 #[tokio::test]
-async fn non_senior_child_control_rejected() {
+async fn non_admin_child_control_rejected() {
     let parent_key = SecretKey::generate();
-    let senior_key = SecretKey::generate();
+    let admin_key = SecretKey::generate();
     let junior_key = SecretKey::generate();
     let parent_id = parent_key.public().to_string();
-    let senior_id = senior_key.public().to_string();
+    let admin_id = admin_key.public().to_string();
     let junior_id = junior_key.public().to_string();
     let parent_op = operator(&parent_key);
-    let senior_op = operator(&senior_key);
+    let admin_op = operator(&admin_key);
     let junior_op = operator(&junior_key);
 
     let children = [
         ChildSpec {
-            id: &senior_id,
+            id: &admin_id,
             kind: ChildKind::Node,
             slot: 0,
             date_joined: 10,
@@ -536,20 +560,28 @@ async fn non_senior_child_control_rejected() {
         parent: None,
         children: &children,
         peers: vec![
-            peer(&senior_id, &senior_op, Some(&ledger(11)), PeerRole::Node),
+            peer(&admin_id, &admin_op, Some(&ledger(11)), PeerRole::Node),
             peer(&junior_id, &junior_op, Some(&ledger(12)), PeerRole::Node),
         ],
     })
     .await;
 
+    // Only the seeded current priority entry is an administrator.
+    seed_priority(
+        parent_dir.path(),
+        &[&admin_id],
+        0,
+        now_unix_seconds(),
+    );
+
     let sender_key = SecretKey::generate();
     let sender = bind(&sender_key).await;
 
-    // The junior child (later date_joined) tries to clear the parent's address.
+    // The non-priority child tries to provision a child under the parent.
     let signed = authorize(
         node(&junior_id),
         &junior_op,
-        ControlRequest::SetAddress(SetAddress { address: None }),
+        create_child_request("grandchild", 2),
     );
     let reply = send(&sender, &parent.addr, &signed).await;
     assert_eq!(reply, ControlReply::Rejected(RejectCode::Unauthorized));
@@ -564,11 +596,11 @@ async fn non_senior_child_control_rejected() {
     parent.shutdown().await;
 }
 
-/// A `ChildKind::User` browser client with the earliest `date_joined` must not
-/// be the senior child: only `ChildKind::Node` children carry senior-child
-/// control authority, while a node child still does.
+/// R4: a node with a `ChildKind::User` (browser) child is administered **only**
+/// by that browser, with full rights; the seeded priority list is not consulted
+/// for authority. The node child (even when seeded current) is denied.
 #[tokio::test]
-async fn user_child_is_never_senior_for_control() {
+async fn user_child_is_administrator_and_priority_is_not_consulted() {
     let parent_key = SecretKey::generate();
     let user_key = SecretKey::generate();
     let node_child_key = SecretKey::generate();
@@ -579,8 +611,6 @@ async fn user_child_is_never_senior_for_control() {
     let user_op = operator(&user_key);
     let node_child_op = operator(&node_child_key);
 
-    // The user joined first (earliest date_joined), so it would be "senior" if
-    // user children were counted; the node child joined later.
     let children = [
         ChildSpec {
             id: &user_id,
@@ -606,8 +636,7 @@ async fn user_child_is_never_senior_for_control() {
         children: &children,
         peers: vec![
             // The user peer is otherwise fully verifiable: its registered
-            // operator matches its signer, so only the seniority rule can
-            // reject it. Without the fix this request would be accepted.
+            // operator matches its signer.
             peer(&user_id, &user_op, None, PeerRole::User),
             peer(
                 &node_child_id,
@@ -619,36 +648,43 @@ async fn user_child_is_never_senior_for_control() {
     })
     .await;
 
+    // Seed the node child as the priority administrator; R4 must still win.
+    seed_priority(
+        parent_dir.path(),
+        &[&node_child_id],
+        0,
+        now_unix_seconds(),
+    );
+
     let sender = bind(&SecretKey::generate()).await;
 
-    // The earliest-joining user child is not authorized to clear the address.
-    let user_clear = authorize(
+    // The browser child has full admin over its parent.
+    let user_create = authorize(
         node(&user_id),
         &user_op,
-        ControlRequest::SetAddress(SetAddress { address: None }),
+        create_child_request("user-grandchild", 2),
     );
     assert_eq!(
-        send(&sender, &parent.addr, &user_clear).await,
-        ControlReply::Rejected(RejectCode::Unauthorized)
-    );
-    {
-        let engine = parent.engine().await;
-        assert_eq!(engine.record().address, Some("0".parse().unwrap()));
-    }
-
-    // The node child (later date_joined) is still authorized.
-    let node_clear = authorize(
-        node(&node_child_id),
-        &node_child_op,
-        ControlRequest::SetAddress(SetAddress { address: None }),
-    );
-    assert_eq!(
-        send(&sender, &parent.addr, &node_clear).await,
+        send(&sender, &parent.addr, &user_create).await,
         ControlReply::Accepted
     );
+
+    // R4 makes the browser the *only* administrator: the seeded priority node
+    // child is denied even though it is current and leased.
+    let node_create = authorize(
+        node(&node_child_id),
+        &node_child_op,
+        create_child_request("node-grandchild", 3),
+    );
+    assert_eq!(
+        send(&sender, &parent.addr, &node_create).await,
+        ControlReply::Rejected(RejectCode::Unauthorized)
+    );
+
     {
         let engine = parent.engine().await;
-        assert_eq!(engine.record().address, None);
+        assert!(engine.record().children.iter().any(|c| c.child_id == "user-grandchild"));
+        assert!(!engine.record().children.iter().any(|c| c.child_id == "node-grandchild"));
     }
 
     sender.close().await;
@@ -656,20 +692,20 @@ async fn user_child_is_never_senior_for_control() {
 }
 
 #[tokio::test]
-async fn senior_child_can_control_parent() {
+async fn priority_admin_child_can_control_parent() {
     let parent_key = SecretKey::generate();
-    let senior_key = SecretKey::generate();
+    let admin_key = SecretKey::generate();
     let junior_key = SecretKey::generate();
     let parent_id = parent_key.public().to_string();
-    let senior_id = senior_key.public().to_string();
+    let admin_id = admin_key.public().to_string();
     let junior_id = junior_key.public().to_string();
     let parent_op = operator(&parent_key);
-    let senior_op = operator(&senior_key);
+    let admin_op = operator(&admin_key);
     let junior_op = operator(&junior_key);
 
     let children = [
         ChildSpec {
-            id: &senior_id,
+            id: &admin_id,
             kind: ChildKind::Node,
             slot: 0,
             date_joined: 10,
@@ -691,54 +727,42 @@ async fn senior_child_can_control_parent() {
         parent: None,
         children: &children,
         peers: vec![
-            peer(&senior_id, &senior_op, Some(&ledger(11)), PeerRole::Node),
+            peer(&admin_id, &admin_op, Some(&ledger(11)), PeerRole::Node),
             peer(&junior_id, &junior_op, Some(&ledger(12)), PeerRole::Node),
         ],
     })
     .await;
 
+    seed_priority(
+        parent_dir.path(),
+        &[&admin_id],
+        0,
+        now_unix_seconds(),
+    );
+
     let sender = bind(&SecretKey::generate()).await;
 
-    // Clear, then re-assert, the parent's address.
+    // `SetAddress` is self-operator only (spec §2.6): an administrator child
+    // cannot re-assert or clear the parent's own address.
     let clear = authorize(
-        node(&senior_id),
-        &senior_op,
+        node(&admin_id),
+        &admin_op,
         ControlRequest::SetAddress(SetAddress { address: None }),
     );
     assert_eq!(
         send(&sender, &parent.addr, &clear).await,
-        ControlReply::Accepted
+        ControlReply::Rejected(RejectCode::Unauthorized)
     );
-    {
-        let engine = parent.engine().await;
-        assert_eq!(engine.record().address, None);
-    }
 
-    let set = authorize(
-        node(&senior_id),
-        &senior_op,
-        ControlRequest::SetAddress(SetAddress {
-            address: Some("0".parse().unwrap()),
-        }),
-    );
-    assert_eq!(
-        send(&sender, &parent.addr, &set).await,
-        ControlReply::Accepted
-    );
-    {
-        let engine = parent.engine().await;
-        assert_eq!(engine.record().address, Some("0".parse().unwrap()));
-    }
-
-    // Create a new child under the parent.
+    // The administrator may provision a new child (legacy topology surface).
     let grandchild_key = SecretKey::generate();
     let grandchild_id = grandchild_key.public().to_string();
     let grandchild_op = operator(&grandchild_key);
     let grandchild_op_pub: OperatorPubKey = grandchild_op.public();
     let grandchild_ledger = ledger(21);
     let create = authorize(
-        node(&senior_id),
-        &senior_op,
+        node(&admin_id),
+        &admin_op,
         ControlRequest::CreateChild(CreateChild {
             child: node(&grandchild_id),
             operator: grandchild_op_pub,

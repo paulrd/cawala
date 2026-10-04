@@ -1,22 +1,21 @@
-//! Hermetic integration tests for the read-only `AdminLedgerQuery` (P3) over
-//! the real `cawala/control/0` protocol.
+//! Hermetic integration tests for the read-only `AdminLedgerQuery` over the
+//! real `cawala/control/0` protocol.
 //!
-//! A value-scoped v2 grant (or the node's own operator) reads the node's books
-//! from a temp ledger; joins-only/v1 grants and a missing ledger handle fail
-//! closed. Read-only: nothing here mutates the ledger or the record.
+//! Under topology authority the direct admin surface accepts only the node's
+//! own operator (`Authority::SelfOperator`); remote child-admin authority is
+//! proven in `admin_authority.rs`/`routed_control.rs`. A missing ledger handle
+//! fails closed (`Internal`). Read-only: nothing here mutates the ledger or the
+//! record.
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cawala_control::{
-    ADMIN_GRANT_V1_VERSION, ADMIN_GRANT_VERSION, AdminGrant, AdminGrantV2, AdminScope, AdminScopes,
     CONTROL_REQUEST_MAX_TTL_SECS, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply,
-    ControlRequest, DEFAULT_ADMIN_TTL_SECS, MAX_VALUE_ADMIN_TTL_SECS, NodeId, OperatorSecretKey,
-    RejectCode, SignedAdminGrant, SignedAdminGrantV2, SignedControl,
+    ControlRequest, NodeId, OperatorSecretKey, RejectCode, SignedControl,
 };
 use cawala_ledger::{LedgerPubKey, PeerRegistry};
-use cawala_node::admin_store::StoredGrant;
 use cawala_node::control::{ControlNode, spawn_control_only_on};
 use cawala_node::control_store::ControlStore;
 use cawala_node::ledger_service::LedgerService;
@@ -64,56 +63,24 @@ async fn bind(secret: &SecretKey) -> Endpoint {
         .expect("bind endpoint")
 }
 
-/// Which grant form the fixture installs.
-#[derive(Clone, Copy, Debug)]
-enum GrantForm {
-    Value,
-    JoinsOnly,
-    LegacyV1,
-}
-
 struct Fixture {
     router: Router,
-    engine: Arc<Mutex<ControlNode>>,
+    _engine: Arc<Mutex<ControlNode>>,
     addr: EndpointAddr,
     node_id: String,
     node_op: OperatorSecretKey,
-    admin_op: OperatorSecretKey,
     admin_endpoint: Endpoint,
     ledger_id: LedgerPubKey,
     _dir: tempfile::TempDir,
 }
 
-fn v2_grant(
-    node_id: &str,
-    admin: cawala_ledger::OperatorPubKey,
-    scopes: AdminScopes,
-    now: u64,
-) -> AdminGrantV2 {
-    let ttl = if scopes.value {
-        DEFAULT_ADMIN_TTL_SECS.min(MAX_VALUE_ADMIN_TTL_SECS)
-    } else {
-        DEFAULT_ADMIN_TTL_SECS
-    };
-    AdminGrantV2 {
-        version: ADMIN_GRANT_VERSION,
-        node: node(node_id),
-        admin,
-        scopes,
-        granted_at: now,
-        expiry: now + ttl,
-        label: Some("p3-hermetic".to_string()),
-    }
-}
-
 /// Build a node with a running ledger (50 to `user-a`, `user-b` listed but
 /// unopened), a record at address `0`, and an optional attached ledger handle.
-async fn fixture(form: GrantForm, with_ledger: bool) -> Fixture {
+async fn fixture(with_ledger: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let secret = cawala_node::identity::load_or_create_secret_key(dir.path()).unwrap();
     let node_id = secret.public().to_string();
     let node_op = operator(&secret);
-    let admin_op = OperatorSecretKey::from_bytes([0x5a; 32]);
     let now = now_unix_seconds();
 
     let mut ledger = LedgerService::open(dir.path(), &node_id).unwrap();
@@ -150,50 +117,6 @@ async fn fixture(form: GrantForm, with_ledger: bool) -> Fixture {
     }
     let engine = Arc::new(Mutex::new(engine));
 
-    {
-        let mut e = engine.lock().await;
-        match form {
-            GrantForm::Value => {
-                let grant = v2_grant(
-                    &node_id,
-                    admin_op.public(),
-                    AdminScopes {
-                        joins: false,
-                        topology: false,
-                        value: true,
-                    },
-                    now,
-                );
-                e.grant_admin(StoredGrant::V2(
-                    SignedAdminGrantV2::authorize(grant, &node_op).unwrap(),
-                ))
-                .unwrap();
-            }
-            GrantForm::JoinsOnly => {
-                let grant = v2_grant(&node_id, admin_op.public(), AdminScopes::v1(), now);
-                e.grant_admin(StoredGrant::V2(
-                    SignedAdminGrantV2::authorize(grant, &node_op).unwrap(),
-                ))
-                .unwrap();
-            }
-            GrantForm::LegacyV1 => {
-                let grant = AdminGrant {
-                    version: ADMIN_GRANT_V1_VERSION,
-                    node: node(&node_id),
-                    admin: admin_op.public(),
-                    scope: AdminScope::Admin,
-                    granted_at: now.saturating_sub(1),
-                    expiry: now + DEFAULT_ADMIN_TTL_SECS,
-                    label: Some("p3-v1".to_string()),
-                };
-                e.grant_admin(StoredGrant::V1(
-                    SignedAdminGrant::authorize(grant, &node_op).unwrap(),
-                ))
-                .unwrap();
-            }
-        }
-    }
-
     let endpoint = bind(&secret).await;
     let addr = endpoint.addr();
     let router = spawn_control_only_on(endpoint.clone(), Arc::clone(&engine));
@@ -201,11 +124,10 @@ async fn fixture(form: GrantForm, with_ledger: bool) -> Fixture {
 
     Fixture {
         router,
-        engine,
+        _engine: engine,
         addr,
         node_id,
         node_op,
-        admin_op,
         admin_endpoint,
         ledger_id,
         _dir: dir,
@@ -218,6 +140,9 @@ impl Fixture {
         self.router.shutdown().await.expect("router shutdown");
     }
 
+    /// An `AdminLedgerQuery` signed by `op` as this node's own origin,
+    /// optionally declaring a different wire `version` (re-signed so the
+    /// version byte is inside the signed preimage).
     fn query(&self, op: &OperatorSecretKey, version: Option<u8>) -> SignedControl {
         let nonce = fresh_nonce();
         let expiry = now_unix_seconds() + CONTROL_REQUEST_TTL_SECS;
@@ -244,12 +169,12 @@ async fn send(sender: &Endpoint, target: &EndpointAddr, signed: &SignedControl) 
 }
 
 #[tokio::test]
-async fn value_grant_reads_the_snapshot() {
-    let fixture = fixture(GrantForm::Value, true).await;
+async fn self_operator_reads_the_snapshot() {
+    let fixture = fixture(true).await;
     let reply = send(
         &fixture.admin_endpoint,
         &fixture.addr,
-        &fixture.query(&fixture.admin_op, None),
+        &fixture.query(&fixture.node_op, None),
     )
     .await;
 
@@ -286,31 +211,13 @@ async fn value_grant_reads_the_snapshot() {
 }
 
 #[tokio::test]
-async fn joins_only_and_legacy_v1_grants_are_unauthorized() {
-    for form in [GrantForm::JoinsOnly, GrantForm::LegacyV1] {
-        let fixture = fixture(form, true).await;
-        assert_eq!(
-            send(
-                &fixture.admin_endpoint,
-                &fixture.addr,
-                &fixture.query(&fixture.admin_op, None),
-            )
-            .await,
-            ControlReply::Rejected(RejectCode::Unauthorized),
-            "{form:?} must not read the ledger"
-        );
-        fixture.shutdown().await;
-    }
-}
-
-#[tokio::test]
 async fn missing_ledger_handle_is_internal() {
-    let fixture = fixture(GrantForm::Value, false).await;
+    let fixture = fixture(false).await;
     assert_eq!(
         send(
             &fixture.admin_endpoint,
             &fixture.addr,
-            &fixture.query(&fixture.admin_op, None),
+            &fixture.query(&fixture.node_op, None),
         )
         .await,
         ControlReply::Rejected(RejectCode::Internal)
@@ -319,31 +226,15 @@ async fn missing_ledger_handle_is_internal() {
 }
 
 #[tokio::test]
-async fn self_operator_reads_the_snapshot() {
-    let fixture = fixture(GrantForm::JoinsOnly, true).await;
-    // The node's own operator does not need a delegated grant.
-    let reply = send(
-        &fixture.admin_endpoint,
-        &fixture.addr,
-        &fixture.query(&fixture.node_op.clone(), None),
-    )
-    .await;
-    assert!(
-        matches!(reply, ControlReply::AdminLedgerSnapshot(_)),
-        "self-operator must read the ledger, got {reply:?}"
-    );
-    fixture.shutdown().await;
-}
-
-#[tokio::test]
 async fn v4_declared_ledger_query_is_bad_version() {
-    let fixture = fixture(GrantForm::Value, true).await;
-    // A v4 frame cannot carry the v5-only `AdminLedgerQuery`.
+    let fixture = fixture(true).await;
+    // A v4 frame cannot carry the v5-only `AdminLedgerQuery`; v4 is also below
+    // the accepted window (7|8) entirely.
     assert_eq!(
         send(
             &fixture.admin_endpoint,
             &fixture.addr,
-            &fixture.query(&fixture.admin_op, Some(4)),
+            &fixture.query(&fixture.node_op, Some(4)),
         )
         .await,
         ControlReply::Rejected(RejectCode::BadVersion)
@@ -352,11 +243,11 @@ async fn v4_declared_ledger_query_is_bad_version() {
 }
 
 #[tokio::test]
-async fn replay_revoke_expiry_and_over_ttl() {
-    let fixture = fixture(GrantForm::Value, true).await;
+async fn replay_and_expiry_are_enforced() {
+    let fixture = fixture(true).await;
 
     // Replay: the byte-identical frame is refused after the first read.
-    let query = fixture.query(&fixture.admin_op, None);
+    let query = fixture.query(&fixture.node_op, None);
     assert!(matches!(
         send(&fixture.admin_endpoint, &fixture.addr, &query).await,
         ControlReply::AdminLedgerSnapshot(_)
@@ -364,25 +255,6 @@ async fn replay_revoke_expiry_and_over_ttl() {
     assert_eq!(
         send(&fixture.admin_endpoint, &fixture.addr, &query).await,
         ControlReply::Rejected(RejectCode::Replay)
-    );
-
-    // Revoke: the delegated authority is gone; self-operator would still work.
-    assert!(
-        fixture
-            .engine
-            .lock()
-            .await
-            .revoke_admin(&fixture.admin_op.public())
-            .unwrap()
-    );
-    assert_eq!(
-        send(
-            &fixture.admin_endpoint,
-            &fixture.addr,
-            &fixture.query(&fixture.admin_op, None),
-        )
-        .await,
-        ControlReply::Rejected(RejectCode::Unauthorized)
     );
 
     // Expired frame.

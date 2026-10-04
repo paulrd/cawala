@@ -13,14 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cawala_control::{
-    ADMIN_GRANT_V1_VERSION, ADMIN_GRANT_VERSION, AdminDetachChild, AdminGrant, AdminGrantV2,
-    AdminMoveChild, AdminScope, AdminScopes, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply,
-    ControlRequest, DEFAULT_ADMIN_TTL_SECS, MAX_VALUE_ADMIN_TTL_SECS, NodeId, OperatorSecretKey,
-    RejectCode, SignedAdminGrant, SignedAdminGrantV2, SignedControl,
+    AdminDetachChild, AdminMoveChild, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply,
+    ControlRequest, NodeId, OperatorSecretKey, RejectCode, SignedControl,
 };
 use cawala_ledger::{PeerKeys, PeerRegistry};
 use cawala_node::AdminStore;
-use cawala_node::admin_store::StoredGrant;
 use cawala_node::control::{ControlNode, OutboundControl, OutboundKind, spawn_control_only_on};
 use cawala_node::control_store::ControlStore;
 use cawala_node::record::RecordStore;
@@ -66,59 +63,6 @@ fn authorize(origin: NodeId, op: &OperatorSecretKey, request: ControlRequest) ->
         request,
     )
     .expect("sign control request")
-}
-
-/// Sign an admin request addressed to `parent_id` with the delegated key.
-fn admin_request(
-    parent_id: &str,
-    admin_op: &OperatorSecretKey,
-    request: ControlRequest,
-) -> SignedControl {
-    authorize(node(parent_id), admin_op, request)
-}
-
-/// A node-signed v2 admin grant scoped to `parent_id` with `scopes`.
-fn admin_grant_v2(
-    parent_id: &str,
-    parent_op: &OperatorSecretKey,
-    admin_op: &OperatorSecretKey,
-    scopes: AdminScopes,
-) -> StoredGrant {
-    let now = now_unix_seconds();
-    let ttl = if scopes.value {
-        DEFAULT_ADMIN_TTL_SECS.min(MAX_VALUE_ADMIN_TTL_SECS)
-    } else {
-        DEFAULT_ADMIN_TTL_SECS
-    };
-    let grant = AdminGrantV2 {
-        version: ADMIN_GRANT_VERSION,
-        node: node(parent_id),
-        admin: admin_op.public(),
-        scopes,
-        granted_at: now,
-        expiry: now + ttl,
-        label: Some("p4-hermetic".to_string()),
-    };
-    StoredGrant::V2(SignedAdminGrantV2::authorize(grant, parent_op).expect("sign v2 admin grant"))
-}
-
-/// A legacy v1 admin grant (interpreted joins-only) scoped to `parent_id`.
-fn admin_grant_v1(
-    parent_id: &str,
-    parent_op: &OperatorSecretKey,
-    admin_op: &OperatorSecretKey,
-) -> StoredGrant {
-    let now = now_unix_seconds();
-    let grant = AdminGrant {
-        version: ADMIN_GRANT_V1_VERSION,
-        node: node(parent_id),
-        admin: admin_op.public(),
-        scope: AdminScope::Admin,
-        granted_at: now,
-        expiry: now + DEFAULT_ADMIN_TTL_SECS,
-        label: Some("p4-hermetic-v1".to_string()),
-    };
-    StoredGrant::V1(SignedAdminGrant::authorize(grant, parent_op).expect("sign v1 admin grant"))
 }
 
 async fn bind(secret: &SecretKey) -> Endpoint {
@@ -212,36 +156,11 @@ async fn send(target: &Endpoint, addr: &EndpointAddr, signed: &SignedControl) ->
         .expect("control exchange")
 }
 
-/// Which grant form the fixture installs.
-#[derive(Clone, Copy, Debug)]
-enum GrantForm {
-    /// A legacy v1 grant (interpreted joins-only).
-    V1,
-    /// A v2 grant with the given scopes.
-    V2(AdminScopes),
-}
-
-fn topology_scopes() -> AdminScopes {
-    AdminScopes {
-        joins: false,
-        topology: true,
-        value: false,
-    }
-}
-
-fn value_scopes() -> AdminScopes {
-    AdminScopes {
-        joins: false,
-        topology: false,
-        value: true,
-    }
-}
-
-/// A parent with children and a delegated admin key, for topology tests.
+/// A parent with children; mutations are driven by the node's own operator
+/// (`SelfOperator`), the direct-path authority under the topology model.
 struct TopologyFixture {
     parent: TestNode,
-    parent_op: OperatorSecretKey,
-    admin_op: OperatorSecretKey,
+    node_op: OperatorSecretKey,
     admin_endpoint: Endpoint,
     parent_id: String,
     _dir: tempfile::TempDir,
@@ -249,7 +168,7 @@ struct TopologyFixture {
 
 impl TopologyFixture {
     async fn send_admin(&self, request: ControlRequest) -> ControlReply {
-        let signed = admin_request(&self.parent_id, &self.admin_op, request);
+        let signed = authorize(node(&self.parent_id), &self.node_op, request);
         send(&self.admin_endpoint, &self.parent.addr, &signed).await
     }
 
@@ -312,14 +231,12 @@ impl TopologyFixture {
 }
 
 async fn topology_fixture(
-    form: GrantForm,
     address: Option<&str>,
     children: &[(&str, ChildKind, u8)],
 ) -> TopologyFixture {
     let parent_key = SecretKey::generate();
     let parent_id = parent_key.public().to_string();
     let parent_op = operator(&parent_key);
-    let admin_op = OperatorSecretKey::from_bytes([0x5a; 32]);
     let dir = tempfile::tempdir().unwrap();
     let specs: Vec<ChildSpec> = children
         .iter()
@@ -340,18 +257,10 @@ async fn topology_fixture(
         peers: vec![],
     })
     .await;
-    {
-        let grant = match form {
-            GrantForm::V1 => admin_grant_v1(&parent_id, &parent_op, &admin_op),
-            GrantForm::V2(scopes) => admin_grant_v2(&parent_id, &parent_op, &admin_op, scopes),
-        };
-        parent.engine().await.grant_admin(grant).expect("grant admin");
-    }
     let admin_endpoint = bind(&SecretKey::generate()).await;
     TopologyFixture {
         parent,
-        parent_op,
-        admin_op,
+        node_op: parent_op,
         admin_endpoint,
         parent_id,
         _dir: dir,
@@ -359,9 +268,8 @@ async fn topology_fixture(
 }
 
 #[tokio::test]
-async fn topology_grant_detaches_node_child_and_queues_notice() {
+async fn admin_detaches_node_child_and_queues_notice() {
     let f = topology_fixture(
-        GrantForm::V2(topology_scopes()),
         Some("0"),
         &[
             ("node-child", ChildKind::Node, 1),
@@ -390,7 +298,7 @@ async fn topology_grant_detaches_node_child_and_queues_notice() {
     assert_eq!(audit["action"].as_str(), Some("detach"));
     assert_eq!(
         audit["actor"].as_str(),
-        Some(f.admin_op.public().to_string().as_str())
+        Some(f.node_op.public().to_string().as_str())
     );
     assert_eq!(audit["child"].as_str(), Some("node-child"));
     assert!(audit["requested_slot"].is_null());
@@ -400,9 +308,8 @@ async fn topology_grant_detaches_node_child_and_queues_notice() {
 }
 
 #[tokio::test]
-async fn topology_grant_moves_node_child_and_queues_rebase() {
+async fn admin_moves_node_child_and_queues_rebase() {
     let f = topology_fixture(
-        GrantForm::V2(topology_scopes()),
         Some("0"),
         &[
             ("node-child", ChildKind::Node, 1),
@@ -440,7 +347,7 @@ async fn topology_grant_moves_node_child_and_queues_rebase() {
     assert_eq!(audit["action"].as_str(), Some("move"));
     assert_eq!(
         audit["actor"].as_str(),
-        Some(f.admin_op.public().to_string().as_str())
+        Some(f.node_op.public().to_string().as_str())
     );
     assert_eq!(audit["child"].as_str(), Some("node-child"));
     assert_eq!(audit["requested_slot"].as_u64(), Some(0));
@@ -452,38 +359,8 @@ async fn topology_grant_moves_node_child_and_queues_rebase() {
 }
 
 #[tokio::test]
-async fn non_topology_grants_are_unauthorized_on_both_variants() {
-    for form in [
-        GrantForm::V1,
-        GrantForm::V2(AdminScopes::v1()),
-        GrantForm::V2(value_scopes()),
-    ] {
-        let f = topology_fixture(form, Some("0"), &[("node-child", ChildKind::Node, 1)]).await;
-        for request in [
-            ControlRequest::AdminDetachChild(AdminDetachChild {
-                child: node("node-child"),
-            }),
-            ControlRequest::AdminMoveChild(AdminMoveChild {
-                child: node("node-child"),
-                slot: Some(0),
-            }),
-        ] {
-            assert_eq!(
-                f.send_admin(request).await,
-                ControlReply::Rejected(RejectCode::Unauthorized),
-                "{form:?} must not use topology admin"
-            );
-        }
-        assert!(f.has_child("node-child").await, "{form:?} changed nothing");
-        assert!(f.pending().await.is_empty(), "{form:?} queued no notice");
-        f.shutdown().await;
-    }
-}
-
-#[tokio::test]
 async fn self_operator_uses_topology_admin_actions() {
     let f = topology_fixture(
-        GrantForm::V1,
         Some("0"),
         &[
             ("node-child", ChildKind::Node, 1),
@@ -494,7 +371,7 @@ async fn self_operator_uses_topology_admin_actions() {
 
     let detach = authorize(
         node(&f.parent_id),
-        &f.parent_op,
+        &f.node_op,
         ControlRequest::AdminDetachChild(AdminDetachChild {
             child: node("node-child"),
         }),
@@ -505,7 +382,7 @@ async fn self_operator_uses_topology_admin_actions() {
     // A user-leaf move is refused even for self-operator (shared helper parity).
     let move_child = authorize(
         node(&f.parent_id),
-        &f.parent_op,
+        &f.node_op,
         ControlRequest::AdminMoveChild(AdminMoveChild {
             child: node("user-leaf"),
             slot: None,
@@ -522,7 +399,6 @@ async fn self_operator_uses_topology_admin_actions() {
 #[tokio::test]
 async fn admin_detach_user_child_is_accepted_and_noticed() {
     let f = topology_fixture(
-        GrantForm::V2(topology_scopes()),
         Some("0"),
         &[("user-leaf", ChildKind::User, 5)],
     )
@@ -542,7 +418,6 @@ async fn admin_detach_user_child_is_accepted_and_noticed() {
 #[tokio::test]
 async fn admin_move_user_child_is_bad_request() {
     let f = topology_fixture(
-        GrantForm::V2(topology_scopes()),
         Some("0"),
         &[("user-leaf", ChildKind::User, 5)],
     )
@@ -563,7 +438,6 @@ async fn admin_move_user_child_is_bad_request() {
 #[tokio::test]
 async fn admin_topology_not_a_child_is_not_found() {
     let f = topology_fixture(
-        GrantForm::V2(topology_scopes()),
         Some("0"),
         &[("node-child", ChildKind::Node, 1)],
     )
@@ -589,7 +463,6 @@ async fn admin_topology_not_a_child_is_not_found() {
 #[tokio::test]
 async fn admin_move_occupied_slot_is_slot_taken() {
     let f = topology_fixture(
-        GrantForm::V2(topology_scopes()),
         Some("0"),
         &[
             ("node-child", ChildKind::Node, 1),
@@ -612,7 +485,6 @@ async fn admin_move_occupied_slot_is_slot_taken() {
 #[tokio::test]
 async fn admin_move_slot_eight_is_slot_out_of_range() {
     let f = topology_fixture(
-        GrantForm::V2(topology_scopes()),
         Some("0"),
         &[("node-child", ChildKind::Node, 1)],
     )
@@ -632,7 +504,6 @@ async fn admin_move_slot_eight_is_slot_out_of_range() {
 #[tokio::test]
 async fn admin_move_none_picks_lowest_free_and_same_slot_is_noop() {
     let f = topology_fixture(
-        GrantForm::V2(topology_scopes()),
         Some("0"),
         &[
             ("node-child", ChildKind::Node, 1),
@@ -669,7 +540,6 @@ async fn admin_move_none_picks_lowest_free_and_same_slot_is_noop() {
 #[tokio::test]
 async fn admin_move_without_address_succeeds_without_notice() {
     let f = topology_fixture(
-        GrantForm::V2(topology_scopes()),
         None,
         &[("node-child", ChildKind::Node, 1)],
     )
@@ -691,9 +561,8 @@ async fn admin_move_without_address_succeeds_without_notice() {
 }
 
 #[tokio::test]
-async fn admin_topology_replay_and_revoke() {
+async fn admin_topology_replay_is_rejected() {
     let f = topology_fixture(
-        GrantForm::V2(topology_scopes()),
         Some("0"),
         &[
             ("node-child", ChildKind::Node, 1),
@@ -703,9 +572,9 @@ async fn admin_topology_replay_and_revoke() {
     .await;
 
     // Replay: the byte-identical frame is refused after the first detach.
-    let signed = admin_request(
-        &f.parent_id,
-        &f.admin_op,
+    let signed = authorize(
+        node(&f.parent_id),
+        &f.node_op,
         ControlRequest::AdminDetachChild(AdminDetachChild {
             child: node("node-child"),
         }),
@@ -716,21 +585,5 @@ async fn admin_topology_replay_and_revoke() {
         ControlReply::Rejected(RejectCode::Replay)
     );
 
-    // Revoke: the delegated authority is gone.
-    assert!(
-        f.parent
-            .engine()
-            .await
-            .revoke_admin(&f.admin_op.public())
-            .unwrap()
-    );
-    assert_eq!(
-        f.send_admin(ControlRequest::AdminMoveChild(AdminMoveChild {
-            child: node("user-leaf"),
-            slot: Some(0),
-        }))
-        .await,
-        ControlReply::Rejected(RejectCode::Unauthorized)
-    );
     f.shutdown().await;
 }

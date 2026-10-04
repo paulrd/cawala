@@ -18,13 +18,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cawala_control::{
-    ADMIN_GRANT_V1_VERSION, ADMIN_GRANT_VERSION, AdminDetachChild, AdminGrant, AdminGrantV2,
-    AdminJoinApprove, AdminMoveChild, AdminScope, AdminScopes, AdminValueDirection,
-    AdminValueRequest, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest,
-    DEFAULT_ADMIN_TTL_SECS, DeliveryStatus, JoinApproval, JoinRejection, JoinRequest,
-    MAX_CONTROL_FRAME, MAX_VALUE_ADMIN_TTL_SECS, NodeId, OperatorSecretKey, ROUTED_CONTROL_VERSION,
-    RejectCode, RoutedControlV1, RoutedForward, SignedAdminGrant, SignedAdminGrantV2,
-    SignedControl, SignedRoutedReply, ValueRequestId,
+    AdminJoinApprove, AdminMoveChild, AdminValueDirection, AdminValueRequest,
+    CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest, DeliveryStatus, JoinApproval,
+    JoinRejection, JoinRequest, MAX_CONTROL_FRAME, NodeId, OperatorSecretKey,
+    ROUTED_CONTROL_VERSION, RejectCode, RoutedControlV1, RoutedForward, SignedControl,
+    SignedRoutedReply, ValueRequestId,
 };
 use cawala_ledger::{LedgerPubKey, LedgerSecretKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::{AckStatus, Envelope, MSG_CONTROL_V1, MsgId, PeerRef, RejectReason};
@@ -34,10 +32,10 @@ use cawala_node::msg::{
     MsgConfig, NeighborSource, RoutableSnapshot, build_envelope, dispatch_control_envelope,
     send_envelope,
 };
-use cawala_node::admin_store::{ADMINS_FILE, StoredGrant};
 use cawala_node::record::RecordStore;
 use cawala_node::{
-    AdminStore, LedgerService, OutboundKind, VALUE_POLICY_VERSION, ValueLimits, ValuePolicy,
+    AdminState, AdminStore, LedgerService, OutboundKind, VALUE_POLICY_VERSION, ValueLimits,
+    ValuePolicy,
 };
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::presets;
@@ -401,51 +399,29 @@ fn peer(addr: &str, id: &str) -> PeerRef {
     }
 }
 
-fn admin_grant(root_id: &str, root_op: &OperatorSecretKey, admin_op: &OperatorSecretKey) -> SignedAdminGrant {
-    let now = now_unix_seconds();
-    SignedAdminGrant::authorize(
-        AdminGrant {
-            version: ADMIN_GRANT_V1_VERSION,
-            node: node(root_id),
-            admin: admin_op.public(),
-            scope: AdminScope::Admin,
-            granted_at: now.saturating_sub(1),
-            expiry: now + DEFAULT_ADMIN_TTL_SECS,
-            label: Some("routed-test".to_string()),
-        },
-        root_op,
-    )
-    .expect("sign admin grant")
+/// Persist an explicit R5 priority seed directly to `dir`. Routed dispatch
+/// reloads `admin_state.json` per request, so the seed is observed without a
+/// restart.
+fn write_priority(dir: &std::path::Path, priority: Vec<String>, current: i32, now: u64) {
+    let mut state = AdminState::empty();
+    state.set_priority(priority);
+    state.set_current(current);
+    state.bump_epoch();
+    state.record_lease(now);
+    state.save(dir).expect("save admin state");
 }
 
-/// A v2 grant with explicit scopes, for installing into the node's store.
-fn admin_grant_v2(
-    root_id: &str,
-    root_op: &OperatorSecretKey,
-    admin_op: &OperatorSecretKey,
-    scopes: AdminScopes,
-) -> StoredGrant {
-    let now = now_unix_seconds();
-    let ttl = if scopes.value {
-        DEFAULT_ADMIN_TTL_SECS.min(MAX_VALUE_ADMIN_TTL_SECS)
-    } else {
-        DEFAULT_ADMIN_TTL_SECS
-    };
-    StoredGrant::V2(
-        SignedAdminGrantV2::authorize(
-            AdminGrantV2 {
-                version: ADMIN_GRANT_VERSION,
-                node: node(root_id),
-                admin: admin_op.public(),
-                scopes,
-                granted_at: now,
-                expiry: now + ttl,
-                label: Some("routed-test-v2".to_string()),
-            },
-            root_op,
-        )
-        .expect("sign v2 admin grant"),
-    )
+/// Seed the shared world's root with priority `[A, B]` and `A` current: the
+/// last hop of a request relayed by `A` (e.g. from the browser `U`) is then the
+/// root's leased administrator.
+async fn seed_root_priority(root: &TestNode, w: &World) {
+    let dir = root.control.lock().await.data_dir().to_path_buf();
+    write_priority(
+        &dir,
+        vec![w.a_id.clone(), w.b_id.clone()],
+        0,
+        now_unix_seconds(),
+    );
 }
 
 /// An admin intent addressed to `root_id` and signed by `admin_op`.
@@ -464,15 +440,12 @@ fn admin_intent(
     .expect("sign admin intent")
 }
 
-/// A routed control request payload with the frozen version.
-///
-/// `_grant` is retained in the signature for now: routed control v2 dropped the
-/// carried-grant field, and these tests are rewritten in C6.
+/// A routed control request payload with the frozen version (routed v2 carries
+/// no grant: authority is topology-derived from the authenticated last hop).
 fn routed(
     target: PeerRef,
     requester: PeerRef,
     intent: SignedControl,
-    _grant: Option<SignedAdminGrant>,
     forwards: Vec<RoutedForward>,
 ) -> RoutedControlV1 {
     RoutedControlV1 {
@@ -583,21 +556,11 @@ async fn routed_admin_query_reaches_ancestor_and_reply_verifies() {
         panic!("world shape")
     };
 
-    root.control
-        .lock()
-        .await
-        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op).into())
-        .expect("grant admin");
+    seed_root_priority(root, &w).await;
 
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
     let forward = own_forward(u, &intent.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        Some(admin_grant(&w.root_id, &w.root_op, &w.admin_op)),
-        vec![forward],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1.3", &w.u_id), intent, vec![forward]);
 
     let (msg_id, status) = send_routed(u, "0", request).await;
     assert_eq!(status, AckStatus::Delivered);
@@ -631,11 +594,7 @@ async fn routed_admin_approve_applies_and_delivers_to_applicant() {
         panic!("world shape")
     };
 
-    root.control
-        .lock()
-        .await
-        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op).into())
-        .expect("grant admin");
+    seed_root_priority(root, &w).await;
 
     // A control-only applicant starts an outbound join and delivers it directly
     // (join traffic is refused on the routed path).
@@ -698,13 +657,7 @@ async fn routed_admin_approve_applies_and_delivers_to_applicant() {
         }),
     );
     let forward = own_forward(u, &intent.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        None,
-        vec![forward],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1.3", &w.u_id), intent, vec![forward]);
     assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
 
     let reply = recv_reply(u).await;
@@ -721,243 +674,6 @@ async fn routed_admin_approve_applies_and_delivers_to_applicant() {
     wait_joined(&x_control, &w.root_id, "0.3").await;
 
     x_endpoint.close().await;
-}
-
-/// (3) Revoking the grant wins over a well-formed carried grant: the routed
-/// admin request is refused and the audit records the missing store entry.
-#[tokio::test]
-async fn routed_admin_revoked_grant_is_refused_despite_carried_evidence() {
-    let w = world();
-    let lookup = MemoryLookup::new();
-    let mut nodes = build_world(&w, &lookup).await;
-    let [root, _a, _b, u] = &mut nodes[..] else {
-        panic!("world shape")
-    };
-
-    let grant = admin_grant(&w.root_id, &w.root_op, &w.admin_op);
-    root.control
-        .lock()
-        .await
-        .grant_admin(grant.clone().into())
-        .expect("grant admin");
-    assert!(
-        root.control
-            .lock()
-            .await
-            .revoke_admin(&w.admin_op.public())
-            .unwrap(),
-        "grant must be present before revoke"
-    );
-
-    let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
-    let forward = own_forward(u, &intent.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        Some(grant),
-        vec![forward],
-    );
-    assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
-
-    assert_eq!(
-        recv_reply(u).await,
-        ControlReply::Rejected(RejectCode::Unauthorized)
-    );
-
-    let audit_path = root.control.lock().await.data_dir().join("control_audit.jsonl");
-    let audit = std::fs::read_to_string(audit_path).expect("audit log");
-    assert!(
-        audit.contains("grant_store_missing"),
-        "carried-but-unstored grant must be audited: {audit}"
-    );
-}
-
-/// (3b) A v2 `{topology}` grant reaches the routed admin surface but cannot
-/// authorize a join mutation: scope denial is enforced on the routed path too,
-/// not only by the shared direct-path code.
-#[tokio::test]
-async fn routed_v2_topology_grant_cannot_mutate_joins() {
-    let w = world();
-    let lookup = MemoryLookup::new();
-    let mut nodes = build_world(&w, &lookup).await;
-    let [root, _a, _b, u] = &mut nodes[..] else {
-        panic!("world shape")
-    };
-
-    root.control
-        .lock()
-        .await
-        .grant_admin(admin_grant_v2(
-            &w.root_id,
-            &w.root_op,
-            &w.admin_op,
-            AdminScopes {
-                joins: false,
-                topology: true,
-                value: false,
-            },
-        ))
-        .expect("grant v2 topology admin");
-
-    let intent = admin_intent(
-        &w.root_id,
-        &w.admin_op,
-        ControlRequest::AdminApproveJoin(AdminJoinApprove {
-            child: node("ghost"),
-            slot: None,
-        }),
-    );
-    let forward = own_forward(u, &intent.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        None,
-        vec![forward],
-    );
-    assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
-    assert_eq!(
-        recv_reply(u).await,
-        ControlReply::Rejected(RejectCode::Unauthorized),
-        "a topology-only v2 grant must not authorize a join mutation on the routed path"
-    );
-}
-
-/// (3e) A joins-only v2 grant cannot read the ledger over the routed path:
-/// `AdminLedgerQuery` requires the `value` scope, and the routed admin class
-/// reuses the same gate.
-#[tokio::test]
-async fn routed_joins_only_grant_cannot_read_ledger() {
-    let w = world();
-    let lookup = MemoryLookup::new();
-    let mut nodes = build_world(&w, &lookup).await;
-    let [root, _a, _b, u] = &mut nodes[..] else {
-        panic!("world shape")
-    };
-
-    root.control
-        .lock()
-        .await
-        .grant_admin(admin_grant_v2(
-            &w.root_id,
-            &w.root_op,
-            &w.admin_op,
-            AdminScopes::v1(),
-        ))
-        .expect("grant joins-only admin");
-
-    let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminLedgerQuery);
-    let forward = own_forward(u, &intent.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        None,
-        vec![forward],
-    );
-    assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
-    assert_eq!(
-        recv_reply(u).await,
-        ControlReply::Rejected(RejectCode::Unauthorized),
-        "a joins-only grant must not read the ledger on the routed path"
-    );
-}
-
-/// (P4) A joins-only grant cannot use the topology-admin variants on the routed
-/// path either: `AdminDetachChild`/`AdminMoveChild` require the `topology` scope.
-#[tokio::test]
-async fn routed_joins_only_grant_cannot_use_topology_admin() {
-    let w = world();
-    let lookup = MemoryLookup::new();
-    let mut nodes = build_world(&w, &lookup).await;
-    let [root, _a, _b, u] = &mut nodes[..] else {
-        panic!("world shape")
-    };
-
-    root.control
-        .lock()
-        .await
-        .grant_admin(admin_grant_v2(
-            &w.root_id,
-            &w.root_op,
-            &w.admin_op,
-            AdminScopes::v1(),
-        ))
-        .expect("grant joins-only admin");
-
-    for request in [
-        ControlRequest::AdminDetachChild(AdminDetachChild {
-            child: node(&w.a_id),
-        }),
-        ControlRequest::AdminMoveChild(AdminMoveChild {
-            child: node(&w.a_id),
-            slot: Some(0),
-        }),
-    ] {
-        let intent = admin_intent(&w.root_id, &w.admin_op, request);
-        let forward = own_forward(u, &intent.request).await;
-        let envelope = routed(
-            peer("0", &w.root_id),
-            peer("0.1.3", &w.u_id),
-            intent,
-            None,
-            vec![forward],
-        );
-        assert_eq!(send_routed(u, "0", envelope).await.1, AckStatus::Delivered);
-        assert_eq!(
-            recv_reply(u).await,
-            ControlReply::Rejected(RejectCode::Unauthorized),
-            "a joins-only grant must not use topology admin on the routed path"
-        );
-    }
-}
-
-/// (3c) A grant revoked *out of process* (only `admins.json` rewritten) must
-/// still be reflected in the `grant_store_missing` evidence line: the audit is
-/// derived from the reloaded on-disk store, not a stale in-memory copy.
-#[tokio::test]
-async fn routed_out_of_process_revoke_is_reflected_in_the_evidence_audit() {
-    let w = world();
-    let lookup = MemoryLookup::new();
-    let mut nodes = build_world(&w, &lookup).await;
-    let [root, _a, _b, u] = &mut nodes[..] else {
-        panic!("world shape")
-    };
-
-    let grant = admin_grant(&w.root_id, &w.root_op, &w.admin_op);
-    root.control
-        .lock()
-        .await
-        .grant_admin(grant.clone().into())
-        .expect("grant admin");
-
-    // Rewrite the store on disk without touching the engine's in-memory copy,
-    // simulating an operator CLI revoke in a separate process.
-    let dir = root.control.lock().await.data_dir().to_path_buf();
-    std::fs::write(dir.join(ADMINS_FILE), br#"{"version":1,"admins":[]}"#)
-        .expect("write emptied admin store");
-
-    let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
-    let forward = own_forward(u, &intent.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        Some(grant),
-        vec![forward],
-    );
-    assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
-    assert_eq!(
-        recv_reply(u).await,
-        ControlReply::Rejected(RejectCode::Unauthorized)
-    );
-
-    let audit = std::fs::read_to_string(dir.join("control_audit.jsonl")).expect("audit log");
-    assert!(
-        audit.contains("grant_store_missing"),
-        "the evidence line must reflect the on-disk store, not stale memory: {audit}"
-    );
 }
 
 /// (3d) A routed value-scoped `AdminLedgerQuery` executes the ledger read at the
@@ -990,30 +706,11 @@ async fn routed_value_query_returns_verified_snapshot() {
         .await
         .attach_ledger(Arc::new(Mutex::new(ledger)));
 
-    root.control
-        .lock()
-        .await
-        .grant_admin(admin_grant_v2(
-            &w.root_id,
-            &w.root_op,
-            &w.admin_op,
-            AdminScopes {
-                joins: false,
-                topology: false,
-                value: true,
-            },
-        ))
-        .expect("grant value admin");
+    seed_root_priority(root, &w).await;
 
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminLedgerQuery);
     let forward = own_forward(u, &intent.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        None,
-        vec![forward],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1.3", &w.u_id), intent, vec![forward]);
     assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
 
     let signed = recv_signed_reply(u).await;
@@ -1054,20 +751,7 @@ async fn routed_admin_move_returns_verified_accepted_and_delivers_rebase() {
         panic!("world shape")
     };
 
-    root.control
-        .lock()
-        .await
-        .grant_admin(admin_grant_v2(
-            &w.root_id,
-            &w.root_op,
-            &w.admin_op,
-            AdminScopes {
-                joins: false,
-                topology: true,
-                value: false,
-            },
-        ))
-        .expect("grant topology admin");
+    seed_root_priority(root, &w).await;
 
     let intent = admin_intent(
         &w.root_id,
@@ -1078,13 +762,7 @@ async fn routed_admin_move_returns_verified_accepted_and_delivers_rebase() {
         }),
     );
     let forward = own_forward(u, &intent.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        None,
-        vec![forward],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1.3", &w.u_id), intent, vec![forward]);
     assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
 
     let signed = recv_signed_reply(u).await;
@@ -1130,20 +808,7 @@ async fn routed_admin_move_failed_notice_is_requeued() {
         store.save().unwrap();
     }
 
-    root.control
-        .lock()
-        .await
-        .grant_admin(admin_grant_v2(
-            &w.root_id,
-            &w.root_op,
-            &w.admin_op,
-            AdminScopes {
-                joins: false,
-                topology: true,
-                value: false,
-            },
-        ))
-        .expect("grant topology admin");
+    seed_root_priority(root, &w).await;
 
     let intent = admin_intent(
         &w.root_id,
@@ -1154,13 +819,7 @@ async fn routed_admin_move_failed_notice_is_requeued() {
         }),
     );
     let forward = own_forward(u, &intent.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        None,
-        vec![forward],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1.3", &w.u_id), intent, vec![forward]);
     assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
 
     let signed = recv_signed_reply(u).await;
@@ -1205,20 +864,7 @@ async fn routed_admin_issue_returns_verified_and_retry_dedupes() {
     .save(&dir)
     .unwrap();
 
-    root.control
-        .lock()
-        .await
-        .grant_admin(admin_grant_v2(
-            &w.root_id,
-            &w.root_op,
-            &w.admin_op,
-            AdminScopes {
-                joins: false,
-                topology: false,
-                value: true,
-            },
-        ))
-        .expect("grant value admin");
+    seed_root_priority(root, &w).await;
 
     // The same request id is reused across both attempts (the retry path).
     let issue = || {
@@ -1232,13 +878,7 @@ async fn routed_admin_issue_returns_verified_and_retry_dedupes() {
 
     let intent = admin_intent(&w.root_id, &w.admin_op, issue());
     let forward = own_forward(u, &intent.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        None,
-        vec![forward],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1.3", &w.u_id), intent, vec![forward]);
     assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
 
     let signed = recv_signed_reply(u).await;
@@ -1255,13 +895,7 @@ async fn routed_admin_issue_returns_verified_and_retry_dedupes() {
     // Retry: same request_id/params, fresh control nonce -> duplicate.
     let intent = admin_intent(&w.root_id, &w.admin_op, issue());
     let forward = own_forward(u, &intent.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        None,
-        vec![forward],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1.3", &w.u_id), intent, vec![forward]);
     assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
     let signed = recv_signed_reply(u).await;
     signed.verify(&w.root_op.public()).unwrap();
@@ -1285,22 +919,12 @@ async fn routed_target_and_requester_mismatch_are_refused() {
         panic!("world shape")
     };
 
-    root.control
-        .lock()
-        .await
-        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op).into())
-        .expect("grant admin");
+    seed_root_priority(root, &w).await;
 
     // `target.node` names someone else though the address is the root's.
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
     let forward = own_forward(a, &intent.request).await;
-    let bad_target = routed(
-        peer("0", "not-the-root"),
-        peer("0.1", &w.a_id),
-        intent,
-        None,
-        vec![forward],
-    );
+    let bad_target = routed(peer("0", "not-the-root"), peer("0.1", &w.a_id), intent, vec![forward]);
     assert_eq!(send_routed(a, "0", bad_target).await.1, AckStatus::Delivered);
     assert_eq!(
         recv_reply(a).await,
@@ -1310,13 +934,7 @@ async fn routed_target_and_requester_mismatch_are_refused() {
     // `requester.node` disagrees with the authenticated envelope source.
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
     let forward = own_forward(a, &intent.request).await;
-    let bad_requester = routed(
-        peer("0", &w.root_id),
-        peer("0.1", "not-a"),
-        intent,
-        None,
-        vec![forward],
-    );
+    let bad_requester = routed(peer("0", &w.root_id), peer("0.1", "not-a"), intent, vec![forward]);
     assert_eq!(send_routed(a, "0", bad_requester).await.1, AckStatus::Delivered);
     assert_eq!(
         recv_reply(a).await,
@@ -1335,11 +953,7 @@ async fn routed_expired_intent_and_intent_replay() {
         panic!("world shape")
     };
 
-    root.control
-        .lock()
-        .await
-        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op).into())
-        .expect("grant admin");
+    seed_root_priority(root, &w).await;
 
     // Expired intent (sent directly, so no relay drops it first).
     let expired = SignedControl::authorize(
@@ -1351,41 +965,30 @@ async fn routed_expired_intent_and_intent_replay() {
     )
     .unwrap();
     let forward = own_forward(a, &expired.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1", &w.a_id),
-        expired,
-        None,
-        vec![forward],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1", &w.a_id), expired, vec![forward]);
     assert_eq!(send_routed(a, "0", request).await.1, AckStatus::Delivered);
     assert_eq!(
         recv_reply(a).await,
         ControlReply::Rejected(RejectCode::Expired)
     );
 
-    // Fresh intent: the first application succeeds...
+    // Fresh request: the first application succeeds...
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
     let forward = own_forward(a, &intent.request).await;
     let request = routed(
         peer("0", &w.root_id),
         peer("0.1", &w.a_id),
         intent.clone(),
-        None,
-        vec![forward],
+        vec![forward.clone()],
     );
     assert_eq!(send_routed(a, "0", request).await.1, AckStatus::Delivered);
     assert!(matches!(recv_reply(a).await, ControlReply::AdminSnapshot(_)));
 
-    // ...and replaying the same intent nonce (fresh envelope + forward) is Replay.
-    let forward = own_forward(a, &intent.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1", &w.a_id),
-        intent,
-        None,
-        vec![forward],
-    );
+    // ...and replaying the *dispatched* last-hop control (same predecessor
+    // nonce) with a fresh envelope and intent is Replay. Non-value admin
+    // dispatch uses the last hop's signed control, so that is what the engine's
+    // replay guard keys on.
+    let request = routed(peer("0", &w.root_id), peer("0.1", &w.a_id), intent, vec![forward]);
     assert_eq!(send_routed(a, "0", request).await.1, AckStatus::Delivered);
     assert_eq!(
         recv_reply(a).await,
@@ -1402,11 +1005,7 @@ async fn routed_forged_last_forward_is_refused() {
     let [root, _a, _b, u] = &mut nodes[..] else {
         panic!("world shape")
     };
-    root.control
-        .lock()
-        .await
-        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op).into())
-        .expect("grant admin");
+    seed_root_priority(root, &w).await;
 
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
     // A forward whose hop names U but whose signature is by an unrelated key.
@@ -1420,13 +1019,7 @@ async fn routed_forged_last_forward_is_refused() {
     )
     .unwrap();
     let forward = RoutedForward::new(peer("0.1.3", &w.u_id), forged);
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        None,
-        vec![forward],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1.3", &w.u_id), intent, vec![forward]);
     assert_eq!(
         send_routed(u, "0", request).await.1,
         AckStatus::Rejected(RejectReason::BadPayload)
@@ -1434,23 +1027,17 @@ async fn routed_forged_last_forward_is_refused() {
 
     // A missing predecessor forward is refused too.
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        None,
-        vec![],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1.3", &w.u_id), intent, vec![]);
     assert_eq!(
         send_routed(u, "0", request).await.1,
         AckStatus::Rejected(RejectReason::BadPayload)
     );
 }
 
-/// (7) H1 teeth: a topology request from the senior child is applied, while the
-/// same request from a non-senior child is refused.
+/// (7) H1 teeth: a topology request from the current, leased priority child is
+/// applied, while the same request from a non-priority child is refused.
 #[tokio::test]
-async fn routed_topology_senior_allowed_nonsenior_denied() {
+async fn routed_priority_allowed_nonsenior_denied() {
     let w = world();
     let lookup = MemoryLookup::new();
     let mut nodes = build_world(&w, &lookup).await;
@@ -1458,7 +1045,9 @@ async fn routed_topology_senior_allowed_nonsenior_denied() {
         panic!("world shape")
     };
 
-    // Senior child A: its own signed Query is dispatched.
+    seed_root_priority(root, &w).await;
+
+    // Priority child A: its own signed Query is dispatched.
     let query = SignedControl::authorize(
         node(&w.a_id),
         &w.a_op,
@@ -1468,17 +1057,11 @@ async fn routed_topology_senior_allowed_nonsenior_denied() {
     )
     .unwrap();
     let forward = own_forward(a, &query.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1", &w.a_id),
-        query,
-        None,
-        vec![forward],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1", &w.a_id), query, vec![forward]);
     assert_eq!(send_routed(a, "0", request).await.1, AckStatus::Delivered);
     assert!(
         matches!(recv_reply(a).await, ControlReply::Snapshot(_)),
-        "the senior child's topology request must be applied"
+        "the priority child's topology request must be applied"
     );
 
     // A2: the dispatched routed topology request records its routing context.
@@ -1497,7 +1080,7 @@ async fn routed_topology_senior_allowed_nonsenior_denied() {
         "{audit}"
     );
 
-    // Non-senior child B: structurally valid, but not the senior child.
+    // Non-priority child B: structurally valid, but not the current priority.
     let query = SignedControl::authorize(
         node(&w.b_id),
         &w.b_op,
@@ -1507,13 +1090,7 @@ async fn routed_topology_senior_allowed_nonsenior_denied() {
     )
     .unwrap();
     let forward = own_forward(b, &query.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.2", &w.b_id),
-        query,
-        None,
-        vec![forward],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.2", &w.b_id), query, vec![forward]);
     assert_eq!(send_routed(b, "0", request).await.1, AckStatus::Delivered);
     assert_eq!(
         recv_reply(b).await,
@@ -1573,13 +1150,7 @@ async fn routed_join_variants_are_refused() {
         )
         .unwrap();
         let forward = own_forward(a, &intent.request).await;
-        let request = routed(
-            peer("0", &w.root_id),
-            peer("0.1", &w.a_id),
-            intent,
-            None,
-            vec![forward],
-        );
+        let request = routed(peer("0", &w.root_id), peer("0.1", &w.a_id), intent, vec![forward]);
         assert_eq!(send_routed(a, "0", request).await.1, AckStatus::Delivered);
         assert_eq!(
             recv_reply(a).await,
@@ -1617,22 +1188,12 @@ async fn routed_reply_passes_through_relay_and_undecodable_payload_is_refused() 
     let [root, _a, _b, u] = &mut nodes[..] else {
         panic!("world shape")
     };
-    root.control
-        .lock()
-        .await
-        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op).into())
-        .expect("grant admin");
+    seed_root_priority(root, &w).await;
 
     // The reply from test (1)'s request has to traverse A to reach U.
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
     let forward = own_forward(u, &intent.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        None,
-        vec![forward],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1.3", &w.u_id), intent, vec![forward]);
     let (msg_id, status) = send_routed(u, "0", request).await;
     assert_eq!(status, AckStatus::Delivered);
     let signed = recv_signed_reply(u).await;
@@ -1662,21 +1223,11 @@ async fn routed_forward_hop_count_mismatch_rejected() {
     let [root, _a, _b, u] = &mut nodes[..] else {
         panic!("world shape")
     };
-    root.control
-        .lock()
-        .await
-        .grant_admin(admin_grant(&w.root_id, &w.root_op, &w.admin_op).into())
-        .expect("grant admin");
+    seed_root_priority(root, &w).await;
 
     // Empty forwards against a one-hop chain.
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        None,
-        vec![],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1.3", &w.u_id), intent, vec![]);
     assert_eq!(
         send_routed(u, "0", request).await.1,
         AckStatus::Rejected(RejectReason::BadPayload)
@@ -1685,13 +1236,7 @@ async fn routed_forward_hop_count_mismatch_rejected() {
     // Too many forwards against a one-hop chain.
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
     let forward = own_forward(u, &intent.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        None,
-        vec![forward.clone(), forward],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1.3", &w.u_id), intent, vec![forward.clone(), forward]);
     assert_eq!(
         send_routed(u, "0", request).await.1,
         AckStatus::Rejected(RejectReason::BadPayload)
@@ -1722,13 +1267,7 @@ async fn routed_destination_rejects_forged_predecessor_forward() {
     )
     .unwrap();
     let forward = RoutedForward::new(peer("0.1", &w.a_id), forged);
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1", &w.a_id),
-        intent,
-        None,
-        vec![forward],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1", &w.a_id), intent, vec![forward]);
     assert_eq!(send_routed(a, "0", request).await.1, AckStatus::Delivered);
     assert_eq!(
         recv_reply(a).await,
@@ -1737,16 +1276,18 @@ async fn routed_destination_rejects_forged_predecessor_forward() {
 }
 
 /// (A7) A two-hop topology request from a user is answered by the *predecessor's*
-/// control: U's intent alone is not authority, but the relaying senior child A's
-/// signed control is.
+/// control: U's intent alone is not authority, but the relaying priority child
+/// A's signed control is.
 #[tokio::test]
 async fn routed_topology_dispatches_last_hop_control_not_intent() {
     let w = world();
     let lookup = MemoryLookup::new();
     let mut nodes = build_world(&w, &lookup).await;
-    let [_root, _a, _b, u] = &mut nodes[..] else {
+    let [root, _a, _b, u] = &mut nodes[..] else {
         panic!("world shape")
     };
+
+    seed_root_priority(root, &w).await;
 
     let intent = SignedControl::authorize(
         node(&w.u_id),
@@ -1757,17 +1298,11 @@ async fn routed_topology_dispatches_last_hop_control_not_intent() {
     )
     .unwrap();
     let forward = own_forward(u, &intent.request).await;
-    let request = routed(
-        peer("0", &w.root_id),
-        peer("0.1.3", &w.u_id),
-        intent,
-        None,
-        vec![forward],
-    );
+    let request = routed(peer("0", &w.root_id), peer("0.1.3", &w.u_id), intent, vec![forward]);
     assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
     assert!(
         matches!(recv_reply(u).await, ControlReply::Snapshot(_)),
-        "the root must dispatch the senior predecessor's control, not the user intent"
+        "the root must dispatch the priority predecessor's control, not the user intent"
     );
 }
 
@@ -1833,19 +1368,13 @@ async fn routed_observes_externally_rewritten_node_record() {
         ControlRequest::Query,
     )
     .unwrap();
-    let request = routed(
-        target,
-        requester,
-        intent,
-        None,
-        vec![RoutedForward::new(
+    let request = routed(target, requester, intent, vec![RoutedForward::new(
             PeerRef {
                 addr: "0".parse().unwrap(),
                 node: hop_id.clone(),
             },
             forward,
-        )],
-    );
+        )]);
 
     // Stale: the in-memory record still says `0`, so `target.addr == 0.1` fails
     // before the forward/registry checks.
@@ -1858,12 +1387,18 @@ async fn routed_observes_externally_rewritten_node_record() {
 
     // A separate process re-parents and re-addresses the node on disk. The
     // address must be cleared before the parent link (a root address is invalid
-    // under a parent).
+    // under a parent). The hop is also attached as a node child and seeded as
+    // the current priority administrator, so the dispatched (last-hop) control
+    // authorizes.
     let mut external = RecordStore::open(dir.path(), &dest_id).unwrap();
     external.unset_address().unwrap();
     external.set_parent("external-parent", 1).unwrap();
     external.set_address("0.1".parse().unwrap()).unwrap();
+    external
+        .attach_child(&hop_id, ChildKind::Node, Some(0), 1)
+        .unwrap();
     external.save().unwrap();
+    write_priority(dir.path(), vec![hop_id.clone()], 0, now_unix_seconds());
 
     assert!(
         matches!(
@@ -1882,9 +1417,10 @@ async fn routed_observes_externally_rewritten_node_record() {
 }
 
 /// A routed request must observe a `ledger_peers.json` row written by a
-/// *separate process*. A routed topology request from a senior child is refused
-/// while the destination's in-memory registry is empty; once the child's row is
-/// written to disk the forward verifies and the request is dispatched.
+/// *separate process*. A routed topology request from the current priority
+/// child is refused while the destination's in-memory registry is empty; once
+/// the child's row is written to disk the forward verifies and the request is
+/// dispatched.
 #[tokio::test]
 async fn routed_observes_externally_written_peer_row() {
     let dest_secret = SecretKey::generate();
@@ -1914,6 +1450,9 @@ async fn routed_observes_externally_written_peer_row() {
         ControlStore::open(dir.path()).unwrap(),
         AdminStore::empty(),
     );
+    // The child is the current, leased priority administrator. The destination
+    // reloads `admin_state.json` per request, so the seed is observed.
+    write_priority(dir.path(), vec![child_id.clone()], 0, now_unix_seconds());
 
     let query = || {
         SignedControl::authorize(
@@ -1926,25 +1465,19 @@ async fn routed_observes_externally_written_peer_row() {
         .unwrap()
     };
     let make = |intent: SignedControl| {
-        routed(
-            PeerRef {
+        routed(PeerRef {
                 addr: "0".parse().unwrap(),
                 node: dest_id.clone(),
-            },
-            PeerRef {
+            }, PeerRef {
                 addr: "0.0".parse().unwrap(),
                 node: child_id.clone(),
-            },
-            intent.clone(),
-            None,
-            vec![RoutedForward::new(
+            }, intent.clone(), vec![RoutedForward::new(
                 PeerRef {
                     addr: "0.0".parse().unwrap(),
                     node: child_id.clone(),
                 },
                 intent,
-            )],
-        )
+            )])
     };
 
     // Without the row, `verify_forward` refuses the routed frame.
