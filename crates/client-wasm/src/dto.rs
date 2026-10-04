@@ -15,6 +15,7 @@ use cawala_ledger::{Hash, LedgerPubKey};
 use cawala_msg::OctAddr;
 use wasm_bindgen::{JsError, prelude::wasm_bindgen};
 
+use crate::control::AncestorEntry;
 use crate::ledger_state::{
     ActivityEntryV1, LedgerStateV1, OrderResultApplication, SettlementApplication, SettlementRecordV1,
     VerifiedBalanceV1, hop_role_str, settlement_state_reason, settlement_state_str,
@@ -1312,7 +1313,7 @@ impl AdminLedgerSnapshotDto {
     }
 }
 
-/// The outcome of a delegated issue/burn, as returned by
+/// The outcome of a remote issue/burn, as returned by
 /// [`crate::ClientNode::admin_issue`] / [`crate::ClientNode::admin_burn`].
 #[wasm_bindgen]
 pub struct AdminValueAppliedDto {
@@ -1607,6 +1608,52 @@ pub(crate) fn parse_receive_uri_inner(uri: &str) -> Result<ParsedReceiveUri, Str
         leaf_node,
         leaf_ledger,
     })
+}
+
+/// One administrable ancestor target, for R7's up/down traversal.
+///
+/// Returned by [`crate::ClientNode::discover_admin_targets`] (walk + cache) and
+/// [`crate::ClientNode::admin_targets`] (cache only). `depth` is 1-based: `1`
+/// is the browser's direct parent, and the last entry is the root.
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct AdminTargetDto {
+    node: String,
+    address: String,
+    depth: f64,
+}
+
+impl AdminTargetDto {
+    /// Convert one verified ancestor entry.
+    pub(crate) fn from_entry(entry: &AncestorEntry) -> Self {
+        AdminTargetDto {
+            node: entry.node.clone(),
+            address: entry.addr.to_string(),
+            depth: entry.depth as f64,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl AdminTargetDto {
+    /// The ancestor's node id.
+    #[wasm_bindgen(getter)]
+    pub fn node(&self) -> String {
+        self.node.clone()
+    }
+
+    /// The ancestor's asserted address, verified to derive from this leaf's own
+    /// assigned address.
+    #[wasm_bindgen(getter)]
+    pub fn address(&self) -> String {
+        self.address.clone()
+    }
+
+    /// 1-based depth above this leaf (`1` is the direct parent).
+    #[wasm_bindgen(getter)]
+    pub fn depth(&self) -> f64 {
+        self.depth
+    }
 }
 
 #[cfg(test)]

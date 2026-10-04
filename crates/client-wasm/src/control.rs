@@ -12,11 +12,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use cawala_control::{
     CONTROL_ALPN, CONTROL_REQUEST_TTL_SECS, ControlReply, ControlRequest, DetachNotice, Invite,
-    JoinApproval, JoinRejection, MAX_CONTROL_FRAME, NodeId, OperatorPubKey, OperatorSecretKey,
-    ROUTED_CONTROL_VERSION, RebaseNotice, RejectCode, RoutedControlV1, RoutedForward,
-    SignedControl, SignedRoutedReply, is_supported_control_version,
+    JoinApproval, JoinRejection, MAX_CONTROL_FRAME, NodeId, NodeSnapshot, OperatorPubKey,
+    OperatorSecretKey, ROUTED_CONTROL_VERSION, RebaseNotice, RejectCode, RoutedControlV1,
+    RoutedForward, SignedControl, SignedRoutedReply, is_supported_control_version,
 };
-use cawala_msg::{Envelope, MSG_CONTROL_V1, MsgId, PeerRef};
+use cawala_msg::{Envelope, MSG_CONTROL_V1, MsgId, OctAddr, PeerRef};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{EndpointAddr, EndpointId, TransportAddr};
@@ -24,7 +24,7 @@ use tracing::info;
 
 use crate::dto::ControlEventDto;
 use crate::ledger_state::LedgerStateV1;
-use crate::state::{LocalStateV1, Transition};
+use crate::state::{LocalStateV1, ParentLink, Transition};
 use crate::{now_unix_seconds, to_js_err};
 
 /// Per-request direct-control deadline, mirroring the native client.
@@ -48,16 +48,44 @@ pub(crate) const JOIN_TTL_SECONDS: u64 = 3600;
 pub(crate) struct SharedControl {
     node_id: String,
     pub(crate) operator: Option<OperatorSecretKey>,
-    /// A delegated administrator key (K_admin), supplied by JS at runtime.
-    ///
-    /// This is **never** persisted on the Rust side and never enters
-    /// [`LocalStateV1`] or the exported state blobs; the PWA owns its storage.
-    admin: Mutex<Option<OperatorSecretKey>>,
     state: Mutex<LocalStateV1>,
     events: Mutex<VecDeque<ControlEventDto>>,
     /// In-memory ordering guard for inbound `Rebase` notices (see
     /// [`RebaseGuard`]).
     rebase_guard: Mutex<RebaseGuard>,
+    /// Cached ancestor discovery chain, if a walk has completed for the
+    /// current `(self_addr, parent id)`.
+    ancestors: Mutex<Option<AncestorCache>>,
+}
+
+/// One authenticated ancestor of this browser leaf, discovered by walking the
+/// routing tree with [`ControlRequest::Query`] (P3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AncestorEntry {
+    /// The ancestor's node id.
+    pub node: String,
+    /// The ancestor's asserted address, verified to equal the address derivable
+    /// from this leaf's own assigned address at `depth`.
+    pub addr: OctAddr,
+    /// 1-based depth: `1` is the direct parent, `2` the grandparent, and so on.
+    pub depth: usize,
+}
+
+/// A completed ancestor walk, keyed on the `(self_addr, parent id)` it was
+/// discovered for.
+///
+/// Deliberately **not** part of [`LocalStateV1`]: adding a persisted field
+/// would force a [`LOCAL_STATE_VERSION`](crate::state::LOCAL_STATE_VERSION)
+/// bump and discard every existing user blob. It is cleared whenever the leaf
+/// joins, detaches, or leaves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AncestorCache {
+    /// The leaf's assigned address the walk started from.
+    pub self_addr: OctAddr,
+    /// The direct parent's node id the walk started from.
+    pub parent: String,
+    /// `[parent, grandparent, …, root]`, each with its verified address/depth.
+    pub entries: Vec<AncestorEntry>,
 }
 
 /// In-memory high-water mark of `RebaseNotice.generation` applied from the
@@ -88,10 +116,10 @@ impl SharedControl {
         SharedControl {
             node_id,
             operator,
-            admin: Mutex::new(None),
             state: Mutex::new(LocalStateV1::new()),
             events: Mutex::new(VecDeque::new()),
             rebase_guard: Mutex::new(RebaseGuard::default()),
+            ancestors: Mutex::new(None),
         }
     }
 
@@ -113,21 +141,31 @@ impl SharedControl {
         &self.node_id
     }
 
-    /// Install (or clear) the delegated admin key.
-    pub(crate) fn set_admin(&self, admin: Option<OperatorSecretKey>) {
-        let mut slot = self
-            .admin
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *slot = admin;
-    }
-
-    /// The delegated admin key, if one is configured (cloned for signing).
-    pub(crate) fn admin_key(&self) -> Option<OperatorSecretKey> {
-        self.admin
+    /// Clone the cached ancestor discovery chain, if any.
+    pub(crate) fn cached_ancestors(&self) -> Option<AncestorCache> {
+        self.ancestors
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Replace the cached ancestor discovery chain.
+    pub(crate) fn store_ancestors(&self, cache: AncestorCache) {
+        let mut slot = self
+            .ancestors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(cache);
+    }
+
+    /// Drop any cached ancestor chain. Called on join, detach, and leave, so a
+    /// stale chain can never outlive the link it was discovered over.
+    pub(crate) fn clear_ancestors(&self) {
+        let mut slot = self
+            .ancestors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = None;
     }
 
     /// Lock the local state, recovering from a poisoned lock.
@@ -325,10 +363,12 @@ impl ControlHandler {
         }
         let transition = self.shared.lock_state().apply_detach();
         if matches!(transition, Transition::Detached) {
-            // The parent is gone: drop the ordering guard and the parent-scoped
-            // ledger binding (pin + balance + pending) before the event.
+            // The parent is gone: drop the ordering guard, the ancestor chain
+            // discovered over the old link, and the parent-scoped ledger
+            // binding (pin + balance + pending) before the event.
             self.lock_ledger().clear_parent_binding();
             self.shared.reset_rebase_guard();
+            self.shared.clear_ancestors();
             self.shared
                 .push_event(ControlEventDto::detached(&parent.node_id));
         }
@@ -355,8 +395,10 @@ impl ControlHandler {
             // accepted event (and before `reset_rebase_guard`), so the balance
             // request the event triggers verifies under the new leaf's key.
             self.lock_ledger().rebind_parent(approval.parent_ledger);
-            // A fresh link has no known generation: reset the ordering guard.
+            // A fresh link has no known generation: reset the ordering guard,
+            // and any ancestor chain discovered under the old link is stale.
             self.shared.reset_rebase_guard();
+            self.shared.clear_ancestors();
             self.shared
                 .push_event(ControlEventDto::accepted(&signed.origin, approval));
         }
@@ -497,53 +539,181 @@ pub(crate) async fn exchange_control(
     .map_err(|_| wasm_bindgen::JsError::new("control request timed out"))?
 }
 
-/// Build an operator-signed admin request addressed to `target`.
+/// Build an **own-operator-signed** control request.
 ///
-/// `origin` is the target node id (the running node's engine requires
-/// `signed.origin == self.node_id`), `controller` is the delegated admin key, the
-/// nonce is fresh, and the expiry is `now + CONTROL_REQUEST_TTL_SECS` so a
-/// browser clock cannot mint an over-long-lived frame.
-pub(crate) fn sign_admin_request(
-    target: EndpointId,
-    admin: &OperatorSecretKey,
+/// The browser signs with the operator key derived from its own endpoint seed:
+/// `origin` is this client's node id and `controller` is its own operator public
+/// key (node-id == operator-key). There is no delegated admin key. The nonce is
+/// fresh and the expiry is `now + CONTROL_REQUEST_TTL_SECS`, so a browser clock
+/// cannot mint an over-long-lived frame.
+pub(crate) fn sign_own_control(
+    node_id: &str,
+    operator: &OperatorSecretKey,
     request: ControlRequest,
-) -> Result<SignedControl, wasm_bindgen::JsError> {
+) -> Result<SignedControl, String> {
     let mut nonce_bytes = [0u8; 8];
-    getrandom::fill(&mut nonce_bytes).map_err(to_js_err)?;
+    getrandom::fill(&mut nonce_bytes).map_err(|err| err.to_string())?;
     SignedControl::authorize(
-        NodeId::from(target.to_string()),
-        admin,
+        NodeId::from(node_id),
+        operator,
         u64::from_le_bytes(nonce_bytes),
         now_unix_seconds().saturating_add(CONTROL_REQUEST_TTL_SECS),
         request,
     )
-    .map_err(to_js_err)
+    .map_err(|err| err.to_string())
 }
 
-/// Sign an admin request with `admin` and directly exchange it with `target` on
-/// [`CONTROL_ALPN`].
+/// The address of the ancestor `depth` levels above `self_addr` (`1` is the
+/// direct parent).
 ///
-/// Dialing uses an id-only [`EndpointAddr`], exactly like the join path, so the
-/// N0 address-lookup service resolves the node.
-pub(crate) async fn exchange_admin(
-    endpoint: &iroh::Endpoint,
-    target: EndpointId,
-    admin: &OperatorSecretKey,
+/// Returns `None` when `depth` is zero or is not a strict ancestor of
+/// `self_addr`, so a caller can never derive the root's parent or an address
+/// at or below the leaf itself.
+pub(crate) fn ancestor_address_at(self_addr: &OctAddr, depth: usize) -> Option<OctAddr> {
+    if depth == 0 || depth >= self_addr.depth() {
+        return None;
+    }
+    let end = self_addr.depth() - depth;
+    OctAddr::from_digits(self_addr.digits()[..end].to_vec())
+}
+
+/// Every strict ancestor address of `self_addr`, nearest first.
+///
+/// For a leaf at `0.1.3` this is `[0.1, 0]` — the direct parent then the root.
+pub(crate) fn ancestor_addresses(self_addr: &OctAddr) -> Vec<OctAddr> {
+    (1..self_addr.depth())
+        .filter_map(|depth| ancestor_address_at(self_addr, depth))
+        .collect()
+}
+
+/// Resolve the asserted address of an admin `target_node` from this client's
+/// own assigned address.
+///
+/// The direct parent is resolved from the known [`ParentLink`] (depth 1). A
+/// higher ancestor must be present in a `cache` keyed to the same leaf and must
+/// still match the address derivable from `self_addr` at its recorded depth; a
+/// target that is not a strict ancestor (or was never discovered) fails closed.
+pub(crate) fn ancestor_address(
+    target_node: &str,
+    self_addr: &OctAddr,
+    parent: &ParentLink,
+    cache: Option<&AncestorCache>,
+) -> Result<OctAddr, String> {
+    if target_node == parent.node_id.as_str() {
+        return self_addr
+            .parent()
+            .ok_or_else(|| "joined at the root: no parent to administer".to_string());
+    }
+    let cache = cache
+        .ok_or_else(|| "admin target is not an ancestor of this client".to_string())?;
+    if cache.self_addr != *self_addr || cache.parent != parent.node_id.as_str() {
+        return Err("cached admin targets are stale; rediscover first".to_string());
+    }
+    let entry = cache
+        .entries
+        .iter()
+        .find(|entry| entry.node == target_node)
+        .ok_or_else(|| "admin target is not an ancestor of this client".to_string())?;
+    // Re-derive and require the cached address, so a stale or tampered cache can
+    // never point a request at the wrong node.
+    let expected = ancestor_address_at(self_addr, entry.depth)
+        .ok_or_else(|| "admin target is not an ancestor of this client".to_string())?;
+    if entry.addr != expected {
+        return Err("cached admin target address is not derivable".to_string());
+    }
+    Ok(entry.addr.clone())
+}
+
+/// Validate one authenticated ancestor-discovery reply and derive the next
+/// ancestor to query.
+///
+/// `self_addr` is the leaf's own assigned address; `depth` is the 1-based depth
+/// of the ancestor that answered; `expected_node` is the node id that was
+/// queried; `responder` is the node id that signed the reply. Fails closed
+/// unless the responder is the queried node, the snapshot names that same node,
+/// and the snapshot's asserted address is exactly the address derivable from
+/// `self_addr` at `depth`. On success returns the next ancestor to query (from
+/// the snapshot's parent link, itself address-checked), or `None` at the root.
+pub(crate) fn validate_ancestor_link(
+    self_addr: &OctAddr,
+    depth: usize,
+    expected_node: &str,
+    responder: &str,
+    snapshot: &NodeSnapshot,
+) -> Result<Option<AncestorEntry>, String> {
+    if responder != expected_node {
+        return Err("ancestor reply is not signed by the queried node".to_string());
+    }
+    if snapshot.node_id.as_str() != expected_node {
+        return Err("ancestor reply names a different node".to_string());
+    }
+    let derived = ancestor_addresses(self_addr);
+    if depth == 0 {
+        return Err("ancestor depth is not a strict ancestor of self".to_string());
+    }
+    let expected_addr = derived
+        .get(depth - 1)
+        .ok_or_else(|| "ancestor depth is not a strict ancestor of self".to_string())?;
+    if snapshot.address.as_ref() != Some(expected_addr) {
+        return Err("ancestor reply address does not match the derived address".to_string());
+    }
+    let Some(parent) = &snapshot.parent else {
+        // A node may only claim to be the root if it actually sits at `0`.
+        if !expected_addr.is_root() {
+            return Err("ancestor reply claims the root at a non-root address".to_string());
+        }
+        return Ok(None);
+    };
+    let next_depth = depth + 1;
+    let next_addr = derived
+        .get(depth)
+        .ok_or_else(|| "ancestor reply names a parent beyond the root".to_string())?;
+    if parent.address != *next_addr {
+        return Err("ancestor parent address does not match the derived address".to_string());
+    }
+    Ok(Some(AncestorEntry {
+        node: parent.node_id.as_str().to_string(),
+        addr: parent.address.clone(),
+        depth: next_depth,
+    }))
+}
+
+/// Resolve and own-sign one routed admin exchange.
+///
+/// Separated from the asynchronous network call so every fail-closed path is
+/// native-testable: an unjoined client (`joined == None`) has no address or
+/// parent and is refused here, before any sign or dial.
+pub(crate) fn prepare_admin_exchange(
+    self_node: &str,
+    operator: &OperatorSecretKey,
+    joined: Option<(OctAddr, ParentLink)>,
+    cache: Option<&AncestorCache>,
+    target_node: &str,
     request: ControlRequest,
-) -> Result<ControlReply, wasm_bindgen::JsError> {
-    let signed = sign_admin_request(target, admin, request)?;
-    exchange_control(endpoint, EndpointAddr::from(target), &signed).await
+) -> Result<(EndpointId, OctAddr, SignedControl), String> {
+    let (self_addr, parent) =
+        joined.ok_or_else(|| "not joined: no assigned address".to_string())?;
+    let target: EndpointId = target_node
+        .parse()
+        .map_err(|_| format!("invalid admin target node id '{target_node}'"))?;
+    let target_addr = ancestor_address(target_node, &self_addr, &parent, cache)?;
+    let intent = sign_own_control(self_node, operator, request)?;
+    Ok((target, target_addr, intent))
 }
 
 /// Build the tree-routed request payload for one control `intent` addressed to
 /// `target`.
 ///
-/// The request is carried by a single [`RoutedForward`] signed under the
-/// browser's **operator** key for `requester.node` — NOT the delegated admin
-/// key that may have signed `intent`. The first relay verifies that forward
-/// against its own child registry, which binds this browser node to its
-/// operator key; the delegated `K_admin` travels inside `intent.controller`
-/// and is checked end-to-end by the target.
+/// Under the P3 always-routed model the browser owns no delegated admin key:
+/// `intent` must already be **own-operator-signed** for `requester.node` (its
+/// `origin` is the requester and its `controller` is the requester's operator
+/// key). The single first-hop [`RoutedForward`] is signed by that same operator.
+/// The first relay verifies the forward against its own child registry, which
+/// binds the requester node to its operator key; the target re-derives the
+/// end-to-end requester from `intent.origin` for audit/value policy.
+///
+/// Fails closed if `intent` is not coherent with `requester`/`operator`, so a
+/// caller can never splice a delegated or mixed-key intent into the tree.
 ///
 /// Returns a plain [`String`] error (not [`wasm_bindgen::JsError`]) so every
 /// error path is testable on native targets; the wasm boundary wraps it with
@@ -556,6 +726,12 @@ pub(crate) fn build_routed_control(
     forward_nonce: u64,
     forward_expiry: u64,
 ) -> Result<RoutedControlV1, String> {
+    if intent.origin != NodeId::from(requester.node.clone()) {
+        return Err("routed control intent must originate at the requester".to_string());
+    }
+    if intent.controller != operator.public() {
+        return Err("routed control intent must be signed by the requester's operator".to_string());
+    }
     let forward = SignedControl::authorize(
         NodeId::from(requester.node.clone()),
         operator,
@@ -650,17 +826,6 @@ pub(crate) fn operator_key_from_node(node: &str) -> Result<OperatorPubKey, Strin
 /// not a parseable endpoint id.
 fn origin_binds_controller(signed: &SignedControl) -> bool {
     operator_key_from_node(signed.origin.as_str()).is_ok_and(|key| key == signed.controller)
-}
-
-/// Whether a failed *direct* admin exchange should be retried over the routed
-/// tree.
-///
-/// A delivered reply — including `Rejected(..)` — means the node answered, so
-/// the routed path must never run (the answer would be identical at best, and
-/// a fallback could mask a real authorization refusal). Only a transport
-/// failure (dial error, timeout, no route) is retried.
-pub(crate) fn should_try_routed<T, E>(direct: &Result<T, E>) -> bool {
-    direct.is_err()
 }
 
 /// Stable label for a reply, for logs.
@@ -763,12 +928,13 @@ mod tests {
         }
     }
 
-    /// A delegated-admin-signed intent addressed to `target_node`, mirroring
-    /// [`sign_admin_request`].
-    fn admin_intent(target_node: &str, admin: &OperatorSecretKey) -> SignedControl {
+    /// An own-operator-signed intent for `requester_node`, mirroring
+    /// [`sign_own_control`]: `origin` is the requester and `controller` is its
+    /// own operator key.
+    fn own_intent(requester_node: &str, operator: &OperatorSecretKey) -> SignedControl {
         SignedControl::authorize(
-            NodeId::from(target_node),
-            admin,
+            NodeId::from(requester_node),
+            operator,
             11,
             10_000,
             ControlRequest::AdminQuery,
@@ -794,12 +960,16 @@ mod tests {
     #[test]
     fn routed_control_builds_and_reply_round_trips() {
         let target_op = operator(7);
-        let admin_op = operator(9);
         let browser_op = operator(1);
         let target = peer("0.3", &target_op.public().to_string());
         let requester = peer("0.1.2", &browser_op.public().to_string());
 
-        let intent = admin_intent(&target.node, &admin_op);
+        // The browser signs the intent itself: origin == requester node and
+        // controller == the browser's own operator key.
+        let intent = own_intent(&requester.node, &browser_op);
+        assert_eq!(intent.origin, NodeId::from(requester.node.clone()));
+        assert_eq!(intent.controller, browser_op.public());
+
         let routed = build_routed_control(
             target.clone(),
             requester.clone(),
@@ -810,8 +980,8 @@ mod tests {
         )
         .expect("routed control builds");
 
-        // One forward and the forward is signed by the browser's operator key
-        // (not the delegated admin key in `intent`).
+        // One forward, signed by the browser's own operator key; the intent is
+        // coherent with it.
         assert_eq!(routed.forwards.len(), 1);
         assert_eq!(routed.forwards[0].hop, requester);
         assert_eq!(
@@ -820,7 +990,7 @@ mod tests {
         );
         assert_eq!(routed.forwards[0].signed.controller, browser_op.public());
         assert_eq!(routed.forwards[0].signed.request, routed.intent.request);
-        assert_ne!(routed.intent.controller, browser_op.public());
+        assert_eq!(routed.intent.controller, browser_op.public());
         assert_eq!(routed.validate(), Ok(()));
 
         let payload = routed.to_bytes().expect("routed payload encodes");
@@ -846,6 +1016,212 @@ mod tests {
         assert_eq!(verified.reply.requester, requester);
         assert_eq!(verified.reply.responder, target);
         assert_eq!(verified.reply.reply, ControlReply::Accepted);
+    }
+
+    /// The own-operator rule is enforced while building the routed frame: a
+    /// foreign-key intent or one addressed to a different origin is refused.
+    #[test]
+    fn own_operator_signs_intent_and_forward() {
+        let browser_op = operator(1);
+        let other_op = operator(2);
+        let target = peer("0.7", &operator(9).public().to_string());
+        let requester = peer("0.1.2", &browser_op.public().to_string());
+
+        // Correct: intent and forward are both signed by the browser's operator.
+        let routed = build_routed_control(
+            target.clone(),
+            requester.clone(),
+            own_intent(&requester.node, &browser_op),
+            &browser_op,
+            1,
+            9_000,
+        )
+        .expect("own-operator routed control builds");
+        assert_eq!(routed.intent.origin, NodeId::from(requester.node.clone()));
+        assert_eq!(routed.intent.controller, browser_op.public());
+        assert_eq!(routed.forwards[0].signed.controller, browser_op.public());
+
+        // An intent signed by a foreign key (a delegated admin) is refused: the
+        // browser owns no such key any more.
+        assert!(
+            build_routed_control(
+                target.clone(),
+                requester.clone(),
+                own_intent(&requester.node, &other_op),
+                &browser_op,
+                1,
+                9_000,
+            )
+            .is_err()
+        );
+
+        // An intent originating somewhere else is refused too.
+        let other_requester = peer("0.1.3", &other_op.public().to_string());
+        assert!(
+            build_routed_control(
+                target,
+                requester,
+                own_intent(&other_requester.node, &browser_op),
+                &browser_op,
+                1,
+                9_000,
+            )
+            .is_err()
+        );
+    }
+
+    /// Ancestor addresses are derived purely from the leaf's own address and a
+    /// non-ancestor target is refused.
+    #[test]
+    fn ancestor_addresses_derive_from_self_address() {
+        let self_addr: OctAddr = "0.1.3".parse().expect("sample address parses");
+        assert_eq!(
+            ancestor_addresses(&self_addr),
+            vec![
+                "0.1".parse::<OctAddr>().unwrap(),
+                "0".parse::<OctAddr>().unwrap(),
+            ]
+        );
+        assert_eq!(
+            ancestor_address_at(&self_addr, 1),
+            Some("0.1".parse().unwrap())
+        );
+        assert_eq!(ancestor_address_at(&self_addr, 2), Some("0".parse().unwrap()));
+        // At or below the leaf is not an ancestor.
+        assert_eq!(ancestor_address_at(&self_addr, 0), None);
+        assert_eq!(ancestor_address_at(&self_addr, 3), None);
+
+        let parent = ParentLink {
+            node_id: NodeId::from("parent-node"),
+            slot: 3,
+        };
+        // The direct parent resolves from the known link alone.
+        assert_eq!(
+            ancestor_address("parent-node", &self_addr, &parent, None).unwrap(),
+            "0.1".parse::<OctAddr>().unwrap()
+        );
+        // A target that is neither the parent nor a cached ancestor is refused.
+        assert!(ancestor_address("0.2", &self_addr, &parent, None).is_err());
+        assert!(ancestor_address("unrelated", &self_addr, &parent, None).is_err());
+    }
+
+    /// A discovery reply is accepted only when the responder/node id and the
+    /// asserted address all agree with the derived ancestor, and the next
+    /// ancestor is derived from the (address-checked) parent link.
+    #[test]
+    fn discovery_binds_ancestor_id_to_address() {
+        use cawala_control::ParentSnapshot;
+
+        let self_addr: OctAddr = "0.1.3".parse().expect("sample address parses");
+        let parent_snapshot = NodeSnapshot {
+            node_id: NodeId::from("parent-node"),
+            address: Some("0.1".parse().expect("parent address parses")),
+            parent: Some(ParentSnapshot {
+                node_id: NodeId::from("root-node"),
+                slot: 1,
+                address: "0".parse().expect("root address parses"),
+            }),
+            children: vec![],
+        };
+
+        let next = validate_ancestor_link(
+            &self_addr,
+            1,
+            "parent-node",
+            "parent-node",
+            &parent_snapshot,
+        )
+        .expect("a well-formed reply is accepted");
+        assert_eq!(
+            next,
+            Some(AncestorEntry {
+                node: "root-node".to_string(),
+                addr: "0".parse().unwrap(),
+                depth: 2,
+            })
+        );
+
+        // A reply signed by a different node is refused.
+        assert!(
+            validate_ancestor_link(&self_addr, 1, "parent-node", "attacker", &parent_snapshot)
+                .is_err()
+        );
+
+        // A reply that names a node other than the queried one is refused.
+        let mut wrong_node = parent_snapshot.clone();
+        wrong_node.node_id = NodeId::from("other-node");
+        assert!(
+            validate_ancestor_link(&self_addr, 1, "parent-node", "parent-node", &wrong_node)
+                .is_err()
+        );
+
+        // A reply asserting an address that is not derivable is refused.
+        let mut wrong_addr = parent_snapshot.clone();
+        wrong_addr.address = Some("0.2".parse().unwrap());
+        assert!(
+            validate_ancestor_link(&self_addr, 1, "parent-node", "parent-node", &wrong_addr)
+                .is_err()
+        );
+
+        // A parent link whose address is not the next derived ancestor is refused.
+        let mut wrong_next = parent_snapshot.clone();
+        wrong_next.parent = Some(ParentSnapshot {
+            node_id: NodeId::from("root-node"),
+            slot: 1,
+            address: "0.7".parse().unwrap(),
+        });
+        assert!(
+            validate_ancestor_link(&self_addr, 1, "parent-node", "parent-node", &wrong_next)
+                .is_err()
+        );
+    }
+
+    /// A snapshot with no parent is the root: the walk stops.
+    #[test]
+    fn discovery_stops_at_root() {
+        let self_addr: OctAddr = "0.1.3".parse().expect("sample address parses");
+        let root_snapshot = NodeSnapshot {
+            node_id: NodeId::from("root-node"),
+            address: Some("0".parse().expect("root address parses")),
+            parent: None,
+            children: vec![],
+        };
+        assert_eq!(
+            validate_ancestor_link(&self_addr, 2, "root-node", "root-node", &root_snapshot)
+                .expect("a root reply is accepted"),
+            None
+        );
+
+        // A node that claims to be the root while sitting at a non-root address
+        // is refused.
+        let lying = NodeSnapshot {
+            node_id: NodeId::from("mid-node"),
+            address: Some("0.1".parse().expect("address parses")),
+            parent: None,
+            children: vec![],
+        };
+        assert!(
+            validate_ancestor_link(&self_addr, 1, "mid-node", "mid-node", &lying).is_err()
+        );
+    }
+
+    /// An unjoined client has no address/parent, so an admin exchange is
+    /// refused before any signing or dialing.
+    #[test]
+    fn admin_exchange_fails_closed_unjoined() {
+        let operator = operator(1);
+        assert!(
+            prepare_admin_exchange(
+                "self-node",
+                &operator,
+                None,
+                None,
+                "target-node",
+                ControlRequest::AdminQuery,
+            )
+            .is_err(),
+            "an unjoined client must fail closed"
+        );
     }
 
     #[test]
@@ -928,19 +1304,6 @@ mod tests {
         .expect("reply signs");
         let bytes = wrong_requester.to_bytes().expect("reply encodes");
         assert!(verify_routed_reply_bytes(&bytes, msg_id, &target, &requester).is_err());
-    }
-
-    #[test]
-    fn fallback_only_on_transport_error() {
-        let transport: Result<ControlReply, &str> = Err("dial failed");
-        assert!(should_try_routed(&transport));
-
-        let refused: Result<ControlReply, &str> =
-            Ok(ControlReply::Rejected(RejectCode::Unauthorized));
-        assert!(!should_try_routed(&refused));
-
-        let accepted: Result<ControlReply, &str> = Ok(ControlReply::Accepted);
-        assert!(!should_try_routed(&accepted));
     }
 
     // ── M5 exit rights (format 4): Rebase / DetachNotice ─────────────

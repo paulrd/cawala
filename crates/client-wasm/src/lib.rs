@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 use cawala_control::{
     AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminMoveChild, AdminRedeliverJoin,
     AdminValueRequest, CONTROL_ALPN, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply,
-    ControlRequest, ExitRequest, Invite, JoinRequest, NodeId, OperatorSecretKey, RejectCode,
-    SignedControl,
+    ControlRequest, DesignationChange, ExitRequest, Invite, JoinRequest, NodeId,
+    OperatorSecretKey, RejectCode, SignedControl,
 };
 use cawala_msg::{
     Ack, AckStatus, BalanceQueryV1, Envelope, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
@@ -48,14 +48,15 @@ pub mod ledger_state;
 pub mod state;
 
 use crate::control::{
-    ControlHandler, JOIN_TTL_SECONDS, ROUTED_REPLY_TIMEOUT_SECS, SharedControl,
-    build_routed_control, exchange_admin, exchange_control, invite_endpoint_addr,
-    routed_request_envelope, should_try_routed, sign_admin_request, verify_routed_reply_bytes,
+    AncestorCache, AncestorEntry, ControlHandler, JOIN_TTL_SECONDS, ROUTED_REPLY_TIMEOUT_SECS,
+    SharedControl, build_routed_control, exchange_control, invite_endpoint_addr,
+    prepare_admin_exchange, routed_request_envelope, validate_ancestor_link,
+    verify_routed_reply_bytes,
 };
 use crate::dto::{
-    AdminActionDto, AdminLedgerSnapshotDto, AdminSnapshotDto, AdminValueAppliedDto, ControlEventDto,
-    JoinOutcome, JoinStatus, LeaveOutcome, LedgerEventDto, LedgerStatusDto, PaymentOutcome,
-    SnapshotDto, parse_operator_hex, parse_request_id_hex, reject_code_str,
+    AdminActionDto, AdminLedgerSnapshotDto, AdminSnapshotDto, AdminTargetDto, AdminValueAppliedDto,
+    ControlEventDto, JoinOutcome, JoinStatus, LeaveOutcome, LedgerEventDto, LedgerStatusDto,
+    PaymentOutcome, SnapshotDto, parse_operator_hex, parse_request_id_hex, reject_code_str,
 };
 use crate::ledger_state::LedgerStateV1;
 use crate::state::{LocalStateV1, ParentLink, Transition};
@@ -899,53 +900,23 @@ impl ClientNode {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clear_parent_binding();
+            // The link is gone: drop any discovered ancestor chain with it.
+            self.control.clear_ancestors();
             self.control
                 .push_event(ControlEventDto::detached(&parent.node_id));
         }
         Ok(LeaveOutcome::new(delivery))
     }
 
-    /// Install a delegated admin key (K_admin) used by the `admin_*` methods.
-    ///
-    /// `secret_key` must be exactly 32 bytes (an Ed25519 seed). The key is held
-    /// in memory only: it is **never** persisted on the Rust side and never
-    /// enters [`ClientNode::export_state`]/[`ClientNode::export_ledger_state`].
-    /// The PWA owns its storage.
-    pub fn set_admin_key(&self, secret_key: &[u8]) -> Result<(), JsError> {
-        let seed: [u8; 32] = secret_key
-            .try_into()
-            .map_err(|_| JsError::new("admin key must be exactly 32 bytes"))?;
-        self.control
-            .set_admin(Some(OperatorSecretKey::from_bytes(seed)));
-        Ok(())
-    }
-
-    /// Forget the delegated admin key, if any.
-    pub fn clear_admin_key(&self) {
-        self.control.set_admin(None);
-    }
-
-    /// The configured admin public key as 64 lowercase hex characters, or
-    /// `None` when no admin key is set.
-    pub fn admin_public_key(&self) -> Option<String> {
-        self.control.admin_key().map(|key| key.public().to_string())
-    }
-
     /// Query `node`'s admin snapshot (its topology plus pending joins).
     ///
-    /// `node` is the target's endpoint id. Requires a configured admin key.
-    /// When `node_addr` is `None` the node is dialed directly over
-    /// `cawala/control/0`; when it is `Some`, a failed direct dial (transport
-    /// error only) is retried over the routed tree using `node_addr` as the
-    /// target's asserted address.
-    pub async fn admin_query(
-        &self,
-        node: String,
-        node_addr: Option<String>,
-    ) -> Result<AdminSnapshotDto, JsError> {
-        let reply = self
-            .admin_exchange(&node, ControlRequest::AdminQuery, node_addr)
-            .await?;
+    /// `node` is the target's endpoint id. The request is always tree-routed
+    /// over the authenticated parent link: the browser signs with its **own**
+    /// operator key and the target address is derived from this client's
+    /// assigned address (see [`ClientNode::admin_exchange`]). The browser must
+    /// be a designated administrator of the target for it to answer.
+    pub async fn admin_query(&self, node: String) -> Result<AdminSnapshotDto, JsError> {
+        let reply = self.admin_exchange(&node, ControlRequest::AdminQuery).await?;
         match reply {
             ControlReply::AdminSnapshot(snapshot) => Ok(AdminSnapshotDto::from_snapshot(&snapshot)),
             ControlReply::Rejected(code) => Err(admin_rejected(code)),
@@ -955,18 +926,17 @@ impl ClientNode {
 
     /// Query `node`'s read-only ledger view (accounts, parent balance, equity).
     ///
-    /// Requires a configured admin key holding the `value` scope (or the
-    /// node's own operator). `node_addr` optionally names `node`'s asserted
-    /// address for the routed fallback; see [`ClientNode::admin_query`].
+    /// Requires the browser's own operator key to hold the `value` authority
+    /// (or be the node's own operator). See [`ClientNode::admin_query`] for the
+    /// always-routed exchange.
     ///
     /// This is read-only: the node never mutates its ledger to answer.
     pub async fn admin_ledger_query(
         &self,
         node: String,
-        node_addr: Option<String>,
     ) -> Result<AdminLedgerSnapshotDto, JsError> {
         let reply = self
-            .admin_exchange(&node, ControlRequest::AdminLedgerQuery, node_addr)
+            .admin_exchange(&node, ControlRequest::AdminLedgerQuery)
             .await?;
         match reply {
             ControlReply::AdminLedgerSnapshot(snapshot) => {
@@ -979,18 +949,16 @@ impl ClientNode {
 
     /// Approve `child`'s pending join at `node`, optionally assigning `slot`.
     ///
-    /// `node_addr` optionally names `node`'s asserted address for the routed
-    /// fallback; see [`ClientNode::admin_query`].
+    /// Always routed; see [`ClientNode::admin_query`].
     pub async fn admin_approve_join(
         &self,
         node: String,
         child: String,
         slot: Option<u8>,
-        node_addr: Option<String>,
     ) -> Result<AdminActionDto, JsError> {
         let child = parse_child(&child)?;
         let request = ControlRequest::AdminApproveJoin(AdminJoinApprove { child, slot });
-        let reply = self.admin_exchange(&node, request, node_addr).await?;
+        let reply = self.admin_exchange(&node, request).await?;
         match reply {
             ControlReply::AdminApproved(approved) => Ok(AdminActionDto::from_approved(&approved)),
             ControlReply::AdminRejected(rejected) => Ok(AdminActionDto::from_rejected(&rejected)),
@@ -1001,18 +969,16 @@ impl ClientNode {
 
     /// Reject `child`'s pending join at `node`, optionally carrying `reason`.
     ///
-    /// `node_addr` optionally names `node`'s asserted address for the routed
-    /// fallback; see [`ClientNode::admin_query`].
+    /// Always routed; see [`ClientNode::admin_query`].
     pub async fn admin_reject_join(
         &self,
         node: String,
         child: String,
         reason: Option<String>,
-        node_addr: Option<String>,
     ) -> Result<AdminActionDto, JsError> {
         let child = parse_child(&child)?;
         let request = ControlRequest::AdminRejectJoin(AdminJoinReject { child, reason });
-        let reply = self.admin_exchange(&node, request, node_addr).await?;
+        let reply = self.admin_exchange(&node, request).await?;
         match reply {
             ControlReply::AdminApproved(approved) => Ok(AdminActionDto::from_approved(&approved)),
             ControlReply::AdminRejected(rejected) => Ok(AdminActionDto::from_rejected(&rejected)),
@@ -1023,17 +989,15 @@ impl ClientNode {
 
     /// Re-send `child`'s most recent stored decision from `node`.
     ///
-    /// `node_addr` optionally names `node`'s asserted address for the routed
-    /// fallback; see [`ClientNode::admin_query`].
+    /// Always routed; see [`ClientNode::admin_query`].
     pub async fn admin_redeliver_join(
         &self,
         node: String,
         child: String,
-        node_addr: Option<String>,
     ) -> Result<AdminActionDto, JsError> {
         let child = parse_child(&child)?;
         let request = ControlRequest::AdminRedeliverJoin(AdminRedeliverJoin { child });
-        let reply = self.admin_exchange(&node, request, node_addr).await?;
+        let reply = self.admin_exchange(&node, request).await?;
         match reply {
             ControlReply::AdminApproved(approved) => Ok(AdminActionDto::from_approved(&approved)),
             ControlReply::AdminRejected(rejected) => Ok(AdminActionDto::from_rejected(&rejected)),
@@ -1042,21 +1006,19 @@ impl ClientNode {
         }
     }
 
-    /// Detach `child` from `node` (topology scope).
+    /// Detach `child` from `node` (topology authority).
     ///
-    /// `node_addr` optionally names `node`'s asserted address for the routed
-    /// fallback; see [`ClientNode::admin_query`]. Returns `Ok(())` on
+    /// Always routed; see [`ClientNode::admin_query`]. Returns `Ok(())` on
     /// [`ControlReply::Accepted`]; a refusal maps to the stable
     /// `"admin request rejected: <code>"` error.
     pub async fn admin_detach_child(
         &self,
         node: String,
         child: String,
-        node_addr: Option<String>,
     ) -> Result<(), JsError> {
         let child = parse_child(&child)?;
         let request = ControlRequest::AdminDetachChild(AdminDetachChild { child });
-        let reply = self.admin_exchange(&node, request, node_addr).await?;
+        let reply = self.admin_exchange(&node, request).await?;
         match reply {
             ControlReply::Accepted => Ok(()),
             ControlReply::Rejected(code) => Err(admin_rejected(code)),
@@ -1064,11 +1026,10 @@ impl ClientNode {
         }
     }
 
-    /// Re-slot `child` under `node` (topology scope). `slot` of `None` asks the
-    /// node to pick the lowest free slot.
+    /// Re-slot `child` under `node` (topology authority). `slot` of `None` asks
+    /// the node to pick the lowest free slot.
     ///
-    /// `node_addr` optionally names `node`'s asserted address for the routed
-    /// fallback; see [`ClientNode::admin_query`]. Returns `Ok(())` on
+    /// Always routed; see [`ClientNode::admin_query`]. Returns `Ok(())` on
     /// [`ControlReply::Accepted`]; a refusal maps to the stable
     /// `"admin request rejected: <code>"` error.
     pub async fn admin_move_child(
@@ -1076,11 +1037,10 @@ impl ClientNode {
         node: String,
         child: String,
         slot: Option<u8>,
-        node_addr: Option<String>,
     ) -> Result<(), JsError> {
         let child = parse_child(&child)?;
         let request = ControlRequest::AdminMoveChild(AdminMoveChild { child, slot });
-        let reply = self.admin_exchange(&node, request, node_addr).await?;
+        let reply = self.admin_exchange(&node, request).await?;
         match reply {
             ControlReply::Accepted => Ok(()),
             ControlReply::Rejected(code) => Err(admin_rejected(code)),
@@ -1088,12 +1048,43 @@ impl ClientNode {
         }
     }
 
-    /// Issue `amount` into `account` at `node` (value scope).
+    /// Designate `child` as an administrator of `node` (topology authority).
+    ///
+    /// `child` may be a child node or a leaf; it must already be a current child
+    /// of `node`. Always routed; the authenticated last hop must itself be a
+    /// current designated administrator of `node`. Returns `Ok(())` on
+    /// [`ControlReply::Accepted`]; a refusal maps to the stable
+    /// `"admin request rejected: <code>"` error.
+    pub async fn admin_designate(&self, node: String, child: String) -> Result<(), JsError> {
+        let request = designation_request(&child, true).map_err(to_js_err)?;
+        let reply = self.admin_exchange(&node, request).await?;
+        match reply {
+            ControlReply::Accepted => Ok(()),
+            ControlReply::Rejected(code) => Err(admin_rejected(code)),
+            _ => Err(unexpected_admin_reply("an admin designation")),
+        }
+    }
+
+    /// Revoke `child`'s administrator designation at `node` (topology
+    /// authority).
+    ///
+    /// Always routed; see [`ClientNode::admin_designate`].
+    pub async fn admin_revoke(&self, node: String, child: String) -> Result<(), JsError> {
+        let request = designation_request(&child, false).map_err(to_js_err)?;
+        let reply = self.admin_exchange(&node, request).await?;
+        match reply {
+            ControlReply::Accepted => Ok(()),
+            ControlReply::Rejected(code) => Err(admin_rejected(code)),
+            _ => Err(unexpected_admin_reply("an admin revocation")),
+        }
+    }
+
+    /// Issue `amount` into `account` at `node` (value authority).
     ///
     /// `request_id_hex` is the client idempotency key (32 hex chars); the node
-    /// derives its ledger nonce. `node_addr` optionally names `node`'s asserted
-    /// address for the routed fallback; see [`ClientNode::admin_query`].
-    #[allow(clippy::too_many_arguments)]
+    /// derives its ledger nonce. Always routed; the browser's own operator key
+    /// must be listed in the target's `value_policy.json`. See
+    /// [`ClientNode::admin_query`].
     pub async fn admin_issue(
         &self,
         node: String,
@@ -1101,7 +1092,6 @@ impl ClientNode {
         account: String,
         amount: u64,
         reason: String,
-        node_addr: Option<String>,
     ) -> Result<AdminValueAppliedDto, JsError> {
         let request_id = parse_request_id_hex(&request_id_hex).map_err(to_js_err)?;
         let account = parse_child(&account)?;
@@ -1111,7 +1101,7 @@ impl ClientNode {
             amount,
             reason,
         });
-        let reply = self.admin_exchange(&node, request, node_addr).await?;
+        let reply = self.admin_exchange(&node, request).await?;
         match reply {
             ControlReply::AdminValueApplied(applied) => {
                 Ok(AdminValueAppliedDto::from_applied(&applied))
@@ -1121,12 +1111,10 @@ impl ClientNode {
         }
     }
 
-    /// Burn `amount` from `account` at `node` (value scope).
+    /// Burn `amount` from `account` at `node` (value authority).
     ///
     /// `request_id_hex` is the client idempotency key (32 hex chars); the node
-    /// derives its ledger nonce. `node_addr` optionally names `node`'s asserted
-    /// address for the routed fallback; see [`ClientNode::admin_query`].
-    #[allow(clippy::too_many_arguments)]
+    /// derives its ledger nonce. Always routed; see [`ClientNode::admin_issue`].
     pub async fn admin_burn(
         &self,
         node: String,
@@ -1134,7 +1122,6 @@ impl ClientNode {
         account: String,
         amount: u64,
         reason: String,
-        node_addr: Option<String>,
     ) -> Result<AdminValueAppliedDto, JsError> {
         let request_id = parse_request_id_hex(&request_id_hex).map_err(to_js_err)?;
         let account = parse_child(&account)?;
@@ -1144,7 +1131,7 @@ impl ClientNode {
             amount,
             reason,
         });
-        let reply = self.admin_exchange(&node, request, node_addr).await?;
+        let reply = self.admin_exchange(&node, request).await?;
         match reply {
             ControlReply::AdminValueApplied(applied) => {
                 Ok(AdminValueAppliedDto::from_applied(&applied))
@@ -1154,38 +1141,173 @@ impl ClientNode {
         }
     }
 
-    /// Run one admin request: direct first, routed fallback only on a
-    /// **transport** failure.
+    /// Run one admin request, always over the routing tree.
     ///
-    /// With `node_addr == None` this is exactly the old direct exchange,
-    /// including its error. With `Some`, a failed direct dial (dial error,
-    /// timeout, no route) is retried over the routed tree; a delivered
-    /// `Rejected(..)` reply means the node answered and is never retried.
+    /// The browser resolves its own operator key and joined context, derives
+    /// the target's asserted address from its own assigned address (the direct
+    /// parent from the known [`ParentLink`], higher ancestors from the cached
+    /// discovery chain), signs an **own-operator** intent, and hands it to
+    /// [`ClientNode::exchange_routed_control`]. There is no direct dial and no
+    /// fallback. An unjoined client, or a target that is not a strict ancestor,
+    /// fails closed before any sign or dial.
     async fn admin_exchange(
         &self,
         node: &str,
         request: ControlRequest,
-        node_addr: Option<String>,
     ) -> Result<ControlReply, JsError> {
-        let (target, admin) = self.admin_context(node)?;
-        let direct = exchange_admin(self.router.endpoint(), target, &admin, request.clone()).await;
-
-        if !should_try_routed(&direct) {
-            return direct;
-        }
-        let Some(raw_addr) = node_addr else {
-            // No target address supplied: preserve the exact direct error and
-            // never fall back.
-            return direct;
+        let operator = self
+            .control
+            .operator
+            .clone()
+            .ok_or_else(|| JsError::new("client has no control identity; use spawn_control"))?;
+        let joined = {
+            let state = self.control.lock_state();
+            match (state.record.address.clone(), state.record.parent.clone()) {
+                (Some(addr), Some(parent)) => Some((addr, parent)),
+                _ => None,
+            }
         };
-        let target_addr: OctAddr = raw_addr.parse().map_err(to_js_err)?;
-        // The routed intent is signed exactly like the direct request: origin
-        // is the target (the destination engine requires `origin == self`) and
-        // the controller is the delegated admin key. The per-hop forward is
-        // signed separately with this browser's operator key.
-        let intent = sign_admin_request(target, &admin, request)?;
+        let cache = self.control.cached_ancestors();
+        let (target, target_addr, intent) = prepare_admin_exchange(
+            self.control.node_id(),
+            &operator,
+            joined,
+            cache.as_ref(),
+            node,
+            request,
+        )
+        .map_err(to_js_err)?;
         self.exchange_routed_control(target, target_addr, intent)
             .await
+    }
+
+    /// Walk the strict ancestor chain and refresh the cached admin targets.
+    ///
+    /// Each step sends an own-operator-signed [`ControlRequest::Query`] over the
+    /// tree, one authenticated reply at a time: the queried ancestor's
+    /// `snapshot.parent` supplies the next node id/address, the claimed address
+    /// is required to equal the address derivable from this leaf's own assigned
+    /// address, and the next reply must be signed by that node id. The walk
+    /// stops at the root (`parent == None`). A malicious parent can misdirect
+    /// the walk, but every id/address/signature check fails closed.
+    ///
+    /// Because `Query` is authority-gated, the browser must be a **designated
+    /// administrator of its direct parent** to walk at all.
+    ///
+    /// The result is cached in [`SharedControl`] keyed on `(self_addr, parent
+    /// id)` and is cleared on join, detach, and leave.
+    async fn discover_ancestors(&self) -> Result<(), JsError> {
+        let (self_addr, parent) = self.joined_context()?;
+        let parent_id = parent.node_id.as_str().to_string();
+
+        // A cache for the current link is authoritative; do not re-walk.
+        if let Some(cache) = self.control.cached_ancestors()
+            && cache.self_addr == self_addr
+            && cache.parent == parent_id
+        {
+            return Ok(());
+        }
+
+        let operator = self
+            .control
+            .operator
+            .clone()
+            .ok_or_else(|| JsError::new("client has no control identity; use spawn_control"))?;
+        let mut entries: Vec<AncestorEntry> = Vec::new();
+        let mut depth = 1usize;
+        let mut expected_node = parent_id.clone();
+        let mut expected_addr = self_addr
+            .parent()
+            .ok_or_else(|| JsError::new("joined at the root: nothing to discover"))?;
+
+        loop {
+            let target: EndpointId = expected_node.parse().map_err(to_js_err)?;
+            let intent = crate::control::sign_own_control(
+                self.control.node_id(),
+                &operator,
+                ControlRequest::Query,
+            )
+            .map_err(to_js_err)?;
+            let reply = self
+                .exchange_routed_control(target, expected_addr.clone(), intent)
+                .await?;
+            let snapshot = match reply {
+                ControlReply::Snapshot(snapshot) => snapshot,
+                ControlReply::Rejected(code) => {
+                    return Err(JsError::new(&format!(
+                        "ancestor discovery refused: {}",
+                        reject_code_str(code)
+                    )));
+                }
+                _ => return Err(JsError::new("unexpected reply to an ancestor query")),
+            };
+            // The routed reply is already verified under `expected_node`'s
+            // operator key, so the responder is that node; bind it to the
+            // asserted address and derive the next ancestor.
+            let next = validate_ancestor_link(
+                &self_addr,
+                depth,
+                &expected_node,
+                &expected_node,
+                &snapshot,
+            )
+            .map_err(to_js_err)?;
+            entries.push(AncestorEntry {
+                node: expected_node.clone(),
+                addr: expected_addr.clone(),
+                depth,
+            });
+            match next {
+                Some(next) => {
+                    expected_node = next.node;
+                    expected_addr = next.addr;
+                    depth += 1;
+                }
+                None => break,
+            }
+        }
+
+        self.control.store_ancestors(AncestorCache {
+            self_addr,
+            parent: parent_id,
+            entries,
+        });
+        Ok(())
+    }
+
+    /// Walk (and cache) the administrable ancestor targets for R7's up/down
+    /// traversal. Requires a designated-admin link to the direct parent.
+    pub async fn discover_admin_targets(&self) -> Result<Vec<AdminTargetDto>, JsError> {
+        self.discover_ancestors().await?;
+        Ok(self.admin_targets())
+    }
+
+    /// The cached administrable ancestor targets, without walking.
+    ///
+    /// Returns an empty list when no walk has completed for the current link,
+    /// so P4 can render "not yet discovered" without a network call.
+    pub fn admin_targets(&self) -> Vec<AdminTargetDto> {
+        let joined = {
+            let state = self.control.lock_state();
+            match (state.record.address.clone(), state.record.parent.clone()) {
+                (Some(addr), Some(parent)) => Some((addr, parent)),
+                _ => None,
+            }
+        };
+        let Some((self_addr, parent)) = joined else {
+            return Vec::new();
+        };
+        let Some(cache) = self.control.cached_ancestors() else {
+            return Vec::new();
+        };
+        if cache.self_addr != self_addr || cache.parent != parent.node_id.as_str() {
+            return Vec::new();
+        }
+        cache
+            .entries
+            .iter()
+            .map(AdminTargetDto::from_entry)
+            .collect()
     }
 
     /// Send `intent` to `target` over the routing tree and await its verified
@@ -1306,16 +1428,6 @@ impl ClientNode {
         )
         .await
         .map_err(|_| JsError::new("routed control request timed out"))?
-    }
-
-    /// Require a configured admin key and parse the target node id.
-    fn admin_context(&self, node: &str) -> Result<(EndpointId, OperatorSecretKey), JsError> {
-        let admin = self
-            .control
-            .admin_key()
-            .ok_or_else(|| JsError::new("no admin key configured; call set_admin_key first"))?;
-        let target: EndpointId = node.parse().map_err(to_js_err)?;
-        Ok((target, admin))
     }
 
     /// A snapshot of this client's local topology (address, parent, children).
@@ -1980,6 +2092,24 @@ fn parse_child(raw: &str) -> Result<NodeId, JsError> {
     Ok(NodeId::from(endpoint.to_string()))
 }
 
+/// Build an [`AdminDesignate`](ControlRequest::AdminDesignate) or
+/// [`AdminRevoke`](ControlRequest::AdminRevoke) request for `child`.
+///
+/// Separated from the wasm method so the variant mapping is native-testable.
+/// `child` is validated as a real endpoint id and normalized, matching the rest
+/// of the admin surface.
+pub(crate) fn designation_request(child: &str, designate: bool) -> Result<ControlRequest, String> {
+    let endpoint: EndpointId = child
+        .parse()
+        .map_err(|_| format!("invalid child node id '{child}'"))?;
+    let child = NodeId::from(endpoint.to_string()).as_str().to_string();
+    Ok(if designate {
+        ControlRequest::AdminDesignate(DesignationChange { child })
+    } else {
+        ControlRequest::AdminRevoke(DesignationChange { child })
+    })
+}
+
 /// Map an admin reply rejection to a JS error carrying the stable code string.
 fn admin_rejected(code: RejectCode) -> JsError {
     JsError::new(&format!(
@@ -2144,5 +2274,27 @@ mod tests {
         );
         assert!(sink_rx.try_recv().is_err());
         assert!(control_rx.try_recv().is_err());
+    }
+
+    /// `admin_designate`/`admin_revoke` map to the new remote designation
+    /// variants, with the child normalized to a canonical endpoint id.
+    #[test]
+    fn admin_designate_revoke_map_to_new_variants() {
+        let child = OperatorSecretKey::from_bytes([5u8; 32]).public().to_string();
+
+        let designate = designation_request(&child, true).expect("child parses");
+        match designate {
+            ControlRequest::AdminDesignate(change) => assert_eq!(change.child, child),
+            other => panic!("expected AdminDesignate, got {other:?}"),
+        }
+
+        let revoke = designation_request(&child, false).expect("child parses");
+        match revoke {
+            ControlRequest::AdminRevoke(change) => assert_eq!(change.child, child),
+            other => panic!("expected AdminRevoke, got {other:?}"),
+        }
+
+        // A non-endpoint child id is refused before any request is built.
+        assert!(designation_request("not-a-node", true).is_err());
     }
 }
