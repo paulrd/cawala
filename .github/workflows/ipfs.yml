@@ -1,0 +1,183 @@
+# Publishes the web app (web/dist) to IPFS on `v*` tags and pins it to the
+# configured provider(s), giving the app a provider-independent static mirror.
+# The publish job is skipped (workflow still succeeds) when no pinning
+# credentials are configured.
+#
+# Repository secrets - configure at least one provider:
+#   PINATA_JWT_TOKEN              Pinata V3 API JWT (Files: write)
+#   KUBO_API_URL, KUBO_API_AUTH   your own Kubo RPC URL + `basic:user:pass`
+# Optional DNSLink (keep it under your own domain):
+#   CF_DNS_ZONE_ID, CF_DNS_AUTH_TOKEN  + repository variable IPFS_DNSLINK_DOMAIN
+#
+# CIDv1 via the `unixfs-v1-2025` profile (+ the same Kubo version) makes the
+# root CID deterministic and valid as a subdomain-gateway label, which is what
+# gives the PWA its own origin/service-worker scope on the mirror.
+name: Publish web app to IPFS
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preflight:
+    name: detect pinning credentials
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+      pinata: ${{ steps.check.outputs.pinata }}
+      kubo: ${{ steps.check.outputs.kubo }}
+      dnslink: ${{ steps.check.outputs.dnslink }}
+    steps:
+      - id: check
+        env:
+          PINATA_JWT_TOKEN: ${{ secrets.PINATA_JWT_TOKEN }}
+          KUBO_API_URL: ${{ secrets.KUBO_API_URL }}
+          KUBO_API_AUTH: ${{ secrets.KUBO_API_AUTH }}
+          CF_DNS_ZONE_ID: ${{ secrets.CF_DNS_ZONE_ID }}
+          CF_DNS_AUTH_TOKEN: ${{ secrets.CF_DNS_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          pinata=false; [ -n "$PINATA_JWT_TOKEN" ] && pinata=true
+          kubo=false; [ -n "$KUBO_API_URL" ] && [ -n "$KUBO_API_AUTH" ] && kubo=true
+          dnslink=false
+          [ -n "$CF_DNS_ZONE_ID" ] && [ -n "$CF_DNS_AUTH_TOKEN" ] && dnslink=true
+          enabled=false
+          if [ "$pinata" = true ] || [ "$kubo" = true ]; then enabled=true; fi
+          {
+            echo "enabled=$enabled"
+            echo "pinata=$pinata"
+            echo "kubo=$kubo"
+            echo "dnslink=$dnslink"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$enabled" = false ]; then
+            echo "::notice::No IPFS pinning credentials configured; skipping publish job."
+          fi
+
+  publish:
+    name: publish web/dist to IPFS
+    needs: preflight
+    if: needs.preflight.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen-cli 0.2.122
+        run: cargo install wasm-bindgen-cli --version 0.2.122
+
+      - name: Install npm dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build web app (wasm + vite)
+        working-directory: web
+        run: npm run build
+
+      - name: Install Kubo
+        uses: ipfs/download-ipfs-distribution-action@v2
+        with:
+          name: kubo
+          version: v0.43.1
+
+      - name: Compute deterministic CIDv1 + export CAR
+        id: ipfs
+        run: |
+          set -euo pipefail
+          ipfs init
+          ipfs config profile apply unixfs-v1-2025
+          cid=$(ipfs add -Qr web/dist)
+          ipfs dag export "$cid" > web-dist.car
+          echo "cid=$cid" >> "$GITHUB_OUTPUT"
+          echo "car=web-dist.car" >> "$GITHUB_OUTPUT"
+          echo "Computed CIDv1: $cid"
+
+      - name: Pin CAR to Pinata
+        if: needs.preflight.outputs.pinata == 'true'
+        env:
+          PINATA_JWT_TOKEN: ${{ secrets.PINATA_JWT_TOKEN }}
+          CID: ${{ steps.ipfs.outputs.cid }}
+          CAR: ${{ steps.ipfs.outputs.car }}
+        run: |
+          set -euo pipefail
+          name="${GITHUB_REPOSITORY//\//-}-${GITHUB_SHA:0:7}"
+          body=$(curl -fsS -X POST "https://uploads.pinata.cloud/v3/files" \
+            -H "Authorization: Bearer ${PINATA_JWT_TOKEN}" \
+            -F "network=public" \
+            -F "file=@${CAR}" \
+            -F "name=${name}" \
+            -F "car=true")
+          returned=$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("data",{}).get("cid",""))')
+          echo "Pinata pinned: ${returned:-<unknown>}"
+          if [ -n "$returned" ] && [ "$returned" != "$CID" ]; then
+            echo "::warning::Pinata returned CID $returned, expected $CID"
+          fi
+
+      - name: Pin CAR to your own Kubo
+        if: needs.preflight.outputs.kubo == 'true'
+        env:
+          KUBO_API_URL: ${{ secrets.KUBO_API_URL }}
+          KUBO_API_AUTH: ${{ secrets.KUBO_API_AUTH }}
+          CID: ${{ steps.ipfs.outputs.cid }}
+          CAR: ${{ steps.ipfs.outputs.car }}
+        run: |
+          set -euo pipefail
+          curl -fsS -X POST "${KUBO_API_URL%/}/api/v0/dag/import?pin-roots=true" \
+            -H "Authorization: $KUBO_API_AUTH" \
+            -F "file=@${CAR}" > /dev/null
+          echo "Pinned $CID to own Kubo"
+
+      - name: Update DNSLink
+        if: needs.preflight.outputs.dnslink == 'true' && vars.IPFS_DNSLINK_DOMAIN != ''
+        uses: ipshipyard/dnslink-action@v1
+        with:
+          cid: ${{ steps.ipfs.outputs.cid }}
+          dnslink_domain: ${{ vars.IPFS_DNSLINK_DOMAIN }}
+          cf_zone_id: ${{ secrets.CF_DNS_ZONE_ID }}
+          cf_auth_token: ${{ secrets.CF_DNS_AUTH_TOKEN }}
+
+      - name: Write CID file + job summary
+        env:
+          CID: ${{ steps.ipfs.outputs.cid }}
+          PINATA: ${{ needs.preflight.outputs.pinata }}
+          KUBO: ${{ needs.preflight.outputs.kubo }}
+        run: |
+          set -euo pipefail
+          {
+            echo "cid=$CID"
+            echo "subdomain_gateway=https://${CID}.ipfs.dweb.link/"
+            echo "commit=${GITHUB_SHA}"
+          } > web-dist.cid
+          {
+            echo "## IPFS publish"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| CID (CIDv1) | \`$CID\` |"
+            echo "| Subdomain gateway | https://${CID}.ipfs.dweb.link/ |"
+            echo "| Pinned to Pinata | $PINATA |"
+            echo "| Pinned to own Kubo | $KUBO |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attach web-dist.cid to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: web-dist.cid
+          fail_on_unmatched_files: true

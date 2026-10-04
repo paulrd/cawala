@@ -1,0 +1,55 @@
+# Security and cache headers for the Cawala web app.
+#
+# Vite copies this file from web/public/ to web/dist/_headers, where it is read
+# by Cloudflare Pages. GitHub Pages ignores it. On Netlify we deliberately use
+# web/netlify.toml [[headers]] instead (see the note below), so this file is
+# NOT the source of truth there.
+#
+# ORDER MATTERS on hosts with first-match semantics: specific rules first, the
+# `/*` catch-all last. Cloudflare Pages merges all matching rules, so the order
+# is harmless there; Netlify would let a first-placed catch-all shadow these
+# specific rules. Keep this order.
+#
+# The CSP connect-src list is the iroh N0 preset endpoints the wasm client dials
+# (crates/client-wasm uses iroh::endpoint::presets::N0):
+#   https://dns.iroh.link           pkarr / DNS-over-HTTPS discovery
+#   https://*.relay.n0.iroh.link    relays over HTTPS / WebTransport
+#   wss://*.relay.n0.iroh.link      relays over WebSocket
+# If you self-host an iroh-relay or use the staging endpoints, adjust this list.
+#
+# Roll out CSP as `Content-Security-Policy-Report-Only` first if you want to
+# observe violations before enforcing.
+#
+# HSTS deliberately omits `preload`: it is a one-way door (removal takes months
+# across browsers) and `includeSubDomains` already binds every subdomain,
+# including any *.ipfs.cawala.ca gateway, to valid HTTPS. Do not add `preload`
+# without a deliberate decision.
+
+# Content-hashed build assets are immutable.
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+# Un-hashed entry points must revalidate so a new deploy is picked up.
+/index.html
+  Cache-Control: no-cache
+
+/manifest.webmanifest
+  Cache-Control: no-cache
+
+/sw.js
+  Cache-Control: no-cache
+
+/.well-known/*
+  Cache-Control: no-cache
+
+# Catch-all: security headers only. Do NOT set Cache-Control here, or
+# Cloudflare will merge it into the specific rules above.
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' blob: https://dns.iroh.link https://*.relay.n0.iroh.link wss://*.relay.n0.iroh.link; worker-src 'self' blob:; manifest-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; upgrade-insecure-requests
+  Strict-Transport-Security: max-age=63072000; includeSubDomains
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Resource-Policy: same-origin
+  X-Frame-Options: DENY

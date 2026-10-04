@@ -1,8 +1,18 @@
-// Cawala M0 service worker — caches the app shell on install so the app
-// loads offline after the first visit. No stale-while-revalidate complexity
-// yet; this is M0-minimal.
-const CACHE = 'cawala-m0-v1';
-// URLs are relative to the SW scope (resolved from /cawala/ on GitHub Pages).
+// Cawala service worker.
+//
+// The `__BUILD_ID__` placeholder is replaced at build time by
+// web/scripts/stamp-sw.mjs (invoked from the `build` npm script), so every
+// deploy gets a fresh cache name: `install` re-populates the shell and
+// `activate` purges the previous cache. This is what prevents a stale cached
+// shell from pinning users to an old build.
+//
+// Strategy:
+//   - navigations: network-first (so a new index.html + its hashed assets win),
+//     falling back to the cached shell when offline.
+//   - other same-origin GETs: stale-while-revalidate.
+//   - cross-origin requests (relays, discovery): not intercepted.
+const BUILD_ID = '__BUILD_ID__';
+const CACHE = `cawala-${BUILD_ID}`;
 const SHELL = ['./', './index.html', './manifest.webmanifest'];
 
 self.addEventListener('install', (event) => {
@@ -26,16 +36,43 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
-  if (event.request.method !== 'GET') return;
+  const request = event.request;
+  if (request.method !== 'GET') return;
+
+  const url = new URL(request.url);
+  // Let cross-origin traffic (iroh relays / pkarr discovery) go straight to the
+  // network; only manage our own app shell and assets.
+  if (url.origin !== self.location.origin) return;
+
+  if (request.mode === 'navigate') {
+    event.respondWith(
+      fetch(request)
+        .then((response) => {
+          const copy = response.clone();
+          caches.open(CACHE).then((cache) => cache.put('./index.html', copy));
+          return response;
+        })
+        .catch(() =>
+          caches
+            .match('./index.html')
+            .then((cached) => cached || caches.match('./')),
+        ),
+    );
+    return;
+  }
+
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      if (cached) return cached;
-      return fetch(event.request).then((response) => {
-        // cache successful, same-origin GETs as a runtime cache
-        const copy = response.clone();
-        caches.open(CACHE).then((cache) => cache.put(event.request, copy));
-        return response;
-      });
+    caches.match(request).then((cached) => {
+      const network = fetch(request)
+        .then((response) => {
+          if (response && response.ok) {
+            const copy = response.clone();
+            caches.open(CACHE).then((cache) => cache.put(request, copy));
+          }
+          return response;
+        })
+        .catch(() => cached);
+      return cached || network;
     }),
   );
 });

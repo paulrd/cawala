@@ -5,6 +5,7 @@
 #   cawala-node-aarch64-unknown-linux-musl  (+ .sha256)
 #   cawala-node@.service                    (systemd template unit)
 #   install.sh                              (operator installer)
+#   cawala-web-<tag>.tar.gz (+ checksums)   (built web app, for mirrors)
 #
 # Operators install a node with:
 #   curl -fsSL https://raw.githubusercontent.com/paulrd/cawala/main/packaging/install.sh | sudo bash
@@ -97,4 +98,65 @@ jobs:
           files: |
             packaging/cawala-node@.service
             packaging/install.sh
+          fail_on_unmatched_files: true
+
+  web-dist:
+    name: web app artifact
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen 0.2.122
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.122
+
+      - name: Install npm dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build web app (wasm + vite)
+        working-directory: web
+        run: npm run build
+
+      - name: Package web/dist deterministically + checksums
+        run: |
+          set -euo pipefail
+          asset="cawala-web-${{ github.ref_name }}"
+          epoch=$(git log -1 --format=%ct)
+          tar --sort=name --mtime="@${epoch}" --owner=0 --group=0 --numeric-owner \
+            --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+            -C web/dist -cf "$asset.tar" .
+          gzip -n -9 "$asset.tar"
+          rm -f "$asset.tar"
+          sha256sum "$asset.tar.gz" > "$asset.tar.gz.sha256"
+          (cd web/dist && find . -type f -exec sha256sum {} + | sort -k2 > "../../$asset.SHA256SUMS")
+          ls -la "$asset.tar.gz" "$asset.tar.gz.sha256" "$asset.SHA256SUMS"
+
+      - name: Attest web artifact provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: cawala-web-${{ github.ref_name }}.tar.gz
+
+      - name: Attach web artifact + checksums to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            cawala-web-${{ github.ref_name }}.tar.gz
+            cawala-web-${{ github.ref_name }}.tar.gz.sha256
+            cawala-web-${{ github.ref_name }}.SHA256SUMS
           fail_on_unmatched_files: true

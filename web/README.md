@@ -48,6 +48,25 @@ after any `crates/client-wasm` change**, or the JS/wasm arity can desync.
 The build uses `base: './'` so `web/dist/` deploys as-is under the GitHub Pages
 subpath `/cawala/`.
 
+## Deploying and security headers
+
+GitHub Pages is fine for demos but cannot set response headers and restricts
+commercial/financial use. See `../DEPLOYMENT.md` for the full strategy
+(no-SPOF topology, self-hosting, mirrors, verification). Quick version:
+
+- Header config is **per host, one source of truth**: `web/public/_headers`
+  (Cloudflare Pages), `web/netlify.toml` `[[headers]]` (Netlify; the build drops
+  `dist/_headers` because Netlify is first-match), `web/vercel.json` (Vercel),
+  and nginx/Caddy snippets in `DEPLOYMENT.md`. Adjust `connect-src` if you
+  self-host an iroh-relay.
+- The service worker is versioned per deploy: `web/scripts/stamp-sw.mjs`
+  (run by `npm run build`) replaces the `__BUILD_ID__` placeholder in
+  `dist/sw.js` with `GITHUB_SHA` (or a fallback), so a new deploy installs a new
+  worker and purges the old cache. Navigation is network-first; hashed
+  `/assets/*` are cache-first.
+- Each `v*` release attaches a checksummed, provenance-attested
+  `cawala-web-<tag>.tar.gz` so third parties can verify and self-host.
+
 ## Routes and navigation
 
 Hash routes (`web/src/lib/constants.js`):
