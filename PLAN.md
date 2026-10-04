@@ -209,15 +209,13 @@
 
 # Roadmap
   - Base network M0-M5 is delivered on `main` (records in `PLAN-ARCHIVE.md`).
-  - **Administration refactor** (branch `refactor/topology-admin`, **not
-    merged**): P0-P4 delivered and gate-passed -
-    P1 authority core (control format 8, routed 2, reply 5, `admin_state.json`),
-    P2 delegated-grant subsystem deleted, P3 wasm client always-routed admin,
-    P4 web lock gate + admin page + ancestor up/down + simplified nav.
-    **P5 = this docs consolidation.**
-  - P1-P4 ship as **one lockstep release** (the format/routed changes do not
-    interoperate with the old wasm/web); keep each commit compiling, merge
-    together.
+  - **Administration refactor P0-P5 is delivered, gate-passed, merged to `main`,
+    and pushed** (`ec31535`): P1 authority core (control format 8, routed 2,
+    reply 5, `admin_state.json`), P2 delegated-grant subsystem deleted, P3 wasm
+    client always-routed admin, P4 web lock gate + admin page + ancestor up/down
+    + simplified nav, P5 docs consolidation (R2).
+  - Shipped as **one lockstep release** (the format/routed changes do not
+    interoperate with the old wasm/web).
   - Deferred / settled backlog: control version negotiation (single lockstep
     codebase); no `OctAddr` depth cap; foster-parent recovery cut; moved
     pointers rejected; signed topology/registry distribution rejected; browser
