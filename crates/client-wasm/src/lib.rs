@@ -49,9 +49,8 @@ pub mod state;
 
 use crate::control::{
     AncestorCache, AncestorEntry, ControlHandler, JOIN_TTL_SECONDS, ROUTED_REPLY_TIMEOUT_SECS,
-    SharedControl, build_routed_control, exchange_control, invite_endpoint_addr,
-    prepare_admin_exchange, routed_request_envelope, validate_ancestor_link,
-    verify_routed_reply_bytes,
+    SharedControl, ancestor_walk_step, build_routed_control, exchange_control, invite_endpoint_addr,
+    prepare_admin_exchange, routed_request_envelope, verify_routed_reply_bytes,
 };
 use crate::dto::{
     AdminActionDto, AdminLedgerSnapshotDto, AdminSnapshotDto, AdminTargetDto, AdminValueAppliedDto,
@@ -1188,11 +1187,19 @@ impl ClientNode {
     /// `snapshot.parent` supplies the next node id/address, the claimed address
     /// is required to equal the address derivable from this leaf's own assigned
     /// address, and the next reply must be signed by that node id. The walk
-    /// stops at the root (`parent == None`). A malicious parent can misdirect
-    /// the walk, but every id/address/signature check fails closed.
+    /// stops at the root (`parent == None`).
+    ///
+    /// Reach is bounded hop by hop: the chain only continues while every hop's
+    /// node child is that ancestor's administrator. An ancestor that refuses the
+    /// query (it has not designated the previous hop) **terminates** the walk at
+    /// that ancestor; the direct-parent entry is recorded before the walk
+    /// continues, so a browser designated only at its parent still gets that
+    /// parent as an admin target rather than an error. Only a refusal by the
+    /// direct parent itself is a hard error (there is no admin link at all).
     ///
     /// Because `Query` is authority-gated, the browser must be a **designated
-    /// administrator of its direct parent** to walk at all.
+    /// administrator of its direct parent** to walk at all. A malicious parent
+    /// can misdirect the walk, but every id/address/signature check fails closed.
     ///
     /// The result is cached in [`SharedControl`] keyed on `(self_addr, parent
     /// id)` and is cleared on join, detach, and leave.
@@ -1231,33 +1238,12 @@ impl ClientNode {
             let reply = self
                 .exchange_routed_control(target, expected_addr.clone(), intent)
                 .await?;
-            let snapshot = match reply {
-                ControlReply::Snapshot(snapshot) => snapshot,
-                ControlReply::Rejected(code) => {
-                    return Err(JsError::new(&format!(
-                        "ancestor discovery refused: {}",
-                        reject_code_str(code)
-                    )));
-                }
-                _ => return Err(JsError::new("unexpected reply to an ancestor query")),
-            };
-            // The routed reply is already verified under `expected_node`'s
-            // operator key, so the responder is that node; bind it to the
-            // asserted address and derive the next ancestor.
-            let next = validate_ancestor_link(
-                &self_addr,
-                depth,
-                &expected_node,
-                &expected_node,
-                &snapshot,
-            )
-            .map_err(to_js_err)?;
-            entries.push(AncestorEntry {
-                node: expected_node.clone(),
-                addr: expected_addr.clone(),
-                depth,
-            });
-            match next {
+            // `ancestor_walk_step` records the answered ancestor *before*
+            // deciding whether to continue, so the prefix is always retained
+            // when a higher hop refuses.
+            match ancestor_walk_step(&self_addr, depth, &expected_node, &reply, &mut entries)
+                .map_err(to_js_err)?
+            {
                 Some(next) => {
                     expected_node = next.node;
                     expected_addr = next.addr;

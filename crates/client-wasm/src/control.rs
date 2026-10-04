@@ -678,6 +678,62 @@ pub(crate) fn validate_ancestor_link(
     }))
 }
 
+/// Classify and apply one ancestor-discovery reply to the running walk.
+///
+/// This is the whole termination policy, kept pure so it is native-testable:
+///
+/// - a `Snapshot` that verifies is recorded in `entries` and returns the next
+///   ancestor to query (`Some`) or `None` at the root;
+/// - a `Rejected(_)` **at depth > 1** ends the walk gracefully (`Ok(None)`) —
+///   the ancestor above the previous hop is not an administrator, so the chain
+///   terminates there and the already-recorded prefix is kept;
+/// - a `Rejected(_)` **at depth 1** is a hard error: there is no admin link to
+///   the direct parent at all;
+/// - any other reply shape is a hard error (structurally impossible on the
+///   wire).
+pub(crate) fn ancestor_walk_step(
+    self_addr: &OctAddr,
+    depth: usize,
+    expected_node: &str,
+    reply: &ControlReply,
+    entries: &mut Vec<AncestorEntry>,
+) -> Result<Option<AncestorEntry>, String> {
+    match reply {
+        ControlReply::Snapshot(snapshot) => {
+            // The routed reply is already verified under `expected_node`'s
+            // operator key, so the responder is that node; bind it to the
+            // asserted address and derive the next ancestor.
+            let next = validate_ancestor_link(
+                self_addr,
+                depth,
+                expected_node,
+                expected_node,
+                snapshot,
+            )?;
+            let addr = ancestor_address_at(self_addr, depth)
+                .ok_or_else(|| "ancestor depth is not a strict ancestor of self".to_string())?;
+            entries.push(AncestorEntry {
+                node: expected_node.to_string(),
+                addr,
+                depth,
+            });
+            Ok(next)
+        }
+        ControlReply::Rejected(code) if depth > 1 => {
+            tracing::debug!(
+                depth,
+                code = ?code,
+                "ancestor discovery terminates at the first undesignated hop"
+            );
+            Ok(None)
+        }
+        ControlReply::Rejected(code) => Err(format!(
+            "ancestor discovery refused at the direct parent: {code:?}"
+        )),
+        _ => Err("unexpected reply to an ancestor query".to_string()),
+    }
+}
+
 /// Resolve and own-sign one routed admin exchange.
 ///
 /// Separated from the asynchronous network call so every fail-closed path is
@@ -1203,6 +1259,130 @@ mod tests {
         assert!(
             validate_ancestor_link(&self_addr, 1, "mid-node", "mid-node", &lying).is_err()
         );
+    }
+
+    /// The depth-1 answer is recorded before the walk continues, so a refusal
+    /// at a higher hop terminates gracefully and still yields the direct-parent
+    /// target; only a depth-1 refusal is a hard error.
+    #[test]
+    fn discovery_terminates_at_first_undesignated_hop() {
+        use cawala_control::ParentSnapshot;
+
+        let self_addr: OctAddr = "0.1.3".parse().expect("sample address parses");
+        let parent_snapshot = NodeSnapshot {
+            node_id: NodeId::from("parent-node"),
+            address: Some("0.1".parse().expect("parent address parses")),
+            parent: Some(ParentSnapshot {
+                node_id: NodeId::from("root-node"),
+                slot: 1,
+                address: "0".parse().expect("root address parses"),
+            }),
+            children: vec![],
+        };
+
+        // Depth 1 answers: the direct parent is recorded and the walk proceeds.
+        let mut entries = Vec::new();
+        let next = ancestor_walk_step(
+            &self_addr,
+            1,
+            "parent-node",
+            &ControlReply::Snapshot(parent_snapshot),
+            &mut entries,
+        )
+        .expect("a depth-1 answer is accepted");
+        assert_eq!(
+            next,
+            Some(AncestorEntry {
+                node: "root-node".to_string(),
+                addr: "0".parse().unwrap(),
+                depth: 2,
+            })
+        );
+        assert_eq!(
+            entries,
+            vec![AncestorEntry {
+                node: "parent-node".to_string(),
+                addr: "0.1".parse().unwrap(),
+                depth: 1,
+            }]
+        );
+
+        // Depth 2 refuses (the grandparent has not designated the parent): the
+        // walk terminates with the direct-parent prefix intact.
+        let stop = ancestor_walk_step(
+            &self_addr,
+            2,
+            "root-node",
+            &ControlReply::Rejected(RejectCode::Unauthorized),
+            &mut entries,
+        )
+        .expect("a higher-hop refusal is a normal termination");
+        assert_eq!(stop, None);
+        assert_eq!(entries.len(), 1, "the direct-parent target is retained");
+        assert_eq!(entries[0].node, "parent-node");
+
+        // A depth-1 refusal is a hard error and records nothing: there is no
+        // admin link at all.
+        let mut empty = Vec::new();
+        assert!(
+            ancestor_walk_step(
+                &self_addr,
+                1,
+                "parent-node",
+                &ControlReply::Rejected(RejectCode::Unauthorized),
+                &mut empty,
+            )
+            .is_err()
+        );
+        assert!(empty.is_empty());
+    }
+
+    /// The `ancestor_address` cache branch matches the `(self_addr, parent)`
+    /// key, re-derives the cached address, and refuses a stale or tampered
+    /// chain.
+    #[test]
+    fn ancestor_address_uses_the_cached_chain_and_rederives() {
+        let self_addr: OctAddr = "0.1.3".parse().expect("sample address parses");
+        let parent = ParentLink {
+            node_id: NodeId::from("parent-node"),
+            slot: 3,
+        };
+        let cache = AncestorCache {
+            self_addr: self_addr.clone(),
+            parent: "parent-node".to_string(),
+            entries: vec![
+                AncestorEntry {
+                    node: "parent-node".to_string(),
+                    addr: "0.1".parse().unwrap(),
+                    depth: 1,
+                },
+                AncestorEntry {
+                    node: "root-node".to_string(),
+                    addr: "0".parse().unwrap(),
+                    depth: 2,
+                },
+            ],
+        };
+
+        assert_eq!(
+            ancestor_address("root-node", &self_addr, &parent, Some(&cache)).unwrap(),
+            "0".parse::<OctAddr>().unwrap()
+        );
+
+        // A cache for a different `(self_addr, parent)` key is stale.
+        let stale = AncestorCache {
+            self_addr: "0.7.7".parse().expect("sample address parses"),
+            ..cache.clone()
+        };
+        assert!(ancestor_address("root-node", &self_addr, &parent, Some(&stale)).is_err());
+
+        // A cached address that no longer derives from `self_addr` is refused.
+        let mut tampered = cache.clone();
+        tampered.entries[1].addr = "0.2".parse().expect("sample address parses");
+        assert!(ancestor_address("root-node", &self_addr, &parent, Some(&tampered)).is_err());
+
+        // An unknown target is not an ancestor.
+        assert!(ancestor_address("other-node", &self_addr, &parent, Some(&cache)).is_err());
     }
 
     /// An unjoined client has no address/parent, so an admin exchange is
