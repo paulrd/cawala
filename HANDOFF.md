@@ -3,123 +3,117 @@
 Short entry point. This file is deliberately small: it carries **current state,
 how to verify, and conventions**. Detail lives elsewhere:
 
-- **`PLAN.md`** (tracked) — the design and the per-increment DONE records (wire
-  versions, residuals, deferred items). Read the M0–M5 milestones for what
-  exists and why.
-- **`REFACTOR.md`** (tracked) — requirements for the next refactor.
-- **`.slim/deepwork/*.md`** (gitignored, local-only) — per-effort working notes:
-  design rationale, gate findings, lane evidence, and accepted residuals.
-  Useful only while continuing that effort; not visible to a fresh clone.
-  Relevant files: `m2-ledger-settlement.md`, `m4-cross-subtree-transfers.md`,
-  `m5-routed-control.md`, `m5-admin-hardening.md`, `m5-exit-rights.md`,
-  `m5-foster-recovery.md`, `m5-carried-prefix-phase2.md`, `m5-edge-close.md`,
-  `p2-scoped-grants.md`, `p3-ledger-view.md`.
+- **`PLAN.md`** (tracked) — the design and per-increment DONE records.
+- **`REFACTOR.md`** (tracked) — requirements R1–R9 (R4/R5 rewritten 2026-10-04:
+  explicit admin designation, no priority/failover).
+- **`REFACTOR_PLAN.md`** (tracked) — design + phased plan (see the v2 amendment).
+- **`ADMIN_POLICY.md`** (tracked) — the policy shown at the P4 admin-unlock gate
+  (stub pending final wording).
+- **`.slim/deepwork/*.md`** (gitignored, local-only) — per-effort working notes.
+  For this effort: `admin-refactor.md`, `admin-refactor-p1-spec.md`,
+  `admin-refactor-v2-spec.md`, `admin-refactor-remediation.md`.
 
 ## Next session brief
 
-The next action is to implement the administration refactor bottom-up: first
-resolve the "Decisions pending (human)" in `REFACTOR.md` (most importantly R5
-seeding), then work `REFACTOR_PLAN.md` §4 from P0/P1 — the node/control authority
-core (topology-derived authority, `admin_state.json`, priority list + TTL lease
-failover, local CLI fallback) with the wire bumps `CONTROL_FORMAT_VERSION` 7→8
-and `ROUTED_CONTROL_VERSION` 1→2 and the grant subsystem deleted. P1–P4 must ship
-as one lockstep release (the wire changes do not interoperate with the old
-wasm/web); develop on a branch, keep each commit compiling, and merge together.
-Baseline: current `main` (clean). Rebuild `web/src/wasm/` in lockstep.
+Continue the administration refactor on branch **`refactor/topology-admin`** (not
+pushed, not merged). The **P0+P1+P2 core is DONE and passed the @oracle gate**
+(COMMITTABLE, attempt 2 of 3, `eabf749`). Authority is now an explicit per-node
+**designation set**: a node lists the children (node *or* leaf) allowed to
+administer it; there is **no priority list, TTL, lease, epoch, or automatic
+failover**, and browsers have no automatic authority. All admin is tree-routed;
+routed `AdminDesignate`/`AdminRevoke` let a current admin change the set.
+
+Next, finish the lockstep release bottom-up.
+
+- **P3 — wasm client** (`crates/client-wasm`): make admin always-routed; sign with
+  the client's **own** operator key (origin/controller = the client); derive
+  ancestor addresses from the client's own address; implement the **ancestor
+  node-id discovery walk**; delete the admin-key API/store (`set_admin_key`,
+  `clear_admin_key`, `admin_public_key`, `SharedControl.admin`, `exchange_admin`,
+  `should_try_routed`); rebuild `web/src/wasm/` (`npm run build:wasm`).
+- **P4 — web**: admin lock gate + policy acknowledgement; dedicated admin page
+  (issue/burn, invite, pending joins, topology, leave/join); up/down target
+  switching (ancestor chain); simplify `Sidebar`/`MobileNav`/`NodeContextBar`;
+  delete the grant UI/store (`adminKeys.js`, `adminSeedCrypto.js`, grant
+  components, `cawala.admin.*`).
+- **P5 — docs** (R2): fold `REFACTOR.md`/this plan into `PLAN.md`; shrink this
+  file; fix `web/README.md`.
+
+P1–P4 ship as **one lockstep release** (format/routed changes do not interoperate
+with the old wasm/web). Keep each commit compiling on the branch; merge together.
 
 ## Current state
-- `main` is clean and pushed. **M0–M5 are built.**
-- Unified administered-node console **P1–P6 are DONE** (2026-10-02): unified
-  shell + node selector (P1), scoped delegated admin grants + the
-  `cawala://admin` bundle (P2), read-only admin ledger view (P3), delegated
-  topology administration (P4), delegated value administration with
-  end-to-end idempotency + operator caps (P5), and web-only value-seed
-  passphrase hardening (P6). See PLAN.md "Next Phases — Unified Node
-  Administration" for the authoritative delivery notes.
-- Also built: tree-routed `MSG_CONTROL_V1` (H1 per-hop authority), a durable
-  control replay guard, unilateral exit rights with topology-true address
-  rebasing, the stranded-claim bundle (foster recovery was **cut** by decision),
-  `EdgeClose` clean edge settlement, `MoveChild` re-slot rebase, and the browser
-  re-attach ledger re-pin. See the PLAN.md M4/M5 records.
-- Browser admin store is now **`cawala.admin.v3`** (read-migrates v2/v1). A
-  value-scoped seed must be passphrase-wrapped before any value action;
-  joins/topology seeds stay plaintext.
-- `web/src/wasm/` is gitignored and regenerated by `npm run build:wasm`.
-- **Refactor in planning:** `REFACTOR.md` (R1–R9 requirements + pending human
-  decisions) and `REFACTOR_PLAN.md` (design + phased plan). See the "Next session
-  brief" above; P1–P4 ship as one lockstep release.
+
+- `main` is clean and pushed; baseline before this branch: `11d7717`.
+- **Refactor branch `refactor/topology-admin`** @ `eabf749` (not pushed):
+  - Control wire: **control format 8** (mint 8; accept 7|8), **routed control 2**
+    (carried grant dropped), reply version 4, new `AdminDesignate`/
+    `AdminRevoke` (variants 21/22) gated by the authenticated last hop.
+  - Node: explicit designation set in `<data-dir>/admin_state.json`
+    (`{version, admins:[child_id...], updated_at, updated_by}`); authority =
+    last hop is a current `node.json` child **and** designated; local CLI
+    `control admin add|remove|list`; durable one-shot prune.
+  - **Deleted:** delegated grants (`AdminGrant*`, `admins.json`, `AdminStore`,
+    `cawala://admin` bundle, grant CLI), scopes, priority/TTL/lease/epilogue
+    failover, `senior.rs`.
+  - Tests: `CARGO_BUILD_JOBS=1 cargo test --workspace` → 950 pass / clippy clean /
+    wasm check ok.
+- `web/src/wasm/` is gitignored and **stale** until P3 (`npm run build:wasm`).
+- M0–M5 and the earlier unified-console P1–P6 remain built on `main`; the branch
+  replaces their admin/grant layers.
 
 ## Open items (recorded backlog)
-- **Refactor pending decisions** — see `REFACTOR.md` → "Decisions pending
-  (human)"; resolve before `REFACTOR_PLAN.md` P1.
-- **Foster-parent recovery — cut by decision.** Reconnection is
-  leave (if needed) + invitation; the stranded-claim bundle is out-of-band
-  review evidence only, never authority and never on the wire.
-- **Control version negotiation — assessed, deferred.** There is one lockstep
-  codebase and the wasm bundle is rebuilt with the node, so no mixed-version
-  fleet exists today; the full per-peer design is real but not justified now.
-- **`OctAddr` depth cap — deliberately not done** (frames are already bounded by
-  `MAX_CONTROL_FRAME`).
-- **Moved pointers are rejected, not deferred** — a changed topology is a
-  material change in trust, so an in-flight transaction must fail and be retried
-  with fresh addresses discovered out of band. **Signed topology/registry
-  distribution is likewise rejected** (the live topology is the source of truth).
-- **Delegated-value follow-ups — deferred:** grant-embedded limits
-  (`ADMIN_GRANT_VERSION` 3), 2-person/time-locks, global config/credit limits, a
-  persisted node `role`, bundle QR, anomaly dashboard, non-senior routed
-  topology, and an `AdminValuePolicyQuery` (format 8). See the PLAN.md P6 entry.
-- **Documentation consolidation** — tracked as `REFACTOR.md` R2.
+
+- **P3/P4/P5** as in the next-session brief. No human decisions are blocking
+  P3/P4 (resolved 2026-10-04: explicit designation, operator + current admins).
+- **Gate residuals (accepted):** concurrent local-CLI vs engine `admin_state.json`
+  writes are last-writer-wins (single-operator host); a corrupt-file error path
+  audits per request but is local-only and CLI-repairable; docs referencing the
+  removed priority/lease model are cleaned in P5.
+- **Foster-parent recovery — cut by decision** (unchanged).
+- **Control version negotiation — deferred** (single lockstep codebase).
+- **`OctAddr` depth cap** — deliberately not done.
+- **Moved pointers rejected; signed topology distribution rejected** (unchanged).
+- **`REFACTOR.md` pending decisions** for P4 (policy doc wording, unlock
+  persistence, up/down traversal, tab sets) and P5 (docs archive vs delete).
 
 ## Verify
+
 - `CARGO_BUILD_JOBS=1 cargo test --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo check -p cawala-client --target wasm32-unknown-unknown`
 - `cd web && npm run build`
-- `cd web && npm test` (node `--test` unit tests: identity bundle, admin-key
-  store v3 + selection, `nodeKind`/`adminView`, the admin-bundle API
-  post-verification half, and the admin-ledger mapping/gating).
-- Targeted node suites: `--test admin_ledger`, `--test control_admin`,
-  `--test settlement_transport`, `--test routed_control`, `--test seen_restart`,
-  `--test exit_rebase`, `--test claim_bundle`, `--test edge_close`,
+- `cd web && npm test`
+- Targeted node suites: `--test admin_authority`, `--test admin_state`,
+  `--test local_admin_cli`, `--test control_admin`, `--test routed_control`,
+  `--test settlement_transport`, `--test exit_rebase`, `--test edge_close`,
   `--test netting_harness`.
-- Network-dependent smoke (N0 relay required): `web/scripts/smoke-join.mjs`,
-  `smoke-payment.mjs`, `smoke-crossleaf.mjs`, `smoke-admin.mjs` (set
-  `SMOKE_*_REQUIRE_NETWORK=1` to hard-fail instead of skipping). No live smoke
-  covers `leave()` yet.
+- Network smoke (N0 relay required): `web/scripts/smoke-*.mjs` (set
+  `SMOKE_*_REQUIRE_NETWORK=1` to hard-fail instead of skipping).
 
 ## Conventions
-- `~/.cargo/config.toml` sets `[build] jobs = 2` (OOM mitigation). Run
-  cargo-heavy specialist lanes serially — one cargo process at a time.
-  **Workspace-wide runs need `CARGO_BUILD_JOBS=1`** (a `cargo test --workspace`
-  at `jobs = 2` OOM-crashed the session, 2026-09-17); targeted crate/test suites
-  are fine at 2.
+
+- `~/.cargo/config.toml` sets `[build] jobs = 2` (OOM mitigation). Run cargo-heavy
+  specialist lanes **serially** — one cargo process at a time. Workspace-wide runs
+  need `CARGO_BUILD_JOBS=1`; targeted crate/test suites are fine at 2.
 - `.slim/clonedeps/repos/` holds pinned read-only iroh source.
 - **Hard breaks** — recreate `node-data` and rebuild the wasm bundle when they
-  change: **control format 7** (mint 7; accept 6|7; v5 dropped), **admin grant
-  format 2**, ledger (entry/signed) format 4, node on-disk ledger meta format 3,
-  settlement payload 3, browser ledger payload 3. The v7-only value variants
-  (`AdminIssue`/`AdminBurn`) cannot reach a v6 peer, so rebuild the wasm bundle
-  with the node. Delegated value ops are idempotent end-to-end (a 16-byte
-  `request_id` -> ledger nonce/index) and bounded by `<data-dir>/value_policy.json`,
-  which is deny-by-default when absent. Admin redelivery re-signs the retained
-  request with a fresh nonce/expiry. Settlement v3 rejects v2 inbound (lockstep).
+  change: **control format 8** (mint 8; accept 7|8), **routed control 2**,
+  ledger (entry/signed) format 4, node on-disk ledger meta format 3, settlement
+  payload 3, browser ledger payload 3. `ROUTED_CONTROL_VERSION=2` drops the
+  carried grant; there is no `admins.json` (replaced by `admin_state.json`).
 - `web/src/wasm/` is gitignored; run `npm run build:wasm` after any
   `crates/client-wasm` change or the JS/wasm arity can desync.
-- Control-plane local state under `<data-dir>`: `control_seen.json`,
-  `control_audit.jsonl`, `admins.json`, `pending_joins.json`, `outbound_join.json`,
-  `ledger_peers.json`, `node.json`. Record and peers are re-read per control
-  request (direct **and** routed); `admins.json` dual-accepts v1/v2 signed grants;
-  the browser store `cawala.admin.v3` read-migrates v2/v1.
+- Control-plane local state under `<data-dir>`: `admin_state.json`,
+  `value_policy.json`, `control_seen.json`, `control_audit.jsonl`,
+  `pending_joins.json`, `outbound_join.json`, `ledger_peers.json`, `node.json`.
+  Record and peers are re-read per control request (direct **and** routed).
 - Addresses are network-local and topology-true: an exit rebases the subtree onto
-  root `0`, so cached addresses for a whole subtree can be invalidated at once
-  (moved pointers are **rejected** — retry with fresh addresses discovered out of
-  band). The clean path is `control exit` then `ledger edge-close` (detached
-  only); `edge-close` forfeits the **entire pooled `Parent` balance**
-  irreversibly, so close **before** a new parent prefunds.
-- A peer **ledger-key rotation** is reconciled on re-attach (the child's
-  self-signed join vouches for the new key) or by the node's own operator on
-  `CreateChild`. The browser re-pins on re-attach; a browser same-parent rotation
-  without re-approval still hard-rejects until a re-join.
+  root `0`; moved pointers are **rejected**. The clean path is `control exit`
+  then `ledger edge-close` (detached only); `edge-close` forfeits the entire
+  pooled `Parent` balance irreversibly.
+- Ledger-key rotation is reconciled on re-attach or by the node operator on
+  `CreateChild`.
 - **Commit and push as you deem fit.** Prefer small, focused, verified commits;
-  match the existing message style (`M4 web:`, `docs:`, …); never commit secrets
-  or unrelated changes. A clean, pushed tree is the default.
+  match the existing message style (`node:`, `control:`, `docs:`). Never commit
+  secrets or unrelated changes.
