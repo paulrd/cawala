@@ -11,7 +11,8 @@ use cawala_control::{
 use cawala_ledger::{AccountRef, Amount, EntryBody, LedgerPubKey, commitment_hash, verify_chain};
 use cawala_msg::{MSG_CONTROL_V1, MSG_LEDGER_V1, MSG_SETTLE_V1};
 use cawala_node::control::{
-    pull_rebase_from_parent, spawn_control_node_live, sweep_pending_rebase,
+    ADMIN_PROBE_TIMEOUT_SECS, admin_failover_probe, admin_probe_cadence, pull_rebase_from_parent,
+    spawn_control_node_live, sweep_pending_rebase,
 };
 use cawala_node::msg::{
     NeighborSource, dispatch_control_envelope, dispatch_ledger_envelope, dispatch_settle_envelope,
@@ -709,9 +710,11 @@ async fn run(data_dir: PathBuf) -> Result<()> {
         let sweep_node = node_id.clone();
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         let mut tick: u64 = 0;
+        let mut last_admin_probe: u64 = 0;
         loop {
             ticker.tick().await;
             tick = tick.wrapping_add(1);
+            let now = now_unix_seconds();
             sweep_settlements(
                 &sweep_endpoint,
                 &sweep_source,
@@ -720,11 +723,33 @@ async fn run(data_dir: PathBuf) -> Result<()> {
                 &sweep_dir,
                 &sweep_node,
                 &sweep_manager,
-                now_unix_seconds(),
+                now,
             )
             .await;
             // Retry topology notices whose immediate dial failed.
             sweep_pending_rebase(&sweep_endpoint, &sweep_control).await;
+            // Active admin failover: on a `ttl_secs / 3` cadence (bounded), a
+            // node with an expired/absent lease probes the priority candidates
+            // in order and promotes the first responsive one (spec §5.3 step 2).
+            // Offline harnesses inject liveness via `set_admin_probe_alive`; this
+            // is the live probe sender.
+            let cadence = {
+                let engine = sweep_control.lock().await;
+                admin_probe_cadence(engine.admin_state().ttl_secs())
+            };
+            if last_admin_probe == 0 || now.saturating_sub(last_admin_probe) >= cadence {
+                last_admin_probe = now;
+                if admin_failover_probe(
+                    &sweep_endpoint,
+                    &sweep_control,
+                    Duration::from_secs(ADMIN_PROBE_TIMEOUT_SECS),
+                    now,
+                )
+                .await
+                {
+                    info!("admin failover probe updated the priority lease");
+                }
+            }
             // Low-frequency healing probe: repeated hop rejections are not
             // visible to the control engine (routing lives in the msg layer), so
             // a node with a parent re-asks it for the current prefix every ~30s.

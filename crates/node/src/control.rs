@@ -69,6 +69,21 @@ const MAX_PENDING_JOINS: usize = 64;
 /// to its applicant.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Deadline for one `AdminLeaseProbe` dial during failover (spec §5.3 step 2).
+pub const ADMIN_PROBE_TIMEOUT_SECS: u64 = 2;
+
+/// Upper bound on the active failover probe cadence (5 min).
+pub const MAX_ADMIN_PROBE_CADENCE_SECS: u64 = 300;
+
+/// Probe cadence for a lease TTL: `ttl_secs / 3`, bounded to
+/// `1..=MAX_ADMIN_PROBE_CADENCE_SECS`.
+///
+/// The current administrator renews every `ttl_secs / 3` (spec §5.2), so the
+/// node probes at the same cadence once the lease has actually expired.
+pub fn admin_probe_cadence(ttl_secs: u64) -> u64 {
+    (ttl_secs / 3).clamp(1, MAX_ADMIN_PROBE_CADENCE_SECS)
+}
+
 /// Replay-guard bounds for the per-node control engine.
 ///
 /// Control requests are terminal, so there is no `unobserve` rollback; the
@@ -734,6 +749,24 @@ impl ControlNode {
         Ok(())
     }
 
+    /// Sign an [`AdminLeaseProbe`] for priority `index` at `epoch`.
+    ///
+    /// Self-signed with this node's operator key (the probing parent); a
+    /// candidate accepts it only when this node is its recorded parent
+    /// ([`ControlNode::handle_admin_lease_probe`]).
+    pub fn sign_admin_lease_probe(
+        &self,
+        epoch: u64,
+        index: u8,
+        now: u64,
+    ) -> Result<SignedControl, ControlError> {
+        self.sign_decision(
+            ControlRequest::AdminLeaseProbe(AdminLeaseProbe { epoch, index }),
+            now,
+        )
+        .map_err(|code| ControlError::Codec(format!("cannot sign admin lease probe: {code:?}")))
+    }
+
     /// Sign a `RebasePull` for this node, or `None` when it has no parent link.
     pub fn sign_rebase_pull(&self, now: u64) -> Option<SignedControl> {
         self.record.record().parent.as_ref()?;
@@ -1184,6 +1217,17 @@ impl ControlNode {
     fn run_failover(&mut self, now: u64) {
         let probe = self.admin_probe_alive.clone();
         self.maybe_failover(now, |id| probe.iter().any(|alive| alive == id));
+    }
+
+    /// Resolve an expired priority lease using an explicit liveness set.
+    ///
+    /// Used by the active [`admin_failover_probe`] loop, which learns the set by
+    /// dialing candidates. Unlike the injectable table this does not persist the
+    /// set, so a later per-request [`ControlNode::run_failover`] cannot promote a
+    /// candidate that has not just answered a probe. Returns whether the state
+    /// changed.
+    fn run_failover_with(&mut self, now: u64, alive: &[String]) -> bool {
+        self.maybe_failover(now, |id| alive.iter().any(|candidate| candidate == id))
     }
 
     /// Replay-guard then dispatch one authenticated request.
@@ -4072,6 +4116,81 @@ pub async fn sweep_pending_rebase(endpoint: &Endpoint, control: &Arc<Mutex<Contr
     engine.requeue_pending_rebase(retry);
 }
 
+/// Actively probe the priority list after the current lease expires and apply
+/// the failover outcome (spec §5.3 step 2).
+///
+/// A node with an expired (or absent) lease and a non-empty priority list dials
+/// the candidates after `current` in priority order over direct
+/// `cawala/control/0` with an [`AdminLeaseProbe`], waiting at most
+/// `probe_timeout` for each. The first candidate that answers with a
+/// [`ControlReply::LeaseState`] is promoted through
+/// [`ControlNode::maybe_failover`] (persist before memory, `epoch += 1`,
+/// `lease_until = now + ttl`, audit `admin-failover`); if none answer, the
+/// current/lease are cleared and `admin-unavailable` is audited. Returns whether
+/// the state changed.
+///
+/// The refresh and the candidate list are read under the engine lock; dialing
+/// happens without it, so a probe can never block another request. The pure
+/// [`failover_select`] remains the offline-tested selector.
+pub async fn admin_failover_probe(
+    endpoint: &Endpoint,
+    control: &Arc<Mutex<ControlNode>>,
+    probe_timeout: Duration,
+    now: u64,
+) -> bool {
+    let plan = {
+        let mut engine = control.lock().await;
+        // Observe an out-of-process priority edit and prune stale children
+        // before deciding whether to probe.
+        engine.refresh_control_plane();
+        engine.reload_admin_state();
+        let state = engine.admin_state();
+        if state.lease_valid(now) || state.priority().is_empty() {
+            None
+        } else {
+            let start = if state.current_index() >= 0 {
+                state.current_index() as usize + 1
+            } else {
+                0
+            };
+            Some((state.priority().to_vec(), start, state.epoch()))
+        }
+    };
+    let Some((priority, start, epoch)) = plan else {
+        return false;
+    };
+
+    let mut alive: Vec<String> = Vec::new();
+    for (index, candidate) in priority.iter().enumerate().skip(start) {
+        let Ok(target) = candidate.parse::<EndpointId>() else {
+            continue;
+        };
+        let Ok(index_u8) = u8::try_from(index) else {
+            continue;
+        };
+        let signed = {
+            let engine = control.lock().await;
+            match engine.sign_admin_lease_probe(epoch, index_u8, now) {
+                Ok(signed) => signed,
+                Err(err) => {
+                    warn!(%err, candidate = %candidate, "admin probe could not be signed");
+                    continue;
+                }
+            }
+        };
+        if matches!(
+            ControlNode::send_direct(endpoint, target, &signed, probe_timeout).await,
+            Ok(ControlReply::LeaseState(_))
+        ) {
+            alive.push(candidate.clone());
+            break;
+        }
+    }
+
+    let mut engine = control.lock().await;
+    engine.run_failover_with(now, &alive)
+}
+
 /// Ask this node's parent for its snapshot and apply a verified re-base.
 ///
 /// The pull is self-signed and sent over direct control. The reply is verified
@@ -4290,6 +4409,64 @@ mod tests {
             }
         }
         assert_eq!(lowest_free_slot(&rec), None);
+    }
+
+    #[test]
+    fn admin_probe_cadence_is_ttl_thirds_bounded() {
+        assert_eq!(admin_probe_cadence(300), 100);
+        assert_eq!(admin_probe_cadence(3), 1);
+        assert_eq!(admin_probe_cadence(0), 1);
+        assert_eq!(admin_probe_cadence(1_000_000), MAX_ADMIN_PROBE_CADENCE_SECS);
+    }
+
+    #[tokio::test]
+    async fn run_failover_with_promotes_first_live_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let operator = OperatorSecretKey::from_bytes([9u8; 32]);
+        let persisted = NodeRecord {
+            node_id: "parent".to_string(),
+            address: Some("0".parse().unwrap()),
+            parent: None,
+            children: vec![child("a", 0, 1), child("b", 1, 2)],
+            address_epoch: 0,
+        };
+        std::fs::write(
+            dir.path().join(crate::record::NODE_RECORD_FILE),
+            serde_json::to_vec(&persisted).unwrap(),
+        )
+        .unwrap();
+        let record = RecordStore::open(dir.path(), "parent").unwrap();
+        let store = ControlStore::open(dir.path()).unwrap();
+        let mut engine = ControlNode::new(
+            dir.path(),
+            "parent",
+            operator,
+            record,
+            PeerRegistry::new(),
+            store,
+            AdminStore::empty(),
+        );
+        engine
+            .admin_state
+            .set_priority(vec!["a".to_string(), "b".to_string()]);
+        engine.admin_state.set_current(0);
+        engine.admin_state.bump_epoch();
+        assert!(!engine.admin_state.lease_valid(10_000));
+
+        // The stalled current entry (`a`) is skipped; `b` answers.
+        assert!(engine.run_failover_with(10_000, &["b".to_string()]));
+        assert_eq!(engine.admin_state.current_id().unwrap().as_str(), "b");
+        assert_eq!(engine.admin_state.epoch(), 2, "failover bumps the epoch");
+        assert!(engine.admin_state.lease_valid(10_000));
+
+        // A later expiry with no live candidate clears current/lease; the
+        // anti-downgrade epoch is not rolled back.
+        let epoch = engine.admin_state.epoch();
+        let expired = 10_000 + engine.admin_state.ttl_secs() + 1;
+        assert!(engine.run_failover_with(expired, &[]));
+        assert_eq!(engine.admin_state.current_index(), -1);
+        assert_eq!(engine.admin_state.lease_until(), 0);
+        assert_eq!(engine.admin_state.epoch(), epoch);
     }
 
     fn applicant_join(i: usize, operator: &OperatorSecretKey) -> JoinRequest {
