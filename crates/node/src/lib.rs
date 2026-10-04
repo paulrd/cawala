@@ -35,7 +35,7 @@ pub mod seen_store;
 pub mod settlement;
 pub mod value_policy;
 
-pub use admin_cli::AdminCliError;
+pub use admin_cli::{AdminCliError, AdminListing};
 pub use admin_state::{
     ADMIN_STATE_FILE, ADMIN_STATE_VERSION, MAX_DESIGNATED_ADMINS, AdminState, AdminStateError,
 };

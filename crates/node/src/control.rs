@@ -33,7 +33,8 @@ use cawala_control::{
     AdminPendingJoin, AdminRedeliverJoin, AdminRejected, AdminSnapshot, AdminValueApplied,
     AdminValueDirection, AdminValueRequest, CONTROL_ALPN, CONTROL_REQUEST_MAX_TTL_SECS,
     CONTROL_REQUEST_TTL_SECS, ChildKind, ChildSnapshot, ControlError, ControlReply, ControlRequest,
-    CreateChild, DeliveryStatus, DetachChild, DetachNotice, ExitRequest, Invite, JoinApproval,
+    CreateChild, DeliveryStatus, DesignationChange, DetachChild, DetachNotice, ExitRequest, Invite,
+    JoinApproval,
     JoinRejection, JoinRequest, MAX_CONTROL_FRAME, MoveChild, NodeId, NodeSnapshot, OctAddr,
     OperatorPubKey, OperatorSecretKey, ParentSnapshot, ROUTED_REPLY_VERSION, RebaseNotice,
     RebasePull, RejectCode, RoutedControlV1, RoutedForward, RoutedReplyV1, SetAddress,
@@ -731,10 +732,11 @@ impl ControlNode {
     ///
     /// Shared by the direct and routed entry points so an out-of-process edit
     /// (`control admin add|remove ...`) is observed without a restart.
-    /// Designations that are no longer node children are pruned in memory; the
-    /// pruned form is written on the next mutation. On failure it serves
-    /// [`AdminState::empty`] and audits `admin-state-load-failed`, but never
-    /// writes over the persisted file.
+    /// Designations that are no longer node children are pruned; a prune is
+    /// **persisted atomically and audited once** so later reloads find nothing
+    /// to prune (no per-request `fsync`/audit amplification). On a load failure
+    /// it serves [`AdminState::empty`] and audits `admin-state-load-failed`,
+    /// but never writes over the persisted file.
     fn reload_admin_state(&mut self) {
         match AdminState::load(&self.data_dir) {
             Ok(mut state) => {
@@ -746,9 +748,21 @@ impl ControlNode {
                     .map(|child| child.child_id.clone())
                     .collect();
                 if state.prune(&children) {
-                    self.audit(serde_json::json!({
-                        "event": "admin-state-pruned",
-                    }));
+                    // Persist the pruned form immediately. Without this the
+                    // prune (and its audit line) would repeat on every request,
+                    // and the on-disk file would keep a stale designation
+                    // forever. An in-memory prune still applies if the save
+                    // fails, but the audit is only appended once the prune is
+                    // durable.
+                    match state.save(&self.data_dir) {
+                        Ok(()) => self.audit(serde_json::json!({
+                            "event": "admin-state-pruned",
+                            "admins": state.list(),
+                        })),
+                        Err(err) => {
+                            warn!(%err, "admin state prune could not be persisted");
+                        }
+                    }
                 }
                 self.admin_state = state;
             }
@@ -864,8 +878,15 @@ impl ControlNode {
             self.audit_request(&signed, &reply, now);
             return Handled::Reply(reply);
         }
-        self.dispatch_authorized(remote, &signed, now, authority.as_ref(), signed.controller)
-            .await
+        self.dispatch_authorized(
+            remote,
+            &signed,
+            now,
+            authority.as_ref(),
+            signed.controller,
+            None,
+        )
+        .await
     }
 
     /// Version/shape/signature/expiry checks and per-request reloads.
@@ -906,7 +927,10 @@ impl ControlNode {
     /// that [`needs_authority`] (admin + topology classes), `None` otherwise.
     /// `e2e_requester` is the end-to-end value-policy key: for direct requests
     /// it is `signed.controller`; for routed value requests it is the intent
-    /// controller (the browser), never the signing relay.
+    /// controller (the browser), never the signing relay. `route` carries the
+    /// routed `(requester, forwarder)` node ids when the request arrived over
+    /// the tree, so designation handlers can audit both; it is `None` on the
+    /// direct path.
     async fn dispatch_authorized(
         &mut self,
         _remote: EndpointId,
@@ -914,6 +938,7 @@ impl ControlNode {
         now: u64,
         authority: Option<&Authority>,
         e2e_requester: OperatorPubKey,
+        route: Option<(&str, &str)>,
     ) -> Handled {
         // Replay guard: per (origin, controller), keyed by the request nonce.
         // Control requests are terminal, so a marked nonce is never unobserved.
@@ -1028,6 +1053,12 @@ impl ControlNode {
                     Ok(pending) => return Handled::LedgerMutation(pending),
                     Err(code) => ControlReply::Rejected(code),
                 }
+            }
+            ControlRequest::AdminDesignate(change) => {
+                self.handle_admin_designate(signed, change, now, route)
+            }
+            ControlRequest::AdminRevoke(change) => {
+                self.handle_admin_revoke(signed, change, now, route)
             }
         };
         self.audit_request(signed, &reply, now);
@@ -1292,7 +1323,14 @@ impl ControlNode {
         };
 
         match self
-            .dispatch_authorized(remote, &dispatched, now, Some(&authority), e2e_requester)
+            .dispatch_authorized(
+                remote,
+                &dispatched,
+                now,
+                Some(&authority),
+                e2e_requester,
+                Some((requester.as_str(), forwarder.as_str())),
+            )
             .await
         {
             Handled::Reply(reply) => {
@@ -2881,6 +2919,114 @@ impl ControlNode {
         reply
     }
 
+    /// Admin: designate a current child as an administrator (routed authority
+    /// change).
+    ///
+    /// The child must be a current `node.json` child of this node (of any
+    /// [`ChildKind`]). The designation set is persisted atomically before the
+    /// in-memory state is updated, so a save failure leaves memory unchanged and
+    /// replies [`RejectCode::Internal`]. An already-designated child is an
+    /// idempotent `Accepted`. `route` is the routed `(requester, forwarder)`
+    /// pair, or `None` on the direct (self-operator) path.
+    fn handle_admin_designate(
+        &mut self,
+        signed: &SignedControl,
+        change: &DesignationChange,
+        now: u64,
+        route: Option<(&str, &str)>,
+    ) -> ControlReply {
+        if change.validate().is_err() {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        let is_child = self
+            .record
+            .record()
+            .children
+            .iter()
+            .any(|child| child.child_id == change.child);
+        if !is_child {
+            return ControlReply::Rejected(RejectCode::NotFound);
+        }
+        if !self.admin_state.has(&change.child) {
+            let mut state = self.admin_state.clone();
+            if !state.add(&change.child) {
+                // The id was validated above and is not present, so the only
+                // remaining refusal is a full designation set.
+                return ControlReply::Rejected(RejectCode::Capacity);
+            }
+            state.mark_updated(now, &designation_updated_by(route));
+            if state.save(&self.data_dir).is_err() {
+                return ControlReply::Rejected(RejectCode::Internal);
+            }
+            self.admin_state = state;
+        }
+        self.audit_designation(now, "admin-designate", &change.child, signed, route);
+        ControlReply::Accepted
+    }
+
+    /// Admin: revoke a child's administrator designation (routed authority
+    /// change).
+    ///
+    /// Unlike `admin add` / `AdminDesignate` this does **not** require the child
+    /// to still be a current child: it deliberately clears stale entries (e.g. a
+    /// designation left behind after the child detached). The set is persisted
+    /// atomically before the in-memory state is updated; revoking a
+    /// non-designated id is an idempotent `Accepted`.
+    fn handle_admin_revoke(
+        &mut self,
+        signed: &SignedControl,
+        change: &DesignationChange,
+        now: u64,
+        route: Option<(&str, &str)>,
+    ) -> ControlReply {
+        if change.validate().is_err() {
+            return ControlReply::Rejected(RejectCode::BadRequest);
+        }
+        if self.admin_state.has(&change.child) {
+            let mut state = self.admin_state.clone();
+            state.remove(&change.child);
+            state.mark_updated(now, &designation_updated_by(route));
+            if state.save(&self.data_dir).is_err() {
+                return ControlReply::Rejected(RejectCode::Internal);
+            }
+            self.admin_state = state;
+        }
+        self.audit_designation(now, "admin-revoke", &change.child, signed, route);
+        ControlReply::Accepted
+    }
+
+    /// Append the shared `admin-state` audit line for a designation change.
+    ///
+    /// On the routed path `actor` is the end-to-end requester and `forwarder`
+    /// the authenticated last hop; on the direct path `actor` is `"operator"`
+    /// and `forwarder` is this node. The line also records the resulting set, so
+    /// it is self-contained for any `control_audit.jsonl` consumer.
+    fn audit_designation(
+        &self,
+        now: u64,
+        action: &str,
+        child: &str,
+        signed: &SignedControl,
+        route: Option<(&str, &str)>,
+    ) {
+        let (via, actor, forwarder) = match route {
+            Some((requester, forwarder)) => ("routed", requester.to_string(), forwarder.to_string()),
+            None => ("direct", "operator".to_string(), signed.origin.to_string()),
+        };
+        self.audit(serde_json::json!({
+            "ts": now,
+            "event": "admin-state",
+            "action": action,
+            "via": via,
+            "actor": actor,
+            "forwarder": forwarder,
+            "child": child,
+            "admins": self.admin_state.list(),
+            "updated_by": self.admin_state.updated_by(),
+            "updated_at": self.admin_state.updated_at(),
+        }));
+    }
+
     /// Validate an admin approval against current state, returning the precise
     /// [`RejectCode`] without mutating anything.
     ///
@@ -3538,6 +3684,18 @@ fn map_approve_error(err: &ControlError) -> RejectCode {
         RejectCode::SlotOutOfRange
     } else {
         RejectCode::Internal
+    }
+}
+
+/// Who to record as `updated_by` on a designation change.
+///
+/// The routed path records the authenticated last hop (the designated
+/// administrator that performed the change); the direct path records `"local"`,
+/// matching the local CLI.
+fn designation_updated_by(route: Option<(&str, &str)>) -> String {
+    match route {
+        Some((_, forwarder)) => forwarder.to_string(),
+        None => "local".to_string(),
     }
 }
 
@@ -6078,14 +6236,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v5_frame_is_bad_version_and_v6_query_works() {
+    async fn v6_frame_is_bad_version_and_v7_query_works() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
         let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &[]);
 
-        // v4 and v5 are below the accepted window (6|7).
-        for (nonce, version) in [(1u64, 4u8), (2, 5)] {
+        // v4, v5, and v6 are below the accepted window (7|8).
+        for (nonce, version) in [(1u64, 4u8), (2, 5), (3, 6)] {
             let query =
                 authorize_version("parent", &parent_op, nonce, ControlRequest::Query, version);
             assert_eq!(
@@ -6095,10 +6253,10 @@ mod tests {
             );
         }
 
-        // A v6 frame over a pre-existing variant is dispatched normally.
-        let v6_query = authorize_version("parent", &parent_op, 3, ControlRequest::Query, 6);
+        // A v7 frame over a pre-existing variant is dispatched normally.
+        let v7_query = authorize_version("parent", &parent_op, 4, ControlRequest::Query, 7);
         assert!(matches!(
-            engine.receive_at(any_remote(), v6_query, 0).await,
+            engine.receive_at(any_remote(), v7_query, 0).await,
             ControlReply::Snapshot(_)
         ));
     }
@@ -6136,10 +6294,10 @@ mod tests {
         );
     }
 
-    /// v5 is below the accepted window; v6 and v7 frames may carry the
+    /// v6 is below the accepted window; v7 and v8 frames may carry the
     /// v4-introduced exit variant (`declared >= min_control_version`).
     #[tokio::test]
-    async fn v6_and_v7_frames_can_carry_exit_variant() {
+    async fn v7_and_v8_frames_can_carry_exit_variant() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let child_op = secret(2);
@@ -6153,34 +6311,36 @@ mod tests {
         let peers = [node_peer("child", &child_op, 2)];
         let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
 
-        // v5 is rejected wholesale (not just the shape gate).
-        let v5_exit = authorize_version("child", &child_op, 1, exit_request("child", 1), 5);
-        assert_eq!(
-            engine.receive_at(any_remote(), v5_exit, 0).await,
-            ControlReply::Rejected(RejectCode::BadVersion)
-        );
+        // v5 and v6 are rejected wholesale (not just the shape gate).
+        for (nonce, version) in [(1u64, 5u8), (2, 6)] {
+            let exit = authorize_version("child", &child_op, nonce, exit_request("child", 1), version);
+            assert_eq!(
+                engine.receive_at(any_remote(), exit, 0).await,
+                ControlReply::Rejected(RejectCode::BadVersion)
+            );
+        }
 
-        // v6 carries the v4-introduced variant (6 >= 4).
-        let v6_exit = authorize_version("child", &child_op, 2, exit_request("child", 1), 6);
-        assert_ne!(
-            engine.receive_at(any_remote(), v6_exit, 0).await,
-            ControlReply::Rejected(RejectCode::BadVersion),
-            "a v6 frame may carry a v4-introduced variant"
-        );
-
-        // The current (v7) mint also carries it.
-        let v7_exit = authorize_at("child", &child_op, 3, exit_request("child", 1));
+        // v7 carries the v4-introduced variant (7 >= 4).
+        let v7_exit = authorize_version("child", &child_op, 3, exit_request("child", 1), 7);
         assert_ne!(
             engine.receive_at(any_remote(), v7_exit, 0).await,
             ControlReply::Rejected(RejectCode::BadVersion),
             "a v7 frame may carry a v4-introduced variant"
         );
+
+        // The current (v8) mint also carries it.
+        let v8_exit = authorize_at("child", &child_op, 4, exit_request("child", 1));
+        assert_ne!(
+            engine.receive_at(any_remote(), v8_exit, 0).await,
+            ControlReply::Rejected(RejectCode::BadVersion),
+            "a v8 frame may carry a v4-introduced variant"
+        );
     }
 
-    /// A v6-declared frame carrying an *old* (pre-v4) variant dispatches
+    /// A v7-declared frame carrying an *old* (pre-v4) variant dispatches
     /// normally; only the introduction-version gate applies.
     #[tokio::test]
-    async fn v6_frame_carrying_old_variant_still_dispatches() {
+    async fn v7_frame_carrying_old_variant_still_dispatches() {
         let dir = tempfile::tempdir().unwrap();
         let parent_op = secret(1);
         let applicant_op = secret(2);
@@ -6197,17 +6357,17 @@ mod tests {
             nonce: 7,
             expiry: u64::MAX,
         };
-        let v6_join = authorize_version(
+        let v7_join = authorize_version(
             "applicant",
             &applicant_op,
             1,
             ControlRequest::Join(join),
-            6,
+            7,
         );
         assert_eq!(
-            engine.receive_at(any_remote(), v6_join, 0).await,
+            engine.receive_at(any_remote(), v7_join, 0).await,
             ControlReply::Pending,
-            "a v6 frame over a pre-existing variant must dispatch"
+            "a v7 frame over a pre-existing variant must dispatch"
         );
     }
 

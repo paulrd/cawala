@@ -131,3 +131,19 @@ fn prune_non_child() {
     // A second prune with no change reports false.
     assert!(!state.prune(&children));
 }
+
+/// `add` enforces [`MAX_DESIGNATED_ADMINS`]: the ninth entry is refused and the
+/// set is left unchanged.
+#[test]
+fn max_designated_admins_enforced_by_add() {
+    let mut state = AdminState::empty();
+    for i in 0..MAX_DESIGNATED_ADMINS {
+        assert!(state.add(&format!("admin-{i}")), "entry {i} fits");
+    }
+    assert_eq!(state.list().len(), MAX_DESIGNATED_ADMINS);
+    assert!(!state.add("overflow"), "the set is full");
+    assert_eq!(state.list().len(), MAX_DESIGNATED_ADMINS);
+    // A duplicate of an existing entry is also refused.
+    assert!(!state.add("admin-0"));
+    assert_eq!(state.list().len(), MAX_DESIGNATED_ADMINS);
+}

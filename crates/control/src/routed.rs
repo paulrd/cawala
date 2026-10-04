@@ -25,7 +25,7 @@
 //! The reply half is fully end-to-end signed under the destination node's
 //! operator key with a dedicated BLAKE3 derive-key domain
 //! ([`ROUTED_REPLY_CONTEXT`]), so it can never be replayed as a control request
-//! or an admin grant.
+//! or an admin designation.
 //!
 //! # Bounds
 //!
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(bytes.len(), 252);
         assert_eq!(
             blake3::hash(&bytes).to_hex().as_str(),
-            "f2958b0755c4c96f828f2f004509386bcfcc32286ecd6dd866230b5be3d18764"
+            "ba61348f39ee65627c299a2af6a4521eae78a8687946dcf264461075b9e474de"
         );
     }
 

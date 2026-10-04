@@ -118,12 +118,6 @@ impl AdminState {
         Ok(state)
     }
 
-    /// Replace this state with a fresh, validated load from `data_dir`.
-    pub fn reload(&mut self, data_dir: impl AsRef<Path>) -> Result<(), AdminStateError> {
-        *self = Self::load(data_dir)?;
-        Ok(())
-    }
-
     /// Persist via a temp file + atomic rename.
     pub fn save(&self, data_dir: impl AsRef<Path>) -> Result<(), AdminStateError> {
         let path = data_dir.as_ref().join(ADMIN_STATE_FILE);

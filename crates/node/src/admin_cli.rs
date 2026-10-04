@@ -17,11 +17,21 @@
 //!
 //! # Semantics
 //!
-//! - `admin add` designates a current child; `admin remove` revokes it. Every
-//!   command fails closed when the target child is not a current child of this
-//!   node.
+//! - `admin add` designates a **current** child (of any [`ChildKind`]); a
+//!   non-child is refused. `admin remove` revokes **any** designated id,
+//!   current child or not, so stale entries can always be cleared.
+//! - `admin list` lists the designated ids and marks entries that are no longer
+//!   current children as stale.
 //! - `updated_by = "local"`, `updated_at = now`; an `admin-state` audit line is
 //!   appended with `via: "local"`, `actor: "operator"`.
+//!
+//! # Recovery
+//!
+//! The CLI reads `admin_state.json` **leniently**: a corrupt or over-cap file
+//! starts from [`AdminState::empty`] with a warning and an
+//! `admin-state-load-failed` audit instead of blocking the command. The local
+//! operator is therefore never permanently locked out and can re-seed/repair the
+//! file with `admin add`.
 //!
 //! # Audit
 //!
@@ -36,7 +46,7 @@ use thiserror::Error;
 use cawala_ledger::OperatorSecretKey;
 
 use crate::admin_state::{AdminState, AdminStateError};
-use crate::control::ControlNode;
+use crate::record::RecordStore;
 
 /// Designate `child` as an administrator of this node.
 ///
@@ -45,21 +55,21 @@ use crate::control::ControlNode;
 pub fn admin_add(
     data_dir: &Path,
     node_id: &str,
-    operator: &OperatorSecretKey,
+    _operator: &OperatorSecretKey,
     child: &str,
     now: u64,
 ) -> Result<AdminState, AdminCliError> {
-    let mut state = AdminState::load(data_dir)?;
+    let mut state = load_for_repair(data_dir);
     if state.has(child) {
         return Err(AdminCliError::AlreadyAdmin(child.to_string()));
     }
-    let engine = open_engine(data_dir, node_id, operator)?;
-    if !is_child(engine.record(), child) {
+    if !is_child(&current_children(data_dir, node_id)?, child) {
         return Err(AdminCliError::NotChild(child.to_string()));
     }
     if !state.add(child) {
-        // The designation set is full or the id is invalid.
-        return Err(AdminCliError::AlreadyAdmin(child.to_string()));
+        // The id was checked above and is not present, so the set is full (or
+        // the id is empty/oversized).
+        return Err(AdminCliError::SetFull(child.to_string()));
     }
     state.mark_updated(now, "local");
     state.save(data_dir)?;
@@ -75,22 +85,19 @@ pub fn admin_add(
 
 /// Revoke `child`'s administrator designation.
 ///
-/// The child must be a current child of this node (of any kind). Removing a
-/// non-designated child is an error.
+/// Removes `child` regardless of whether it is still a current child, so a
+/// stale (non-child) designation can always be cleared. Revoking a
+/// non-designated id is an error.
 pub fn admin_remove(
     data_dir: &Path,
     node_id: &str,
-    operator: &OperatorSecretKey,
+    _operator: &OperatorSecretKey,
     child: &str,
     now: u64,
 ) -> Result<AdminState, AdminCliError> {
-    let mut state = AdminState::load(data_dir)?;
+    let mut state = load_for_repair(data_dir);
     if !state.has(child) {
         return Err(AdminCliError::NotAdmin(child.to_string()));
-    }
-    let engine = open_engine(data_dir, node_id, operator)?;
-    if !is_child(engine.record(), child) {
-        return Err(AdminCliError::NotChild(child.to_string()));
     }
     state.remove(child);
     state.mark_updated(now, "local");
@@ -105,26 +112,82 @@ pub fn admin_remove(
     Ok(state)
 }
 
-/// The persisted administrator designation set.
-pub fn admin_list(data_dir: &Path) -> Result<AdminState, AdminCliError> {
-    Ok(AdminState::load(data_dir)?)
+/// List the persisted administrator designation set, marking entries that are no
+/// longer current children of this node as stale.
+pub fn admin_list(data_dir: &Path, node_id: &str) -> Result<AdminListing, AdminCliError> {
+    let state = load_for_repair(data_dir);
+    let children = current_children(data_dir, node_id)?;
+    let stale = state
+        .list()
+        .iter()
+        .filter(|id| !is_child(&children, id))
+        .cloned()
+        .collect();
+    Ok(AdminListing { state, stale })
 }
 
-/// Open a control engine to read this node's record.
-fn open_engine(
-    data_dir: &Path,
-    node_id: &str,
-    operator: &OperatorSecretKey,
-) -> Result<ControlNode, AdminCliError> {
-    ControlNode::open(data_dir, node_id, operator.clone()).map_err(AdminCliError::Control)
+/// The persisted designation set plus the ids that are no longer current
+/// children.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminListing {
+    /// The persisted administrator designation set.
+    pub state: AdminState,
+    /// Designated ids that are no longer current children of this node.
+    pub stale: Vec<String>,
+}
+
+impl AdminListing {
+    /// Whether `id` is a stale designation (no longer a current child).
+    pub fn is_stale(&self, id: &str) -> bool {
+        self.stale.iter().any(|stale| stale == id)
+    }
+}
+
+/// Load the designation set for a **repair** CLI, starting from
+/// [`AdminState::empty`] with a warning/audit when the persisted file is corrupt
+/// or over-cap.
+///
+/// This is the local operator's escape hatch: a malformed `admin_state.json`
+/// must not prevent `admin add`/`admin remove` from running, and the next
+/// successful write replaces it with a valid document.
+fn load_for_repair(data_dir: &Path) -> AdminState {
+    match AdminState::load(data_dir) {
+        Ok(state) => state,
+        Err(err) => {
+            // Best-effort audit, mirroring the engine's `admin-state-load-failed`.
+            crate::audit::append(
+                data_dir,
+                serde_json::json!({
+                    "event": "admin-state-load-failed",
+                    "error": err.to_string(),
+                }),
+            );
+            eprintln!(
+                "warning: admin state could not be loaded ({err}); \
+                 starting from an empty designation set"
+            );
+            AdminState::empty()
+        }
+    }
+}
+
+/// The current child node ids of this node, or an empty list when no readable
+/// `node.json` exists (all designations are then stale).
+fn current_children(data_dir: &Path, node_id: &str) -> Result<Vec<String>, AdminCliError> {
+    match RecordStore::open(data_dir, node_id) {
+        Ok(record) => Ok(record
+            .record()
+            .children
+            .iter()
+            .map(|child| child.child_id.clone())
+            .collect()),
+        Err(_) => Ok(Vec::new()),
+    }
 }
 
 /// Whether `child` is a current child of this node (of any [`ChildKind`]).
-fn is_child(record: &crate::record::NodeRecord, child: &str) -> bool {
-    record
-        .children
-        .iter()
-        .any(|candidate| candidate.child_id == child)
+fn is_child(children: &[String], child: &str) -> bool {
+    children.iter().any(|candidate| candidate == child)
 }
 
 /// Append the shared `admin-state` audit line (best-effort).
@@ -159,10 +222,11 @@ pub enum AdminCliError {
     /// full).
     #[error("'{0}' is already a designated administrator (or the set is full)")]
     AlreadyAdmin(String),
+    /// The designation set already holds
+    /// [`MAX_DESIGNATED_ADMINS`](crate::MAX_DESIGNATED_ADMINS) entries.
+    #[error("cannot designate '{0}': the administrator set is full")]
+    SetFull(String),
     /// The persisted admin state could not be loaded or saved.
     #[error("admin state: {0}")]
     State(#[from] AdminStateError),
-    /// The control engine could not be opened.
-    #[error("control engine: {0}")]
-    Control(#[from] cawala_control::ControlError),
 }

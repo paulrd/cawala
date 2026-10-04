@@ -210,7 +210,8 @@ pub struct DetachChild {
 /// The request states the desired target, but v1 supports only re-slotting a
 /// direct child under the parent that already holds it: the receiving node
 /// rejects any `new_parent` other than itself, and its authority gate rejects a
-/// sender that is not this node's operator or senior child. Moving a subtree to
+/// sender that is not this node's operator or a designated administrator child.
+/// Moving a subtree to
 /// a *different* parent (the old parent releases it, the new parent approves,
 /// and the subtree's addresses are rebased) is not implemented.
 ///
@@ -482,10 +483,35 @@ impl AdminRedeliverJoin {
     }
 }
 
+/// A currently-designated administrator's request to change this node's
+/// administrator designation set (routed).
+///
+/// Under the v2 model a designated administrator may add or revoke another
+/// administrator remotely; the request is routed hop-by-hop and authorized by
+/// the authenticated last hop (see [`ControlRequest::AdminDesignate`] /
+/// [`ControlRequest::AdminRevoke`]). `child` is the child node id of any
+/// [`ChildKind`] to designate or revoke. Added in
+/// [`CONTROL_FORMAT_VERSION`](crate::CONTROL_FORMAT_VERSION) 8 (variants 21/22).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesignationChange {
+    /// The child to designate or revoke.
+    pub child: String,
+}
+
+impl DesignationChange {
+    /// Check the child-id length bound.
+    ///
+    /// `child` must be at most [`MAX_NODE_ID_LEN`] bytes; whether it is actually
+    /// a current child (for `AdminDesignate`) is the node's concern.
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_node_id("child", &self.child)
+    }
+}
+
 /// An admin's request to detach a direct child (topology scope).
 ///
 /// Detaching a child with a non-zero ledger balance is allowed (parity with the
-/// senior path); the child self-re-homes via its own exit/healing.
+/// non-admin topology path); the child self-re-homes via its own exit/healing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminDetachChild {
     /// The direct child to detach.
@@ -679,6 +705,12 @@ pub enum ControlRequest {
     AdminIssue(AdminValueRequest),
     /// Value-scoped admin burn from a child account (discriminant 20, format 7).
     AdminBurn(AdminValueRequest),
+    /// A designated administrator's request to add a child to this node's
+    /// designation set (discriminant 21, format 8).
+    AdminDesignate(DesignationChange),
+    /// A designated administrator's request to remove a child from this node's
+    /// designation set (discriminant 22, format 8).
+    AdminRevoke(DesignationChange),
 }
 
 impl ControlRequest {
@@ -706,6 +738,8 @@ impl ControlRequest {
             ControlRequest::AdminMoveChild(_) => "admin-move-child",
             ControlRequest::AdminIssue(_) => "admin-issue",
             ControlRequest::AdminBurn(_) => "admin-burn",
+            ControlRequest::AdminDesignate(_) => "admin-designate",
+            ControlRequest::AdminRevoke(_) => "admin-revoke",
         }
     }
 
@@ -726,6 +760,8 @@ impl ControlRequest {
                 | ControlRequest::AdminMoveChild(_)
                 | ControlRequest::AdminIssue(_)
                 | ControlRequest::AdminBurn(_)
+                | ControlRequest::AdminDesignate(_)
+                | ControlRequest::AdminRevoke(_)
         )
     }
 }
@@ -855,6 +891,12 @@ mod tests {
             }),
             ControlRequest::AdminIssue(value_request()),
             ControlRequest::AdminBurn(value_request()),
+            ControlRequest::AdminDesignate(DesignationChange {
+                child: "applicant".to_string(),
+            }),
+            ControlRequest::AdminRevoke(DesignationChange {
+                child: "applicant".to_string(),
+            }),
         ]
     }
 
@@ -885,6 +927,8 @@ mod tests {
                 "admin-move-child",
                 "admin-issue",
                 "admin-burn",
+                "admin-designate",
+                "admin-revoke",
             ]
         );
     }
@@ -1123,6 +1167,8 @@ mod tests {
                     | ControlRequest::AdminMoveChild(_)
                     | ControlRequest::AdminIssue(_)
                     | ControlRequest::AdminBurn(_)
+                    | ControlRequest::AdminDesignate(_)
+                    | ControlRequest::AdminRevoke(_)
             );
             assert_eq!(request.is_admin(), expected, "{request:?}");
             assert_eq!(is_admin_request(&request), expected, "{request:?}");
@@ -1131,7 +1177,7 @@ mod tests {
 
     #[test]
     fn new_admin_discriminants_are_frozen() {
-        // Variants 16..=20 (0-based). An insert or reorder would shift every
+        // Variants 16..=22 (0-based). An insert or reorder would shift every
         // later discriminant.
         let ledger = postcard::to_allocvec(&ControlRequest::AdminLedgerQuery).unwrap();
         let detach = postcard::to_allocvec(&ControlRequest::AdminDetachChild(AdminDetachChild {
@@ -1145,11 +1191,21 @@ mod tests {
         .unwrap();
         let issue = postcard::to_allocvec(&ControlRequest::AdminIssue(value_request())).unwrap();
         let burn = postcard::to_allocvec(&ControlRequest::AdminBurn(value_request())).unwrap();
+        let designate = postcard::to_allocvec(&ControlRequest::AdminDesignate(DesignationChange {
+            child: "c".to_string(),
+        }))
+        .unwrap();
+        let revoke = postcard::to_allocvec(&ControlRequest::AdminRevoke(DesignationChange {
+            child: "c".to_string(),
+        }))
+        .unwrap();
         assert_eq!(ledger, vec![16]);
         assert_eq!(detach[0], 17);
         assert_eq!(move_child[0], 18);
         assert_eq!(issue[0], 19);
         assert_eq!(burn[0], 20);
+        assert_eq!(designate[0], 21);
+        assert_eq!(revoke[0], 22);
     }
 
     #[test]
@@ -1271,6 +1327,35 @@ mod tests {
             AdminMoveChild {
                 child: node(&"n".repeat(MAX_NODE_ID_LEN + 1)),
                 slot: None,
+            }
+            .validate(),
+            Err(ControlError::FieldTooLong {
+                field: "child",
+                len: MAX_NODE_ID_LEN + 1,
+                max: MAX_NODE_ID_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn designation_change_validate_enforces_bounds() {
+        assert_eq!(
+            DesignationChange {
+                child: "child".to_string(),
+            }
+            .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            DesignationChange {
+                child: "n".repeat(MAX_NODE_ID_LEN),
+            }
+            .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            DesignationChange {
+                child: "n".repeat(MAX_NODE_ID_LEN + 1),
             }
             .validate(),
             Err(ControlError::FieldTooLong {

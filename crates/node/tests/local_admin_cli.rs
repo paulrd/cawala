@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cawala_control::{ChildKind, ControlRequest, SignedControl};
 use cawala_ledger::OperatorSecretKey;
 use cawala_node::record::RecordStore;
-use cawala_node::{AdminCliError, CONTROL_AUDIT_FILE, ControlNode, admin_cli};
+use cawala_node::{
+    ADMIN_STATE_FILE, ADMIN_STATE_VERSION, AdminCliError, AdminState, CONTROL_AUDIT_FILE,
+    ControlNode, admin_cli,
+};
 use iroh::{EndpointId, SecretKey};
 
 fn operator(secret: &SecretKey) -> OperatorSecretKey {
@@ -135,4 +138,91 @@ fn local_audit_marker_via_local() {
 fn fresh_nonce() -> u64 {
     static NONCE: AtomicU64 = AtomicU64::new(1);
     NONCE.fetch_add(1, Ordering::Relaxed)
+}
+
+/// `admin_remove` clears a designated id even when it is no longer a current
+/// child, so a stale designation is never stuck.
+#[test]
+fn admin_remove_clears_stale_non_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SecretKey::generate();
+    let op = operator(&key);
+    let node_id = key.public().to_string();
+    setup(dir.path(), &node_id, &[("child", 0)]);
+
+    // Seed a designation for an id that is not a current child.
+    let mut state = AdminState::empty();
+    assert!(state.add("ghost"));
+    state.save(dir.path()).unwrap();
+
+    let state = admin_cli::admin_remove(dir.path(), &node_id, &op, "ghost", 200).unwrap();
+    assert!(!state.has("ghost"));
+    assert!(state.list().is_empty());
+}
+
+/// `admin_list` marks designated ids that are no longer current children.
+#[test]
+fn admin_list_marks_stale_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SecretKey::generate();
+    let node_id = key.public().to_string();
+    setup(dir.path(), &node_id, &[("child", 0)]);
+
+    let mut state = AdminState::empty();
+    state.add("child");
+    state.add("ghost");
+    state.save(dir.path()).unwrap();
+
+    let listing = admin_cli::admin_list(dir.path(), &node_id).unwrap();
+    assert!(listing.state.has("child"));
+    assert!(listing.state.has("ghost"));
+    assert!(!listing.is_stale("child"));
+    assert!(listing.is_stale("ghost"), "a non-child entry must be marked stale");
+    assert_eq!(listing.stale, vec!["ghost".to_string()]);
+}
+
+/// A corrupt `admin_state.json` must not lock the operator out: `admin add`
+/// starts from empty and writes a valid document.
+#[test]
+fn corrupt_file_is_repaired_by_add() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SecretKey::generate();
+    let op = operator(&key);
+    let node_id = key.public().to_string();
+    setup(dir.path(), &node_id, &[("child", 0)]);
+    std::fs::write(dir.path().join(ADMIN_STATE_FILE), b"{ not json").unwrap();
+
+    let state = admin_cli::admin_add(dir.path(), &node_id, &op, "child", 100).unwrap();
+    assert!(state.has("child"));
+    // The file is now a valid, loadable document.
+    assert!(AdminState::load(dir.path()).unwrap().has("child"));
+}
+
+/// An over-cap `admin_state.json` (which `load` rejects) must not lock the
+/// operator out either.
+#[test]
+fn over_cap_file_is_repaired_by_add() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SecretKey::generate();
+    let op = operator(&key);
+    let node_id = key.public().to_string();
+    setup(dir.path(), &node_id, &[("child", 0)]);
+
+    let admins: Vec<String> = (0..=cawala_node::MAX_DESIGNATED_ADMINS)
+        .map(|i| format!("admin-{i}"))
+        .collect();
+    std::fs::write(
+        dir.path().join(ADMIN_STATE_FILE),
+        serde_json::to_vec(&serde_json::json!({
+            "version": ADMIN_STATE_VERSION,
+            "admins": admins,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(AdminState::load(dir.path()).is_err());
+
+    let state = admin_cli::admin_add(dir.path(), &node_id, &op, "child", 100).unwrap();
+    assert_eq!(state.list(), &["child".to_string()]);
+    assert!(AdminState::load(dir.path()).unwrap().has("child"));
 }

@@ -1903,18 +1903,15 @@ fn admin_command(
     let now = now_unix_seconds();
     match command {
         AdminCommand::Add { child } => {
-            let state = admin_cli::admin_add(data_dir, node_id, operator, &child, now)
-                .map_err(cli_error)?;
-            print_admin_state(&state);
+            admin_cli::admin_add(data_dir, node_id, operator, &child, now).map_err(cli_error)?;
+            print_admin_listing(data_dir, node_id)?;
         }
         AdminCommand::Remove { child } => {
-            let state = admin_cli::admin_remove(data_dir, node_id, operator, &child, now)
-                .map_err(cli_error)?;
-            print_admin_state(&state);
+            admin_cli::admin_remove(data_dir, node_id, operator, &child, now).map_err(cli_error)?;
+            print_admin_listing(data_dir, node_id)?;
         }
         AdminCommand::List => {
-            let state = admin_cli::admin_list(data_dir).map_err(cli_error)?;
-            print_admin_state(&state);
+            print_admin_listing(data_dir, node_id)?;
         }
         AdminCommand::ValuePolicy(command) => {
             value_policy_command(data_dir, command)?;
@@ -1928,21 +1925,27 @@ fn cli_error(err: cawala_node::AdminCliError) -> anyhow::Error {
     anyhow::anyhow!("{err}")
 }
 
-/// Print the persisted administrator designation set.
-fn print_admin_state(state: &cawala_node::AdminState) {
-    if state.list().is_empty() {
+/// Print the persisted administrator designation set, flagging stale entries.
+fn print_admin_listing(data_dir: &std::path::Path, node_id: &str) -> Result<()> {
+    let listing = admin_cli::admin_list(data_dir, node_id).map_err(cli_error)?;
+    if listing.state.list().is_empty() {
         println!("admins: (none)");
     } else {
-        println!("admins: {} designated", state.list().len());
-        for id in state.list() {
-            println!("  - {id}");
+        println!("admins: {} designated", listing.state.list().len());
+        for id in listing.state.list() {
+            if listing.is_stale(id) {
+                println!("  - {id} (stale: not a current child)");
+            } else {
+                println!("  - {id}");
+            }
         }
     }
     println!(
         "updated_at: {} updated_by: {}",
-        state.updated_at(),
-        state.updated_by()
+        listing.state.updated_at(),
+        listing.state.updated_by()
     );
+    Ok(())
 }
 
 /// Local `control admin value-policy show|set`.

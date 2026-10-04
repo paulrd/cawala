@@ -1,10 +1,10 @@
 //! Hermetic integration tests for delegated value administration (P5) over the
 //! real `cawala/control/0` protocol.
 //!
-//! A value-scoped v2 grant (or the node's own operator) issues and burns value
-//! on a child account; the node executes with its own operator/ledger keys. The
-//! tests cover idempotency (including after reopen), operator caps,
-//! deny-by-default policy, audit lines, and the failure modes.
+//! A designated administrator child (or the node's own operator) issues and
+//! burns value on a child account; the node executes with its own
+//! operator/ledger keys. The tests cover idempotency (including after reopen),
+//! operator caps, deny-by-default policy, audit lines, and the failure modes.
 
 use std::net::Ipv4Addr;
 use std::path::Path;

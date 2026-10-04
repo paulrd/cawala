@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use cawala_control::{
     AdminDetachChild, AdminValueRequest, ChildKind, ControlReply, ControlRequest, CreateChild,
-    NodeId, OperatorSecretKey, ROUTED_CONTROL_VERSION, RejectCode, RoutedControlV1, RoutedForward,
-    SignedControl, ValueRequestId,
+    DesignationChange, NodeId, OperatorSecretKey, ROUTED_CONTROL_VERSION, RejectCode,
+    RoutedControlV1, RoutedForward, SignedControl, ValueRequestId,
 };
 use cawala_ledger::{LedgerSecretKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::PeerRef;
@@ -259,7 +259,33 @@ async fn self_operator_still_authorized() {
 }
 
 #[tokio::test]
-async fn routed_admin_from_direct_parent_applies() {
+async fn non_designated_leaf_child_denied_on_admin() {
+    let parent_key = SecretKey::generate();
+    let browser_key = SecretKey::generate();
+    let parent_op = operator(&parent_key);
+    let browser_op = operator(&browser_key);
+    let browser_id = browser_key.public().to_string();
+
+    let (mut engine, _dir) = build(
+        "parent",
+        "0",
+        &[(&browser_id, ChildKind::User, 0)],
+        vec![user_peer(&browser_id, &browser_op)],
+        parent_op,
+    );
+    let remote = EndpointId::from(browser_key.public());
+
+    // The leaf is a current child but is *not* designated: it has no authority.
+    let query = sign(&browser_id, &browser_op, ControlRequest::AdminQuery);
+    let routed = routed_from("parent", &query, &browser_id);
+    assert_eq!(
+        engine.receive_routed_at(remote, routed, NOW).await,
+        ControlReply::Rejected(RejectCode::Unauthorized)
+    );
+}
+
+#[tokio::test]
+async fn routed_admin_from_direct_child_applies() {
     let parent_key = SecretKey::generate();
     let admin_key = SecretKey::generate();
     let victim_key = SecretKey::generate();
@@ -446,5 +472,229 @@ async fn direct_remote_admin_is_refused() {
     assert_eq!(
         engine.receive_at(remote, query, NOW).await,
         ControlReply::Rejected(RejectCode::Unauthorized)
+    );
+}
+
+/// A designated administrator may add a current child to the designation set
+/// remotely (routed); the change is persisted.
+#[tokio::test]
+async fn routed_designated_admin_can_designate_child() {
+    let parent_key = SecretKey::generate();
+    let admin_key = SecretKey::generate();
+    let victim_key = SecretKey::generate();
+    let parent_op = operator(&parent_key);
+    let admin_op = operator(&admin_key);
+    let victim_op = operator(&victim_key);
+    let admin_id = admin_key.public().to_string();
+    let victim_id = victim_key.public().to_string();
+
+    let (mut engine, dir) = build(
+        "parent",
+        "0",
+        &[
+            (&admin_id, ChildKind::Node, 0),
+            (&victim_id, ChildKind::Node, 1),
+        ],
+        vec![
+            node_peer(&admin_id, &admin_op, 3),
+            node_peer(&victim_id, &victim_op, 4),
+        ],
+        parent_op,
+    );
+    designate(dir.path(), &[&admin_id]);
+    let remote = EndpointId::from(admin_key.public());
+
+    let designate_child = sign(
+        &admin_id,
+        &admin_op,
+        ControlRequest::AdminDesignate(DesignationChange {
+            child: victim_id.clone(),
+        }),
+    );
+    let routed = routed_from("parent", &designate_child, &admin_id);
+    assert_eq!(
+        engine.receive_routed_at(remote, routed, NOW).await,
+        ControlReply::Accepted
+    );
+    assert!(engine.admin_state().has(&victim_id));
+    assert!(
+        AdminState::load(dir.path()).unwrap().has(&victim_id),
+        "the designation must be persisted"
+    );
+}
+
+/// A non-designated child cannot change the designation set.
+#[tokio::test]
+async fn routed_non_admin_cannot_designate() {
+    let parent_key = SecretKey::generate();
+    let child_key = SecretKey::generate();
+    let victim_key = SecretKey::generate();
+    let parent_op = operator(&parent_key);
+    let child_op = operator(&child_key);
+    let child_id = child_key.public().to_string();
+    let victim_id = victim_key.public().to_string();
+
+    let (mut engine, _dir) = build(
+        "parent",
+        "0",
+        &[
+            (&child_id, ChildKind::Node, 0),
+            (&victim_id, ChildKind::Node, 1),
+        ],
+        vec![node_peer(&child_id, &child_op, 3)],
+        parent_op,
+    );
+    let remote = EndpointId::from(child_key.public());
+
+    let designate_child = sign(
+        &child_id,
+        &child_op,
+        ControlRequest::AdminDesignate(DesignationChange { child: victim_id }),
+    );
+    let routed = routed_from("parent", &designate_child, &child_id);
+    assert_eq!(
+        engine.receive_routed_at(remote, routed, NOW).await,
+        ControlReply::Rejected(RejectCode::Unauthorized)
+    );
+    assert!(!engine.admin_state().has(&victim_key.public().to_string()));
+}
+
+/// Designating an id that is not a current child is rejected.
+#[tokio::test]
+async fn routed_designate_non_child_is_rejected() {
+    let parent_key = SecretKey::generate();
+    let admin_key = SecretKey::generate();
+    let parent_op = operator(&parent_key);
+    let admin_op = operator(&admin_key);
+    let admin_id = admin_key.public().to_string();
+
+    let (mut engine, dir) = build(
+        "parent",
+        "0",
+        &[(&admin_id, ChildKind::Node, 0)],
+        vec![node_peer(&admin_id, &admin_op, 3)],
+        parent_op,
+    );
+    designate(dir.path(), &[&admin_id]);
+    let remote = EndpointId::from(admin_key.public());
+
+    let designate_ghost = sign(
+        &admin_id,
+        &admin_op,
+        ControlRequest::AdminDesignate(DesignationChange {
+            child: "ghost".to_string(),
+        }),
+    );
+    let routed = routed_from("parent", &designate_ghost, &admin_id);
+    assert_eq!(
+        engine.receive_routed_at(remote, routed, NOW).await,
+        ControlReply::Rejected(RejectCode::NotFound)
+    );
+    assert!(!engine.admin_state().has("ghost"));
+}
+
+/// `AdminRevoke` removes a current child and idempotently clears a stale
+/// non-child designation.
+#[tokio::test]
+async fn routed_revoke_removes_child_and_clears_stale() {
+    let parent_key = SecretKey::generate();
+    let admin_key = SecretKey::generate();
+    let victim_key = SecretKey::generate();
+    let parent_op = operator(&parent_key);
+    let admin_op = operator(&admin_key);
+    let victim_op = operator(&victim_key);
+    let admin_id = admin_key.public().to_string();
+    let victim_id = victim_key.public().to_string();
+
+    let (mut engine, dir) = build(
+        "parent",
+        "0",
+        &[
+            (&admin_id, ChildKind::Node, 0),
+            (&victim_id, ChildKind::Node, 1),
+        ],
+        vec![
+            node_peer(&admin_id, &admin_op, 3),
+            node_peer(&victim_id, &victim_op, 4),
+        ],
+        parent_op,
+    );
+    // `ghost` is designated but is not (and never was) a current child.
+    designate(dir.path(), &[&admin_id, &victim_id, "ghost"]);
+    let remote = EndpointId::from(admin_key.public());
+
+    // Revoke a current child.
+    let revoke_victim = sign(
+        &admin_id,
+        &admin_op,
+        ControlRequest::AdminRevoke(DesignationChange {
+            child: victim_id.clone(),
+        }),
+    );
+    let routed = routed_from("parent", &revoke_victim, &admin_id);
+    assert_eq!(
+        engine.receive_routed_at(remote, routed, NOW).await,
+        ControlReply::Accepted
+    );
+    assert!(!engine.admin_state().has(&victim_id));
+    assert!(!AdminState::load(dir.path()).unwrap().has(&victim_id));
+
+    // Revoke a stale non-child designation: still idempotently accepted, and it
+    // is gone from the persisted set.
+    let revoke_ghost = sign(
+        &admin_id,
+        &admin_op,
+        ControlRequest::AdminRevoke(DesignationChange {
+            child: "ghost".to_string(),
+        }),
+    );
+    let routed = routed_from("parent", &revoke_ghost, &admin_id);
+    assert_eq!(
+        engine.receive_routed_at(remote, routed, NOW).await,
+        ControlReply::Accepted
+    );
+    assert!(!engine.admin_state().has("ghost"));
+    assert!(!AdminState::load(dir.path()).unwrap().has("ghost"));
+}
+
+/// A prune triggered by the per-request reload revokes the stale designation's
+/// authority **and persists** the pruned set, so later reloads are no-ops.
+#[tokio::test]
+async fn prune_on_reload_revokes_authority_and_persists() {
+    let parent_key = SecretKey::generate();
+    let admin_key = SecretKey::generate();
+    let parent_op = operator(&parent_key);
+    let admin_op = operator(&admin_key);
+    let admin_id = admin_key.public().to_string();
+
+    let (mut engine, dir) = build(
+        "parent",
+        "0",
+        &[(&admin_id, ChildKind::Node, 0)],
+        vec![node_peer(&admin_id, &admin_op, 3)],
+        parent_op,
+    );
+    designate(dir.path(), &[&admin_id]);
+
+    // A separate process detaches the child from `node.json`.
+    {
+        let mut record = RecordStore::open(dir.path(), "parent").unwrap();
+        record.detach_child(&admin_id).unwrap();
+        record.save().unwrap();
+    }
+
+    // The routed request from the now-detached child is refused, and the reload
+    // has pruned the designation from disk.
+    let remote = EndpointId::from(admin_key.public());
+    let query = sign(&admin_id, &admin_op, ControlRequest::AdminQuery);
+    let routed = routed_from("parent", &query, &admin_id);
+    assert_eq!(
+        engine.receive_routed_at(remote, routed, NOW).await,
+        ControlReply::Rejected(RejectCode::Unauthorized)
+    );
+    assert!(!engine.admin_state().has(&admin_id));
+    assert!(
+        !AdminState::load(dir.path()).unwrap().has(&admin_id),
+        "the prune must be persisted so it is not repeated per request"
     );
 }

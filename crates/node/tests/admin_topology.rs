@@ -1,10 +1,10 @@
 //! Hermetic integration tests for delegated topology administration (P4) over
 //! the real `cawala/control/0` protocol.
 //!
-//! A `topology`-scoped v2 grant (or the node's own operator) may detach and
+//! A designated administrator child (or the node's own operator) may detach and
 //! re-slot a direct child; the mutation is the same authority-free helper the
-//! senior path uses, so validation parity is structural. Joins-only, value-only,
-//! and legacy v1 grants are `Unauthorized` on both variants.
+//! non-admin topology path uses, so validation parity is structural.
+//! Non-designated children are `Unauthorized` on both variants.
 
 use std::net::Ipv4Addr;
 use std::path::Path;
