@@ -10,6 +10,8 @@ how to verify, and conventions**. Detail lives elsewhere:
   (the former `REFACTOR.md`/`REFACTOR_PLAN.md`, deleted 2026-10-04).
 - **`ADMIN_POLICY.md`** (tracked) — the policy shown at the P4 admin-unlock gate
   (stub pending final wording).
+- **`CLI.md`** (tracked) — operator guide to the `cawala-node` command surface:
+  each command's behavior, intended use, and destructive caveats.
 - **`.slim/deepwork/*.md`** (gitignored, local-only) — per-effort working notes.
   For this effort: `admin-refactor.md`, `admin-refactor-p1-spec.md`,
   `admin-refactor-v2-spec.md`, `admin-refactor-remediation.md`.

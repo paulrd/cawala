@@ -5,9 +5,10 @@ a live single-leaf network, same-leaf and cross-leaf payments, browser
 administration by designation, identity portability, exit/recovery, and the
 headless smoke scripts.
 
-> See `web/README.md` for how to build and run the app, and `PLAN.md` for the
-> current authority model. There is no ping/debug UI (`#/debug` is a 404); the
-> send form takes a receive **URI**, not a bare endpoint id.
+> See `web/README.md` for how to build and run the app, `PLAN.md` for the
+> current authority model, and `CLI.md` for the full `cawala-node` command
+> reference. There is no ping/debug UI (`#/debug` is a 404); the send form takes
+> a receive **URI**, not a bare endpoint id.
 
 ## 0. Setup
 
@@ -30,8 +31,9 @@ npm run dev          # builds the wasm glue, then starts Vite
 Open <http://localhost:5173>. Live mode is the default. `npm run dev` regenerates
 `web/src/wasm/` from `crates/client-wasm`, so rebuild after any client change.
 
-Node CLI is always `cargo run -p cawala-node -- <args>` from the repo root.
-`--data-dir` is a **global flag that must precede the subcommand**.
+Node CLI is `cargo run -p cawala-node -- <args>` from the repo root (examples
+below that show `cawala-node` directly assume it is on PATH). `--data-dir` is a
+**global flag**: clap accepts it before or after the subcommand.
 
 ---
 
@@ -86,8 +88,10 @@ node's 64-hex operator id.
 ### 2b. Join flow (browser)
 
 1. Open <http://localhost:5173> (live), go to **Join**, paste the invite,
-   **Paste & check**, then **Connect**. State → **"Waiting for approval"**
-   (persists across reload).
+   **Paste & check**. The summary shows the parent, the pinned operator key
+   (copyable), relay/direct transport hints, optional slot/label, and an
+   **Expired** badge (Connect is disabled) when past its expiry. Then
+   **Connect**. State → **"Waiting for approval"** (persists across reload).
 2. In Terminal B: `... control joins` → lists the pending browser.
 3. `... control approve --node <browser-endpoint-id>`
    (or `control reject --node <id> --reason ...`).
@@ -120,7 +124,12 @@ mock). Both join the same leaf and get approved.
    **Send payment**.
 3. Expect Pending → **Applied**; A balance `75`, B balance `25`; Activity shows
    the transfer truthfully.
-4. Edge cases: a URI without `ln`/`lk` shows **"No pin"** (TOFU); a tampered
+4. Terminal states are honest, not binary: `applied`, `duplicate`,
+   `unverified`, `partial`, `indeterminate`, and `rejected` each render
+   distinctly. The send form polls for 60 s, then reports **"Still pending"**.
+   `unverified` means the proof could not be checked — **do not resend**; a
+   `rejected` card offers **Retry payment**.
+5. Edge cases: a URI without `ln`/`lk` shows **"No pin"** (TOFU); a tampered
    `lk` must not show success; sending more than the balance must render a
    distinct failure/partial state.
 
@@ -156,7 +165,8 @@ The browser never holds a node operator or ledger key. It signs admin requests
 with its own operator key; the target applies a request only if the authenticated
 direct neighbor that handed it over is one of the target's **designated
 administrators**. All admin requests are **tree-routed**; there is no direct dial
-to an admin target.
+to an admin target. The **Admin** nav item carries a badge with the pending-join
+count.
 
 1. **Designate the browser** with the local CLI (always works, and bootstraps the
    first administrator). The child must be a current child of the node:
@@ -173,6 +183,8 @@ to an admin target.
    a stored acknowledgement (it is stored by document hash).
 3. **Switch target** with the up/down switcher over the strict ancestor chain
    (the browser's own leaf, then parent, ...); the ends disable their buttons.
+   The chain is designation-bounded: it stops at the first undesignated hop and
+   shows "No ancestor found ... Retry".
 4. Test each surface on the administered node:
    - **Designated Administrators** - each child row shows whether it is
      designated; **Designate** / **Revoke** send routed `AdminDesignate` /
@@ -180,12 +192,19 @@ to an admin target.
    - **Pending joins** - Approve / Reject / Resend (Resend appears only after a
      non-delivered attempt).
    - **Topology** - select a node child row, then **Re-slot…** / **Detach…**
-     (browser `User` leaves cannot be re-slotted in v1). **Create child** is a
-     mock-only control; live children appear by approving a join request or from
-     the node CLI.
+     (browser `User` leaves cannot be re-slotted in v1). A node child's kind
+     is inferred and labelled ("Inferred from the node's children"), never
+     guessed. **Create child** is a mock-only control; live children appear by
+     approving a join request or via the node CLI (`control create-child` /
+     `topo attach-child`).
    - **Value Issue & Burn** - pick an account, enter an amount and a required
      reason (posting against the node's equity). Issue is **uncapped**; burn is
-     limited by the account's current balance.
+     limited by the account's current balance. The same **Issue.../Burn...**
+     actions also appear on the **Accounts** page once a value-capable target is
+     selected; a pending op shows **Retry** / **Discard** (persisted across
+     reload).
+   - **Network Membership** - **Leave network...** detaches this browser's own
+     leaf (independent of the selected target; My Account has the same action).
 5. Negative tests: a browser that is **not** in the target's designation set is
    refused (`unauthorized`); `control admin remove <id>` then refresh; a locked
    Admin page shows the policy gate; a reload re-locks.
@@ -200,20 +219,26 @@ to an admin target.
 - **Export identity**: passphrase (≥12 chars) + confirm → downloads
   `cawala-identity-<id>.json`.
 - **Import identity**: load the file on another profile/device, preview
-  "Incoming node", confirm → reload. Same seed = same address and balance.
+  "Incoming node", confirm → reload. Same seed = same address and balance. The
+  preview flags whether the incoming identity is the **same or different** from
+  the current one.
 - **Wrong passphrase / tampered file** must fail inline.
 - **Remove identity**: confirm → wipes the seed + join/ledger state; reload
   shows a fresh identity.
 - Cross-device: using one identity on two devices concurrently is *not
   prevented* — run one device at a time.
+- Settings also surfaces the pinned **leaf ledger key** (TOFU), a **multi-tab**
+  warning card, and the **Admin mode** status (policy hash, "changed since you
+  acknowledged it", unlock/lock).
 
 ---
 
 ## 5. Exit, recovery, and clean settlement
 
-- **Leave network**: My Account → Network → **Leave network** → confirm.
-  Address clears; Dashboard/My Account show "Not connected"; re-join via a
-  fresh invite.
+- **Leave network**: My Account → Network → **Leave network** → confirm
+  (Admin → **Network Membership** has the same action; it detaches this
+  browser's own leaf, independent of the selected admin target). Address clears;
+  Dashboard/My Account show "Not connected"; re-join via a fresh invite.
 - **Parent unreachable**: stop the parent; after ~2 failed balance probes a
   "Parent unreachable" notice appears with "Re-join via invitation".
 - CLI-side:
@@ -247,17 +272,19 @@ flows need outbound HTTPS/DNS/UDP to N0 (`dns.iroh.link` + public relays).
 
 ## 7. Gotchas / resets
 
-- **No ping/debug UI exists anymore.** Use the smoke scripts for raw
-  connectivity; `#/debug` is a 404.
+- **No ping/debug UI exists anymore.** `#/debug` is a 404 and `#/node` now
+  redirects to `#/admin`. Use the smoke scripts, or
+  `cargo run -p cawala-node -- msg send --to <addr>`, for raw connectivity.
 - **Storage keys** (clear to reset): `cawala.identity.v1`,
   `cawala.state.v1:<nodeId>`, `cawala.ledger.v1:<nodeId>`,
   `cawala.value.pending.v1`, `cawala.recovery.v1`,
-  `cawala.admin.policy.v1` (policy acknowledgement hash). There is no
-  `cawala.admin.*` key store.
+  `cawala.admin.policy.v1` (policy acknowledgement hash). Legacy un-suffixed
+  `cawala.state.v1` / `cawala.ledger.v1` are read once as a fallback. There is
+  no `cawala.admin.*` grant/key store (only the policy acknowledgement above).
 - **Hard breaks** (control format 8, routed control 2, reply 5, ledger entry 4,
-  ledger meta 3, settlement/browser payload 3): when these change, delete the
-  test `node-data` and run `npm run build:wasm` so JS/wasm arity and wire
-  versions stay in lockstep.
+  ledger meta 3, settlement/browser ledger payload 3, browser ledger state 4,
+  browser local state 1): when these change, delete the test `node-data` and run
+  `npm run build:wasm` so JS/wasm arity and wire versions stay in lockstep.
 - Browser users are always `ChildKind::User`; only node children can be
   moved/re-slotted. Cross-leaf payments require the multi-node tree, not just
   the root leaf.
