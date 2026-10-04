@@ -28,6 +28,7 @@
     rejectJoin,
     redeliverJoin,
     getChildren,
+    getAdministrators,
     adminDetachChild,
     adminMoveChild,
     adminDesignate,
@@ -153,13 +154,22 @@
     }
   }
 
+  // ── Designated administrators (read surface) ──────────────
+  // The node reports its designated-admin set in the same admin query; this is
+  // the authoritative list, not an inference from the child rows.
+  let adminIds = $derived(new Set(nodeState.admins ?? []));
+
+  async function loadAdministrators() {
+    nodeState.admins = await getAdministrators();
+  }
+
   async function reload() {
     if (locked) return;
-    await Promise.all([loadJoins(), loadChildren(), loadValueAccounts()]);
+    await Promise.all([loadJoins(), loadChildren(), loadAdministrators(), loadValueAccounts()]);
     loaded = true;
   }
 
-  // Every target or lock change re-reads the three lists; locked mode reads
+  // Every target or lock change re-reads the lists; locked mode reads
   // nothing at all (the gate is the whole page).
   $effect(() => {
     void targetEpoch.value;
@@ -168,6 +178,7 @@
     if (locked) {
       nodeState.joinRequests = [];
       nodeState.children = [];
+      nodeState.admins = [];
       valueAccounts = [];
       loaded = false;
       return;
@@ -248,6 +259,11 @@
   }
 
   // ── Designated administrators ─────────────────────────────
+  /** Whether `child` is in the node's reported designation set. */
+  function isDesignated(child) {
+    return adminIds.has(child?.endpointId);
+  }
+
   async function designate(child, on) {
     if (!child?.endpointId) return;
     designateBusy = child.endpointId;
@@ -260,6 +276,8 @@
           : 'Revocation request sent; the node applied or refused it.',
         'ok',
       );
+      // Re-read the set so the buttons reflect what the node actually applied.
+      await loadAdministrators();
     } catch (err) {
       showToast(err?.message || 'Designation request failed.', 'danger', 7000);
     } finally {
@@ -608,14 +626,14 @@
     <Card title="Designated Administrators">
       <p class="text-sm muted">
         A node administrator designates which of its children may administer it. Designating
-        your own child here sends the request to the node, which applies or refuses it.
+        a child here sends the request to the node, which applies or refuses it.
       </p>
       <div class="notice" role="note">
-        <strong class="text-xs">Limitation:</strong>
+        <strong class="text-xs">Reported by the node:</strong>
         <span class="text-xs">
-          this client has no read surface for the node&rsquo;s designated-administrator set, so
-          the list below shows this node&rsquo;s children rather than who currently holds the
-          role. Each button sends an idempotent request; the node has the final say.
+          the list below shows this node&rsquo;s children and marks which of them currently
+          hold the administrator role. Each button sends an idempotent request; the node has
+          the final say and the list refreshes with its answer.
         </span>
       </div>
 
@@ -637,20 +655,27 @@
                 <span class="text-xs muted">
                   {childRole(child)}{child.address ? ` · ${child.address}` : ''}
                 </span>
+                {#if isDesignated(child)}
+                  <Badge variant="ok" label="Designated administrator" />
+                {/if}
               </div>
               <div class="admin-row-actions">
                 <button
                   type="button"
                   class="btn btn--ghost btn--sm"
-                  disabled={!canTopology || designateBusy === child.endpointId}
+                  disabled={!canTopology || designateBusy === child.endpointId || isDesignated(child)}
                   onclick={() => designate(child, true)}
                 >
-                  {designateBusy === child.endpointId ? 'Sending…' : 'Designate'}
+                  {designateBusy === child.endpointId
+                    ? 'Sending…'
+                    : isDesignated(child)
+                      ? 'Designated'
+                      : 'Designate'}
                 </button>
                 <button
                   type="button"
                   class="btn btn--ghost btn--sm"
-                  disabled={!canTopology || designateBusy === child.endpointId}
+                  disabled={!canTopology || designateBusy === child.endpointId || !isDesignated(child)}
                   onclick={() => designate(child, false)}
                 >
                   Revoke

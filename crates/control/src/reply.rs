@@ -33,11 +33,12 @@ pub const CONTROL_ALPN: &[u8] = b"cawala/control/0";
 /// Bumped to 2 when the admin reply variants ([`ControlReply::AdminSnapshot`],
 /// [`ControlReply::AdminApproved`], [`ControlReply::AdminRejected`]) were
 /// appended, to 3 when [`ControlReply::AdminLedgerSnapshot`] was appended
-/// (read-only ledger view), and to 4 when
-/// [`ControlReply::AdminValueApplied`] was appended (delegated value ops). There
-/// is no on-wire reader pinned to this constant yet; it exists so a future
-/// reader can reject a mismatched frame up front.
-pub const CONTROL_REPLY_VERSION: u8 = 4;
+/// (read-only ledger view), to 4 when
+/// [`ControlReply::AdminValueApplied`] was appended (delegated value ops), and to
+/// 5 when [`AdminSnapshot::admins`] was added (the node's designated
+/// administrator set). There is no on-wire reader pinned to this constant yet;
+/// it exists so a future reader can reject a mismatched frame up front.
+pub const CONTROL_REPLY_VERSION: u8 = 5;
 
 /// The node's answer to one direct control request.
 ///
@@ -233,11 +234,15 @@ pub struct ChildSnapshot {
     pub date_joined: u64,
 }
 
-/// The admin view of a node: its control state plus pending joins.
+/// The admin view of a node: its control state, its designated administrator
+/// set, and pending joins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminSnapshot {
     /// The node's ordinary control snapshot.
     pub node: NodeSnapshot,
+    /// The ids of this node's currently designated administrator children, in
+    /// insertion (`admin_state`) order.
+    pub admins: Vec<String>,
     /// Joins queued for admin approval.
     pub pending: Vec<AdminPendingJoin>,
 }
@@ -396,6 +401,7 @@ mod tests {
     fn admin_snapshot() -> AdminSnapshot {
         AdminSnapshot {
             node: snapshot(),
+            admins: vec!["child-a".to_string(), "user-b".to_string()],
             pending: vec![
                 AdminPendingJoin {
                     child: node("applicant"),
@@ -495,6 +501,31 @@ mod tests {
                 postcard::to_allocvec(&applied.entry_hash).unwrap(),
                 postcard::to_allocvec(&applied.duplicate).unwrap(),
             ],
+        );
+    }
+
+    #[test]
+    fn admin_snapshot_golden_field_order() {
+        let snapshot = admin_snapshot();
+        assert_postcard_field_order(
+            &snapshot,
+            &[
+                postcard::to_allocvec(&snapshot.node).unwrap(),
+                postcard::to_allocvec(&snapshot.admins).unwrap(),
+                postcard::to_allocvec(&snapshot.pending).unwrap(),
+            ],
+        );
+    }
+
+    #[test]
+    fn admin_snapshot_admins_round_trip() {
+        let snapshot = admin_snapshot();
+        let bytes = postcard::to_allocvec(&snapshot).unwrap();
+        let back: AdminSnapshot = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, snapshot);
+        assert_eq!(
+            back.admins,
+            vec!["child-a".to_string(), "user-b".to_string()]
         );
     }
 

@@ -1073,10 +1073,12 @@ impl AdminPendingJoinDto {
     }
 }
 
-/// An admin view of a node: its topology snapshot plus pending joins.
+/// An admin view of a node: its topology snapshot, designated administrator
+/// set, and pending joins.
 #[wasm_bindgen]
 pub struct AdminSnapshotDto {
     node: SnapshotDto,
+    admins: Vec<String>,
     pending: Vec<AdminPendingJoinDto>,
 }
 
@@ -1085,6 +1087,7 @@ impl AdminSnapshotDto {
     pub(crate) fn from_snapshot(snapshot: &AdminSnapshot) -> Self {
         AdminSnapshotDto {
             node: SnapshotDto::from_node_snapshot(&snapshot.node),
+            admins: snapshot.admins.clone(),
             pending: snapshot
                 .pending
                 .iter()
@@ -1100,6 +1103,13 @@ impl AdminSnapshotDto {
     #[wasm_bindgen(getter)]
     pub fn node(&self) -> SnapshotDto {
         self.node.clone()
+    }
+
+    /// The ids of the node's currently designated administrator children, in
+    /// `admin_state` insertion order.
+    #[wasm_bindgen(getter)]
+    pub fn admins(&self) -> Vec<String> {
+        self.admins.clone()
     }
 
     /// The joins awaiting admin approval.
@@ -1824,6 +1834,7 @@ mod tests {
                     date_joined: 42,
                 }],
             },
+            admins: vec!["kid".to_string(), "leaf-admin".to_string()],
             pending: vec![AdminPendingJoin {
                 child: node("applicant"),
                 kind: ChildKind::User,
@@ -1844,6 +1855,8 @@ mod tests {
         assert_eq!(dto.node.children[0].child_id, "kid");
         assert_eq!(dto.node.children[0].kind, "node");
         assert_eq!(dto.node.children[0].address.as_deref(), Some("0.3.1"));
+
+        assert_eq!(dto.admins, vec!["kid".to_string(), "leaf-admin".to_string()]);
 
         assert_eq!(dto.pending.len(), 1);
         let pending = &dto.pending[0];

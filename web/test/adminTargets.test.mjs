@@ -50,6 +50,7 @@ const {
   adminPolicyInfo,
   adminDesignate,
   adminRevoke,
+  getAdministrators,
   adminDetachChild,
   adminMoveChild,
   approveJoin,
@@ -169,6 +170,26 @@ test('rediscovery replaces the chain and re-clamps the selection', async () => {
 });
 
 // ── designate / revoke / topology request mapping ────────────────────────────
+
+test('getAdministrators surfaces the node-reported designation set', async () => {
+  await unlock();
+  const admins = await getAdministrators();
+  assert.deepEqual(admins, ['z6MkHs7Kj3xVnR5pQw9bYf2dLg8mC4tEa6uIiOoPp']);
+
+  // A returned copy, never the live mock array.
+  admins.push('mutated');
+  assert.deepEqual(await getAdministrators(), ['z6MkHs7Kj3xVnR5pQw9bYf2dLg8mC4tEa6uIiOoPp']);
+});
+
+test('nodeState.admins holds the fetched set and clears on lock', async () => {
+  await unlock();
+  const { nodeState } = await import('../src/lib/stores.svelte.js');
+  nodeState.admins = await getAdministrators();
+  assert.deepEqual(nodeState.admins, ['z6MkHs7Kj3xVnR5pQw9bYf2dLg8mC4tEa6uIiOoPp']);
+
+  lockAdminMode();
+  assert.deepEqual(nodeState.admins, [], 'locking clears the reported set');
+});
 
 test('designate and revoke echo the child and default to the selected target', async () => {
   await unlock();

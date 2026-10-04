@@ -2652,11 +2652,14 @@ impl ControlNode {
         ControlReply::Snapshot(self.snapshot())
     }
 
-    /// Admin: return this node's control snapshot plus the joins awaiting
-    /// approval.
+    /// Admin: return this node's control snapshot, its designated
+    /// administrator set, and the joins awaiting approval.
     ///
-    /// Pending rows are capped by [`MAX_PENDING_JOINS`]; the untrusted
-    /// `location_hint` on a [`JoinRequest`] is deliberately omitted.
+    /// The `admins` list reflects the persisted `admin_state.json` set after
+    /// the per-request reload/prune in [`ControlNode::precheck`], so it is the
+    /// same set that gates authority. Pending rows are capped by
+    /// [`MAX_PENDING_JOINS`]; the untrusted `location_hint` on a [`JoinRequest`]
+    /// is deliberately omitted.
     fn handle_admin_query(&mut self, _signed: &SignedControl, _now: u64) -> ControlReply {
         let pending = self
             .pending
@@ -2673,6 +2676,7 @@ impl ControlNode {
             .collect();
         ControlReply::AdminSnapshot(AdminSnapshot {
             node: self.snapshot(),
+            admins: self.admin_state.list().to_vec(),
             pending,
         })
     }
@@ -4940,6 +4944,45 @@ mod tests {
         assert_eq!(
             engine.receive_at(remote, query, 0).await,
             ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_query_reports_designated_admins() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let child_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[
+                ("child", ChildKind::Node, 0, 1),
+                ("other", ChildKind::User, 1, 2),
+            ],
+        );
+        let peers = [node_peer("child", &child_op, 3)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op.clone(), record, &peers);
+
+        // Seed the persisted designation set; insertion order is preserved.
+        assert!(engine.admin_state.add("child"));
+        engine.admin_state.save(dir.path()).unwrap();
+
+        let remote = any_remote();
+        let query = authorize_at("parent", &parent_op, 900, ControlRequest::AdminQuery);
+        let reply = engine.receive_at(remote, query, 0).await;
+        let ControlReply::AdminSnapshot(snapshot) = reply else {
+            panic!("expected AdminSnapshot, got {reply:?}");
+        };
+        assert_eq!(
+            snapshot.admins,
+            vec!["child".to_string()],
+            "the reply must echo the persisted designation set"
+        );
+        assert!(
+            !snapshot.admins.iter().any(|id| id == "other"),
+            "a non-designated child must not appear in the set"
         );
     }
 

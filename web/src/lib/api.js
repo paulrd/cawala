@@ -863,7 +863,7 @@ function _readLocalChildren() {
  * addresses itself — there is no `node_addr` argument and no key to install.
  *
  * @param {string} target
- * @returns {Promise<{ nodeId: string|null, address: string|null, children: Array<object>, pending: number, pendingRows: Array<object> }>}
+ * @returns {Promise<{ nodeId: string|null, address: string|null, admins: Array<string>, children: Array<object>, pending: number, pendingRows: Array<object> }>}
  */
 async function _queryAdminSnapshot(target) {
   // Admin mode is a client-side gate: while locked, ancestor state is hidden
@@ -883,7 +883,7 @@ async function _queryAdminSnapshot(target) {
  * wrapper per access, so a second read would double-free.
  *
  * @param {object} snapshot
- * @returns {{ nodeId: string|null, address: string|null, children: Array<object>, pending: number, pendingRows: Array<object> }}
+ * @returns {{ nodeId: string|null, address: string|null, admins: Array<string>, children: Array<object>, pending: number, pendingRows: Array<object> }}
  */
 function _readAdminSnapshot(snapshot) {
   let topo = null;
@@ -896,6 +896,8 @@ function _readAdminSnapshot(snapshot) {
     return {
       nodeId: topo.node_id ?? null,
       address: topo.address ?? null,
+      // Designated administrator child ids (strings; no handles to free).
+      admins: [...(snapshot.admins ?? [])],
       children: children.map(_mapChild),
       pending: rows.length,
       pendingRows: rows.map((row) => ({
@@ -3167,6 +3169,44 @@ export async function getChildren(nodeId = undefined) {
 }
 
 /**
+ * Get the current admin target's designated administrator child ids.
+ *
+ * The node reports the set in its `AdminQuery` reply (`AdminSnapshot.admins`),
+ * so this is the authoritative "who currently administers this node" list — not
+ * a guess from the child list.
+ *
+ * - mock: the synthetic designation set.
+ * - `self`: this browser's own leaf has no children and therefore no set → `[]`.
+ * - an ancestor: the `admins` field of its `AdminQuery` reply.
+ * Locked mode yields `[]` without marking the target unreachable.
+ *
+ * @param {string} [nodeId] Target; defaults to the current admin target.
+ * @returns {Promise<Array<string>>}
+ */
+export async function getAdministrators(nodeId = undefined) {
+  const target = _normalizeTarget(nodeId);
+
+  if (_useMock) {
+    await mockDelay(200);
+    return [...MOCK_DATA.admins];
+  }
+
+  if (target === SELF || target === clientState.endpointId) return [];
+  // Locked mode hides ancestor state without marking the target unreachable.
+  if (!adminLock.unlocked) return [];
+
+  try {
+    const data = await _queryAdminSnapshot(target);
+    _recordQueryOutcome(target, { ok: true, kind: inferNodeKind(data.children), address: data.address });
+    return data.admins;
+  } catch (err) {
+    _recordQueryOutcome(target, { ok: false, error: err });
+    _warnOnce(`admin-query-admins:${target}`, '[api] admin_query (admins) failed', err);
+    return [];
+  }
+}
+
+/**
  * Record what an admin query saw about a target (status/kind/address) and
  * refresh the stored view. Failures mark the target unreachable rather than
  * dropping the last observed kind.
@@ -3727,6 +3767,9 @@ const MOCK_DATA = {
       status: 'pending',
     },
   ],
+  // The synthetic designation set: the slot-1 child currently administers the
+  // mock target. Mirrors the node's persisted `admin_state.json` admins list.
+  admins: ['z6MkHs7Kj3xVnR5pQw9bYf2dLg8mC4tEa6uIiOoPp'],
   activity: [
     {
       id: 'a1',

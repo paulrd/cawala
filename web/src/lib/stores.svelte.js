@@ -57,9 +57,11 @@ export const ledgerState = $state({
 
 // ── Node / data state ─────────────────────────────────────────
 
-/** @type {{ children: Array, accounts: Array, accountsTruncated: boolean, joinRequests: Array, activity: Array }} */
+/** @type {{ children: Array, admins: Array<string>, accounts: Array, accountsTruncated: boolean, joinRequests: Array, activity: Array }} */
 export const nodeState = $state({
   children: [],
+  // Designated administrator child ids reported by the target's admin query.
+  admins: [],
   accounts: [],
   // Whether the node's ledger view reported its account-row cap was hit.
   accountsTruncated: false,
@@ -244,6 +246,7 @@ export function dismissToast(id) {
 /** Reset all data state (e.g. on disconnect). */
 export function resetDataState() {
   nodeState.children = [];
+  nodeState.admins = [];
   nodeState.accounts = [];
   nodeState.accountsTruncated = false;
   nodeState.joinRequests = [];
