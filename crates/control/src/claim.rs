@@ -64,8 +64,7 @@ pub const STRANDED_CLAIM_VERSION: u8 = 1;
 
 /// BLAKE3 derive-key context for the stranded-claim signing hash.
 ///
-/// Distinct from [`CONTROL_CONTEXT`](crate::CONTROL_CONTEXT),
-/// [`ADMIN_GRANT_CONTEXT`](crate::ADMIN_GRANT_CONTEXT), and
+/// Distinct from [`CONTROL_CONTEXT`](crate::CONTROL_CONTEXT) and
 /// [`ROUTED_REPLY_CONTEXT`](crate::ROUTED_REPLY_CONTEXT), so a claim signature
 /// can never be replayed as (or confused with) any other control signature.
 pub const STRANDED_CLAIM_CONTEXT: &str = "cawala-control/stranded-claim/v1";

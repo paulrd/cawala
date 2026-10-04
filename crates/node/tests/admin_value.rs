@@ -130,7 +130,6 @@ async fn fixture(policy: Option<ValueLimits>) -> Fixture {
         record,
         PeerRegistry::new(),
         ControlStore::open(dir.path()).unwrap(),
-        cawala_node::AdminStore::empty(),
     );
     engine.attach_ledger(Arc::new(Mutex::new(ledger)));
     let engine = Arc::new(Mutex::new(engine));
@@ -481,7 +480,6 @@ async fn missing_ledger_handle_is_internal() {
         record,
         PeerRegistry::new(),
         ControlStore::open(dir.path()).unwrap(),
-        cawala_node::AdminStore::empty(),
     );
     let engine = Arc::new(Mutex::new(engine));
     let signed = SignedControl::authorize(

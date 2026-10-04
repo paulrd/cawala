@@ -24,7 +24,6 @@ use cawala_control::{
 };
 use cawala_ledger::{LedgerPubKey, LedgerSecretKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::{AckStatus, Envelope, MSG_LEDGER_V1, RejectReason};
-use cawala_node::AdminStore;
 use cawala_node::control::{
     ControlNode, pull_rebase_from_parent, spawn_control_node_live_on, sweep_pending_rebase,
 };
@@ -211,7 +210,6 @@ async fn build(defs: Vec<NodeDef>) -> (HashMap<String, TestNode>, HashMap<String
             record,
             registry,
             store,
-            AdminStore::empty(),
         );
         let control = Arc::new(Mutex::new(engine));
 

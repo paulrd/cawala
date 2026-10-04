@@ -110,7 +110,6 @@ async fn fixture(with_ledger: bool) -> Fixture {
         record,
         PeerRegistry::new(),
         ControlStore::open(dir.path()).unwrap(),
-        cawala_node::AdminStore::empty(),
     );
     if with_ledger {
         engine.attach_ledger(Arc::new(Mutex::new(ledger)));

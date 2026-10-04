@@ -25,7 +25,6 @@
 //! # Crash safety
 //!
 //! Mutations are written with an atomic temp-file + rename, matching
-//! [`AdminStore::save`](crate::admin_store::AdminStore::save) and
 //! [`ValuePolicy::save`](crate::value_policy::ValuePolicy::save). Authority
 //! changes persist before memory is updated; lease renewals persist first but
 //! must not deny service on a write failure.
@@ -46,8 +45,7 @@ pub const ADMIN_STATE_VERSION: u32 = 1;
 /// Default lease duration when an operator has not configured one.
 pub const DEFAULT_ADMIN_TTL_SECS: u64 = 300;
 
-/// Upper clamp for a configured lease TTL (30 days), mirroring
-/// [`cawala_control::MAX_ADMIN_TTL_SECS`](cawala_control::MAX_ADMIN_TTL_SECS).
+/// Upper clamp for a configured lease TTL (30 days).
 pub const MAX_ADMIN_STATE_TTL_SECS: u64 = 30 * 24 * 3600;
 
 /// Maximum number of priority entries (`cawala_topology::MAX_SLOT + 1`).

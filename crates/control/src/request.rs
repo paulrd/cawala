@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use cawala_ledger::{LedgerPubKey, NodeId, OperatorPubKey};
 use cawala_topology::{ChildKind, MAX_SLOT, OctAddr};
 
-use crate::admin::RequiredScope;
 use crate::sign::ControlError;
 
 /// Maximum accepted length, in bytes, of a node id string (`JoinRequest::node`,
@@ -383,8 +382,8 @@ fn validate_node_id(field: &'static str, id: &str) -> Result<(), ControlError> {
 /// An admin's approval of a join that a node queued for approval.
 ///
 /// The enclosing [`SignedControl`](crate::SignedControl) must be signed by the
-/// node's registered operator key; the node additionally requires that key to
-/// hold an active [`AdminGrant`](crate::AdminGrant) before applying this.
+/// authenticating peer; the node additionally requires it to be a
+/// topology-derived administrator (R4/R5) before applying this.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminJoinApprove {
     /// The pending child to approve.
@@ -746,46 +745,33 @@ impl ControlRequest {
     }
 
     /// Whether this is one of the admin-only variants.
-    pub fn is_admin(&self) -> bool {
-        self.required_scope().is_some()
-    }
-
-    /// The scope an admin request needs, or `None` for a non-admin request
-    /// (which is never authorized by an admin grant).
     ///
-    /// Mapping (frozen):
-    /// - `AdminQuery` -> [`RequiredScope::AnyActive`] (any scope implies read);
-    /// - `AdminApproveJoin` / `AdminRejectJoin` / `AdminRedeliverJoin` ->
-    ///   [`RequiredScope::Joins`];
-    /// - `AdminLedgerQuery` -> [`RequiredScope::Value`];
-    /// - `AdminDetachChild` / `AdminMoveChild` -> [`RequiredScope::Topology`];
-    /// - `AdminLease` / `AdminLeaseProbe` -> `None` (lease traffic is
-    ///   authenticated by the priority/lease check, never by a grant);
-    /// - every non-admin variant -> `None`.
-    pub fn required_scope(&self) -> Option<RequiredScope> {
-        match self {
-            ControlRequest::AdminQuery => Some(RequiredScope::AnyActive),
-            ControlRequest::AdminApproveJoin(_)
-            | ControlRequest::AdminRejectJoin(_)
-            | ControlRequest::AdminRedeliverJoin(_) => Some(RequiredScope::Joins),
-            ControlRequest::AdminLedgerQuery => Some(RequiredScope::Value),
-            ControlRequest::AdminDetachChild(_) | ControlRequest::AdminMoveChild(_) => {
-                Some(RequiredScope::Topology)
-            }
-            ControlRequest::AdminIssue(_) | ControlRequest::AdminBurn(_) => {
-                Some(RequiredScope::Value)
-            }
-            ControlRequest::AdminLease(_) | ControlRequest::AdminLeaseProbe(_) => None,
-            _ => None,
-        }
+    /// This is a **class predicate only**: it selects the variants that are
+    /// subject to the admin authorization path. The authority itself is
+    /// topology-derived (R4/R5); there is no scope lookup. Lease traffic
+    /// (`AdminLease`/`AdminLeaseProbe`) is deliberately not admin: it is
+    /// authenticated by the priority/lease check, never by an admin class.
+    pub fn is_admin(&self) -> bool {
+        matches!(
+            self,
+            ControlRequest::AdminQuery
+                | ControlRequest::AdminApproveJoin(_)
+                | ControlRequest::AdminRejectJoin(_)
+                | ControlRequest::AdminRedeliverJoin(_)
+                | ControlRequest::AdminLedgerQuery
+                | ControlRequest::AdminDetachChild(_)
+                | ControlRequest::AdminMoveChild(_)
+                | ControlRequest::AdminIssue(_)
+                | ControlRequest::AdminBurn(_)
+        )
     }
 }
 
 /// Whether `request` is one of the admin-only variants.
 ///
 /// Admin requests are authenticated like any other control request, but are
-/// authorised only when the signing operator holds an active
-/// [`AdminGrant`](crate::AdminGrant) scoped to the `origin` node.
+/// authorized by the topology-derived administrator rule (R4/R5) rather than by
+/// a delegated grant.
 pub fn is_admin_request(request: &ControlRequest) -> bool {
     request.is_admin()
 }
@@ -1246,7 +1232,6 @@ mod tests {
         ] {
             assert!(!request.is_admin(), "{request:?}");
             assert!(!is_admin_request(&request), "{request:?}");
-            assert_eq!(request.required_scope(), None, "{request:?}");
         }
     }
 
@@ -1278,55 +1263,6 @@ mod tests {
             postcard::to_allocvec(&lease).unwrap(),
             postcard::to_allocvec(&probe).unwrap()
         );
-    }
-
-    #[test]
-    fn required_scope_mapping_is_frozen() {
-        assert_eq!(
-            ControlRequest::AdminQuery.required_scope(),
-            Some(RequiredScope::AnyActive)
-        );
-        for request in [
-            ControlRequest::AdminApproveJoin(AdminJoinApprove {
-                child: node("applicant"),
-                slot: None,
-            }),
-            ControlRequest::AdminRejectJoin(AdminJoinReject {
-                child: node("applicant"),
-                reason: None,
-            }),
-            ControlRequest::AdminRedeliverJoin(AdminRedeliverJoin {
-                child: node("applicant"),
-            }),
-        ] {
-            assert_eq!(request.required_scope(), Some(RequiredScope::Joins));
-        }
-        assert_eq!(
-            ControlRequest::AdminLedgerQuery.required_scope(),
-            Some(RequiredScope::Value)
-        );
-        for request in [
-            ControlRequest::AdminDetachChild(AdminDetachChild { child: node("c") }),
-            ControlRequest::AdminMoveChild(AdminMoveChild {
-                child: node("c"),
-                slot: None,
-            }),
-        ] {
-            assert_eq!(request.required_scope(), Some(RequiredScope::Topology));
-        }
-        for request in [
-            ControlRequest::AdminIssue(value_request()),
-            ControlRequest::AdminBurn(value_request()),
-        ] {
-            assert_eq!(request.required_scope(), Some(RequiredScope::Value));
-        }
-        for request in [
-            ControlRequest::Query,
-            ControlRequest::SetAddress(SetAddress { address: None }),
-            ControlRequest::RebasePull(RebasePull { node: node("c") }),
-        ] {
-            assert_eq!(request.required_scope(), None);
-        }
     }
 
     #[test]

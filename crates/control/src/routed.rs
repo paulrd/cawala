@@ -56,11 +56,8 @@ pub const ROUTED_REPLY_VERSION: u8 = 1;
 
 /// BLAKE3 derive-key context for the routed-reply signing hash.
 ///
-/// Distinct from
-/// [`CONTROL_CONTEXT`](crate::CONTROL_CONTEXT) and
-/// [`ADMIN_GRANT_CONTEXT`](crate::ADMIN_GRANT_CONTEXT), so a routed reply
-/// signature can never be replayed as a control request or an admin grant, or
-/// vice versa.
+/// Distinct from [`CONTROL_CONTEXT`](crate::CONTROL_CONTEXT), so a routed reply
+/// signature can never be replayed as a direct control request, or vice versa.
 pub const ROUTED_REPLY_CONTEXT: &str = "cawala-control/routed-reply/v1";
 
 /// Maximum number of per-hop forwards carried by a [`RoutedControlV1`].
@@ -230,8 +227,7 @@ impl RoutedReplyV1 {
 /// A node-operator-signed [`RoutedReplyV1`].
 ///
 /// The signature is over a BLAKE3 derive-key([`ROUTED_REPLY_CONTEXT`]) hash of
-/// the **full** postcard encoding of the reply, mirroring
-/// [`SignedAdminGrant::signing_hash`](crate::SignedAdminGrant::signing_hash).
+/// the **full** postcard encoding of the reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedRoutedReply {
     /// The reply being attested.
@@ -471,7 +467,6 @@ mod tests {
     use cawala_ledger::{NodeId, OperatorSecretKey};
     use cawala_msg::OctAddr;
 
-    use crate::admin::ADMIN_GRANT_CONTEXT;
     use crate::request::ControlRequest;
     use crate::sign::{CONTROL_CONTEXT, CONTROL_FORMAT_VERSION};
 
@@ -877,16 +872,16 @@ mod tests {
         };
 
         // A signature produced under the direct-control domain must not verify
-        // as a routed reply, and likewise for the admin-grant domain.
-        for context in [CONTROL_CONTEXT, ADMIN_GRANT_CONTEXT] {
+        // as a routed reply.
+        {
             let forged = SignedRoutedReply {
                 reply: reply.clone(),
-                signature: sign_under(context),
+                signature: sign_under(CONTROL_CONTEXT),
             };
             assert_eq!(
                 forged.verify(&operator(7).public()),
                 Err(RoutedError::InvalidSignature),
-                "signature under {context} must not verify as a routed reply"
+                "a direct-control signature must not verify as a routed reply"
             );
         }
     }

@@ -44,7 +44,6 @@ use cawala_ledger::{LedgerPubKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::{MsgId, PeerRef, Seen, SeenConfig};
 
 use crate::admin_state::AdminState;
-use crate::admin_store::{AdminStore, StoredGrant};
 use crate::control_store::ControlStore;
 use crate::ledger_peers;
 use crate::ledger_service::{LedgerService, ValueError};
@@ -220,7 +219,6 @@ pub struct ControlNode {
     record: RecordStore,
     peers: PeerRegistry,
     pending: ControlStore,
-    admins: AdminStore,
     /// Topology-derived admin priority/lease state, reloaded per request.
     admin_state: AdminState,
     /// Injectable candidate-liveness table for [`ControlNode::maybe_failover`].
@@ -332,7 +330,6 @@ impl ControlNode {
         record: RecordStore,
         peers: PeerRegistry,
         pending: ControlStore,
-        admins: AdminStore,
     ) -> Self {
         ControlNode {
             data_dir: data_dir.into(),
@@ -341,7 +338,6 @@ impl ControlNode {
             record,
             peers,
             pending,
-            admins,
             admin_state: AdminState::empty(),
             admin_probe_alive: Vec::new(),
             outbound: VecDeque::new(),
@@ -354,11 +350,12 @@ impl ControlNode {
         }
     }
 
-    /// Open (or create) the node's record, peers, pending-join, and admin-grant
-    /// state from `data_dir`.
+    /// Open (or create) the node's record, peers, pending-join, and
+    /// topology-admin state from `data_dir`.
     ///
-    /// `admins.json` is validated against this node's operator key: a corrupt
-    /// or mis-scoped document fails the open (fail closed).
+    /// The topology-admin state (`admin_state.json`) is fail-closed: a corrupt
+    /// or unknown document leaves remote administration unavailable (empty
+    /// state) rather than failing the open, so the local CLI can repair it.
     pub fn open(
         data_dir: impl Into<PathBuf>,
         node_id: &str,
@@ -371,8 +368,6 @@ impl ControlNode {
             .map_err(|err| ControlError::Codec(err.to_string()))?;
         let pending =
             ControlStore::open(&data_dir).map_err(|err| ControlError::Codec(err.to_string()))?;
-        let admins = AdminStore::load(&data_dir, node_id, &operator.public())
-            .map_err(|err| ControlError::Codec(err.to_string()))?;
         // Admin state is fail-closed: a corrupt/unknown file leaves remote admin
         // unavailable (empty state) rather than failing the open, so the local
         // CLI can still repair it.
@@ -398,7 +393,6 @@ impl ControlNode {
             record,
             peers,
             pending,
-            admins,
             admin_state,
             admin_probe_alive: Vec::new(),
             outbound: VecDeque::new(),
@@ -434,11 +428,6 @@ impl ControlNode {
     /// This node's pending/outbound join state.
     pub fn pending(&self) -> &ControlStore {
         &self.pending
-    }
-
-    /// This node's admin-grant store (legacy; deleted in P2/C7).
-    pub fn admins(&self) -> &AdminStore {
-        &self.admins
     }
 
     /// This node's topology-derived admin priority/lease state.
@@ -1012,23 +1001,6 @@ impl ControlNode {
         }
     }
 
-    /// Reload admin grants from disk, failing closed to an empty store on any
-    /// load error.
-    ///
-    /// Shared by [`ControlNode::receive_at`] (before authorizing) and the
-    /// routed admin evidence path, so an audit line about the grant store can
-    /// never be derived from a stale in-memory copy after an out-of-process
-    /// grant/revoke. On failure it serves no delegated authority.
-    fn reload_admins(&mut self) {
-        if let Err(err) = self
-            .admins
-            .reload(&self.data_dir, &self.node_id, &self.operator.public())
-        {
-            warn!(%err, "admin grant reload failed; serving no delegated authority");
-            self.admins = AdminStore::empty();
-        }
-    }
-
     /// Reload the topology-admin state from disk, failing closed to an empty
     /// state on any load error.
     ///
@@ -1201,10 +1173,6 @@ impl ControlNode {
             return Some(ControlReply::Rejected(RejectCode::BadRequest));
         }
         self.refresh_control_plane();
-        // Full reload so a grant/revoke performed by a separate operator CLI
-        // process is observed without a restart. On any load failure, serve no
-        // delegated authority (fail closed).
-        self.reload_admins();
         // Full reload of the topology-admin priority/lease state so an
         // out-of-process `control admin priority|state` edit is observed
         // without a restart (fail closed to empty on error).
@@ -3307,60 +3275,6 @@ impl ControlNode {
             .find(|stored| decision_target(stored) == Some(child))
     }
 
-    /// Insert or replace an operator-signed admin grant and persist it.
-    ///
-    /// The grant must validate against its **own** declared version, be scoped
-    /// to this node, and be signed by this node's own operator key; otherwise
-    /// it is refused before touching the store. Both v2 and legacy v1 grants are
-    /// accepted (the store preserves each row's form).
-    pub fn grant_admin(&mut self, grant: StoredGrant) -> Result<(), ControlError> {
-        grant.validate()?;
-        if grant.node().as_str() != self.node_id {
-            return Err(ControlError::Codec(format!(
-                "admin grant is scoped to node '{}', expected '{}'",
-                grant.node(),
-                self.node_id
-            )));
-        }
-        grant
-            .verify(&self.operator.public())
-            .map_err(|err| ControlError::Codec(err.to_string()))?;
-        let admin = grant.admin();
-        let expiry = grant.expiry();
-        let version = grant.version();
-        let scopes = grant.scopes().label();
-        self.admins.grant(grant);
-        self.admins
-            .save(&self.data_dir)
-            .map_err(|err| ControlError::Codec(err.to_string()))?;
-        self.audit(serde_json::json!({
-            "event": "grant",
-            "admin": admin.to_string(),
-            "node": self.node_id,
-            "expiry": expiry,
-            "version": version,
-            "scopes": scopes,
-        }));
-        Ok(())
-    }
-
-    /// Remove the grant for `admin` and persist, returning whether one existed.
-    pub fn revoke_admin(&mut self, admin: &OperatorPubKey) -> Result<bool, ControlError> {
-        let removed = self.admins.revoke(admin);
-        if removed {
-            self.admins
-                .save(&self.data_dir)
-                .map_err(|err| ControlError::Codec(err.to_string()))?;
-        }
-        self.audit(serde_json::json!({
-            "event": "revoke",
-            "admin": admin.to_string(),
-            "node": self.node_id,
-            "removed": removed,
-        }));
-        Ok(removed)
-    }
-
     /// Append one best-effort JSONL audit record. Never fails a request.
     fn audit(&self, event: serde_json::Value) {
         crate::audit::append(&self.data_dir, event);
@@ -4325,9 +4239,6 @@ fn map_control_error(err: &ControlError) -> RejectCode {
         | ControlError::SlotOutOfRange(_)
         | ControlError::FieldTooLong { .. }
         | ControlError::FieldBelowMinimum { .. }
-        | ControlError::GrantExpiryNotAfterGrant { .. }
-        | ControlError::GrantTtlTooLong { .. }
-        | ControlError::EmptyAdminScopes
         | ControlError::ZeroValueRequestId
         | ControlError::EmptyValueReason => RejectCode::BadRequest,
         ControlError::Codec(_) => RejectCode::Internal,
@@ -4440,7 +4351,6 @@ mod tests {
             record,
             PeerRegistry::new(),
             store,
-            AdminStore::empty(),
         );
         engine
             .admin_state
@@ -4494,7 +4404,6 @@ mod tests {
             record,
             PeerRegistry::new(),
             store,
-            AdminStore::empty(),
         );
         // `receive_at` ignores the remote; any endpoint id will do.
         let remote = EndpointId::from(SecretKey::generate().public());
@@ -4576,7 +4485,6 @@ mod tests {
             record,
             PeerRegistry::new(),
             store,
-            AdminStore::empty(),
         );
         engine
             .begin_outbound_join(request.clone(), NodeId::from("parent"), pinned)
@@ -5044,7 +4952,6 @@ mod tests {
             record,
             PeerRegistry::new(),
             store,
-            AdminStore::empty(),
         );
         (engine, operator)
     }
@@ -5483,7 +5390,6 @@ mod tests {
             record,
             registry,
             store,
-            AdminStore::empty(),
         )
     }
 
@@ -7017,7 +6923,6 @@ mod tests {
             record,
             PeerRegistry::new(),
             ControlStore::open(dir).unwrap(),
-            AdminStore::empty(),
         )
     }
 
@@ -7114,7 +7019,6 @@ mod tests {
             record,
             PeerRegistry::new(),
             ControlStore::open(dir).unwrap(),
-            AdminStore::empty(),
         )
     }
 
@@ -7218,7 +7122,6 @@ mod tests {
             record,
             PeerRegistry::new(),
             ControlStore::open(dir.path()).unwrap(),
-            AdminStore::empty(),
         );
 
         // A request first runs the reload phase (no peer file yet; skipped).

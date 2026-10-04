@@ -19,7 +19,7 @@ use cawala_msg::PeerRef;
 use cawala_node::control_store::ControlStore;
 use cawala_node::record::RecordStore;
 use cawala_node::{
-    AdminState, AdminStore, ControlNode, Handled, LedgerService, VALUE_POLICY_VERSION, ValueLimits,
+    AdminState, ControlNode, Handled, LedgerService, VALUE_POLICY_VERSION, ValueLimits,
     ValuePolicy,
 };
 use iroh::{EndpointId, SecretKey};
@@ -114,7 +114,6 @@ fn build(
         record,
         registry,
         ControlStore::open(dir.path()).unwrap(),
-        AdminStore::empty(),
     );
     (engine, dir)
 }

@@ -17,7 +17,6 @@ pub use proto::{ALPN, PingPong};
 
 pub mod admin_cli;
 pub mod admin_state;
-pub mod admin_store;
 pub mod audit;
 pub mod claim_bundle;
 pub mod control;
@@ -41,7 +40,6 @@ pub use admin_state::{
     ADMIN_STATE_FILE, ADMIN_STATE_VERSION, DEFAULT_ADMIN_TTL_SECS, MAX_ADMIN_STATE_TTL_SECS,
     MAX_PRIORITY, AdminState, AdminStateError,
 };
-pub use admin_store::{ADMIN_STORE_VERSION, ADMINS_FILE, AdminStore, AdminStoreError};
 pub use audit::CONTROL_AUDIT_FILE;
 pub use control::{
     ADMIN_PROBE_TIMEOUT_SECS, Authority, ControlHandler, ControlNode, Handled,

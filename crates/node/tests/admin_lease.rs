@@ -15,7 +15,7 @@ use cawala_ledger::{LedgerSecretKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::PeerRef;
 use cawala_node::control_store::ControlStore;
 use cawala_node::record::RecordStore;
-use cawala_node::{AdminState, AdminStore, ControlNode};
+use cawala_node::{AdminState, ControlNode};
 use iroh::{EndpointId, SecretKey};
 
 const NOW: u64 = 1_000;
@@ -85,7 +85,6 @@ fn build(
         record,
         registry,
         ControlStore::open(dir.path()).unwrap(),
-        AdminStore::empty(),
     );
     (engine, dir)
 }

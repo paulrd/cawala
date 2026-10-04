@@ -311,25 +311,6 @@ pub enum ControlError {
     /// Canonical postcard encoding/decoding failed.
     #[error("postcard encode/decode: {0}")]
     Codec(String),
-    /// An admin grant's expiry is not strictly after its `granted_at`.
-    #[error("admin grant expiry {expiry} is not after granted_at {granted_at}")]
-    GrantExpiryNotAfterGrant {
-        /// Unix-seconds time the grant was issued.
-        granted_at: u64,
-        /// Unix-seconds expiry that must be greater than `granted_at`.
-        expiry: u64,
-    },
-    /// An admin grant's lifetime exceeds [`MAX_ADMIN_TTL_SECS`](crate::MAX_ADMIN_TTL_SECS).
-    #[error("admin grant ttl {ttl}s exceeds max {max}s")]
-    GrantTtlTooLong {
-        /// The requested lifetime (`expiry - granted_at`) in seconds.
-        ttl: u64,
-        /// The permitted maximum lifetime in seconds.
-        max: u64,
-    },
-    /// An [`AdminGrantV2`](crate::AdminGrantV2) carried an empty scope set.
-    #[error("admin grant must carry at least one scope")]
-    EmptyAdminScopes,
     /// A value request carried an all-zero idempotency key.
     #[error("value request_id must not be all-zero")]
     ZeroValueRequestId,

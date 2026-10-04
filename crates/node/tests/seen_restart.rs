@@ -14,7 +14,6 @@ use cawala_control::{
     JoinRequest, NodeId, OperatorSecretKey, RejectCode, SignedControl,
 };
 use cawala_ledger::PeerRegistry;
-use cawala_node::AdminStore;
 use cawala_node::control::ControlNode;
 use cawala_node::control_store::ControlStore;
 use cawala_node::record::RecordStore;
@@ -120,7 +119,6 @@ async fn failed_replay_mark_persist_is_rejected_without_dispatch() {
         record,
         PeerRegistry::new(),
         pending,
-        AdminStore::empty(),
     );
 
     let remote = EndpointId::from(SecretKey::generate().public());

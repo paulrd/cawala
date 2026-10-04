@@ -24,7 +24,6 @@ use cawala_control::{
     NodeId, OperatorSecretKey, RejectCode, SignedControl,
 };
 use cawala_ledger::{PeerKeys, PeerRegistry, PeerRole};
-use cawala_node::AdminStore;
 use cawala_node::control::{ControlNode, spawn_control_only_on};
 use cawala_node::control_store::ControlStore;
 use cawala_node::record::RecordStore;
@@ -161,7 +160,6 @@ async fn spawn_node(spec: NodeSpec<'_>, lookup: Option<MemoryLookup>) -> TestNod
         record,
         registry,
         store,
-        AdminStore::empty(),
     );
     let shared = Arc::new(Mutex::new(engine));
     let router = spawn_control_only_on(endpoint.clone(), shared.clone());

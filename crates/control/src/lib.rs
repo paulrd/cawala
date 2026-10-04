@@ -17,10 +17,11 @@
 //! A valid [`SignedControl`] proves *which operator key* signed the request,
 //! and [`verify_control`] additionally proves that key is the one the
 //! [`cawala_ledger::PeerRegistry`] binds to the `origin` node id. It does
-//! **not** prove the request is *authorized*. Authorization — the senior-child
-//! rule, target/topology rules, downward-only moves — is applied by the node
-//! after verification. The registry binds node id -> operator key; a peer's
-//! `ledger` key is irrelevant to control authority.
+//! **not** prove the request is *authorized*. Authorization — the
+//! topology-derived administrator rule (R4/R5), target/topology rules,
+//! downward-only moves — is applied by the node after verification. The
+//! registry binds node id -> operator key; a peer's `ledger` key is irrelevant
+//! to control authority.
 //!
 //! # Purity
 //!
@@ -39,8 +40,6 @@
 /// [`cawala_msg`]: https://docs.rs/cawala-msg
 pub const MAX_CONTROL_FRAME: u32 = 64 * 1024;
 
-pub mod admin;
-pub mod admin_bundle;
 pub mod claim;
 pub mod invite;
 pub mod reply;
@@ -49,15 +48,6 @@ pub mod routed;
 pub mod senior;
 pub mod sign;
 
-pub use admin::{
-    ADMIN_GRANT_CONTEXT, ADMIN_GRANT_V1_VERSION, ADMIN_GRANT_V2_CONTEXT, ADMIN_GRANT_VERSION,
-    AdminGrant, AdminGrantV2, AdminScope, AdminScopes, DEFAULT_ADMIN_TTL_SECS, MAX_ADMIN_TTL_SECS,
-    MAX_VALUE_ADMIN_TTL_SECS, RequiredScope, SignedAdminGrant, SignedAdminGrantV2,
-};
-pub use admin_bundle::{
-    ADMIN_BUNDLE_HOST, ADMIN_BUNDLE_SCHEME, ADMIN_BUNDLE_VERSION, AdminBundleError,
-    AdminGrantBundleV1, MAX_ADMIN_BUNDLE_BYTES,
-};
 pub use cawala_ledger::{NodeId, OperatorPubKey, OperatorSecretKey, Signature};
 pub use cawala_topology::{ChildKind, OctAddr};
 pub use claim::{

@@ -34,7 +34,7 @@ use cawala_node::msg::{
 };
 use cawala_node::record::RecordStore;
 use cawala_node::{
-    AdminState, AdminStore, LedgerService, OutboundKind, VALUE_POLICY_VERSION, ValueLimits,
+    AdminState, LedgerService, OutboundKind, VALUE_POLICY_VERSION, ValueLimits,
     ValuePolicy,
 };
 use iroh::address_lookup::memory::MemoryLookup;
@@ -240,7 +240,6 @@ async fn build(defs: Vec<NodeDef>, lookup: &MemoryLookup, config: &MsgConfig) ->
             record,
             registry,
             store,
-            AdminStore::empty(),
         );
         let control = Arc::new(Mutex::new(engine));
 
@@ -611,7 +610,6 @@ async fn routed_admin_approve_applies_and_delivers_to_applicant() {
         x_record,
         PeerRegistry::new(),
         ControlStore::open(x_dir.path()).unwrap(),
-        AdminStore::empty(),
     );
     let x_control = Arc::new(Mutex::new(x_engine));
     let x_endpoint = bind(&x_key, None).await;
@@ -1341,7 +1339,6 @@ async fn routed_observes_externally_rewritten_node_record() {
         record,
         peers,
         ControlStore::open(dir.path()).unwrap(),
-        AdminStore::empty(),
     );
 
     let target = PeerRef {
@@ -1448,7 +1445,6 @@ async fn routed_observes_externally_written_peer_row() {
         record,
         PeerRegistry::new(),
         ControlStore::open(dir.path()).unwrap(),
-        AdminStore::empty(),
     );
     // The child is the current, leased priority administrator. The destination
     // reloads `admin_state.json` per request, so the seed is observed.
