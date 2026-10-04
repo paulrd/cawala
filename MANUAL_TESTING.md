@@ -1,14 +1,13 @@
 # Cawala — Manual Web Testing Guide
 
 How to manually exercise Cawala through the browser client. Covers mock mode,
-a live single-leaf network, same-leaf and cross-leaf payments, delegated browser
-admin, identity portability, exit/recovery, and the headless smoke scripts.
+a live single-leaf network, same-leaf and cross-leaf payments, browser
+administration by designation, identity portability, exit/recovery, and the
+headless smoke scripts.
 
-> Note: `web/README.md` is partly stale. It still describes a ping/debug harness
-> and claims there is no browser admin or issue/burn path. The current code has
-> no ping UI (`#/debug` is a 404), and the Joins page, delegated admin grants,
-> and Accounts issue/burn all exist. The send form takes a receive **URI**, not a
-> bare endpoint id.
+> See `web/README.md` for how to build and run the app, and `PLAN.md` for the
+> current authority model. There is no ping/debug UI (`#/debug` is a 404); the
+> send form takes a receive **URI**, not a bare endpoint id.
 
 ## 0. Setup
 
@@ -41,18 +40,20 @@ Node CLI is always `cargo run -p cawala-node -- <args>` from the repo root.
 Open <http://localhost:5173/?mock>. This is the full synthetic UI and the
 automatic fallback when wasm init fails.
 
-Walk each nav item and confirm it renders and reacts:
+Walk each nav item and confirm it renders and reacts. The nav is **Home**,
+**Join** (only while unjoined), **Accounts**, **Activity**, **Settings**, and
+**Admin**; My Account is reached from Home, not a tab.
 
-- **Dashboard** — balance/address/pending/children stat cards, "Mock mode"
-  banner, sample children/accounts.
+- **Home** — balance/address/pending/children stat cards, "Mock mode" banner,
+  sample children/accounts, My Account links.
 - **Join** — shows "Running in mock mode… no real connection will be made."
-- **My Node** — administered node + children.
-- **Join Requests** — approve/reject rows (fake success).
 - **Accounts** — accounting equation + accounts table.
 - **Activity** — log with a type filter.
-- **My Account** — mode badge "Mock", fixed sample receive URI, send form.
-- **Settings** — mock hides "Generate admin key" (needs a live node) and
-  identity portability.
+- **Settings** — identity portability; mock surfaces are clearly banner-marked.
+- **Admin** — locked by default behind the policy gate; unlocking shows the
+  target switcher and the admin cards with fake successes.
+- **My Account** (`#/account`, from Home) — mode badge "Mock", fixed sample
+  receive URI, send form.
 
 Caveats: a second tab in the same browser profile runs in mock by design (the
 identity lock is held by the first tab); mock returns fake successes, so it
@@ -80,7 +81,7 @@ cargo run -p cawala-node -- --data-dir /tmp/cawala-leaf control invite --label t
 ```
 
 Copy the `cawala://join?parent=...&op=...` line. The `op=` value is also the
-node's 64-hex operator id (reused later for admin keys).
+node's 64-hex operator id.
 
 ### 2b. Join flow (browser)
 
@@ -149,39 +150,47 @@ from an A-user to a B-user's receive URI. Expect settlement at `P` (the LCA),
 
 ---
 
-## 3. Delegated browser admin (joins / topology / value)
+## 3. Browser administration (by explicit designation)
 
-The browser never holds the node operator key; it receives a scoped, time-boxed
-delegated admin key.
+The browser never holds a node operator or ledger key. It signs admin requests
+with its own operator key; the target applies a request only if the authenticated
+direct neighbor that handed it over is one of the target's **designated
+administrators**. All admin requests are **tree-routed**; there is no direct dial
+to an admin target.
 
-1. Get the node's 64-hex id from the invite's `op=` value.
-2. **Settings → Node administration → Generate key**: enter Node ID (64 hex),
-   optional label, provisional TTL (days), optional target address → **Generate
-   key** → **Copy** the public key.
-3. On the node:
+1. **Designate the browser** with the local CLI (always works, and bootstraps the
+   first administrator). The child must be a current child of the node:
 
    ```sh
-   cargo run -p cawala-node -- --data-dir /tmp/cawala-leaf control admin grant \
-     --key <admin-pub-hex> --scope joins --scope topology --scope value --label manual
+   cargo run -p cawala-node -- --data-dir /tmp/cawala-leaf control admin add <browser-endpoint-id>
+   cargo run -p cawala-node -- --data-dir /tmp/cawala-leaf control admin list
+   cargo run -p cawala-node -- --data-dir /tmp/cawala-leaf control admin remove <browser-endpoint-id>
    ```
 
-   Copy the printed `cawala://admin?node=...&grant=...` bundle.
-4. In **Settings**, paste it into **Import operator-signed grant** → **Import
-   bundle**.
-5. Test each scoped surface:
-   - **joins** → **Join Requests**: Approve / Reject / Resend (redeliver).
-     "Resend" appears only after a non-delivered attempt.
-   - **topology** → **My Node**: move/detach a *node* child (browser `User`
-     leaves cannot be re-slotted in v1).
-   - **value** → **Accounts**: select a liability row → **Issue…** / **Burn…**
-     (amount + required reason). The first value action forces **Protect value
-     key** (passphrase + confirm); afterwards **Lock now** and re-test the unlock
-     dialog. Pending value ops survive reload with Retry/Discard.
-6. Negative tests: grant only `joins` → Accounts/My Node gate with
-   `GrantEmptyState`; run `control admin revoke --key <pub>` → refresh → query
-   fails unauthorized; let a short grant expire.
-7. Value policy is deny-by-default when `value_policy.json` is absent; set caps
-   with `control admin value-policy set --per-request <n> --window-secs <n>
+2. In the app, open **Admin**. It is **locked by default**: read
+   `ADMIN_POLICY.md` and tick the acknowledgement to unlock. Unlocking is
+   in-memory only - a reload returns to the gate. Editing the policy invalidates
+   a stored acknowledgement (it is stored by document hash).
+3. **Switch target** with the up/down switcher over the strict ancestor chain
+   (the browser's own leaf, then parent, ...); the ends disable their buttons.
+4. Test each surface on the administered node:
+   - **Designated Administrators** - each child row shows whether it is
+     designated; **Designate** / **Revoke** send routed `AdminDesignate` /
+     `AdminRevoke`. The node has the final say and the list refreshes.
+   - **Pending joins** - Approve / Reject / Resend (Resend appears only after a
+     non-delivered attempt).
+   - **Topology** - select a node child row, then **Re-slot…** / **Detach…**
+     (browser `User` leaves cannot be re-slotted in v1). **Create child** is a
+     mock-only control; live children appear by approving a join request or from
+     the node CLI.
+   - **Value Issue & Burn** - pick an account, enter an amount and a required
+     reason (posting against the node's equity, bounded by `value_policy.json`).
+5. Negative tests: a browser that is **not** in the target's designation set is
+   refused (`unauthorized`); `control admin remove <id>` then refresh; a locked
+   Admin page shows the policy gate; a reload re-locks.
+6. Value policy is deny-by-default when `value_policy.json` is absent; inspect
+   and set caps locally with `control admin value-policy show` /
+   `control admin value-policy set --per-request <n> --window-secs <n>
    --window-max <n> --per-account <n>`.
 
 ---
@@ -193,8 +202,8 @@ delegated admin key.
 - **Import identity**: load the file on another profile/device, preview
   "Incoming node", confirm → reload. Same seed = same address and balance.
 - **Wrong passphrase / tampered file** must fail inline.
-- **Remove identity**: confirm → wipes seed + admin keys; reload shows a fresh
-  identity.
+- **Remove identity**: confirm → wipes the seed + join/ledger state; reload
+  shows a fresh identity.
 - Cross-device: using one identity on two devices concurrently is *not
   prevented* — run one device at a time.
 
@@ -228,7 +237,7 @@ node scripts/smoke-tabs.mjs            # tab-to-tab ping
 node scripts/smoke-join.mjs            # join + reject
 node scripts/smoke-payment.mjs         # same-leaf payment
 node scripts/smoke-crossleaf.mjs       # LCA cross-leaf
-node scripts/smoke-admin.mjs           # delegated admin grant/revoke
+node scripts/smoke-admin.mjs           # tree-routed admin (query/approve/designate/revoke)
 ```
 
 Set `SMOKE_*_REQUIRE_NETWORK=1` to turn a SKIP into a hard failure. All live
@@ -241,9 +250,11 @@ flows need outbound HTTPS/DNS/UDP to N0 (`dns.iroh.link` + public relays).
 - **No ping/debug UI exists anymore.** Use the smoke scripts for raw
   connectivity; `#/debug` is a 404.
 - **Storage keys** (clear to reset): `cawala.identity.v1`,
-  `cawala.state.v1:<nodeId>`, `cawala.ledger.v1:<nodeId>`, `cawala.admin.v3`,
-  `cawala.value.pending.v1`, `cawala.recovery.v1`.
-- **Hard breaks** (control format 7, admin grant format 2, ledger entry 4,
+  `cawala.state.v1:<nodeId>`, `cawala.ledger.v1:<nodeId>`,
+  `cawala.value.pending.v1`, `cawala.recovery.v1`,
+  `cawala.admin.policy.v1` (policy acknowledgement hash). There is no
+  `cawala.admin.*` key store.
+- **Hard breaks** (control format 8, routed control 2, reply 5, ledger entry 4,
   ledger meta 3, settlement/browser payload 3): when these change, delete the
   test `node-data` and run `npm run build:wasm` so JS/wasm arity and wire
   versions stay in lockstep.

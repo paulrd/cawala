@@ -8,8 +8,14 @@
   overloaded across the stack, so it is always qualified when it matters.
   - **Node**: a running `cawala-node` process with its own data directory,
     identity key, topology links, and ledger.
+  - **Leaf node**: a node whose children are users - the only node kind a
+    browser talks to. A node with node children is *internal*.
   - **User**: a leaf account holder (a browser client); a `ChildKind::User`
     with an operator key but no ledger of its own.
+  - **Designated administrator**: a current child of a node (of **any** kind -
+    child node or browser user) listed in that node's persisted designation set
+    (see `admin_state.json` below). Designation is the only source of
+    administration rights; there is no grant, scope, priority, or seniority.
   - **EndpointId** (Iroh): the node's Ed25519 public identity key rendered as a
     string. Stable and immutable; used to authenticate the peer.
   - **NodeId**: Cawala/ledger name for that same identity string (an
@@ -35,8 +41,11 @@
     from the ledger key.
   - **Ledger key**: Ed25519 key that signs ledger entries and commitments; it
     never leaves the node.
-  - **Control message**: an M4 operator-signed request (join, topology edit,
-    query) carried over the `cawala/control/0` ALPN.
+  - **Control message**: an operator-signed request (join, topology edit,
+    query, designation, value). The direct `cawala/control/0` ALPN carries the
+    join handshake and a browser's exchanges with its own leaf; all
+    administration of a node other than that direct link is **tree-routed**
+    hop by hop (`MSG_CONTROL_V1`).
   - **Address lookup** (Iroh discovery): given only an EndpointId, Iroh
     resolves it to an EndpointAddr through the configured lookup service
     (pkarr/DNS under the N0 preset). An invite's optional `relay`/`ip`
@@ -51,7 +60,8 @@
     issues the final address.
 
   Protocol ALPNs: `cawala/ping/0` (M0 health check), `cawala/msg/0` (M3
-  envelope routing), `cawala/control/0` (M4 direct signed control).
+  envelope routing), `cawala/control/0` (direct signed control - join handshake
+  and a browser's own leaf). Administration is routed inside `cawala/msg/0`.
 
   Key rule: **identity is immutable; address is mutable.** Both travel together
   in an M3 envelope (`node` = EndpointId, `addr` = octal address).
@@ -85,11 +95,19 @@
   - project is open-source MIT License.
   - each node is small and light-weight instance of an Iroh node
   - each node only communicates with its parent node or up to 8 child nodes.
-  - web clients only communicate with leaf nodes
+  - web clients only communicate with leaf nodes (their direct parent).
   - leaf nodes can have up to 8 users
-  - one child node (the most senior) is selected to control its parent node
-  - the web client allows a user to control more than one node but only
-    indirectly intermediate child nodes.
+  - each node keeps an explicit set of **designated administrator children** in
+    `<data-dir>/admin_state.json`; a designated child of any kind (child node
+    or browser user) may administer the node, and all designated administrators
+    have equal, full rights. There is no senior child, priority, grant, or scope.
+  - all administration is **tree-routed** hop by hop; a browser reaches an
+    ancestor only while each link on the path designates the next child. The
+    local CLI (`control admin add|remove|list`) is the universal fallback.
+  - the web client administers its leaf node and the ancestors reachable from
+    it; the Admin page is locked by default behind a policy acknowledgement
+    (`ADMIN_POLICY.md`) and switches target with up/down over the ancestor
+    chain.
   - more than one node can be deployed to the same server
   - nodes can be deployed on almost any device
   - each node and user will have an octal address that will allow their position
@@ -106,8 +124,10 @@
     Liabilities (accounts held for children/users) equals Equity. Transfers post
     to two accounts and conserve value; only signed issue/burn entries change a
     node's equity.
-  - A node administrator can arbitrarily increase or decrease the value of an
-    account (an issue/burn posted against the node's equity).
+  - A designated administrator (or the local operator) can issue/burn value on
+    an account (posted against the node's equity), bounded by the operator-side
+    `value_policy.json`; the browser never holds the node's operator or ledger
+    key.
 # Constraints
   - tech stack is Iroh, Rust, Typescript, Virtual Private Servers
 # Open Questions
