@@ -12,9 +12,10 @@
 //! [`verify_control`] additionally proves that key is the one the
 //! [`cawala_ledger::PeerRegistry`] binds to the `origin` node id. Neither
 //! proves the request is *authorized*: [`ControlNode::receive`] applies the
-//! senior-child rule (and self-admin) on top. The authenticated QUIC peer id
-//! is deliberately **not** consulted for authorization — signatures are the
-//! authority.
+//! topology-derived administrator rule (R4 browser children, R5 leased priority
+//! entry) and self-operator on top. The authenticated QUIC peer id is
+//! deliberately **not** consulted for authorization — signatures and the last
+//! hop are the authority.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -28,16 +29,16 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use cawala_control::{
-    AdminApproved, AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminMode, AdminMoveChild,
-    AdminPendingJoin, AdminRedeliverJoin, AdminRejected, AdminScopes, AdminSnapshot, AdminValueApplied,
-    AdminValueDirection, AdminValueRequest, CONTROL_ALPN, CONTROL_REQUEST_MAX_TTL_SECS,
-    CONTROL_REQUEST_TTL_SECS, ChildKind, ChildSnapshot, ControlError, ControlReply, ControlRequest,
-    CreateChild, DeliveryStatus, DetachChild, DetachNotice, ExitRequest, Invite, JoinApproval,
-    JoinRejection, JoinRequest, LeaseState, MAX_CONTROL_FRAME, MoveChild, NodeId, NodeSnapshot,
-    OctAddr, OperatorPubKey, OperatorSecretKey, ParentSnapshot, ROUTED_REPLY_VERSION, RebaseNotice,
-    RebasePull, RejectCode, RoutedControlV1, RoutedForward, RoutedReplyV1, SetAddress, SignedControl,
-    SignedRoutedReply, ValueRequestId, is_admin_request, is_supported_control_version,
-    min_control_version, senior_child, verify_control,
+    AdminApproved, AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminLeaseProbe,
+    AdminLeaseRequest, AdminMode, AdminMoveChild, AdminPendingJoin, AdminRedeliverJoin, AdminRejected,
+    AdminSnapshot, AdminValueApplied, AdminValueDirection, AdminValueRequest, CONTROL_ALPN,
+    CONTROL_REQUEST_MAX_TTL_SECS, CONTROL_REQUEST_TTL_SECS, ChildKind, ChildSnapshot, ControlError,
+    ControlReply, ControlRequest, CreateChild, DeliveryStatus, DetachChild, DetachNotice, ExitRequest,
+    Invite, JoinApproval, JoinRejection, JoinRequest, LeaseState, MAX_CONTROL_FRAME, MoveChild,
+    NodeId, NodeSnapshot, OctAddr, OperatorPubKey, OperatorSecretKey, ParentSnapshot,
+    ROUTED_REPLY_VERSION, RebaseNotice, RebasePull, RejectCode, RoutedControlV1, RoutedForward,
+    RoutedReplyV1, SetAddress, SignedControl, SignedRoutedReply, ValueRequestId, is_admin_request,
+    is_supported_control_version, min_control_version, verify_control,
 };
 use cawala_ledger::{LedgerPubKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::{MsgId, PeerRef, Seen, SeenConfig};
@@ -92,19 +93,31 @@ const MAX_PENDING_REBASE: usize = 32;
 /// [`ControlHandler`] patches it after dialing the applicant.
 const PENDING_DELIVERY: DeliveryStatus = DeliveryStatus::Unreachable;
 
-/// Who an authenticated control request is acting as.
+/// Who the msg layer authenticated as the authority for one request.
 ///
-/// Returned by [`ControlNode::authorize`] (topology surface) and
-/// [`ControlNode::authorize_admin`] (admin surface) so a handler can tell which
-/// rule admitted the request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The **last hop** of a routed envelope is the only remote authority; the
+/// end-to-end requester is carried separately for audit and value policy. A
+/// request from this node's own operator key is [`Authority::SelfOperator`];
+/// otherwise authority is derived from `node.json` + `admin_state.json` by
+/// [`ControlNode::is_administrator`] (R4/R5).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Authority {
-    /// This node's own operator key (self-admin).
+    /// This node's own operator key (local CLI / self-dial / in-process).
     SelfOperator,
-    /// An operator holding an active [`AdminScopes`] set scoped to this node.
-    Delegated(AdminScopes),
-    /// A directly-controlled peer (senior child) verified against the registry.
-    Peer,
+    /// The authenticated predecessor is a [`ChildKind::User`] (browser) child
+    /// of this node — R4, full admin over its parent.
+    BrowserChild {
+        /// The browser child node id.
+        child: NodeId,
+    },
+    /// The authenticated predecessor is the current priority administrator
+    /// child (R5), with a valid lease.
+    PriorityChild {
+        /// The priority child node id.
+        child: NodeId,
+        /// Its index in `admin_state.priority`.
+        index: u8,
+    },
 }
 
 /// What a queued outbound frame answers.
@@ -195,6 +208,14 @@ pub struct ControlNode {
     admins: AdminStore,
     /// Topology-derived admin priority/lease state, reloaded per request.
     admin_state: AdminState,
+    /// Injectable candidate-liveness table for [`ControlNode::maybe_failover`].
+    ///
+    /// In a live node this is populated by the transport probe task (which dials
+    /// each candidate with an [`AdminLeaseProbe`](cawala_control::AdminLeaseProbe)
+    /// and records responsive ids); offline harnesses set it directly with
+    /// [`ControlNode::set_admin_probe_alive`]. An empty table means "no candidate
+    /// confirmed", so an expired lease fails over to unavailable (fail closed).
+    admin_probe_alive: Vec<String>,
     /// Frames to deliver after the current request is answered. Drained by the
     /// `ControlHandler` while it still holds the engine lock.
     outbound: VecDeque<OutboundControl>,
@@ -307,6 +328,7 @@ impl ControlNode {
             pending,
             admins,
             admin_state: AdminState::empty(),
+            admin_probe_alive: Vec::new(),
             outbound: VecDeque::new(),
             pending_rebase: VecDeque::new(),
             self_kind: ChildKind::Node,
@@ -363,6 +385,7 @@ impl ControlNode {
             pending,
             admins,
             admin_state,
+            admin_probe_alive: Vec::new(),
             outbound: VecDeque::new(),
             pending_rebase: VecDeque::new(),
             self_kind: ChildKind::Node,
@@ -398,9 +421,201 @@ impl ControlNode {
         &self.pending
     }
 
-    /// This node's admin-grant store.
+    /// This node's admin-grant store (legacy; deleted in P2/C7).
     pub fn admins(&self) -> &AdminStore {
         &self.admins
+    }
+
+    /// This node's topology-derived admin priority/lease state.
+    pub fn admin_state(&self) -> &AdminState {
+        &self.admin_state
+    }
+
+    /// Override the candidate-liveness table used by
+    /// [`ControlNode::maybe_failover`].
+    ///
+    /// Live nodes populate this from the transport probe task; offline harnesses
+    /// use it to make failover deterministic without a network.
+    pub fn set_admin_probe_alive(&mut self, ids: Vec<String>) {
+        self.admin_probe_alive = ids;
+    }
+
+    /// The node's current lease/priority state for `AdminSnapshot` and lease
+    /// replies (spec §5.5).
+    ///
+    /// `mode` is [`AdminMode::BrowserChildren`] when this node has any `User`
+    /// child (R4 takes precedence over priority), else [`AdminMode::Priority`].
+    fn lease_state(&self) -> LeaseState {
+        let mode = if self
+            .record
+            .record()
+            .children
+            .iter()
+            .any(|child| child.kind == ChildKind::User)
+        {
+            AdminMode::BrowserChildren
+        } else {
+            AdminMode::Priority
+        };
+        LeaseState {
+            epoch: self.admin_state.epoch(),
+            lease_until: self.admin_state.lease_until(),
+            current: self.admin_state.current_index(),
+            priority_len: self.admin_state.priority_len(),
+            mode,
+        }
+    }
+
+    /// Reset the priority lease on a valid admin request (spec §5.2).
+    ///
+    /// Persist-before-memory, but a write failure must not deny service: log and
+    /// keep the in-memory bump, retrying on the next renewal.
+    fn refresh_priority_lease(&mut self, now: u64, by: &str) {
+        let mut next = self.admin_state.clone();
+        next.record_lease(now);
+        next.mark_updated(now, by);
+        if let Err(err) = next.save(&self.data_dir) {
+            warn!(%err, "admin lease persist failed; keeping in-memory bump");
+        }
+        self.admin_state = next;
+    }
+
+    /// Handle a direct child→parent `AdminLease` renewal.
+    ///
+    /// Valid iff the registry binds `signed.origin` to its operator key, the
+    /// origin is still a node child, it is the current priority entry, and
+    /// `req.epoch` equals this node's epoch. A stale or future epoch (or a
+    /// non-current signer) is not an error to resync on: reply
+    /// [`ControlReply::LeaseState`] without refreshing. Only an equal epoch with
+    /// the current, live priority holder refreshes the lease
+    /// (persist-then-memory; a persist failure keeps the in-memory bump).
+    pub(crate) async fn handle_admin_lease(
+        &mut self,
+        signed: &SignedControl,
+        req: &AdminLeaseRequest,
+        now: u64,
+    ) -> ControlReply {
+        if verify_control(signed, &self.peers).is_err() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        if !self
+            .record
+            .record()
+            .children
+            .iter()
+            .any(|child| child.child_id == signed.origin.as_str() && child.kind == ChildKind::Node)
+        {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        let current = self.admin_state.current_id();
+        let is_current = current
+            .as_ref()
+            .is_some_and(|id| id.as_str() == signed.origin.as_str());
+        if req.epoch != self.admin_state.epoch() || !is_current {
+            self.audit(serde_json::json!({
+                "ts": now,
+                "event": "admin-lease-stale",
+                "origin": signed.origin.to_string(),
+                "epoch": req.epoch,
+                "state_epoch": self.admin_state.epoch(),
+            }));
+            return ControlReply::LeaseState(self.lease_state());
+        }
+        self.refresh_priority_lease(now, signed.origin.as_str());
+        self.audit(serde_json::json!({
+            "ts": now,
+            "event": "admin-lease",
+            "origin": signed.origin.to_string(),
+            "epoch": self.admin_state.epoch(),
+            "lease_until": self.admin_state.lease_until(),
+        }));
+        ControlReply::LeaseState(self.lease_state())
+    }
+
+    /// Handle a node→candidate `AdminLeaseProbe`. Confirms liveness only; it
+    /// grants nothing.
+    ///
+    /// The probe must come from this candidate's parent (registry-bound), so an
+    /// unrelated node cannot use it as an oracle. The reply is this candidate's
+    /// own lease state; the probing parent only needs a response.
+    pub(crate) async fn handle_admin_lease_probe(
+        &mut self,
+        signed: &SignedControl,
+        _req: &AdminLeaseProbe,
+        _now: u64,
+    ) -> ControlReply {
+        if verify_control(signed, &self.peers).is_err() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        let Some(parent) = self
+            .record
+            .record()
+            .parent
+            .as_ref()
+            .map(|link| link.parent_id.clone())
+        else {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        };
+        if signed.origin.as_str() != parent {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        ControlReply::LeaseState(self.lease_state())
+    }
+
+    /// Resolve an expired priority lease (spec §5.3).
+    ///
+    /// Deterministic and priority-ordered: probe candidates after `current` (via
+    /// the injectable `alive` predicate), and on the first responsive one set
+    /// `current`, bump `epoch`, and grant a fresh lease — persisting **before**
+    /// updating memory and before accepting anything under the new epoch. If no
+    /// candidate responds (or the list is empty), clear `current`/`lease_until`
+    /// and audit `admin-unavailable`. Returns whether state changed.
+    fn maybe_failover(&mut self, now: u64, alive: impl Fn(&str) -> bool) -> bool {
+        if self.admin_state.lease_valid(now) {
+            return false;
+        }
+        let priority = self.admin_state.priority().to_vec();
+        let start = if self.admin_state.current_index() >= 0 {
+            self.admin_state.current_index() as usize + 1
+        } else {
+            0
+        };
+        let elected = failover_select(&priority, start, &alive);
+        let mut next = self.admin_state.clone();
+        match elected {
+            Some(index) => {
+                next.bump_epoch();
+                next.set_current(index as i32);
+                next.record_lease(now);
+                next.mark_updated(now, &priority[index]);
+            }
+            None => {
+                next.set_current(-1);
+                next.set_lease_until(0);
+            }
+        }
+        if next == self.admin_state {
+            return false;
+        }
+        if let Err(err) = next.save(&self.data_dir) {
+            warn!(%err, "admin failover persist failed; leaving state unchanged");
+            return false;
+        }
+        self.admin_state = next;
+        match elected {
+            Some(index) => self.audit(serde_json::json!({
+                "ts": now,
+                "event": "admin-failover",
+                "current": index,
+                "admin": priority[index],
+                "epoch": self.admin_state.epoch(),
+            })),
+            None => self.audit(serde_json::json!({
+                "ts": now,
+                "event": "admin-unavailable",
+            })),
+        }
+        true
     }
 
     /// Attach a running ledger to this engine, enabling value-scoped
@@ -633,26 +848,59 @@ impl ControlNode {
         self.self_kind = kind;
     }
 
-    /// The senior child rule: `origin` may control this node iff it is this
-    /// node (self-admin) or the most senior child (earliest `date_joined`,
-    /// ties broken by ascending node id).
+    /// Derive this node's administrators for one request (R4/R5).
     ///
-    /// This is *authorization only*; the caller still authenticates the
-    /// signature (self-admin) or calls [`verify_control`] (child).
-    fn authorized(&self, origin: &NodeId) -> bool {
-        if origin.as_str() == self.node_id {
-            return true;
+    /// - R4: if `node` is a [`ChildKind::User`] (browser) child, it is a full
+    ///   administrator over its parent.
+    /// - R5: otherwise, when the node has **no** `User` children, the current
+    ///   priority entry is the administrator — but only if it still exists as a
+    ///   node child and holds a valid lease at `now`.
+    ///
+    /// `ledger_peers.json` binding is established by the caller via
+    /// [`verify_control`] before this is consulted; it is never an authority
+    /// source of its own.
+    fn is_administrator(&self, node: &NodeId, now: u64) -> Option<Authority> {
+        if let Some(child) = self
+            .record
+            .record()
+            .children
+            .iter()
+            .find(|c| c.child_id == node.as_str() && c.kind == ChildKind::User)
+        {
+            return Some(Authority::BrowserChild {
+                child: NodeId::from(child.child_id.clone()),
+            });
         }
-        senior_child(&self.seniority()).is_some_and(|id| id == origin)
+        // R5 applies only when the node has NO User children.
+        if self
+            .record
+            .record()
+            .children
+            .iter()
+            .any(|c| c.kind == ChildKind::User)
+        {
+            return None;
+        }
+        self.admin_state
+            .current_id()
+            .filter(|id| id == node && self.admin_state.lease_valid(now))
+            .map(|id| Authority::PriorityChild {
+                child: id,
+                index: self.admin_state.current_index() as u8,
+            })
     }
 
     /// This node's *node* children as `(node_id, date_joined)` pairs, in record
-    /// order. [`senior_child`] is order-independent.
+    /// order.
+    ///
+    /// This is now the **default priority ordering helper only** (spec §2.3,
+    /// §6): the local CLI's `admin priority add --by-join-order` uses it to
+    /// place a new entry at the `(date_joined, id)` position. It confers no
+    /// authority on its own — [`senior_child`] has no authority call site.
     ///
     /// `ChildKind::User` children are excluded: they are browser clients, not
-    /// routing peers, and must never be eligible for senior-child control. Only
-    /// `ChildKind::Node` children carry topology authority.
-    fn seniority(&self) -> Vec<(NodeId, u64)> {
+    /// routing peers, and are never priority entries.
+    pub fn seniority(&self) -> Vec<(NodeId, u64)> {
         self.record
             .record()
             .children
@@ -662,19 +910,15 @@ impl ControlNode {
             .collect()
     }
 
-    /// Authenticate and authorize a topology-changing request.
+    /// Authenticate and authorize one already-signature-checked request.
     ///
-    /// This is the **strict** surface: self-origin must be signed by this
-    /// node's own operator key, and any other origin must be the senior child
-    /// and verify against the peer registry. A *delegated admin* (an operator
-    /// with [`AdminScopes`] but not this node's operator key, and not a
-    /// senior child) therefore never passes here, so it can never reach
-    /// `CreateChild`/`DetachChild`/`MoveChild`/`SetAddress`/`Query`. Use
-    /// [`ControlNode::authorize_admin`] for the admin surface.
-    fn authorize(&self, signed: &SignedControl, _now: u64) -> Result<Authority, RejectCode> {
-        if !self.authorized(&signed.origin) {
-            return Err(RejectCode::Unauthorized);
-        }
+    /// `signed.origin` is the *actor*: for routed requests the routed entry
+    /// point passes the last hop's signed control; for direct requests it is the
+    /// dialer. A same-node origin must be signed by this node's own operator key
+    /// ([`Authority::SelfOperator`]); any other origin is bound to its registry
+    /// operator key by [`verify_control`] and then checked against
+    /// [`ControlNode::is_administrator`] (R4/R5).
+    fn authorize_actor(&self, signed: &SignedControl, now: u64) -> Result<Authority, RejectCode> {
         if signed.origin.as_str() == self.node_id {
             // Self-admin: the controller must be this node's own operator key.
             if signed.controller != self.operator.public() || signed.verify_signature().is_err() {
@@ -682,38 +926,12 @@ impl ControlNode {
             }
             return Ok(Authority::SelfOperator);
         }
+        // Bind the actor's operator key to its node id, then apply topology
+        // authority. Signature/registry binding is authentication, not
+        // authorization.
         verify_control(signed, &self.peers).map_err(|err| map_control_error(&err))?;
-        Ok(Authority::Peer)
-    }
-
-    /// Authenticate and authorize an **admin** request.
-    ///
-    /// Requirements, all mandatory:
-    /// - `signed.origin` is this node (`self.node_id`), so a peer or senior
-    ///   child can never drive the admin surface;
-    /// - the request declares a [`RequiredScope`](cawala_control::RequiredScope);
-    /// - the controller is either this node's own operator key (self-admin) or
-    ///   an operator holding an active [`AdminScopes`] set granted by this node
-    ///   that [`allows`](cawala_control::AdminScopes::allows) the required
-    ///   scope.
-    ///
-    /// The grant store is refreshed from disk before this is consulted (see
-    /// [`ControlNode::receive_at`]); a grant is only active while
-    /// `now <= expiry`.
-    fn authorize_admin(&self, signed: &SignedControl, now: u64) -> Result<Authority, RejectCode> {
-        if signed.origin.as_str() != self.node_id {
-            return Err(RejectCode::Unauthorized);
-        }
-        let Some(required) = signed.request.required_scope() else {
-            return Err(RejectCode::Unauthorized);
-        };
-        if signed.controller == self.operator.public() {
-            return Ok(Authority::SelfOperator);
-        }
-        match self.admins.active_scopes(&signed.controller, now) {
-            Some(scopes) if scopes.allows(required) => Ok(Authority::Delegated(scopes)),
-            _ => Err(RejectCode::Unauthorized),
-        }
+        self.is_administrator(&signed.origin, now)
+            .ok_or(RejectCode::Unauthorized)
     }
 
     /// Reload the **control-plane** state — the persisted node record
@@ -876,43 +1094,78 @@ impl ControlNode {
     /// execute a deferred ledger query after dropping the control lock.
     ///
     /// The checks run strictly in this order:
-    /// 1. wire version is supported ([`is_supported_control_version`]);
-    /// 2. the declared version can carry the request
-    ///    ([`min_control_version`]);
-    /// 3. the operator signature verifies under `signed.controller`;
-    /// 4. `now <= expiry <= now + CONTROL_REQUEST_MAX_TTL_SECS`;
-    /// 5. the persisted node record/peer registry are reloaded from disk
-    ///    (warn-and-continue; see [`ControlNode::refresh_control_plane`]);
-    /// 6. admin grants are reloaded from disk (fail closed to empty);
-    /// 7. the `(origin, controller, nonce)` replay guard;
-    /// 8. dispatch.
+    /// 1. [`ControlNode::precheck`]: wire version, shape gate, signature,
+    ///    expiry, and the per-request record/registry/admin-state reloads;
+    /// 2. lease failover when the priority lease has expired;
+    /// 3. authority derivation ([`ControlNode::authorize_actor`]) for the admin
+    ///    and topology classes;
+    /// 4. the R1 direct-admin gate: a direct admin request must be
+    ///    [`Authority::SelfOperator`] (remote admin must be routed);
+    /// 5. replay guard and dispatch ([`ControlNode::dispatch_authorized`]).
     ///
     /// An `AdminLedgerQuery` that authorizes and has an attached ledger returns
     /// [`Handled::Ledger`] **without auditing** — the caller audits once it has
-    /// the reply. Every other path audits here (as before).
+    /// the reply. Every other path audits here.
     pub async fn receive_at_handled(
         &mut self,
-        _remote: EndpointId,
+        remote: EndpointId,
         signed: SignedControl,
         now: u64,
     ) -> Handled {
+        if let Some(reply) = self.precheck(&signed, now) {
+            return Handled::Reply(reply);
+        }
+        // Resolve an expired priority lease before deriving authority.
+        self.run_failover(now);
+        let authority = if needs_authority(&signed.request) {
+            match self.authorize_actor(&signed, now) {
+                Ok(authority) => Some(authority),
+                Err(code) => {
+                    let reply = ControlReply::Rejected(code);
+                    self.audit_request(&signed, &reply, now);
+                    return Handled::Reply(reply);
+                }
+            }
+        } else {
+            None
+        };
+        // R1: the direct remote-admin path accepts only `SelfOperator`; remote
+        // admin must be routed. Lease variants are not admin requests and are
+        // handled below.
+        if is_admin_request(&signed.request)
+            && authority.as_ref() != Some(&Authority::SelfOperator)
+        {
+            let reply = ControlReply::Rejected(RejectCode::Unauthorized);
+            self.audit_request(&signed, &reply, now);
+            return Handled::Reply(reply);
+        }
+        self.dispatch_authorized(remote, &signed, now, authority.as_ref(), signed.controller)
+            .await
+    }
+
+    /// Version/shape/signature/expiry checks and per-request reloads.
+    ///
+    /// Returns `Some(reply)` when the request must be refused before dispatch.
+    /// On `None` the record/registry/admin state have been reloaded from disk
+    /// (warn-and-continue for the control plane, fail-closed for admin state).
+    fn precheck(&mut self, signed: &SignedControl, now: u64) -> Option<ControlReply> {
         if !is_supported_control_version(signed.version) {
-            return Handled::Reply(ControlReply::Rejected(RejectCode::BadVersion));
+            return Some(ControlReply::Rejected(RejectCode::BadVersion));
         }
         // Shape gate: a declared version below the variant's introduction
         // version is malformed (e.g. a v5-only `AdminLedgerQuery` on a v4
         // frame) and must not be dispatched.
         if signed.version < min_control_version(&signed.request) {
-            return Handled::Reply(ControlReply::Rejected(RejectCode::BadVersion));
+            return Some(ControlReply::Rejected(RejectCode::BadVersion));
         }
         if signed.verify_signature().is_err() {
-            return Handled::Reply(ControlReply::Rejected(RejectCode::Unauthorized));
+            return Some(ControlReply::Rejected(RejectCode::Unauthorized));
         }
         if now > signed.expiry {
-            return Handled::Reply(ControlReply::Rejected(RejectCode::Expired));
+            return Some(ControlReply::Rejected(RejectCode::Expired));
         }
         if signed.expiry > now.saturating_add(CONTROL_REQUEST_MAX_TTL_SECS) {
-            return Handled::Reply(ControlReply::Rejected(RejectCode::BadRequest));
+            return Some(ControlReply::Rejected(RejectCode::BadRequest));
         }
         self.refresh_control_plane();
         // Full reload so a grant/revoke performed by a separate operator CLI
@@ -923,6 +1176,31 @@ impl ControlNode {
         // out-of-process `control admin priority|state` edit is observed
         // without a restart (fail closed to empty on error).
         self.reload_admin_state();
+        None
+    }
+
+    /// Resolve an expired priority lease using the injected candidate-liveness
+    /// table. Best effort: a persist failure leaves disk and memory unchanged.
+    fn run_failover(&mut self, now: u64) {
+        let probe = self.admin_probe_alive.clone();
+        self.maybe_failover(now, |id| probe.iter().any(|alive| alive == id));
+    }
+
+    /// Replay-guard then dispatch one authenticated request.
+    ///
+    /// `authority` is the pre-computed actor authority: `Some` for every request
+    /// that [`needs_authority`] (admin + topology classes), `None` otherwise.
+    /// `e2e_requester` is the end-to-end value-policy key: for direct requests
+    /// it is `signed.controller`; for routed value requests it is the intent
+    /// controller (the browser), never the signing relay.
+    async fn dispatch_authorized(
+        &mut self,
+        _remote: EndpointId,
+        signed: &SignedControl,
+        now: u64,
+        authority: Option<&Authority>,
+        e2e_requester: OperatorPubKey,
+    ) -> Handled {
         // Replay guard: per (origin, controller), keyed by the request nonce.
         // Control requests are terminal, so a marked nonce is never unobserved.
         let seen_origin = format!("{}:{}", signed.origin, signed.controller);
@@ -932,7 +1210,7 @@ impl ControlNode {
         {
             Seen::Duplicate => {
                 let reply = ControlReply::Rejected(RejectCode::Replay);
-                self.audit_request(&signed, &reply, now);
+                self.audit_request(signed, &reply, now);
                 return Handled::Reply(reply);
             }
             Seen::Fresh => {
@@ -947,44 +1225,59 @@ impl ControlNode {
                         "control replay mark could not be persisted; refusing request"
                     );
                     let reply = ControlReply::Rejected(RejectCode::Internal);
-                    self.audit_request(&signed, &reply, now);
+                    self.audit_request(signed, &reply, now);
                     return Handled::Reply(reply);
                 }
             }
         }
+        // Every valid admin request from the current priority child resets its
+        // lease (spec §5.2).
+        if matches!(authority, Some(Authority::PriorityChild { .. }))
+            && is_admin_request(&signed.request)
+        {
+            self.refresh_priority_lease(now, &signed.origin.to_string());
+        }
         let reply = match &signed.request {
-            ControlRequest::Join(join) => self.handle_join(&signed, join, now),
+            ControlRequest::Join(join) => self.handle_join(signed, join, now),
             ControlRequest::JoinApproved(approval) => {
-                self.handle_join_approved(&signed, approval, now)
+                self.handle_join_approved(signed, approval, now)
             }
             ControlRequest::JoinRejected(rejection) => {
-                self.handle_join_rejected(&signed, rejection)
+                self.handle_join_rejected(signed, rejection)
             }
-            ControlRequest::CreateChild(create) => self.handle_create_child(&signed, create, now),
-            ControlRequest::DetachChild(detach) => self.handle_detach_child(&signed, detach, now),
+            ControlRequest::CreateChild(create) => self.handle_create_child(
+                signed,
+                create,
+                now,
+                authority.expect("topology authority precomputed"),
+            ),
+            ControlRequest::DetachChild(detach) => self.handle_detach_child(signed, detach, now),
             ControlRequest::MoveChild(move_child) => {
-                self.handle_move_child(&signed, move_child, now)
+                self.handle_move_child(signed, move_child, now)
             }
-            ControlRequest::SetAddress(set) => self.handle_set_address(&signed, set, now),
-            ControlRequest::Query => self.handle_query(&signed, now),
-            ControlRequest::AdminQuery => self.handle_admin_query(&signed, now),
+            ControlRequest::SetAddress(set) => self.handle_set_address(
+                signed,
+                set,
+                now,
+                authority.expect("topology authority precomputed"),
+            ),
+            ControlRequest::Query => self.handle_query(signed, now),
+            ControlRequest::AdminQuery => self.handle_admin_query(signed, now),
             ControlRequest::AdminApproveJoin(approve) => {
-                self.handle_admin_approve_join(&signed, approve, now)
+                self.handle_admin_approve_join(signed, approve, now)
             }
             ControlRequest::AdminRejectJoin(reject) => {
-                self.handle_admin_reject_join(&signed, reject, now)
+                self.handle_admin_reject_join(signed, reject, now)
             }
             ControlRequest::AdminRedeliverJoin(redeliver) => {
-                self.handle_admin_redeliver_join(&signed, redeliver, now)
+                self.handle_admin_redeliver_join(signed, redeliver, now)
             }
-            ControlRequest::Exit(exit) => self.handle_exit(&signed, exit, now),
-            ControlRequest::DetachNotice(notice) => self.handle_detach_notice(&signed, notice, now),
-            ControlRequest::Rebase(notice) => self.handle_rebase(&signed, notice, now),
-            ControlRequest::RebasePull(pull) => self.handle_rebase_pull(&signed, pull, now),
+            ControlRequest::Exit(exit) => self.handle_exit(signed, exit, now),
+            ControlRequest::DetachNotice(notice) => self.handle_detach_notice(signed, notice, now),
+            ControlRequest::Rebase(notice) => self.handle_rebase(signed, notice, now),
+            ControlRequest::RebasePull(pull) => self.handle_rebase_pull(signed, pull, now),
             ControlRequest::AdminLedgerQuery => {
-                if let Err(code) = self.authorize_admin(&signed, now) {
-                    ControlReply::Rejected(code)
-                } else if self.ledger.is_none() {
+                if self.ledger.is_none() {
                     // No running ledger attached: fail closed.
                     ControlReply::Rejected(RejectCode::Internal)
                 } else {
@@ -993,53 +1286,78 @@ impl ControlNode {
                     return Handled::Ledger(PendingLedgerQuery {
                         record: self.record.record().clone(),
                         origin: signed.origin.clone(),
-                        controller: signed.controller,
+                        controller: e2e_requester,
                     });
                 }
             }
             ControlRequest::AdminDetachChild(detach) => {
-                self.handle_admin_detach_child(&signed, detach, now)
+                self.handle_admin_detach_child(signed, detach, now)
             }
             ControlRequest::AdminMoveChild(move_child) => {
-                self.handle_admin_move_child(&signed, move_child, now)
+                self.handle_admin_move_child(signed, move_child, now)
             }
             ControlRequest::AdminIssue(request) => {
-                match self.prepare_admin_value(AdminValueDirection::Issue, &signed, request, now) {
+                match self.prepare_admin_value(
+                    AdminValueDirection::Issue,
+                    signed,
+                    request,
+                    now,
+                    authority.expect("admin authority precomputed"),
+                    e2e_requester,
+                ) {
                     Ok(pending) => return Handled::LedgerMutation(pending),
                     Err(code) => ControlReply::Rejected(code),
                 }
             }
             ControlRequest::AdminBurn(request) => {
-                match self.prepare_admin_value(AdminValueDirection::Burn, &signed, request, now) {
+                match self.prepare_admin_value(
+                    AdminValueDirection::Burn,
+                    signed,
+                    request,
+                    now,
+                    authority.expect("admin authority precomputed"),
+                    e2e_requester,
+                ) {
                     Ok(pending) => return Handled::LedgerMutation(pending),
                     Err(code) => ControlReply::Rejected(code),
                 }
             }
             // Lease traffic is inherently direct child<->parent and is
-            // authenticated by the priority/lease check, not by a grant. The
-            // handlers land with the authority core; until then fail closed.
-            ControlRequest::AdminLease(_) | ControlRequest::AdminLeaseProbe(_) => {
-                ControlReply::Rejected(RejectCode::Unauthorized)
+            // authenticated by the priority/lease check, not by a grant.
+            ControlRequest::AdminLease(request) => {
+                self.handle_admin_lease(signed, request, now).await
+            }
+            ControlRequest::AdminLeaseProbe(request) => {
+                self.handle_admin_lease_probe(signed, request, now).await
             }
         };
-        self.audit_request(&signed, &reply, now);
+        self.audit_request(signed, &reply, now);
         Handled::Reply(reply)
     }
 
-    /// Authorize and validate a delegated value request, resolving the actor,
-    /// the account kind, and the operator limits under the control lock.
+    /// Validate a delegated value request, resolving the account kind and the
+    /// operator limits under the control lock.
+    ///
+    /// The caller has already authorized the **actor** (the last hop) and passes
+    /// it explicitly; `requester` is the **end-to-end** requester whose operator
+    /// key keys the value policy and the ledger idempotency record (spec §2.4).
+    /// For a direct request the two coincide; for a routed request the relay
+    /// signs but the browser's key bounds the value. An unused `authority` is
+    /// accepted so the call site carries the full decision.
     ///
     /// Returns a [`PendingLedgerMutation`] for deferred execution, or the
     /// immediate refusal reply. It never reads the ledger (lock ordering) and
     /// never loads key material.
+    #[allow(clippy::too_many_arguments)]
     fn prepare_admin_value(
         &mut self,
         direction: AdminValueDirection,
         signed: &SignedControl,
         request: &AdminValueRequest,
-        now: u64,
+        _now: u64,
+        _authority: &Authority,
+        requester: OperatorPubKey,
     ) -> Result<PendingLedgerMutation, RejectCode> {
-        self.authorize_admin(signed, now)?;
         if request.validate().is_err() {
             return Err(RejectCode::BadRequest);
         }
@@ -1062,7 +1380,7 @@ impl ControlNode {
         let Some(policy) = &self.value_policy else {
             return Err(RejectCode::Internal);
         };
-        let limits = policy.limits_for(&signed.controller);
+        let limits = policy.limits_for(&requester);
         // Early refusal on the per-request cap (policy-only; the window/account
         // caps need the ledger and are re-enforced by the service).
         if request.amount > limits.per_request_max {
@@ -1076,7 +1394,7 @@ impl ControlNode {
             request_id: request.request_id,
             reason: request.reason.clone(),
             origin: signed.origin.clone(),
-            controller: signed.controller,
+            controller: requester,
             limits,
         })
     }
@@ -1117,19 +1435,16 @@ impl ControlNode {
     /// 5. a forward exists, its `hop.node` is the authenticated `remote`, and
     ///    the destination's registry verifies it;
     /// 6. class gate:
-    ///    - `Join`/`JoinApproved`/`JoinRejected` are refused on the routed path;
-    ///    - admin requests dispatch the **intent** (so the existing
-    ///      `authorize_admin` grant store, replay, and TTL rules apply verbatim);
-    ///    - a self-operator intent dispatches the intent;
-    ///    - topology requests dispatch the **last hop's** signed control, and
-    ///      only when it is this node's senior node child (`Authority::Peer`).
-    ///
-    /// A carried [`SignedAdminGrant`](cawala_control::SignedAdminGrant) is
-    /// verified for audit only: it must verify
-    /// under this node's operator, be scoped to this node, and name the intent
-    /// controller, but it never authorizes on its own — the
-    /// [`AdminStore`](crate::admin_store::AdminStore) is the authority, so a
-    /// revoke wins over a still-valid carried grant.
+    ///    - `Join`/`JoinApproved`/`JoinRejected`/exit-rights are refused on the
+    ///      routed path;
+    ///    - value requests (`AdminIssue`/`AdminBurn`/`AdminLedgerQuery`)
+    ///      dispatch the **intent** so the value policy and ledger idempotency
+    ///      key on the end-to-end requester, not the relay;
+    ///    - every other admin/topology request dispatches the **last hop's**
+    ///      signed control, whose origin is the authenticated predecessor;
+    /// 7. authority is derived once from the last hop
+    ///    ([`ControlNode::authorize_actor`]) and passed explicitly into the
+    ///    dispatch, so a value intent is never re-authorized against the target.
     ///
     /// # Non-ledger wrapper
     ///
@@ -1155,11 +1470,13 @@ impl ControlNode {
     /// [`ControlNode::receive_routed_at`], returning a [`Handled`] so the caller
     /// can execute a deferred ledger query after dropping the control lock.
     ///
-    /// The class-level dispatch is unchanged: the admin class dispatches the
-    /// end-to-end intent through [`ControlNode::receive_at_handled`] (so the
-    /// grant store, replay, and TTL rules apply verbatim) and propagates a
-    /// [`Handled::Ledger`] to the caller, which must audit the routed line once
-    /// the reply exists. All other paths audit here.
+    /// The class-level dispatch is unified: value requests dispatch the
+    /// end-to-end intent (keyed on the browser requester), every other
+    /// admin/topology request dispatches the last hop's signed control, and
+    /// authority is computed once from the last hop and passed explicitly into
+    /// [`ControlNode::dispatch_authorized`]. A deferred [`Handled::Ledger`] is
+    /// propagated to the caller, which must audit the routed line once the reply
+    /// exists; all other paths audit here.
     pub async fn receive_routed_at_handled(
         &mut self,
         remote: EndpointId,
@@ -1241,51 +1558,52 @@ impl ControlNode {
         let hops = routed.forwards.len();
         let kind = routed.intent.request.kind();
 
-        // Admin class: dispatch the end-to-end intent; its origin is already
-        // this node, so the untouched `authorize_admin` path (store + replay +
-        // TTL) decides.
-        if is_admin_request(&routed.intent.request) {
-            // Routed control v2 dropped the carried-grant evidence field; the
-            // destination authorizes the intent on its own (store/replay/TTL).
-            return match self.receive_at_handled(remote, routed.intent, now).await {
-                Handled::Reply(reply) => {
-                    self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
-                    Handled::Reply(reply)
-                }
-                // A deferred ledger query/mutation: the caller audits the
-                // routed line after executing it (the reply is not known yet).
-                Handled::Ledger(pending) => Handled::Ledger(pending),
-                Handled::LedgerMutation(pending) => Handled::LedgerMutation(pending),
-            };
-        }
+        // Class gate: the value class dispatches the end-to-end intent so the
+        // value policy and ledger idempotency key on the browser (`requester`),
+        // not the relay; every other admin/topology class dispatches the last
+        // hop's signed control (spec §2.4–2.5).
+        let is_value = matches!(
+            &routed.intent.request,
+            ControlRequest::AdminIssue(_)
+                | ControlRequest::AdminBurn(_)
+                | ControlRequest::AdminLedgerQuery
+        );
+        let (dispatched, e2e_requester) = if is_value {
+            (routed.intent.clone(), routed.intent.controller)
+        } else {
+            (last.signed.clone(), last.signed.controller)
+        };
 
-        // Self-operator class: the intent is addressed to this node and signed
-        // by this node's own operator key.
-        if routed.intent.origin.as_str() == self.node_id
-            && routed.intent.controller == self.operator.public()
+        // The same version/shape/signature/expiry/replay rules apply to
+        // whichever frame is actually dispatched.
+        if let Some(reply) = self.precheck(&dispatched, now) {
+            self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
+            return Handled::Reply(reply);
+        }
+        // Resolve an expired priority lease before deriving authority.
+        self.run_failover(now);
+
+        // The last hop is the only remote authority (R4/R5); the end-to-end
+        // requester is carried separately for audit and value policy.
+        let authority = match self.authorize_actor(&last.signed, now) {
+            Ok(authority) => authority,
+            Err(code) => {
+                let reply = ControlReply::Rejected(code);
+                self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
+                return Handled::Reply(reply);
+            }
+        };
+
+        match self
+            .dispatch_authorized(remote, &dispatched, now, Some(&authority), e2e_requester)
+            .await
         {
-            return match self.receive_at_handled(remote, routed.intent, now).await {
-                Handled::Reply(reply) => {
-                    self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
-                    Handled::Reply(reply)
-                }
-                Handled::Ledger(pending) => Handled::Ledger(pending),
-                Handled::LedgerMutation(pending) => Handled::LedgerMutation(pending),
-            };
-        }
-
-        // Topology class: only the immediate predecessor's own signed control
-        // is dispatched, and only if it is this node's senior node child.
-        match self.authorize(&last.signed, now) {
-            Ok(Authority::Peer) => {}
-            _ => return Handled::Reply(ControlReply::Rejected(RejectCode::Unauthorized)),
-        }
-        let last_signed = last.signed.clone();
-        match self.receive_at_handled(remote, last_signed, now).await {
             Handled::Reply(reply) => {
                 self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
                 Handled::Reply(reply)
             }
+            // A deferred ledger query/mutation: the caller audits the routed
+            // line after executing it (the reply is not known yet).
             Handled::Ledger(pending) => Handled::Ledger(pending),
             Handled::LedgerMutation(pending) => Handled::LedgerMutation(pending),
         }
@@ -1556,7 +1874,7 @@ impl ControlNode {
             .map_err(|err| ControlError::Codec(err.to_string()))
     }
 
-    /// Self-admin or senior-child only: build the node's current snapshot.
+    /// Self-operator or administrator only: build the node's current snapshot.
     pub fn snapshot(&self) -> NodeSnapshot {
         let record = self.record.record();
         let address = record.address.clone();
@@ -1980,11 +2298,8 @@ impl ControlNode {
         signed: &SignedControl,
         create: &CreateChild,
         now: u64,
+        authority: &Authority,
     ) -> ControlReply {
-        let authority = match self.authorize(signed, now) {
-            Ok(authority) => authority,
-            Err(code) => return ControlReply::Rejected(code),
-        };
         let role = match create.kind {
             ChildKind::Node => PeerRole::Node,
             ChildKind::User => PeerRole::User,
@@ -1999,13 +2314,14 @@ impl ControlNode {
         // must not be re-inserted, a changed-operator/role row is refused, and a
         // ledger-only change is applied by `reconcile_peer_row` — but **only**
         // when this node's own operator drove the create. Unlike a re-attach
-        // join, a `CreateChild` is not signed by the peer whose row changes: a
-        // senior child (`Authority::Peer`) could otherwise substitute a
-        // sibling's/descendant's ledger key with one it controls. A senior-child
-        // create with a changed ledger therefore keeps the pre-reconciliation
-        // refusal (`Unauthorized`); new/identical rows are unchanged.
+        // join, a `CreateChild` is not signed by the peer whose row changes: an
+        // administrator child (R4/R5) could otherwise substitute a
+        // sibling's/descendant's ledger key with one it controls. An
+        // administrator create with a changed ledger therefore keeps the
+        // pre-reconciliation refusal (`Unauthorized`); new/identical rows are
+        // unchanged.
         let peer_state = self.existing_peer_state(&peer);
-        if (peer_state == PeerState::LedgerChanged && authority != Authority::SelfOperator)
+        if (peer_state == PeerState::LedgerChanged && *authority != Authority::SelfOperator)
             || peer_state == PeerState::Conflict
         {
             return ControlReply::Rejected(RejectCode::Unauthorized);
@@ -2063,17 +2379,14 @@ impl ControlNode {
 
     fn handle_detach_child(
         &mut self,
-        signed: &SignedControl,
+        _signed: &SignedControl,
         detach: &DetachChild,
         now: u64,
     ) -> ControlReply {
-        if let Err(code) = self.authorize(signed, now) {
-            return ControlReply::Rejected(code);
-        }
         self.apply_detach_child(&detach.child, now)
     }
 
-    /// Authority-free detach mutation shared by the senior and admin paths.
+    /// Authority-free detach mutation shared by the legacy and admin paths.
     ///
     /// **The caller must have authorized first**; this helper performs no
     /// authority check and takes no [`Authority`] (the actor is recorded by the
@@ -2124,7 +2437,7 @@ impl ControlNode {
     /// Authority is the child's **own** operator: `exit.node` must equal the
     /// signed `origin`, whose registered operator key must equal the signed
     /// `controller` (`verify_control`). This is deliberately **not**
-    /// seniority-gated — any child may leave. `subtree_nodes` is audit-only and
+    /// administrator-gated — any child may leave. `subtree_nodes` is audit-only and
     /// never gates the request. The child's [`PeerRegistry`] row is retained so
     /// it can re-attach; an already-removed child whose row still exists is an
     /// idempotent [`ControlReply::Accepted`], while an entirely unknown node is
@@ -2482,22 +2795,19 @@ impl ControlNode {
     /// epoch bump, no notice).
     fn handle_move_child(
         &mut self,
-        signed: &SignedControl,
+        _signed: &SignedControl,
         move_child: &MoveChild,
         now: u64,
     ) -> ControlReply {
-        if let Err(code) = self.authorize(signed, now) {
-            return ControlReply::Rejected(code);
-        }
         // v1 supports only re-slotting a direct child under this node; the
-        // admin request has no `new_parent` at all, so this is senior-only.
+        // admin request has no `new_parent` at all.
         if move_child.new_parent.as_str() != self.node_id {
             return ControlReply::Rejected(RejectCode::BadRequest);
         }
         self.apply_move_child(&move_child.child, move_child.slot, now)
     }
 
-    /// Authority-free re-slot mutation shared by the senior and admin paths.
+    /// Authority-free re-slot mutation shared by the legacy and admin paths.
     ///
     /// **The caller must have authorized first**; this helper performs no
     /// authority check and takes no [`Authority`]. It is node-child only (a
@@ -2575,14 +2885,20 @@ impl ControlNode {
         ControlReply::Accepted
     }
 
+    /// Set or clear this node's asserted address.
+    ///
+    /// `SetAddress` is [`Authority::SelfOperator`]-only (spec §2.6, §9.7): a
+    /// child self-asserts its own address and the parent pushes a `Rebase`, so
+    /// there is no functional loss from refusing an administrator here.
     fn handle_set_address(
         &mut self,
-        signed: &SignedControl,
+        _signed: &SignedControl,
         set: &SetAddress,
-        now: u64,
+        _now: u64,
+        authority: &Authority,
     ) -> ControlReply {
-        if let Err(code) = self.authorize(signed, now) {
-            return ControlReply::Rejected(code);
+        if *authority != Authority::SelfOperator {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
         }
         let result = match &set.address {
             Some(address) => self.record.set_address(address.clone()),
@@ -2597,10 +2913,7 @@ impl ControlNode {
         ControlReply::Accepted
     }
 
-    fn handle_query(&mut self, signed: &SignedControl, now: u64) -> ControlReply {
-        if let Err(code) = self.authorize(signed, now) {
-            return ControlReply::Rejected(code);
-        }
+    fn handle_query(&mut self, _signed: &SignedControl, _now: u64) -> ControlReply {
         ControlReply::Snapshot(self.snapshot())
     }
 
@@ -2608,11 +2921,10 @@ impl ControlNode {
     /// approval.
     ///
     /// Pending rows are capped by [`MAX_PENDING_JOINS`]; the untrusted
-    /// `location_hint` on a [`JoinRequest`] is deliberately omitted.
-    fn handle_admin_query(&mut self, signed: &SignedControl, now: u64) -> ControlReply {
-        if let Err(code) = self.authorize_admin(signed, now) {
-            return ControlReply::Rejected(code);
-        }
+    /// `location_hint` on a [`JoinRequest`] is deliberately omitted. The reply
+    /// carries the node's real topology-admin lease state
+    /// ([`ControlNode::lease_state`]).
+    fn handle_admin_query(&mut self, _signed: &SignedControl, _now: u64) -> ControlReply {
         let pending = self
             .pending
             .pending()
@@ -2629,14 +2941,7 @@ impl ControlNode {
         ControlReply::AdminSnapshot(AdminSnapshot {
             node: self.snapshot(),
             pending,
-            // Placeholder until the authority core wires `admin_state` (C4).
-            lease: LeaseState {
-                epoch: 0,
-                lease_until: 0,
-                current: -1,
-                priority_len: 0,
-                mode: AdminMode::Priority,
-            },
+            lease: self.lease_state(),
         })
     }
 
@@ -2651,13 +2956,10 @@ impl ControlNode {
     /// fund`/first issue.
     fn handle_admin_approve_join(
         &mut self,
-        signed: &SignedControl,
+        _signed: &SignedControl,
         approve: &AdminJoinApprove,
         now: u64,
     ) -> ControlReply {
-        if let Err(code) = self.authorize_admin(signed, now) {
-            return ControlReply::Rejected(code);
-        }
         if approve.validate().is_err() {
             return ControlReply::Rejected(RejectCode::BadRequest);
         }
@@ -2702,13 +3004,10 @@ impl ControlNode {
     /// delivery.
     fn handle_admin_reject_join(
         &mut self,
-        signed: &SignedControl,
+        _signed: &SignedControl,
         reject: &AdminJoinReject,
         now: u64,
     ) -> ControlReply {
-        if let Err(code) = self.authorize_admin(signed, now) {
-            return ControlReply::Rejected(code);
-        }
         if reject.validate().is_err() {
             return ControlReply::Rejected(RejectCode::BadRequest);
         }
@@ -2757,13 +3056,10 @@ impl ControlNode {
     /// [`RejectCode::NotFound`].
     fn handle_admin_redeliver_join(
         &mut self,
-        signed: &SignedControl,
+        _signed: &SignedControl,
         redeliver: &AdminRedeliverJoin,
         now: u64,
     ) -> ControlReply {
-        if let Err(code) = self.authorize_admin(signed, now) {
-            return ControlReply::Rejected(code);
-        }
         if redeliver.validate().is_err() {
             return ControlReply::Rejected(RejectCode::BadRequest);
         }
@@ -2814,19 +3110,17 @@ impl ControlNode {
 
     /// Admin: detach a direct child (topology scope).
     ///
-    /// Authority is [`ControlNode::authorize_admin`] only (never the strict
-    /// senior `authorize`); the mutation itself is the authority-free
-    /// [`ControlNode::apply_detach_child`], so parity with the senior path is
-    /// structural. An additive `admin-topology` audit line records the actor.
+    /// Authority was computed by the dispatch ([`ControlNode::authorize_actor`]);
+    /// the mutation itself is the authority-free
+    /// [`ControlNode::apply_detach_child`], so parity with the legacy topology
+    /// path is structural. An additive `admin-topology` audit line records the
+    /// actor.
     fn handle_admin_detach_child(
         &mut self,
         signed: &SignedControl,
         detach: &AdminDetachChild,
         now: u64,
     ) -> ControlReply {
-        if let Err(code) = self.authorize_admin(signed, now) {
-            return ControlReply::Rejected(code);
-        }
         if detach.validate().is_err() {
             return ControlReply::Rejected(RejectCode::BadRequest);
         }
@@ -2846,20 +3140,18 @@ impl ControlNode {
 
     /// Admin: re-slot a direct `Node` child (topology scope).
     ///
-    /// Authority is [`ControlNode::authorize_admin`] only; the mutation is the
-    /// shared [`ControlNode::apply_move_child`]. A declared `slot > 7` maps to
-    /// the wire [`RejectCode::SlotOutOfRange`] (parity with the senior path's
-    /// record-level error). The additive `admin-topology` audit line records the
-    /// requested slot and, for a real move, the old/new slots.
+    /// Authority was computed by the dispatch ([`ControlNode::authorize_actor`]);
+    /// the mutation is the shared [`ControlNode::apply_move_child`]. A declared
+    /// `slot > 7` maps to the wire [`RejectCode::SlotOutOfRange`] (parity with
+    /// the legacy topology path's record-level error). The additive
+    /// `admin-topology` audit line records the requested slot and, for a real
+    /// move, the old/new slots.
     fn handle_admin_move_child(
         &mut self,
         signed: &SignedControl,
         move_child: &AdminMoveChild,
         now: u64,
     ) -> ControlReply {
-        if let Err(code) = self.authorize_admin(signed, now) {
-            return ControlReply::Rejected(code);
-        }
         if let Err(err) = move_child.validate() {
             return ControlReply::Rejected(match err {
                 ControlError::SlotOutOfRange(_) => RejectCode::SlotOutOfRange,
@@ -3563,6 +3855,36 @@ fn nonce_msg_id(nonce: u64) -> MsgId {
     MsgId::from_bytes(id)
 }
 
+/// Whether a request's dispatch requires a pre-computed [`Authority`].
+///
+/// The admin class and the legacy topology surface
+/// (`CreateChild`/`DetachChild`/`MoveChild`/`SetAddress`/`Query`) do; join,
+/// exit-rights, and lease traffic authenticate themselves.
+fn needs_authority(request: &ControlRequest) -> bool {
+    is_admin_request(request)
+        || matches!(
+            request,
+            ControlRequest::CreateChild(_)
+                | ControlRequest::DetachChild(_)
+                | ControlRequest::MoveChild(_)
+                | ControlRequest::SetAddress(_)
+                | ControlRequest::Query
+        )
+}
+
+/// Pure selector: the first candidate at or after `start` for which `alive`
+/// returns true.
+///
+/// Priority order is authoritative; `start` is `current + 1` during failover so
+/// the stalled current entry is skipped. Injectable for offline tests.
+fn failover_select(
+    priority: &[String],
+    start: usize,
+    alive: impl Fn(&str) -> bool,
+) -> Option<usize> {
+    (start..priority.len()).find(|index| alive(&priority[*index]))
+}
+
 /// Stable `"node"`/`"user"` label for a [`ChildKind`], for audit lines.
 fn child_kind_label(kind: ChildKind) -> &'static str {
     match kind {
@@ -3909,7 +4231,7 @@ mod tests {
     use crate::admin_store::StoredGrant;
     use crate::record::ChildEntry;
     use cawala_control::{
-        ADMIN_GRANT_VERSION, AdminGrantV2, DEFAULT_ADMIN_TTL_SECS, SignedAdminGrantV2,
+        ADMIN_GRANT_VERSION, AdminGrantV2, AdminScopes, DEFAULT_ADMIN_TTL_SECS, SignedAdminGrantV2,
     };
     use cawala_ledger::{LedgerPubKey, LedgerSecretKey};
     use iroh::SecretKey;

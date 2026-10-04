@@ -358,10 +358,7 @@ impl AdminState {
         if self.priority.len() == before {
             return false;
         }
-        if self.priority.is_empty() {
-            self.current = -1;
-            self.lease_until = 0;
-        } else if self.current >= self.priority.len() as i32 {
+        if self.priority.is_empty() || self.current >= self.priority.len() as i32 {
             self.current = -1;
             self.lease_until = 0;
         }
