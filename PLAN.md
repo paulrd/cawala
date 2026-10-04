@@ -99,6 +99,9 @@
   out-of-band - bare process, systemd, or docker as convenience; multiple
   nodes per server via separate data dirs. "Creating a node" in the network
   sense = control-plane identity + link operations, not a server command.
+  Prebuilt static Linux binaries, a systemd template unit
+  (`packaging/cawala-node@.service`), and an installer (`packaging/install.sh`,
+  published by `.github/workflows/release.yml`) cover the common VPS path.
 
 # Architecture Summary
 ## Addresses

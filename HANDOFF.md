@@ -61,6 +61,10 @@ Next: the optional backlog in "Open items" below (notably the final
     wasm check ok.
 - `web/src/wasm/` is gitignored and generated; run `npm run build:wasm` (or
   `npm run build`) after any `crates/client-wasm` change.
+- Node packaging lives in `packaging/` (systemd template unit + `install.sh`);
+  pushing a `v*` tag builds static musl binaries for x86_64/aarch64 via
+  `.github/workflows/release.yml` (cargo-zigbuild, no Docker) and attaches them
+  plus the unit/installer to the GitHub Release.
 - M0–M5 and the earlier unified-console P1–P6 remain built on `main` (records in
   `PLAN-ARCHIVE.md`); the branch replaces their admin/grant layers.
 

@@ -1,0 +1,100 @@
+# Builds statically linked cawala-node binaries and attaches them to the GitHub
+# Release for a `v*` tag:
+#
+#   cawala-node-x86_64-unknown-linux-musl   (+ .sha256)
+#   cawala-node-aarch64-unknown-linux-musl  (+ .sha256)
+#   cawala-node@.service                    (systemd template unit)
+#   install.sh                              (operator installer)
+#
+# Operators install a node with:
+#   curl -fsSL https://raw.githubusercontent.com/paulrd/cawala/main/packaging/install.sh | sudo bash
+#
+# Cross-compilation uses cargo-zigbuild, which supplies a musl-capable C
+# compiler/assembler/linker (needed by `ring`) without Docker. Zig is pinned to
+# 0.14.x to avoid the zig>=0.15 libc++/bindgen caveat.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust 1.98.0 + target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.0"
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.14.1"
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build static binary
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }} -p cawala-node
+
+      - name: Stage binary + checksum
+        run: |
+          set -euo pipefail
+          asset="cawala-node-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/cawala-node" "$asset"
+          chmod +x "$asset"
+          sha256sum "$asset" > "$asset.sha256"
+          file "$asset"
+          if ! file "$asset" | grep -Eq 'statically linked|static-pie linked'; then
+            echo "::error::$asset is not statically linked"
+            exit 1
+          fi
+
+      - name: Attach binary + checksum to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            cawala-node-${{ matrix.target }}
+            cawala-node-${{ matrix.target }}.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+  packaging-assets:
+    name: attach packaging assets
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Attach systemd unit + installer to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            packaging/cawala-node@.service
+            packaging/install.sh
+          fail_on_unmatched_files: true

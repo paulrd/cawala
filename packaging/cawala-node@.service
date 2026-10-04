@@ -1,0 +1,45 @@
+# Cawala node systemd template unit.
+#
+# One instance per node, named after its data directory under /var/lib/cawala:
+#
+#   systemctl enable --now cawala-node@leaf1
+#
+# => /usr/local/bin/cawala-node --data-dir /var/lib/cawala/leaf1 run
+#
+# The instance's state directory is created and owned by systemd
+# (StateDirectory=), so the node never needs root and the data dir survives
+# restarts. Install this file to /etc/systemd/system/cawala-node@.service
+# (packaging/install.sh does this), then run:
+#
+#   cawala-node --data-dir /var/lib/cawala/leaf1 init
+#   cawala-node --data-dir /var/lib/cawala/leaf1 topo set-address 0
+#   systemctl restart cawala-node@leaf1
+#   cawala-node --data-dir /var/lib/cawala/leaf1 control invite --label leaf1
+#
+# The node needs outbound UDP + HTTPS/DNS to the N0 relays (dns.iroh.link) and
+# does not require any inbound port while using relays. Re-run the CLI after an
+# out-of-band `control approve`, then restart this unit so the node re-publishes
+# its pkarr record.
+[Unit]
+Description=Cawala node (%i)
+Documentation=https://github.com/paulrd/cawala
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cawala
+Group=cawala
+StateDirectory=cawala/%i
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/cawala-node --data-dir /var/lib/cawala/%i run
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
