@@ -36,7 +36,7 @@ pub mod seen_store;
 pub mod settlement;
 pub mod value_policy;
 
-pub use admin_cli::{AdminCliError, AdminListEntry, GrantOutcome};
+pub use admin_cli::AdminCliError;
 pub use admin_state::{
     ADMIN_STATE_FILE, ADMIN_STATE_VERSION, DEFAULT_ADMIN_TTL_SECS, MAX_ADMIN_STATE_TTL_SECS,
     MAX_PRIORITY, AdminState, AdminStateError,

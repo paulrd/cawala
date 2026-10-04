@@ -4,9 +4,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use cawala_control::{
-    AdminScope, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest, CreateChild,
-    DetachChild, Invite, JoinRejection, JoinRequest, MoveChild, NodeId, OperatorPubKey,
-    OperatorSecretKey, SetAddress, SignedControl,
+    CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply, ControlRequest, CreateChild, DetachChild,
+    Invite, JoinRejection, JoinRequest, MoveChild, NodeId, OperatorPubKey, OperatorSecretKey,
+    SetAddress, SignedControl,
 };
 use cawala_ledger::{AccountRef, Amount, EntryBody, LedgerPubKey, commitment_hash, verify_chain};
 use cawala_msg::{MSG_CONTROL_V1, MSG_LEDGER_V1, MSG_SETTLE_V1};
@@ -259,56 +259,69 @@ enum ControlCommand {
 
 /// `control admin` subcommands, backed by [`admin_cli`].
 ///
-/// These are **local** operator commands: they edit `<data-dir>/admins.json`
-/// directly (no network). Grant/revoke sign with this node's operator key.
-/// A `--scope` value for `control admin grant`. The legacy `admin` scope is
-/// deliberately not selectable (it is v1-only).
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum ScopeArg {
-    Joins,
-    Topology,
-    Value,
-}
-
-impl From<ScopeArg> for AdminScope {
-    fn from(scope: ScopeArg) -> Self {
-        match scope {
-            ScopeArg::Joins => AdminScope::Joins,
-            ScopeArg::Topology => AdminScope::Topology,
-            ScopeArg::Value => AdminScope::Value,
-        }
-    }
-}
-
+/// `priority` and `state` are **local** operator commands: they edit
+/// `<data-dir>/admin_state.json` directly (no network), and a running node
+/// observes the edit via its per-request admin-state reload. `value-policy`
+/// edits the local value-policy file. The online admin/topology commands are
+/// restricted to this node until P3/P4 reroute them.
 #[derive(Subcommand)]
 enum AdminCommand {
-    /// Grant an operator key administrative authority over this node.
-    Grant {
-        /// The admin's operator public key, hex (64 chars).
-        #[arg(long, value_name = "OPERATOR_HEX")]
-        key: String,
-        /// Scope to grant; repeatable. Defaults to `joins` when omitted.
-        #[arg(long = "scope", value_name = "SCOPE", value_enum)]
-        scopes: Vec<ScopeArg>,
-        /// Unix-seconds expiry; omitted defaults to 7 days from now (24 h for
-        /// value-scoped grants).
-        #[arg(long, value_name = "EPOCH_SECONDS")]
-        expiry: Option<u64>,
-        /// Human-readable label (at most 64 bytes).
-        #[arg(long, value_name = "LABEL")]
-        label: Option<String>,
-    },
-    /// Revoke an operator key's administrative authority.
-    Revoke {
-        /// The admin's operator public key, hex (64 chars).
-        #[arg(long, value_name = "OPERATOR_HEX")]
-        key: String,
-    },
-    /// List this node's admin grants.
-    List,
+    /// Show or edit the topology-derived priority list (explicit admin seed).
+    #[command(subcommand)]
+    Priority(PriorityCommand),
+    /// Show or edit the current priority administrator / lease state.
+    #[command(subcommand)]
+    State(StateCommand),
     /// Show or set the operator value policy (delegated issue/burn caps).
     #[command(subcommand)]
     ValuePolicy(ValuePolicyCommand),
+}
+
+/// `control admin priority` subcommands.
+#[derive(Subcommand)]
+enum PriorityCommand {
+    /// Print the priority list and current administrator.
+    Show,
+    /// Add a child to the priority list (bootstraps the first admin).
+    Add {
+        /// The child's `EndpointId`.
+        #[arg(value_name = "CHILD_NODE_ID")]
+        child: String,
+        /// Insert at the child's `(date_joined, id)` join-order position
+        /// instead of appending.
+        #[arg(long)]
+        by_join_order: bool,
+    },
+    /// Remove a child from the priority list (demotion).
+    Remove {
+        /// The child's `EndpointId`.
+        #[arg(value_name = "CHILD_NODE_ID")]
+        child: String,
+    },
+    /// Move a priority entry to a new zero-based index.
+    Move {
+        /// The child's `EndpointId`.
+        #[arg(value_name = "CHILD_NODE_ID")]
+        child: String,
+        /// The target zero-based index.
+        #[arg(long, value_name = "INDEX")]
+        to: usize,
+    },
+}
+
+/// `control admin state` subcommands.
+#[derive(Subcommand)]
+enum StateCommand {
+    /// Print the current priority/lease state.
+    Show,
+    /// Set the current administrator, or `none` to clear it.
+    SetCurrent {
+        /// The child's `EndpointId`, or the literal `none`.
+        #[arg(value_name = "CHILD_NODE_ID|none")]
+        child: String,
+    },
+    /// Clear the priority list and current administrator (bumps the epoch).
+    Reset,
 }
 
 /// `control admin value-policy` subcommands.
@@ -1663,6 +1676,7 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
             ledger,
             slot,
         } => {
+            ensure_local_target(&node, &secret_key)?;
             let request = ControlRequest::CreateChild(CreateChild {
                 child: NodeId::from(child),
                 operator: parse_operator_pubkey(&child_operator)?,
@@ -1674,12 +1688,14 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
             send_control_command(&secret_key, &node, me, &operator, request).await?;
         }
         ControlCommand::DetachChild { node, child } => {
+            ensure_local_target(&node, &secret_key)?;
             let request = ControlRequest::DetachChild(DetachChild {
                 child: NodeId::from(child),
             });
             send_control_command(&secret_key, &node, me, &operator, request).await?;
         }
         ControlCommand::MoveChild { node, child, slot } => {
+            ensure_local_target(&node, &secret_key)?;
             let request = ControlRequest::MoveChild(MoveChild {
                 child: NodeId::from(child),
                 new_parent: NodeId::from(node.clone()),
@@ -1688,6 +1704,7 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
             send_control_command(&secret_key, &node, me, &operator, request).await?;
         }
         ControlCommand::SetAddress { node, address } => {
+            ensure_local_target(&node, &secret_key)?;
             let address = address
                 .map(|raw| {
                     raw.parse::<OctAddr>()
@@ -1698,6 +1715,7 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
             send_control_command(&secret_key, &node, me, &operator, request).await?;
         }
         ControlCommand::Query { node } => {
+            ensure_local_target(&node, &secret_key)?;
             send_control_command(&secret_key, &node, me, &operator, ControlRequest::Query).await?;
         }
         ControlCommand::Exit => {
@@ -1912,7 +1930,7 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
     Ok(())
 }
 
-/// Local `control admin grant|revoke|list`, delegating to [`admin_cli`].
+/// Local `control admin priority|state|value-policy`, delegating to [`admin_cli`].
 fn admin_command(
     data_dir: &std::path::Path,
     node_id: &str,
@@ -1920,60 +1938,122 @@ fn admin_command(
     command: AdminCommand,
 ) -> Result<()> {
     match command {
-        AdminCommand::Grant {
-            key,
-            scopes,
-            expiry,
-            label,
-        } => {
-            let admin = parse_operator_pubkey(&key)?;
-            let scopes = if scopes.is_empty() {
-                vec![AdminScope::Joins]
-            } else {
-                scopes.into_iter().map(AdminScope::from).collect()
-            };
-            let now = now_unix_seconds();
-            let outcome =
-                admin_cli::grant(data_dir, node_id, operator, admin, scopes, expiry, label, now)
-                    .map_err(|err| anyhow::anyhow!("{err}"))?;
-            println!(
-                "granted admin={} scopes={} expires={}",
-                outcome.admin,
-                outcome.scopes.label(),
-                outcome.expiry
-            );
-            println!("bundle: {}", outcome.bundle);
-            if outcome.scopes.value {
-                println!(
-                    "note: a value-scoped admin can issue and burn value on this node's child \
-                     accounts (bounded by the value policy)."
-                );
-            }
-            println!("node {node_id}: paste the bundle in Settings -> Node administration.");
+        AdminCommand::Priority(command) => {
+            priority_command(data_dir, node_id, operator, command)?;
+        }
+        AdminCommand::State(command) => {
+            state_command(data_dir, node_id, operator, command)?;
         }
         AdminCommand::ValuePolicy(command) => {
             value_policy_command(data_dir, command)?;
         }
-        AdminCommand::Revoke { key } => {
-            let admin = parse_operator_pubkey(&key)?;
-            admin_cli::revoke(data_dir, node_id, operator, &admin)
-                .map_err(|err| anyhow::anyhow!("{err}"))?;
-            println!("revoked admin={admin}");
+    }
+    Ok(())
+}
+
+/// Local `control admin priority show|add|remove|move`.
+fn priority_command(
+    data_dir: &std::path::Path,
+    node_id: &str,
+    operator: &OperatorSecretKey,
+    command: PriorityCommand,
+) -> Result<()> {
+    let now = now_unix_seconds();
+    let state = match command {
+        PriorityCommand::Show => admin_cli::state_show(data_dir).map_err(cli_error)?,
+        PriorityCommand::Add { child, by_join_order } => {
+            admin_cli::priority_add(data_dir, node_id, operator, &child, by_join_order, now)
+                .map_err(cli_error)?
         }
-        AdminCommand::List => {
-            let entries = admin_cli::list(data_dir, node_id, operator)
-                .map_err(|err| anyhow::anyhow!("{err}"))?;
-            if entries.is_empty() {
-                println!("no admins");
+        PriorityCommand::Remove { child } => {
+            admin_cli::priority_remove(data_dir, node_id, operator, &child, now)
+                .map_err(cli_error)?
+        }
+        PriorityCommand::Move { child, to } => {
+            admin_cli::priority_move(data_dir, node_id, operator, &child, to, now)
+                .map_err(cli_error)?
+        }
+    };
+    print_admin_state(&state, now);
+    Ok(())
+}
+
+/// Local `control admin state show|set-current|reset`.
+fn state_command(
+    data_dir: &std::path::Path,
+    node_id: &str,
+    operator: &OperatorSecretKey,
+    command: StateCommand,
+) -> Result<()> {
+    let now = now_unix_seconds();
+    match command {
+        StateCommand::Show => {
+            let state = admin_cli::state_show(data_dir).map_err(cli_error)?;
+            print_admin_state(&state, now);
+        }
+        StateCommand::SetCurrent { child } => {
+            let target = if child == "none" {
+                None
             } else {
-                let now = now_unix_seconds();
-                for entry in &entries {
-                    println!("{}", entry.render(now));
-                }
-            }
+                Some(child.as_str())
+            };
+            let state = admin_cli::state_set_current(data_dir, node_id, operator, target, now)
+                .map_err(cli_error)?;
+            println!("set-current: {} (epoch {})", current_label(&state), state.epoch());
+        }
+        StateCommand::Reset => {
+            let state = admin_cli::state_reset(data_dir, now).map_err(cli_error)?;
+            println!("reset: current={} epoch={}", state.current_index(), state.epoch());
         }
     }
     Ok(())
+}
+
+/// Map an [`admin_cli`] error to an `anyhow` error.
+fn cli_error(err: cawala_node::AdminCliError) -> anyhow::Error {
+    anyhow::anyhow!("{err}")
+}
+
+/// Render the current administrator for one-line output.
+fn current_label(state: &cawala_node::AdminState) -> String {
+    match state.current_id() {
+        Some(id) => format!("{} (index {})", id.as_str(), state.current_index()),
+        None => "none".to_string(),
+    }
+}
+
+/// Print the persisted priority/lease state.
+fn print_admin_state(state: &cawala_node::AdminState, now: u64) {
+    if state.priority().is_empty() {
+        println!("priority: (none)");
+    } else {
+        println!("priority: {} entries", state.priority().len());
+        for (index, id) in state.priority().iter().enumerate() {
+            let marker = if index as i32 == state.current_index() {
+                " (current)"
+            } else {
+                ""
+            };
+            println!("  {index}: {id}{marker}");
+        }
+    }
+    println!("current: {}", state.current_index());
+    println!(
+        "lease_until: {}{}",
+        state.lease_until(),
+        if state.lease_valid(now) {
+            " (valid)"
+        } else {
+            " (expired)"
+        }
+    );
+    println!("epoch: {}", state.epoch());
+    println!("ttl_secs: {}", state.ttl_secs());
+    println!(
+        "updated_at: {} updated_by: {}",
+        state.updated_at(),
+        state.updated_by()
+    );
 }
 
 /// Local `control admin value-policy show|set`.
@@ -2019,6 +2099,28 @@ fn value_policy_command(data_dir: &std::path::Path, command: ValuePolicyCommand)
                 .save(data_dir)
                 .map_err(|err| anyhow::anyhow!("{err}"))?;
         }
+    }
+    Ok(())
+}
+
+/// Reject a control command aimed at a node other than this one.
+///
+/// Under the topology-authority rules a direct request is authorized only as
+/// `Authority::SelfOperator` at its target, so a client can no longer self-sign
+/// as a senior child of a different node. Until P3/P4 reroute these commands,
+/// they must be addressed to the local node (`--node` must equal self). The
+/// join approve/reject commands act on this node's own pending store and dial
+/// the applicant directly, so they are already local and are not gated here.
+fn ensure_local_target(node: &str, secret_key: &iroh::SecretKey) -> Result<()> {
+    let target: EndpointId = node
+        .parse()
+        .map_err(|err| anyhow::anyhow!("invalid endpoint id '{node}': {err}"))?;
+    if target != secret_key.public() {
+        anyhow::bail!(
+            "topology control is restricted to the local node until P3/P4 reroutes it; \
+             --node '{target}' is not this node '{}'",
+            secret_key.public()
+        );
     }
     Ok(())
 }
