@@ -9,6 +9,11 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 export default defineConfig({
   base: './',
   plugins: [svelte()],
+  server: {
+    // `lib/adminPolicy.js` imports ../../../../ADMIN_POLICY.md?raw from the
+    // repo root, which is outside this app's root: allow it in dev.
+    fs: { allow: ['..'] },
+  },
   build: {
     // wasm-bindgen glue + modern browser targets; nothing legacy required
     target: 'es2022',

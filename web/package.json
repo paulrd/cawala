@@ -9,7 +9,7 @@
     "build": "npm run build:wasm && vite build",
     "dev": "npm run build:wasm && vite",
     "preview": "vite preview",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --import ./test/loaders/register-raw.mjs --test test/*.test.mjs"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.0",

@@ -140,19 +140,3 @@ export function tempId() {
   return Math.random().toString(36).slice(2, 10);
 }
 
-/**
- * Compact time-to-expiry text for a grant (`6d left`, `2h 14m`, `expired`).
- * @param {number|null|undefined} expiresAt epoch ms
- * @param {number} [now]
- * @returns {string}
- */
-export function formatTtl(expiresAt, now = Date.now()) {
-  if (expiresAt == null) return '';
-  const ms = expiresAt - now;
-  if (ms <= 0) return 'expired';
-  const minutes = Math.floor(ms / 60000);
-  if (minutes < 60) return `${Math.max(minutes, 1)}m left`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 48) return `${hours}h left`;
-  return `${Math.floor(hours / 24)}d left`;
-}

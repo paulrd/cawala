@@ -1,23 +1,21 @@
 <script>
   import { untrack } from 'svelte';
-  import NodeSelector from '../admin/NodeSelector.svelte';
-  import GrantStatusBanner from '../admin/GrantStatusBanner.svelte';
+  import AdminTargetSwitcher from '../admin/AdminTargetSwitcher.svelte';
   import Badge from '../shared/Badge.svelte';
-  import { administeredNode, clientState } from '../../lib/stores.svelte.js';
+  import { administeredNode, adminLock, clientState, targetEpoch } from '../../lib/stores.svelte.js';
   import { probeAdminNode } from '../../lib/api.js';
-  import { statusBadge, ADMIN_STATUS, needsGrantBanner } from '../../lib/adminView.js';
+  import { statusBadge } from '../../lib/adminView.js';
   import { kindLabel, kindBadgeVariant } from '../../lib/nodeKind.js';
-  import { formatTtl } from '../../lib/utils.js';
   import { CLIENT_STATUS } from '../../lib/constants.js';
 
   /**
    * NodeContextBar — the persistent strip under the top bar that says which
-   * node this console is administering, what was last observed about it, and
-   * whether the delegated key still allows queries.
+   * ancestor admin mode is pointing at, what was last observed about it, and
+   * whether admin mode is even unlocked.
    *
-   * Layout (one shape for leaf and internal alike): selector, kind, address,
-   * TTL/status, refresh. Expired/unreachable/revoked selections get the shared
-   * GrantStatusBanner underneath.
+   * Layout (one shape for leaf and internal alike): up/down switcher, kind,
+   * address, status, refresh. Nothing grant-shaped is shown here anymore: the
+   * only gate is the session lock, which the switcher itself offers to open.
    */
   let view = administeredNode;
 
@@ -35,7 +33,7 @@
     return () => clearInterval(_tick);
   });
 
-  /** Probe the selected node once (never throws). */
+  /** Probe the current target once (never throws). */
   async function runProbe(target) {
     // Read the re-entrancy guard untracked: when this runs inside the
     // selection $effect below, a tracked read of `probing` would make the
@@ -53,38 +51,38 @@
     }
   }
 
-  // Probe on first readiness and whenever the selection changes: the selector
-  // must show observed state (kind, address, reachability), never a guess.
+  // Probe whenever the target changes: the bar must show observed state
+  // (kind, address, reachability), never a guess.
   $effect(() => {
-    const target = administeredNode.nodeId;
+    const target = view.nodeId;
+    void targetEpoch.value;
     const ready = clientState.status === CLIENT_STATUS.READY;
     if (!target || !ready) return;
     void runProbe(target);
   });
 
   let statusView = $derived(statusBadge(view.status));
-  let addressText = $derived(view.address ?? view.nodeAddr ?? null);
-  let showBanner = $derived(needsGrantBanner(view.status));
+  let addressText = $derived(view.address ?? null);
 </script>
 
 <div class="context-bar">
   <div class="context-row">
-    <NodeSelector variant="bar" owner="bar" />
+    <AdminTargetSwitcher variant="bar" />
 
     <div class="context-chips" aria-live="polite">
       <Badge variant={kindBadgeVariant(view.kind)} label={kindLabel(view.kind)} />
 
       {#if addressText}
-        <span class="chip chip--mono text-xs" title="Last observed node address">
+        <span class="chip chip--mono text-xs" title="Last observed address of this target">
           Address {addressText}
         </span>
       {/if}
 
       {#if view.mock}
         <Badge variant="info" label="Mock mode" />
-      {:else if view.grantExpiresAt}
-        <span class="chip text-xs" class:chip--warn={view.grantExpiresAt - now < 6 * 3600_000}>
-          Key {formatTtl(view.grantExpiresAt, now)}
+      {:else if adminLock.unlocked && view.isSelf}
+        <span class="chip text-xs" title="Admin mode is unlocked but pointed at this browser">
+          Unlocked
         </span>
       {/if}
 
@@ -96,8 +94,8 @@
       class="context-refresh"
       class:context-refresh--busy={probing}
       disabled={probing}
-      title="Re-query the selected node for its kind, address and reachability"
-      aria-label="Refresh node status"
+      title="Re-query the current target for its kind, address and reachability"
+      aria-label="Refresh target status"
       onclick={() => runProbe(view.nodeId)}
     >
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
@@ -107,17 +105,6 @@
       <span class="context-refresh-text">Refresh</span>
     </button>
   </div>
-
-  {#if showBanner}
-    <div class="context-banner">
-      <GrantStatusBanner
-        status={view.status}
-        label={view.label ?? ''}
-        expiresAt={view.grantExpiresAt}
-        kind={view.kind}
-      />
-    </div>
-  {/if}
 </div>
 
 <style>
@@ -153,10 +140,6 @@
   .chip--mono {
     font-family: var(--mono);
   }
-  .chip--warn {
-    color: var(--warn);
-    border-color: var(--warn);
-  }
   .context-refresh {
     display: inline-flex;
     align-items: center;
@@ -186,9 +169,6 @@
   }
   .context-refresh--busy svg {
     animation: context-spin 900ms linear infinite;
-  }
-  .context-banner {
-    margin-top: var(--sp-2);
   }
 
   @keyframes context-spin {

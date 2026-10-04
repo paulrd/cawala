@@ -19,7 +19,7 @@
  *                     `firstFailureAt = null`) and stamp `lastOkAt`;
  *   - recorded parent changes → the old record is ignored/reset.
  *
- * Storage is resolved like `adminKeys.js` and every read/write is best-effort:
+ * Storage is resolved defensively and every read/write is best-effort:
  * SSR, private mode, quota, or a throwing `localStorage` yield a neutral
  * "reachable" status instead of throwing.
  *
@@ -172,7 +172,7 @@ export function trackerStatus(previous, currentParent) {
 
 /**
  * Resolve a localStorage-like object, or null when storage is unavailable
- * (SSR, private mode, quota, workers). Never throws. Mirrors `adminKeys.js`.
+ * (SSR, private mode, quota, workers). Never throws.
  * @returns {Storage|null}
  */
 function _storage() {

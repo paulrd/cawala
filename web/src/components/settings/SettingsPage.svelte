@@ -1,12 +1,17 @@
 <script>
   import Card from '../shared/Card.svelte';
-  import AdminNodeRow from '../admin/AdminNodeRow.svelte';
   import Address from '../shared/Address.svelte';
   import EndpointId from '../shared/EndpointId.svelte';
   import Badge from '../shared/Badge.svelte';
   import ConfirmDialog from '../shared/ConfirmDialog.svelte';
   import ConnectionIndicator from '../shared/ConnectionIndicator.svelte';
-  import { clientState, ledgerState, apiCapabilities, administeredNode, showToast } from '../../lib/stores.svelte.js';
+  import {
+    clientState,
+    ledgerState,
+    apiCapabilities,
+    adminLock,
+    showToast,
+  } from '../../lib/stores.svelte.js';
   import {
     isMockMode,
     isIdentityPersistent,
@@ -15,18 +20,10 @@
     inspectIdentityBundle,
     importIdentityBundle,
     wipeIdentity,
-    listAdministeredNodes,
-    setAdministeredNode,
-    configureAdminNode,
-    removeAdminNode,
-    applyAdminBundle,
-    lockAdmin,
-    protectValueSeed,
+    adminPolicyInfo,
+    lockAdminMode,
   } from '../../lib/api.js';
-  import { copyToClipboard } from '../../lib/utils.js';
-  import { isValidNodeAddr } from '../../lib/adminKeys.js';
-  import UnlockAdminKeyDialog from '../shared/UnlockAdminKeyDialog.svelte';
-  import { buildSelectorItems } from '../../lib/adminView.js';
+  import AdminUnlockDialog from '../admin/AdminUnlockDialog.svelte';
 
   let caps = $derived(getCapabilities());
   let mock = $derived(isMockMode());
@@ -136,186 +133,21 @@
     }
   }
 
-  // ── Admin node state ──────────────────────────────────────
-  let adminNodes = $state([]);
-  let adminBusy = $state(false);
-  let configureNodeId = $state('');
-  let configureLabel = $state('');
-  let configureDays = $state(7);
-  let configureNodeAddr = $state('');
-  let configureResult = $state(null); // { nodeId, adminPubHex } | null
-  let removeConfirmOpen = $state(false);
-  let removeTarget = $state(null); // nodeId string
-  let bundleUri = $state('');
-  let bundleBusy = $state(false);
-  let bundleMessage = $state(null); // { kind: 'ok' | 'danger', text } | null
+  // ── Admin mode ─────────────────────────────────────────────
+  // Session-only unlock with an explicit acknowledgement of ADMIN_POLICY.md;
+  // the acknowledgement itself is keyed to the document hash (see adminPolicy).
+  let unlockOpen = $state(false);
+  let policy = $derived(adminPolicyInfo());
+  let locked = $derived(!adminLock.unlocked);
 
-  // ── Value key protection ──────────────────────────────────
-  let protectDialog = $state(null); // { nodeId, mode: 'protect' } | null
-  let protectBusy = $state(false);
-  let protectError = $state(null);
-
-  function openProtect(nodeId) {
-    protectDialog = { nodeId, mode: 'protect' };
-    protectError = null;
+  function handleUnlockResult() {
+    unlockOpen = false;
+    showToast('Admin mode unlocked for this session.', 'ok');
   }
 
-  async function handleProtectSubmit(passphrase) {
-    if (!protectDialog) return;
-    protectBusy = true;
-    protectError = null;
-    try {
-      // Fail closed: `protectValueSeed` verifies the wrapped row was persisted
-      // before it resolves, so a storage failure never reports success.
-      await protectValueSeed(protectDialog.nodeId, passphrase);
-      showToast('Value key protected.', 'ok');
-      protectDialog = null;
-      await loadAdminNodes();
-    } catch (err) {
-      protectError = err?.message || 'Could not protect the value key.';
-    } finally {
-      protectBusy = false;
-    }
-  }
-
-  function handleLock(nodeId) {
-    lockAdmin(nodeId);
-    showToast('Value key locked.', 'warn');
-    loadAdminNodes();
-  }
-
-  let configureNodeAddrValid = $derived(
-    configureNodeAddr === '' || isValidNodeAddr(configureNodeAddr),
-  );
-  let configureNodeAddrHint = $derived(
-    configureNodeAddr && !configureNodeAddrValid
-      ? 'Enter a dotted octal address such as 0 or 0.3.1 (one digit 0-7 per level).'
-      : null,
-  );
-
-  async function loadAdminNodes() {
-    if (mock) return;
-    try {
-      adminNodes = listAdministeredNodes();
-    } catch {
-      adminNodes = [];
-    }
-  }
-
-  $effect(() => {
-    if (!mock) loadAdminNodes();
-  });
-
-  /**
-   * The exact rows the header selector shows (self + granted nodes), so the
-   * Settings list can never drift from the selector it feeds.
-   */
-  let selectorGroups = $derived(
-    buildSelectorItems({
-      self: { endpointId: clientState.endpointId },
-      mock,
-      nodes: adminNodes,
-      selected: administeredNode.nodeId,
-    }).groups,
-  );
-
-  // Only value-scoped keys can/must be protected; joins/topology stay plaintext.
-  let valueAdminNodes = $derived(adminNodes.filter((node) => node.scopes?.includes('value')));
-
-  /** Switch the whole console to this node (same action as the selector). */
-  function handleSelectAdmin(item) {
-    try {
-      setAdministeredNode(item.id);
-      showToast(`Now administering ${item.label}.`, 'ok');
-    } catch (err) {
-      showToast(err?.message || 'Could not switch the administered node.', 'danger');
-    }
-  }
-
-  function validateNodeId(id) {
-    return /^[0-9a-fA-F]{64}$/.test(id);
-  }
-
-  let configureReady = $derived(
-    validateNodeId(configureNodeId) &&
-    configureDays > 0 &&
-    configureNodeAddrValid &&
-    !adminBusy,
-  );
-
-  async function handleConfigure() {
-    if (!configureReady) return;
-    adminBusy = true;
-    try {
-      const expirySeconds = Math.round(configureDays * 24 * 60 * 60);
-      const nodeAddr = configureNodeAddr.trim() || null;
-      const result = await configureAdminNode(configureNodeId, {
-        expirySeconds,
-        label: configureLabel.trim() || null,
-        nodeAddr,
-      });
-      configureResult = result;
-      showToast('Admin key generated. Copy the public key and ask the operator to grant it.', 'ok');
-      await loadAdminNodes();
-    } catch (err) {
-      showToast(err?.message || 'Failed to generate admin key.', 'danger');
-    } finally {
-      adminBusy = false;
-    }
-  }
-
-  function handleCopyPubKey() {
-    if (configureResult) {
-      copyToClipboard(configureResult.adminPubHex).then((ok) => {
-        showToast(ok ? 'Public key copied.' : 'Copy failed.', ok ? 'ok' : 'warn');
-      });
-    }
-  }
-
-  function handleCopyCommand() {
-    if (!configureResult) return;
-    const cmd = `cawala-node control admin grant --key ${configureResult.adminPubHex} --label ${configureLabel.trim() || 'browser-admin'}`;
-    copyToClipboard(cmd).then((ok) => {
-      showToast(ok ? 'Command copied.' : 'Copy failed.', ok ? 'ok' : 'warn');
-    });
-  }
-
-  async function handleApplyBundle() {
-    const uri = bundleUri.trim();
-    if (!uri || bundleBusy) return;
-    bundleBusy = true;
-    bundleMessage = null;
-    try {
-      const applied = await applyAdminBundle(uri);
-      bundleMessage = {
-        kind: 'ok',
-        text: `Imported operator-signed grant for ${applied.nodeId.slice(0, 12)}… — scopes: ${applied.scopes.join(', ')}.`,
-      };
-      bundleUri = '';
-      await loadAdminNodes();
-    } catch (err) {
-      bundleMessage = { kind: 'danger', text: err?.message || 'Could not import this bundle.' };
-    } finally {
-      bundleBusy = false;
-    }
-  }
-
-  function handleRemoveAdmin(nodeId) {
-    removeTarget = nodeId;
-    removeConfirmOpen = true;
-  }
-
-  function doRemoveAdmin() {
-    if (!removeTarget) return;
-    try {
-      removeAdminNode(removeTarget);
-      showToast('Admin node removed.', 'ok');
-      loadAdminNodes();
-    } catch (err) {
-      showToast(err?.message || 'Failed to remove admin node.', 'danger');
-    }
-    removeConfirmOpen = false;
-    removeTarget = null;
+  function handleLock() {
+    lockAdminMode();
+    showToast('Admin mode locked. Targets and cached rows were cleared.', 'info');
   }
 
 </script>
@@ -554,216 +386,46 @@
     </div>
   </Card>
 
-  <!-- ── Node Administration ──────────────────────────────────── -->
-  <Card title="Node Administration">
+  <!-- ── Admin mode ─────────────────────────────────────────────── -->
+  <Card title="Admin Mode">
     <div class="settings-section">
-      <p class="muted text-sm">
-        This browser holds a delegated admin key &mdash; never the node operator key or the ledger
-        key. Pick which node every admin page is pointed at, then generate a key for any node that
-        has not granted you one yet.
-      </p>
-
-      <!-- Administered nodes: the same rows as the header selector -->
-      <div class="admin-nodes">
-        <h4 class="admin-heading">Administered nodes</h4>
-        <p class="muted text-xs">
-          These are the entries behind the selector at the top of the window. Selecting one
-          retargets every admin page.
-        </p>
-        {#each selectorGroups as group (group.id)}
-          {#if group.id !== 'context'}
-            <span class="admin-group-label text-xs muted">{group.label}</span>
-          {/if}
-          {#each group.items as item (item.id)}
-            <AdminNodeRow
-              {item}
-              variant="full"
-              onSelect={handleSelectAdmin}
-              onRemove={item.isSelf || item.id === 'mock' ? undefined : handleRemoveAdmin}
-            />
-          {/each}
-        {/each}
+      <div class="setting-row">
+        <span class="setting-label">Status</span>
+        {#if locked}
+          <Badge variant="warn" label="Locked" />
+        {:else}
+          <Badge variant="ok" label="Unlocked for this session" />
+        {/if}
+      </div>
+      <div class="setting-row">
+        <span class="setting-label">Policy</span>
+        <code class="text-xs mono">ADMIN_POLICY.md &middot; {policy.hash.slice(0, 8)}&hellip;</code>
+        {#if policy.acknowledgedHash && !policy.acknowledgementCurrent}
+          <Badge variant="warn" label="Changed since you acknowledged it" />
+        {/if}
       </div>
 
-      {#if !mock && valueAdminNodes.length > 0}
-        <div class="admin-block">
-          <h4 class="admin-heading">Value key protection</h4>
-          <p class="muted text-xs">
-            A value key must be wrapped with a passphrase (PBKDF2 + AES-GCM) before any value
-            action. It adds an unlock step and protects at-rest copies or copied browser profiles,
-            but it does not stop in-session XSS while the key is unlocked. Joins and topology keys
-            stay plaintext.
-          </p>
-          {#each valueAdminNodes as node (node.nodeId)}
-            <div class="protect-row">
-              <span class="text-sm mono">{node.label || `${node.nodeId.slice(0, 12)}…`}</span>
-              {#if node.seedProtected}
-                <Badge variant="ok" label="Protected" />
-                <button
-                  type="button"
-                  class="btn btn--ghost btn--sm"
-                  onclick={() => handleLock(node.nodeId)}
-                >
-                  Lock now
-                </button>
-              {:else}
-                <button
-                  type="button"
-                  class="btn btn--ghost btn--sm"
-                  onclick={() => openProtect(node.nodeId)}
-                >
-                  Protect value key
-                </button>
-              {/if}
-            </div>
-          {/each}
-        </div>
-      {/if}
+      <p class="muted text-sm">
+        Admin mode gates join approval, topology changes and value issue/burn, and it decides
+        which ancestor node the admin pages point at. Unlocking asks you to read and
+        acknowledge the admin policy first. It lasts for this session only &mdash; reloading
+        the page locks it again &mdash; and the only thing written to storage is the hash of
+        the policy you acknowledged, so an edit to that document invalidates it.
+      </p>
 
-      {#if mock}
-        <div class="muted text-sm">
-          Generating an admin key needs a live node, so that step is unavailable in mock mode.
-          The selection above works either way &mdash; the layout does not change.
-        </div>
-      {:else}
-        <!-- Configure form -->
-        <div class="admin-block">
-          <h4 class="admin-heading">Generate admin key</h4>
-          <div class="field">
-            <label class="field-label" for="admin-node-id">Node ID (64 hex characters)</label>
-            <input
-              id="admin-node-id"
-              type="text"
-              class="field-input field-input--mono"
-              placeholder="e.g. z6Mk..."
-              bind:value={configureNodeId}
-              disabled={adminBusy}
-            />
-            {#if configureNodeId && !validateNodeId(configureNodeId)}
-              <span class="field-hint field-hint--danger">Must be exactly 64 hex characters.</span>
-            {/if}
-          </div>
-          <div class="field">
-            <label class="field-label" for="admin-label">Label (optional)</label>
-            <input
-              id="admin-label"
-              type="text"
-              class="field-input"
-              placeholder="e.g. office-laptop"
-              bind:value={configureLabel}
-              disabled={adminBusy}
-            />
-          </div>
-          <div class="field">
-            <label class="field-label" for="admin-days">Provisional TTL (days)</label>
-            <input
-              id="admin-days"
-              type="number"
-              class="field-input"
-              min="1"
-              bind:value={configureDays}
-              disabled={adminBusy}
-            />
-            <span class="field-hint">
-              Local placeholder only. It sets when this browser stops trying, not when
-              the node stops accepting. Import an operator-signed bundle to replace it.
-            </span>
-          </div>
-          <div class="field">
-            <label class="field-label" for="admin-node-addr">Target address (optional)</label>
-            <input
-              id="admin-node-addr"
-              type="text"
-              class="field-input field-input--mono"
-              placeholder="e.g. 0.3.1"
-              bind:value={configureNodeAddr}
-              disabled={adminBusy}
-            />
-            {#if configureNodeAddrHint}
-              <span class="field-hint field-hint--danger">{configureNodeAddrHint}</span>
-            {:else}
-              <span class="field-hint">Octal tree address of the administered node. When set, admin calls can reach the node hop-by-hop through the routing tree if a direct connection is not available.</span>
-            {/if}
-          </div>
-          <button
-            type="button"
-            class="btn btn--primary"
-            disabled={!configureReady}
-            onclick={handleConfigure}
-          >
-            {#if adminBusy}Generating...{:else}Generate key{/if}
+      <div class="admin-mode-actions">
+        {#if locked}
+          <button type="button" class="btn btn--primary" onclick={() => (unlockOpen = true)}>
+            Unlock admin mode
           </button>
-        </div>
-
-        {#if configureResult}
-          <div class="admin-result">
-            <h4 class="admin-heading">Key generated</h4>
-            <p class="muted text-sm">
-              Give the public key below to the node operator. They must run the grant
-              command on the node before this browser can manage joins.
-            </p>
-            <div class="admin-pubkey-row">
-              <code class="admin-pubkey">{configureResult.adminPubHex}</code>
-              <button type="button" class="btn btn--ghost btn--sm" onclick={handleCopyPubKey}>
-                Copy
-              </button>
-            </div>
-            <div class="admin-command-row">
-              <span class="field-label">Operator command</span>
-              <code class="admin-command">
-                cawala-node control admin grant --key {configureResult.adminPubHex} --label {configureLabel.trim() || 'browser-admin'}
-              </code>
-              <button type="button" class="btn btn--ghost btn--sm" onclick={handleCopyCommand}>
-                Copy
-              </button>
-            </div>
-            <div class="warn-box">
-              <span class="warn-icon">!</span>
-              <span>
-                The admin private key is stored in this browser. Anyone with browser access can approve
-                or reject join requests for the configured node until the key expires or is revoked.
-              </span>
-            </div>
-          </div>
+          <a class="link-btn" href="#/admin">Open the Admin tab</a>
+        {:else}
+          <button type="button" class="btn btn--ghost" onclick={handleLock}>
+            Lock admin mode now
+          </button>
+          <a class="link-btn" href="#/admin">Open the Admin tab</a>
         {/if}
-
-        <!-- Verified grant bundle import -->
-        <div class="admin-block">
-          <h4 class="admin-heading">Import operator-signed grant</h4>
-          <p class="muted text-sm">
-            The node operator signs a grant that states your key, its scopes, and its real
-            expiry. Paste the bundle here; this browser verifies the signature and uses the
-            signed scopes and TTL instead of the provisional ones.
-          </p>
-          <div class="field">
-            <label class="field-label" for="admin-bundle">Bundle link</label>
-            <textarea
-              id="admin-bundle"
-              class="field-input field-input--textarea"
-              placeholder="cawala://admin?node=...&grant=..."
-              rows="3"
-              bind:value={bundleUri}
-              disabled={bundleBusy}
-            ></textarea>
-          </div>
-          <button
-            type="button"
-            class="btn btn--primary"
-            disabled={!bundleUri.trim() || bundleBusy}
-            onclick={handleApplyBundle}
-          >
-            {#if bundleBusy}Importing...{:else}Import bundle{/if}
-          </button>
-          {#if bundleMessage}
-            <p
-              class="text-sm"
-              style="color: {bundleMessage.kind === 'ok' ? 'var(--ok)' : 'var(--danger)'};"
-            >
-              {bundleMessage.text}
-            </p>
-          {/if}
-        </div>
-      {/if}
+      </div>
     </div>
   </Card>
 
@@ -789,29 +451,8 @@
     onCancel={() => { wipeConfirmOpen = false; }}
   />
 
-  <!-- Remove admin confirm dialog -->
-  <ConfirmDialog
-    open={removeConfirmOpen}
-    title="Remove admin node?"
-    message="This will remove the admin key for this node from this browser. You will not be able to manage join requests for this node unless you reconfigure."
-    confirmLabel="Remove"
-    variant="danger"
-    onConfirm={doRemoveAdmin}
-    onCancel={() => { removeConfirmOpen = false; removeTarget = null; }}
-  />
-
-  <!-- Value-key protection dialog -->
-  <UnlockAdminKeyDialog
-    open={protectDialog !== null}
-    title="Protect value key"
-    message="Choose a passphrase to wrap this value key. It is used locally to unwrap the key and is never sent anywhere. There is no recovery: if you forget it, remove and re-generate the key."
-    confirmLabel="Protect"
-    busy={protectBusy}
-    error={protectError}
-    requireConfirm={true}
-    onSubmit={handleProtectSubmit}
-    onCancel={() => { protectDialog = null; protectError = null; }}
-  />
+  <!-- Admin unlock gate (same component the Admin tab uses) -->
+  <AdminUnlockDialog open={unlockOpen} onCancel={() => (unlockOpen = false)} onUnlocked={handleUnlockResult} />
 
   <Card title="Location Service">
     <div class="settings-section">
@@ -1021,76 +662,26 @@
     word-break: break-all;
   }
 
-  /* ── Admin card ───────────────────────────────── */
-  .admin-block {
-    padding: var(--sp-4);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-3);
-  }
-  .admin-heading {
-    font-size: var(--text-sm);
-    font-weight: 600;
-    color: var(--fg);
-    margin: 0;
-  }
-  .field-hint {
-    font-size: var(--text-xs);
-    color: var(--muted);
-    margin-top: calc(-1 * var(--sp-1));
-  }
-  .field-hint--danger {
-    color: var(--danger);
-  }
-  .field-input--mono {
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-  }
-  .admin-result {
-    padding: var(--sp-4);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-3);
-    background: var(--bg);
-  }
-  .admin-pubkey-row {
+  /* ── Admin mode card ───────────────────────────── */
+  .admin-mode-actions {
     display: flex;
     align-items: center;
-    gap: var(--sp-2);
-    padding: var(--sp-3);
-    background: var(--bg-raised);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    gap: var(--sp-4);
+    flex-wrap: wrap;
   }
-  .admin-pubkey {
-    flex: 1;
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    word-break: break-all;
+  .link-btn {
+    background: none;
+    border: none;
     color: var(--accent);
+    font: inherit;
+    font-size: var(--text-sm);
+    font-weight: 600;
+    cursor: pointer;
+    padding: 0;
+    text-decoration: underline;
   }
-  .admin-command-row {
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-1);
-  }
-  .admin-command {
-    padding: var(--sp-3);
-    background: var(--bg-raised);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    word-break: break-all;
-    color: var(--fg);
-  }
-  .btn--sm {
-    padding: var(--sp-1) var(--sp-2);
-    font-size: var(--text-xs);
+  .link-btn:hover {
+    color: var(--accent-hover);
   }
   .btn--ghost {
     background: transparent;
@@ -1100,21 +691,5 @@
   .btn--ghost:hover {
     background: var(--bg-hover);
     color: var(--fg);
-  }
-  .admin-nodes {
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-3);
-  }
-  .admin-group-label {
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    font-weight: 600;
-  }
-  .protect-row {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-2);
-    flex-wrap: wrap;
   }
 </style>

@@ -1,7 +1,7 @@
 <script>
-  import { NAV_ITEMS, ROUTES } from '../../lib/constants.js';
+  import { ROUTES } from '../../lib/constants.js';
   import { navigate, activeNavRoute } from '../../lib/router.svelte.js';
-  import { nodeState } from '../../lib/stores.svelte.js';
+  import { nodeState, clientState } from '../../lib/stores.svelte.js';
 
   /**
    * @param {string} route - Current route path.
@@ -10,14 +10,21 @@
 
   let pendingCount = $derived(nodeState.joinRequests.filter((r) => r.status === 'pending').length);
 
-  // Bottom nav shows a subset of nav items (mobile space is limited)
-  const bottomNavItems = [
+  // Bottom bar carries the five permanent tabs. Join is inserted only while
+  // this browser has no address yet, since it is then the only thing that works.
+  const baseItems = [
     { route: ROUTES.DASHBOARD, label: 'Home', icon: 'grid' },
-    { route: ROUTES.MY_NODE, label: 'Node', icon: 'server' },
     { route: ROUTES.ACCOUNTS, label: 'Accounts', icon: 'wallet' },
     { route: ROUTES.ACTIVITY, label: 'Activity', icon: 'list' },
-    { route: ROUTES.SETTINGS, label: 'More', icon: 'settings' },
+    { route: ROUTES.ADMIN, label: 'Admin', icon: 'lock' },
+    { route: ROUTES.SETTINGS, label: 'Settings', icon: 'settings' },
   ];
+
+  let bottomNavItems = $derived(
+    clientState.address
+      ? baseItems
+      : [...baseItems.slice(0, 1), { route: ROUTES.JOIN_FLOW, label: 'Join', icon: 'log-in' }, ...baseItems.slice(1)],
+  );
 
   // Exactly one item is active: the most specific route matching `route`.
   let activeRoute = $derived(activeNavRoute(bottomNavItems.map((item) => item.route), route));
@@ -28,6 +35,8 @@
     wallet: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M2 10h20"/></svg>',
     list: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>',
     settings: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>',
+    lock: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>',
+    'log-in': '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>',
   };
 
   function handleNav(routePath) {
@@ -47,7 +56,7 @@
     >
       <span class="mobile-nav-icon">{@html icons[item.icon]}</span>
       <span class="mobile-nav-label">{item.label}</span>
-      {#if item.route === ROUTES.JOINS && pendingCount > 0}
+      {#if item.route === ROUTES.ADMIN && pendingCount > 0}
         <span class="mobile-nav-badge">{pendingCount}</span>
       {/if}
     </button>

@@ -32,11 +32,11 @@ const { mapAdminLedgerRows, canReadAdminLedger } = await import('../src/lib/api.
 
 // ── canReadAdminLedger ───────────────────────────────────────────────────────
 
-test('only a value scope permits reading an administered ledger', () => {
-  assert.equal(canReadAdminLedger({ scopes: { value: true } }), true);
-  assert.equal(canReadAdminLedger({ scopes: { value: false, joins: true } }), false);
-  assert.equal(canReadAdminLedger({ scopes: { joins: true, topology: true } }), false);
-  assert.equal(canReadAdminLedger({ scopes: {} }), false);
+test('reading an administered ledger needs an administer-capable target', () => {
+  assert.equal(canReadAdminLedger({ canAdminister: true }), true);
+  assert.equal(canReadAdminLedger({ canAdminister: false }), false);
+  assert.equal(canReadAdminLedger({ unlocked: true }), false);
+  assert.equal(canReadAdminLedger({}), false);
   assert.equal(canReadAdminLedger(null), false);
   assert.equal(canReadAdminLedger(undefined), false);
 });

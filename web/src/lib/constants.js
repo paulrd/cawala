@@ -158,28 +158,40 @@ export const CLIENT_STATUS = {
 /** Route definitions (hash-based). */
 export const ROUTES = {
   DASHBOARD: '/',
-  MY_NODE: '/node',
-  CHILDREN: '/node/children',
   ACCOUNTS: '/accounts',
   ACTIVITY: '/activity',
-  JOINS: '/node/joins',
-  MY_ACCOUNT: '/account',
   SETTINGS: '/settings',
+  ADMIN: '/admin',
   JOIN_FLOW: '/join',
-  DEBUG: '/debug',
+  /** Not a tab: reached from Home / Accounts. */
+  MY_ACCOUNT: '/account',
 };
 
-/** Navigation items for sidebar / mobile nav. */
+/**
+ * Navigation items for sidebar / mobile nav, in display order.
+ *
+ * `when: 'unjoined'` marks the Join entry: it only exists while this browser
+ * has no address yet. Everything else always renders; the Admin tab shows the
+ * lock gate until admin mode is unlocked.
+ */
 export const NAV_ITEMS = [
-  { route: ROUTES.DASHBOARD, label: 'Dashboard', icon: 'grid' },
-  { route: ROUTES.JOIN_FLOW, label: 'Join', icon: 'log-in' },
-  { route: ROUTES.MY_NODE, label: 'My Node', icon: 'server' },
+  { route: ROUTES.DASHBOARD, label: 'Home', icon: 'grid' },
+  { route: ROUTES.JOIN_FLOW, label: 'Join', icon: 'log-in', when: 'unjoined' },
   { route: ROUTES.ACCOUNTS, label: 'Accounts', icon: 'wallet' },
   { route: ROUTES.ACTIVITY, label: 'Activity', icon: 'list' },
-  { route: ROUTES.JOINS, label: 'Join Requests', icon: 'user-plus' },
-  { route: ROUTES.MY_ACCOUNT, label: 'My Account', icon: 'user' },
   { route: ROUTES.SETTINGS, label: 'Settings', icon: 'settings' },
+  { route: ROUTES.ADMIN, label: 'Admin', icon: 'lock' },
 ];
+
+/**
+ * The nav items to render right now.
+ *
+ * @param {boolean} unjoined - this browser has no address yet
+ * @returns {Array<{ route: string, label: string, icon: string, when?: string }>}
+ */
+export function visibleNavItems(unjoined) {
+  return NAV_ITEMS.filter((item) => item.when !== 'unjoined' || unjoined);
+}
 
 /** Activity entry types. */
 export const ACTIVITY_TYPES = {

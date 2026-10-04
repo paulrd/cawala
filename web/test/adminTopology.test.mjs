@@ -2,11 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 /**
- * Topology-action gating (P4).
+ * Topology/designation gating (P4).
  *
- * `api.js` imports the Svelte rune stores, so `$state` and localStorage are
- * shimmed before the module loads. These are the pure predicates the NodePage
- * and the api action functions delegate to.
+ * `api.js` imports the Svelte rune stores and the `?raw` policy module, so the
+ * rune primitive, storage and the raw loader are shimmed before it loads. These
+ * are the pure predicates the Admin page delegates to: topology actions need an
+ * unlocked admin mode pointed at a non-self ancestor, and only `node` children
+ * can be re-slotted.
  */
 
 class MemoryStorage {
@@ -26,22 +28,21 @@ class MemoryStorage {
 }
 
 globalThis.localStorage = new MemoryStorage();
+globalThis.window = { localStorage: globalThis.localStorage };
 globalThis.$state = (value) => value;
 
 const { canAdministerTopology, canMoveChild } = await import('../src/lib/api.js');
 
-test('topology actions need a non-self target and a topology scope', () => {
-  const granted = { scopes: { joins: true, topology: true, value: false } };
-  const noTopology = { scopes: { joins: true, topology: false, value: true } };
-
-  assert.equal(canAdministerTopology({ isSelf: false }, granted), true);
-  // This browser's own node is never a delegated-admin target.
-  assert.equal(canAdministerTopology({ isSelf: true }, granted), false);
-  // A joins-only or value-only grant cannot re-slot/detach.
-  assert.equal(canAdministerTopology({ isSelf: false }, noTopology), false);
-  assert.equal(canAdministerTopology({ isSelf: false }, { scopes: {} }), false);
+test('topology actions need a non-self target and canAdminister', () => {
+  assert.equal(canAdministerTopology({ isSelf: false }, { canAdminister: true }), true);
+  // This browser's own node is never an administered target.
+  assert.equal(canAdministerTopology({ isSelf: true }, { canAdminister: true }), false);
+  // Locked admin mode (canAdminister false) cannot re-slot/detach.
+  assert.equal(canAdministerTopology({ isSelf: false }, { canAdminister: false }), false);
+  assert.equal(canAdministerTopology({ isSelf: false }, {}), false);
   assert.equal(canAdministerTopology({ isSelf: false }, null), false);
-  assert.equal(canAdministerTopology(null, granted), false);
+  assert.equal(canAdministerTopology(null, { canAdminister: true }), false);
+  assert.equal(canAdministerTopology(undefined, { canAdminister: true }), false);
 });
 
 test('only node children can be re-slotted', () => {

@@ -10,10 +10,11 @@
  *     `ClientNode.spawn_control`, restores any persisted state, and sets
  *     `_useMock = false`. A 2 s poller drains control events (JoinApproved /
  *     JoinRejected) and persists state.
- *   - Live support is limited to: stable identity, invite parsing, the join
- *     handshake, ping, and a local topology snapshot. Admin actions
- *     (approve/reject), pending joins, accounts, and activity are NOT exposed
- *     by the protocol/web client and degrade gracefully (typed error / empty).
+ *   - Admin mode (R6) is locked by default. Unlocking records a policy
+ *     acknowledgement and discovers this browser's ancestor chain
+ *     (`discover_admin_targets`); every admin read/write then targets one of
+ *     those ancestors, chosen with the up/down control (R7) rather than a
+ *     dropdown. Nothing about the unlock survives a reload.
  *
  * Mock mode:
  *   - When `?mock` is in the URL, or when wasm init fails for any reason,
@@ -38,15 +39,23 @@ import {
   ledgerState,
   apiCapabilities,
   administeredNode,
+  adminLock,
   applyAdministeredNode,
   applyAdminCapabilities,
+  applyAdminLock,
   resetDataState,
   bumpTargetEpoch,
 } from './stores.svelte.js';
 import { NODE_KIND, inferNodeKind } from './nodeKind.js';
 import * as idb from './identityBundle.js';
-import * as adminKeys from './adminKeys.js';
 import * as parentLiveness from './parentLiveness.js';
+import { SELF_ID as SELF, MOCK_ID as MOCK_NODE_ID } from './adminView.js';
+import {
+  POLICY_TEXT,
+  POLICY_HASH,
+  readAcknowledgedPolicy,
+  writeAcknowledgedPolicy,
+} from './adminPolicy.js';
 
 // ── Internal state ────────────────────────────────────────────
 
@@ -344,20 +353,6 @@ async function _spawnRealNode() {
   // notices + terminal settlement records) so past activity survives a reload.
   _rebuildActivityFromState(node);
 
-  // Restore any persisted delegated admin key (K_admin) into the fresh node so
-  // admin actions survive a reload. The seed is read only via adminSeedBytes.
-  const activeAdmin = adminKeys.activeAdminNode();
-  if (activeAdmin) {
-    const adminSeed = adminKeys.adminSeedBytes(activeAdmin.nodeId);
-    if (adminSeed && adminSeed.length === 32) {
-      try {
-        node.set_admin_key(adminSeed);
-      } catch (err) {
-        console.warn('[api] set_admin_key failed; admin actions will be unavailable', err);
-      }
-    }
-  }
-
   _clientNode = node;
   _persistState();
   _persistLedgerState();
@@ -385,12 +380,7 @@ function _requireNode() {
   return _clientNode;
 }
 
-// ── Administered node (the selected admin target) ─────────────
-
-/** Selection value for this browser's own node (see adminKeys). */
-const SELF = adminKeys.SELF_SELECTION;
-/** Selection value of the synthetic node shown in mock mode. */
-const MOCK_NODE_ID = 'mock';
+// ── Admin target (the ancestor admin mode points at) ──────────
 
 /**
  * This browser's own kind. The web client is always a user leaf, so its kind is
@@ -400,33 +390,51 @@ const MOCK_NODE_ID = 'mock';
 let _selfKind = NODE_KIND.USER;
 
 /**
- * Resolve the target of an admin call: an explicit id, else the persisted
- * selection, else `self`.
+ * The ancestor chain this browser may administer, cached from the wasm walk.
+ * `depth` 1 is the direct parent, the last entry is the root. Empty until
+ * admin mode is unlocked and `discoverAdminTargets()` has run.
+ * @type {Array<{ node: string, address: string|null, depth: number }>}
+ */
+let _adminTargets = [];
+
+/**
+ * The selected depth in that chain (null = fall back to the closest parent).
+ * Reset to null when admin mode is locked.
+ * @type {number|null}
+ */
+let _targetDepth = null;
+
+/**
+ * Last observed state per admin target (node id → probe), written only by
+ * `probeAdminNode` / query outcomes. Never guessed, never persisted.
+ * @type {Map<string, { status: string, kind: string|null, address: string|null, childrenCount: number|null, at: number }>}
+ */
+const _targetProbe = new Map();
+
+/**
+ * The selected ancestor, or null while admin mode is locked / undiscovered.
+ * @returns {{ node: string, address: string|null, depth: number }|null}
+ */
+function _selectedTarget() {
+  if (!adminLock.unlocked || _adminTargets.length === 0) return null;
+  const wanted = _targetDepth ?? 1;
+  return _adminTargets.find((target) => target.depth === wanted) ?? _adminTargets[0] ?? null;
+}
+
+/**
+ * Resolve the target of an admin call: an explicit id, else the selected
+ * ancestor, else `self` (this browser's own node).
  * @param {string} [nodeId]
  * @returns {string}
  */
 function _normalizeTarget(nodeId) {
-  if (nodeId == null) return adminKeys.selectedNodeId() ?? SELF;
-  return String(nodeId).toLowerCase();
+  if (nodeId != null) return String(nodeId).toLowerCase();
+  const selected = _selectedTarget();
+  return selected ? String(selected.node).toLowerCase() : SELF;
 }
 
 /**
- * The stored grant that authorizes admin calls on `target`, or null.
- * For `self` that is a grant over this browser's own node id (usually none).
- * @param {string} target
- * @returns {object|null}
- */
-function _grantFor(target) {
-  if (target === SELF) {
-    const own = clientState.endpointId;
-    return own ? adminKeys.findAdminNode(own) : null;
-  }
-  if (target === MOCK_NODE_ID) return null;
-  return adminKeys.findAdminNode(target);
-}
-
-/**
- * Derive the admin view + capability flags for the current selection.
+ * Derive the admin-target view + capability flags for the current selection.
  * Pure read: never probes the network and never invents a kind or address.
  * @returns {{ view: object, caps: object }}
  */
@@ -435,49 +443,41 @@ function _deriveAdminView() {
   const target = _normalizeTarget();
   const isSelf = target === SELF;
   const isMockNode = target === MOCK_NODE_ID;
-  const now = Date.now();
-
-  const grant = _grantFor(target);
-  const expired = grant ? grant.expiresAt <= now : false;
+  const selected = _selectedTarget();
+  const probe = isSelf ? null : _targetProbe.get(target) ?? null;
 
   let status;
   if (mock) status = 'mock';
-  else if (!grant) status = isSelf ? 'self' : 'no-grant';
-  else if (expired) status = 'expired';
-  else if (grant.lastSeenStatus === 'unreachable') status = 'unreachable';
-  else status = 'active';
+  else if (isSelf) status = 'self';
+  else status = probe?.status ?? 'unknown';
 
   const kind = isMockNode
     ? inferNodeKind(MOCK_DATA.children)
     : isSelf
       ? _selfKind
-      : grant?.lastSeenKind ?? NODE_KIND.UNKNOWN;
+      : probe?.kind ?? NODE_KIND.UNKNOWN;
 
   const address = isMockNode
     ? '0.3'
     : isSelf
       ? clientState.address ?? null
-      : grant?.lastSeenAddress ?? null;
+      : probe?.address ?? selected?.address ?? null;
 
-  const scopes = grant ? [...grant.scopes] : [];
-  const canQuery = mock || isSelf || (!!grant && !expired);
-  const canAdminister = mock || (!!grant && !expired && grant.scopes.includes('joins'));
+  const unlocked = adminLock.unlocked;
+  const canQuery = true; // self reads are local; admin reads degrade to []
+  const canAdminister = unlocked && !isSelf;
 
   return {
     view: {
       nodeId: target,
       isSelf,
-      label: isMockNode ? 'Mock node' : isSelf ? 'This browser' : grant?.label ?? null,
-      nodeAddr: grant?.nodeAddr ?? (isMockNode ? '0.3' : null),
-      scopes,
-      // `bundle` means the scopes/TTL came from a node-operator-signed bundle;
-      // `manual` is a locally generated provisional grant. `null` for self/mock.
-      grantSource: grant?.grantSource ?? null,
-      grantExpiresAt: grant?.expiresAt ?? null,
+      label: isMockNode ? 'Mock node' : isSelf ? 'This browser' : null,
+      depth: isSelf ? null : selected?.depth ?? null,
       kind,
       status,
       address,
-      lastSeenAt: grant?.lastSeenAt ?? null,
+      lastSeenAt: probe?.at ?? null,
+      childrenCount: probe?.childrenCount ?? null,
       mock,
     },
     caps: {
@@ -485,22 +485,18 @@ function _deriveAdminView() {
       canQueryNode: canQuery,
       canAdminister,
       canAdmin: canAdminister,
-      scopes: {
-        joins: scopes.includes('joins'),
-        topology: scopes.includes('topology'),
-        value: scopes.includes('value'),
-      },
+      unlocked,
     },
   };
 }
 
 /**
- * Push the current selection into the reactive store (and capabilities).
+ * Push the current admin target into the reactive store (and capabilities).
  */
 function _syncAdministeredNode() {
   const { view, caps } = _deriveAdminView();
 
-  // A selection change retargets every query: drop the previous target's rows
+  // A target change retargets every query: drop the previous target's rows
   // and tell the pages to refetch (targetEpoch) before publishing the view.
   const previous = administeredNode.nodeId;
   if (previous != null && previous !== view.nodeId) {
@@ -513,7 +509,7 @@ function _syncAdministeredNode() {
     mock: caps.mock,
     canQueryNode: caps.canQueryNode,
     canAdminister: caps.canAdminister,
-    scopes: caps.scopes,
+    unlocked: caps.unlocked,
   });
   Object.assign(apiCapabilities, _capabilityView(caps));
 }
@@ -535,7 +531,7 @@ function _capabilityView(caps) {
 }
 
 /**
- * The current administered-node view (seed-free).
+ * The current admin-target view (seed-free).
  * @returns {object}
  */
 export function getAdministeredNode() {
@@ -543,161 +539,205 @@ export function getAdministeredNode() {
 }
 
 /**
- * Every node this browser can administer (stored grants, seed-free), each with
- * `active`/`selected` flags. The UI prepends its own `self` entry.
- * @returns {Array<object>}
+ * The ancestor chain admin mode can point at (seed-free, from the cache).
+ * Empty while admin mode is locked.
+ *
+ * @returns {Array<{ node: string, address: string|null, depth: number }>}
  */
-export function listAdministeredNodes() {
-  return adminKeys.listAdminNodes();
+export function getAdminTargets() {
+  if (!adminLock.unlocked) return [];
+  return _adminTargets.map((target) => ({ ...target }));
 }
 
 /**
- * Select the administered node. `'self'` selects this browser's own node;
- * anything else must be a stored grant. Re-installs the singleton wasm admin
- * key when the target changed, clears page data so no stale rows are shown
- * under the new target, and re-derives capabilities.
+ * Refresh the ancestor chain: a live walk (`discover_admin_targets`), or the
+ * synthetic two-level chain in mock mode. The selection is clamped to the new
+ * chain, so a target that disappeared drops the console back to its parent.
  *
- * @param {string} nodeId `'self'`, `'mock'` (mock mode) or a granted node id.
- * @returns {string} the normalized selection.
+ * @returns {Promise<Array<{ node: string, address: string|null, depth: number }>>}
  */
-export function setAdministeredNode(nodeId) {
-  const selected = adminKeys.selectAdminNode(nodeId);
-  if (!_useMock && selected !== SELF && selected !== MOCK_NODE_ID) {
+export async function discoverAdminTargets() {
+  let next = [];
+
+  if (_useMock) {
+    await mockDelay(200);
+    // Mock is a data source, not a layout: two ancestors so the up/down
+    // control has both an enabled and a disabled end to exercise.
+    next = [
+      { node: MOCK_NODE_ID, address: '0.3', depth: 1 },
+      { node: `${MOCK_NODE_ID}-root`, address: '0', depth: 2 },
+    ];
+  } else {
+    const node = _requireNode();
+    const dtos = await node.discover_admin_targets();
     try {
-      _ensureAdminKey(selected);
-    } catch (err) {
-      _warnOnce('admin-select-key', '[api] could not install the admin key for the new target', err);
-    }
-  }
-  _syncAdministeredNode();
-  return selected;
-}
-
-/**
- * Ensure the wasm singleton admin key matches the stored key for `nodeId`.
- *
- * The wasm client holds exactly one admin key, so switching targets re-installs
- * the seed from the store rather than adding multi-key state to Rust.
- *
- * @param {string} nodeId
- * @param {object} [grant] Stored entry (seed-free); looked up when omitted.
- * @returns {object} the live client node.
- */
-export function _ensureAdminKey(nodeId, grant = null) {
-  const node = _requireNode();
-  const target = String(nodeId).toLowerCase();
-  const entry = grant ?? adminKeys.findAdminNode(target);
-  if (!entry) throw new AdminUnavailableError('admin query');
-
-  if (adminKeys.adminSeedState(target) === 'locked') {
-    throw new AdminLockedError(target);
-  }
-
-  let installed = null;
-  try {
-    installed = node.admin_public_key?.() ?? null;
-  } catch {
-    installed = null;
-  }
-  if (installed && installed.toLowerCase() === entry.adminPubHex) return node;
-
-  const seed = adminKeys.adminSeedBytes(target);
-  if (!seed || seed.length !== 32) throw new AdminUnavailableError('admin query');
-  try {
-    node.set_admin_key(seed);
-  } catch (err) {
-    console.warn('[api] set_admin_key failed while switching admin target', err);
-    throw new AdminUnavailableError('admin query');
-  }
-  return node;
-}
-
-/**
- * Unlock a protected (passphrase-wrapped) admin key, then install it.
- *
- * @param {string} nodeId
- * @param {string} passphrase
- * @returns {Promise<object>} the live client node
- * @throws on a wrong passphrase
- */
-export async function ensureAdminUnlocked(nodeId, passphrase) {
-  const target = String(nodeId).toLowerCase();
-  await adminKeys.unlockAdminSeed(target, passphrase);
-  return _ensureAdminKey(target);
-}
-
-/**
- * Lock a protected key for `nodeId`: clear the in-memory unlock cache and, when
- * it is the installed key, clear it from the wasm client so no further admin
- * call can use it.
- *
- * @param {string} nodeId
- */
-export function lockAdmin(nodeId) {
-  const target = String(nodeId).toLowerCase();
-  const entry = adminKeys.findAdminNode(target);
-  adminKeys.lockAdminSeed(target);
-  if (entry && _clientNode) {
-    try {
-      const installed = _clientNode.admin_public_key?.() ?? null;
-      if (installed && installed.toLowerCase() === entry.adminPubHex) {
-        _clientNode.clear_admin_key?.();
+      for (const dto of dtos) {
+        next.push({
+          node: String(dto.node),
+          address: dto.address ?? null,
+          depth: Number(dto.depth),
+        });
       }
-    } catch (err) {
-      _warnOnce('admin-lock-clear', '[api] clear_admin_key failed', err);
+    } finally {
+      for (const dto of dtos) dto.free?.();
+    }
+    next.sort((a, b) => a.depth - b.depth);
+  }
+
+  _adminTargets = next;
+  const depths = _adminTargets.map((target) => target.depth);
+  if (_targetDepth != null && !depths.includes(_targetDepth)) _targetDepth = null;
+  if (_targetDepth == null && depths.length > 0) _targetDepth = depths[0];
+  // Forget probes for ancestors that are no longer in the chain.
+  for (const key of _targetProbe.keys()) {
+    if (!_adminTargets.some((target) => target.node.toLowerCase() === key)) {
+      _targetProbe.delete(key);
     }
   }
+  _syncAdministeredNode();
+  return getAdminTargets();
+}
+
+/**
+ * Select an ancestor by depth (clamped to the chain). A change retargets every
+ * admin query through `_syncAdministeredNode` (which bumps `targetEpoch`).
+ *
+ * @param {number} depth 1-based depth above this browser (1 = direct parent)
+ * @returns {{ node: string, address: string|null, depth: number }|null}
+ */
+export function setAdministeredNode(depth) {
+  if (!adminLock.unlocked || _adminTargets.length === 0) return null;
+  const wanted = Number(depth);
+  const hit = _adminTargets.find((target) => target.depth === wanted);
+  if (!hit) return null;
+  _targetDepth = hit.depth;
+  _syncAdministeredNode();
+  return { ...hit };
+}
+
+/**
+ * Step one ancestor up (`delta` +1, toward the root) or down (-1, toward this
+ * browser). Disabled at both ends of the chain; returns null there.
+ *
+ * @param {number} delta
+ * @returns {{ node: string, address: string|null, depth: number }|null}
+ */
+export function stepAdminTarget(delta) {
+  if (!adminLock.unlocked || _adminTargets.length === 0) return null;
+  const current = _selectedTarget();
+  if (!current) return null;
+  return setAdministeredNode(current.depth + Number(delta));
+}
+
+/**
+ * Bounds the up/down control needs to disable itself: null while locked.
+ * @returns {{ current: number|null, min: number, max: number, count: number }|null}
+ */
+export function adminTargetBounds() {
+  if (!adminLock.unlocked || _adminTargets.length === 0) return null;
+  const depths = _adminTargets.map((target) => target.depth).sort((a, b) => a - b);
+  const current = _selectedTarget()?.depth ?? null;
+  return { current, min: depths[0], max: depths[depths.length - 1], count: depths.length };
+}
+
+/**
+ * The policy document the unlock gate renders, its hash, and whatever this
+ * browser acknowledged before (which is stale — and therefore called out —
+ * when the document has changed since).
+ *
+ * @returns {{ text: string, hash: string, acknowledgedHash: string|null, acknowledgedAt: number|null, acknowledgementCurrent: boolean }}
+ */
+export function adminPolicyInfo() {
+  const stored = readAcknowledgedPolicy();
+  return {
+    text: POLICY_TEXT,
+    hash: POLICY_HASH,
+    acknowledgedHash: stored?.hash ?? null,
+    acknowledgedAt: stored?.at ?? null,
+    acknowledgementCurrent: Boolean(stored && stored.hash === POLICY_HASH),
+  };
+}
+
+/**
+ * Unlock admin mode: record the policy acknowledgement (so a later edit to
+ * `ADMIN_POLICY.md` invalidates it) and discover the ancestor chain. The
+ * unlocked flag itself is memory only — a reload lands back on the gate.
+ *
+ * @returns {Promise<{ targets: Array<object>, acknowledgementCurrent: boolean }>}
+ */
+export async function unlockAdmin() {
+  const stored = readAcknowledgedPolicy();
+  const acknowledgementCurrent = Boolean(stored && stored.hash === POLICY_HASH);
+  writeAcknowledgedPolicy(POLICY_HASH);
+  applyAdminLock({
+    unlocked: true,
+    policyHash: POLICY_HASH,
+    acknowledgedHash: POLICY_HASH,
+    acknowledgedAt: Date.now(),
+  });
+  // Discovery failure must not undo the unlock: the Admin page can retry the
+  // walk from its own control, and the acknowledgement is already recorded.
+  let targets = [];
+  try {
+    targets = await discoverAdminTargets();
+  } catch (err) {
+    _warnOnce('admin-discover', '[api] ancestor discovery failed', err);
+  }
+  return { targets, acknowledgementCurrent };
+}
+
+/**
+ * Lock admin mode: hide the admin surfaces, drop the discovered ancestor
+ * chain, forget every observed target state, and clear the rows that were
+ * fetched for an ancestor. The policy acknowledgement is kept so the gate can
+ * still say whether the document changed since it was read.
+ */
+export function lockAdminMode() {
+  applyAdminLock({ unlocked: false });
+  _adminTargets = [];
+  _targetDepth = null;
+  _targetProbe.clear();
+  resetDataState();
   _syncAdministeredNode();
 }
 
 /**
- * Refuse a value action while its protected seed is locked, **before** any
- * request_id is generated or pending record written. Plain or session-unlocked
- * seeds pass.
+ * Record what a probe/query saw about an admin target (status/kind/address)
+ * and refresh the stored view. Failures mark the target unreachable rather
+ * than dropping the last observed kind.
  *
  * @param {string} target
+ * @param {{ ok: boolean, kind?: string|null, address?: string|null, childrenCount?: number|null }} outcome
  */
-export function ensureValueSeedUnlocked(target) {
-  const state = adminKeys.adminSeedState(target);
-  if (state === 'locked') throw new AdminLockedError(target);
-  if (state === 'absent') throw new AdminUnavailableError('admin value operation');
-  // A value-scoped key must be wrapped before any value action ("required",
-  // not opt-in). A plain non-value entry never reaches here (value actions are
-  // gated on `scopes.value`).
-  const entry = adminKeys.findAdminNode(target);
-  if (state === 'plain' && entry?.scopes?.includes('value')) {
-    throw new AdminSeedProtectionRequiredError(target);
+function _recordTargetProbe(target, outcome) {
+  const key = String(target).toLowerCase();
+  const previous = _targetProbe.get(key);
+  if (outcome.ok) {
+    _targetProbe.set(key, {
+      status: 'active',
+      kind: outcome.kind ?? previous?.kind ?? null,
+      address: outcome.address ?? previous?.address ?? null,
+      childrenCount: outcome.childrenCount ?? previous?.childrenCount ?? null,
+      at: Date.now(),
+    });
+  } else {
+    _targetProbe.set(key, {
+      status: 'unreachable',
+      kind: previous?.kind ?? null,
+      address: previous?.address ?? null,
+      childrenCount: previous?.childrenCount ?? null,
+      at: Date.now(),
+    });
   }
+  _syncAdministeredNode();
 }
 
 /**
- * Wrap a value-scoped admin seed under `passphrase` (required before any value
- * action). Refuses a non-value entry and any write that did not actually land.
+ * Probe the current admin target: one `AdminQuery` (or a local snapshot read
+ * for this browser's own node) that establishes reachability, kind and
+ * address. Records what it saw so the context bar can show it; never throws.
  *
- * @param {string} nodeId
- * @param {string} passphrase
- * @returns {Promise<void>}
- */
-export async function protectValueSeed(nodeId, passphrase) {
-  const target = String(nodeId).toLowerCase();
-  const entry = adminKeys.findAdminNode(target);
-  if (!entry) throw new AdminUnavailableError('protect value key');
-  if (!entry.scopes?.includes('value')) {
-    throw new AdminUnavailableError('protect value key (value scope required)');
-  }
-  await adminKeys.protectAdminSeed(target, passphrase);
-  // Fail closed for the caller: only report success when the row is wrapped.
-  if (!adminKeys.findAdminNode(target)?.seedProtected) {
-    throw new Error('Could not persist the protected value key (storage unavailable).');
-  }
-}
-
-/**
- * Probe the selected node: one `AdminQuery` (or a local snapshot read for this
- * browser's own node) that establishes reachability, kind and address.
- * Records what it saw so the context bar can show it; never throws.
- *
- * @param {string} [nodeId] Target; defaults to the current selection.
+ * @param {string} [nodeId] Target; defaults to the current admin target.
  * @returns {Promise<{ nodeId: string, ok: boolean, kind: string, address: string|null, childrenCount: number|null, pendingCount: number|null, error: string|null }>}
  */
 export async function probeAdminNode(nodeId = undefined) {
@@ -714,15 +754,22 @@ export async function probeAdminNode(nodeId = undefined) {
       pendingCount: MOCK_DATA.joinRequests.length,
       error: null,
     };
-    if (target !== SELF && target !== MOCK_NODE_ID) {
-      adminKeys.updateLastSeen(target, { status: 'active', kind: view.kind, address: view.address, at: Date.now() });
+    if (target === SELF) {
+      _selfKind = view.kind;
       _syncAdministeredNode();
+    } else {
+      _recordTargetProbe(target, {
+        ok: true,
+        kind: view.kind,
+        address: view.address,
+        childrenCount: view.childrenCount,
+      });
     }
     return view;
   }
 
   if (target === SELF) {
-    // Our own topology is local state: no grant and no network round-trip.
+    // Our own topology is local state: no network round-trip.
     try {
       const rows = _readLocalChildren();
       // The browser client is always a user leaf: its kind is known directly,
@@ -743,21 +790,17 @@ export async function probeAdminNode(nodeId = undefined) {
     }
   }
 
-  const grant = adminKeys.findAdminNode(target);
-  if (!grant) {
-    return { nodeId: target, ok: false, kind: NODE_KIND.UNKNOWN, address: null, childrenCount: null, pendingCount: null, error: 'no-grant' };
-  }
-  if (grant.expiresAt <= Date.now()) {
-    return { nodeId: target, ok: false, kind: grant.lastSeenKind ?? NODE_KIND.UNKNOWN, address: grant.lastSeenAddress, childrenCount: null, pendingCount: null, error: 'expired' };
-  }
-
   try {
-    const data = await _queryAdminSnapshot(target, grant); // reads + frees in one place
+    const data = await _queryAdminSnapshot(target);
     const kind = inferNodeKind(data.children);
-    const address = data.address ?? grant.nodeAddr ?? null;
-    const at = Date.now();
-    adminKeys.updateLastSeen(target, { status: 'active', kind, address, at });
-    _syncAdministeredNode();
+    const address =
+      data.address ?? _adminTargets.find((t) => t.node.toLowerCase() === target)?.address ?? null;
+    _recordTargetProbe(target, {
+      ok: true,
+      kind,
+      address,
+      childrenCount: data.children.length,
+    });
     return {
       nodeId: target,
       ok: true,
@@ -768,13 +811,12 @@ export async function probeAdminNode(nodeId = undefined) {
       error: null,
     };
   } catch (err) {
-    adminKeys.updateLastSeen(target, { status: 'unreachable', at: Date.now() });
-    _syncAdministeredNode();
+    _recordTargetProbe(target, { ok: false });
     return {
       nodeId: target,
       ok: false,
-      kind: grant.lastSeenKind ?? NODE_KIND.UNKNOWN,
-      address: grant.lastSeenAddress,
+      kind: NODE_KIND.UNKNOWN,
+      address: null,
       childrenCount: null,
       pendingCount: null,
       error: _errorMessage(err),
@@ -800,8 +842,8 @@ function _mapChild(child) {
 }
 
 /**
- * Read this client's own children from the local topology snapshot (no grant,
- * no network round-trip).
+ * Read this client's own children from the local topology snapshot (no
+ * network round-trip).
  * @returns {Array<object>}
  */
 function _readLocalChildren() {
@@ -816,19 +858,21 @@ function _readLocalChildren() {
 }
 
 /**
- * Run one `AdminQuery` against `target` with the stored grant installed, then
- * copy the reply to plain data (freeing every handle it created).
+ * Run one `AdminQuery` against `target`, then copy the reply to plain data
+ * (freeing every handle it created). The wasm client resolves ancestor
+ * addresses itself — there is no `node_addr` argument and no key to install.
  *
  * @param {string} target
- * @param {object} [grant]
  * @returns {Promise<{ nodeId: string|null, address: string|null, children: Array<object>, pending: number, pendingRows: Array<object> }>}
  */
-async function _queryAdminSnapshot(target, grant = null) {
-  const entry = grant ?? adminKeys.findAdminNode(target);
-  if (!entry) throw new AdminUnavailableError('admin query');
-  if (entry.expiresAt <= Date.now()) throw new AdminUnavailableError('admin query (grant expired)');
-  const node = _ensureAdminKey(target, entry);
-  const snapshot = await node.admin_query(target, entry.nodeAddr ?? null);
+async function _queryAdminSnapshot(target) {
+  // Admin mode is a client-side gate: while locked, ancestor state is hidden
+  // rather than fetched (self is always readable — it is local state).
+  if (target !== SELF && target !== clientState.endpointId && !adminLock.unlocked) {
+    throw new AdminUnavailableError('admin query (admin mode is locked)');
+  }
+  const node = _requireNode();
+  const snapshot = await node.admin_query(target);
   return _readAdminSnapshot(snapshot);
 }
 
@@ -1784,8 +1828,6 @@ export async function wipeIdentity() {
     _removeScopedBlob(LEDGER_KEY, nodeId);
   }
   _removeLegacyBlobs();
-  // Admin keys are device-local and identity-bound: wipe them too.
-  adminKeys.clearAllAdminEntries();
 }
 
 // ── Identity & connection ─────────────────────────────────────
@@ -2281,218 +2323,6 @@ export class AdminUnavailableError extends Error {
 }
 
 /**
- * Typed error raised when an action needs a protected (passphrase-wrapped) seed
- * that is currently locked. UI callers prompt for the passphrase and retry.
- */
-export class AdminLockedError extends Error {
-  constructor(nodeId = null) {
-    super(
-      nodeId
-        ? `The value key for node ${nodeId} is locked. Unlock it with your passphrase to continue.`
-        : 'The value key is locked. Unlock it with your passphrase to continue.',
-    );
-    this.name = 'AdminLockedError';
-    this.code = 'ADMIN_LOCKED';
-    this.nodeId = nodeId;
-  }
-}
-
-/**
- * Typed error raised when a value action needs a still-plaintext value key.
- * Value actions require the key to be passphrase-wrapped first; UI callers open
- * the protect dialog and retry.
- */
-export class AdminSeedProtectionRequiredError extends Error {
-  constructor(nodeId = null) {
-    super(
-      nodeId
-        ? `The value key for node ${nodeId} must be protected with a passphrase before any value action.`
-        : 'The value key must be protected with a passphrase before any value action.',
-    );
-    this.name = 'AdminSeedProtectionRequiredError';
-    this.code = 'ADMIN_SEED_PROTECT_REQUIRED';
-    this.nodeId = nodeId;
-  }
-}
-
-// ── Delegated admin keys ──────────────────────────────────────
-
-/**
- * Generate a fresh delegated admin key for `nodeId` and install it on the live
- * client. The returned public key is what the operator grants with
- * `control admin grant`.
- *
- * The seed is persisted device-locally (adminKeys) and is never put into an
- * exported identity bundle. In mock mode no wasm is touched and a fake public
- * key is returned (nothing is persisted).
- *
- * @param {string} nodeId Target parent node id (64 hex).
- * @param {{ expirySeconds?: number|null, label?: string|null, nodeAddr?: string|null }} [opts]
- * @returns {Promise<{ nodeId: string, adminPubHex: string, nodeAddr: string|null }>}
- */
-export async function configureAdminNode(
-  nodeId,
-  { expirySeconds = null, label = null, nodeAddr = null } = {},
-) {
-  if (typeof nodeId !== 'string' || !/^[0-9a-fA-F]{64}$/.test(nodeId)) {
-    throw new Error('nodeId must be exactly 64 hex characters');
-  }
-  if (!adminKeys.isValidNodeAddr(nodeAddr)) {
-    throw new Error(adminKeys.nodeAddrMessage);
-  }
-
-  const now = Date.now();
-  const ttlSeconds = expirySeconds == null ? 7 * 24 * 3600 : Number(expirySeconds);
-  if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
-    throw new Error('expirySeconds must be a positive number');
-  }
-  const expiresAt = now + ttlSeconds * 1000;
-
-  if (_useMock) {
-    await mockDelay(200);
-    const adminPubHex = _randomHex32();
-    return { nodeId: nodeId.toLowerCase(), adminPubHex, nodeAddr: nodeAddr ?? null };
-  }
-
-  const node = _requireNode();
-  const seed = _wasmModule.generate_secret_key();
-  const seedBytes = seed instanceof Uint8Array ? seed : new Uint8Array(seed);
-  if (seedBytes.length !== 32) {
-    throw new Error('Failed to configure admin key: generated seed is not 32 bytes.');
-  }
-  node.set_admin_key(seedBytes);
-  const adminPubHex = node.admin_public_key();
-  if (typeof adminPubHex !== 'string' || !adminPubHex) {
-    throw new Error('Failed to configure admin key: node returned no admin public key.');
-  }
-
-  adminKeys.addAdminEntry({
-    nodeId,
-    adminSeedHex: _bytesToHex(seedBytes),
-    adminPubHex,
-    grantedAt: now,
-    expiresAt,
-    label,
-    nodeAddr,
-  });
-  // A first stored key becomes the selection; re-publish view + capabilities.
-  _syncAdministeredNode();
-
-  return { nodeId: nodeId.toLowerCase(), adminPubHex, nodeAddr: nodeAddr ?? null };
-}
-
-/**
- * Forget a delegated admin key: clears the live node's key when this is the
- * active entry, then removes the persisted entry.
- * @param {string} nodeId
- */
-export function removeAdminNode(nodeId) {
-  const target = String(nodeId).toLowerCase();
-  const entry = adminKeys.findAdminNode(target);
-  // Only clear the singleton wasm key when it is the key being removed.
-  if (entry && _clientNode) {
-    try {
-      const installed = _clientNode.admin_public_key?.() ?? null;
-      if (installed && installed.toLowerCase() === entry.adminPubHex) {
-        _clientNode.clear_admin_key?.();
-      }
-    } catch (err) {
-      _warnOnce('admin-clear-key', '[api] clear_admin_key failed', err);
-    }
-  }
-  adminKeys.removeAdminNode(target);
-  _syncAdministeredNode();
-}
-
-/**
- * Admin nodes for UI display (seed-free).
- * @returns {Array<{ nodeId: string, adminPubHex: string, scope: 'admin', scopes: string[], grantSource: 'manual'|'bundle', grantedAt: number, expiresAt: number, label: string|null, nodeAddr: string|null, active: boolean }>}
- */
-export function getAdminNodes() {
-  return adminKeys.listAdminNodes();
-}
-
-/**
- * Import a node-operator-signed `cawala://admin?node=&grant=` bundle.
- *
- * Parses and verifies the bundle in wasm, then applies its truthful
- * scopes/TTL to the **existing** stored key for the bundle's node. The browser
- * never holds operator/ledger keys: the bundle is public signed data, and the
- * admin seed already in this browser is preserved (only the grant's meaning
- * changes). Returns the updated seed-free entry.
- *
- * @param {string} uri
- * @returns {Promise<object>}
- * @throws {AdminUnavailableError} in mock mode (no live node).
- * @throws {Error} on an invalid/unverifiable bundle, no stored key, or a key mismatch.
- */
-export async function applyAdminBundle(uri) {
-  const trimmed = (uri || '').trim();
-  if (!trimmed) {
-    throw new Error('Paste an admin bundle link from a node operator.');
-  }
-  if (_useMock) {
-    throw new AdminUnavailableError('apply admin bundle');
-  }
-  if (!_wasmModule) {
-    throw new Error('Admin bundle import is unavailable: the wasm client is not loaded.');
-  }
-
-  let info;
-  try {
-    info = _wasmModule.parse_admin_bundle(trimmed);
-  } catch (err) {
-    throw new Error(`Invalid admin bundle: ${err?.message ?? err}`);
-  }
-
-  try {
-    // Normalize the wasm getters (snake_case) into the plain camelCase shape
-    // `applyAdminGrantInfo` takes, before the wasm object is freed.
-    return applyAdminGrantInfo({
-      node: info.node,
-      admin: info.admin,
-      scopes: Array.from(info.scopes || []),
-      grantedAt: info.granted_at,
-      expiry: info.expiry,
-      label: info.label ?? null,
-    });
-  } finally {
-    info.free?.();
-  }
-}
-
-/**
- * The post-verification half of [`applyAdminBundle`]: apply already-parsed and
- * signature-verified bundle fields to the stored key for that node.
- *
- * Split out (and exported) so it is unit-testable without a wasm module. It
- * requires an existing entry, requires the bundle's admin key to match the
- * stored public key, and then delegates the strict scope/TTL update to
- * `adminKeys.applyAdminGrant`. Re-derives the administered-node view.
- *
- * @param {{ node: string, admin: string, scopes: string[], grantedAt: number, expiry: number, label?: string|null }} info
- * @returns {object} the updated seed-free stored entry
- */
-export function applyAdminGrantInfo(info) {
-  const nodeId = String(info?.node || '').toLowerCase();
-  const entry = adminKeys.findAdminNode(nodeId);
-  if (!entry) {
-    throw new Error('generate a key for this node first');
-  }
-  if (String(info?.admin || '').toLowerCase() !== entry.adminPubHex) {
-    throw new Error('This bundle grants a different admin key than the one stored for this node.');
-  }
-  const applied = adminKeys.applyAdminGrant(nodeId, {
-    scopes: Array.from(info.scopes || []),
-    grantedAt: info.grantedAt,
-    expiresAt: info.expiry,
-    label: info.label ?? null,
-  });
-  _syncAdministeredNode();
-  return applied;
-}
-
-/**
  * Request to join a parent node.
  *
  * Accepts either a parsed invite object (from `parseInvite`, carrying `raw`),
@@ -2547,32 +2377,46 @@ export async function requestJoin(parsed, addressHint) {
 }
 
 /**
- * Approve a pending join request.
+ * Resolve the ancestor every admin write targets, or throw when admin mode is
+ * still locked (the Admin page shows the unlock gate instead of these
+ * actions, so this is a guard against stale UI state).
  *
- * Live mode requires an active delegated admin key; without one this throws
- * `AdminUnavailableError` (as before). The wasm call may reject with a
- * `JsError` whose message is `admin request rejected: <stable_code>`.
+ * @param {string} action verb phrase for the error copy, e.g. `approve a join`
+ * @param {string} [nodeId] explicit target; defaults to the selected ancestor
+ * @returns {string} the target node id
+ */
+function _requireAdminTarget(action, nodeId = undefined) {
+  if (!adminLock.unlocked) {
+    throw new Error(`Admin mode is locked. Unlock it from the Admin tab to ${action}.`);
+  }
+  if (nodeId != null) return String(nodeId).toLowerCase();
+  const target = _normalizeTarget();
+  if (target === SELF) {
+    throw new Error(`Admin mode is pointed at this browser\u2019s own node: step up to an ancestor node to ${action}.`);
+  }
+  return target;
+}
+
+/**
+ * Approve a pending join request on the current admin target.
+ *
+ * The wasm call may reject with a `JsError` whose message is
+ * `admin request rejected: <stable_code>`.
  *
  * @param {string} childEndpointId
  * @param {number|null} [slot]
  * @returns {Promise<{ status: string, address: string|null, delivery: string }>}
  */
 export async function approveJoin(childEndpointId, slot = null) {
+  const target = _requireAdminTarget('approve a join request');
   if (_useMock) {
     await mockDelay(400);
     const s = slot ?? 4;
     return { status: 'approved', address: `0.3.${s}`, delivery: 'delivered' };
   }
-  const active = adminKeys.activeAdminNode();
-  if (!active) throw new AdminUnavailableError('approve');
 
-  const node = _ensureAdminKey(active.nodeId, active);
-  const dto = await node.admin_approve_join(
-    active.nodeId,
-    childEndpointId,
-    slot,
-    active.nodeAddr ?? null,
-  );
+  const node = _requireNode();
+  const dto = await node.admin_approve_join(target, childEndpointId, slot);
   try {
     return {
       status: 'approved',
@@ -2585,30 +2429,21 @@ export async function approveJoin(childEndpointId, slot = null) {
 }
 
 /**
- * Reject a pending join request.
- *
- * Live mode requires an active delegated admin key; without one this throws
- * `AdminUnavailableError` (as before).
+ * Reject a pending join request on the current admin target.
  *
  * @param {string} childEndpointId
  * @param {string|null} [reason]
  * @returns {Promise<{ status: string, delivery: string }>}
  */
 export async function rejectJoin(childEndpointId, reason = null) {
+  const target = _requireAdminTarget('reject a join request');
   if (_useMock) {
     await mockDelay(300);
     return { status: 'rejected', delivery: 'delivered' };
   }
-  const active = adminKeys.activeAdminNode();
-  if (!active) throw new AdminUnavailableError('reject');
 
-  const node = _ensureAdminKey(active.nodeId, active);
-  const dto = await node.admin_reject_join(
-    active.nodeId,
-    childEndpointId,
-    reason,
-    active.nodeAddr ?? null,
-  );
+  const node = _requireNode();
+  const dto = await node.admin_reject_join(target, childEndpointId, reason);
   try {
     return { status: 'rejected', delivery: dto.delivery };
   } finally {
@@ -2623,15 +2458,14 @@ export async function rejectJoin(childEndpointId, reason = null) {
  * @returns {Promise<{ status: string, delivery: string }>}
  */
 export async function redeliverJoin(childEndpointId) {
+  const target = _requireAdminTarget('redeliver a join decision');
   if (_useMock) {
     await mockDelay(300);
     return { status: 'redelivered', delivery: 'delivered' };
   }
-  const active = adminKeys.activeAdminNode();
-  if (!active) throw new AdminUnavailableError('redeliver');
 
-  const node = _ensureAdminKey(active.nodeId, active);
-  const dto = await node.admin_redeliver_join(active.nodeId, childEndpointId, active.nodeAddr ?? null);
+  const node = _requireNode();
+  const dto = await node.admin_redeliver_join(target, childEndpointId);
   try {
     return { status: 'redelivered', delivery: dto.delivery };
   } finally {
@@ -2640,7 +2474,12 @@ export async function redeliverJoin(childEndpointId) {
 }
 
 /**
- * Create a new child node.
+ * Reserve a child slot without a join request.
+ *
+ * The web client has no `create-child` call on its wasm surface: in a live
+ * network a child appears when a join request is approved (or from the node
+ * CLI). Only mock mode can create one here.
+ *
  * @param {number|null} slot
  * @returns {Promise<{ status: string, address: string }>}
  */
@@ -2650,13 +2489,16 @@ export async function createChild(slot) {
     const s = slot ?? 5;
     return { status: 'created', address: `0.3.${s}` };
   }
-  throw new Error('Not implemented: real createChild');
+  throw new Error(
+    'Creating a child slot is not part of this web client: children are created by ' +
+      'approving a join request (Admin → Pending joins) or from the node CLI.',
+  );
 }
 
 /** Stable reject code → honest user-facing topology error copy. */
 const TOPOLOGY_REJECT_MESSAGES = {
   unauthorized:
-    'Topology grant expired or revoked. Ask the node operator to grant topology scope.',
+    'The node refused this action: this browser is not a designated administrator of that node.',
   slot_taken: 'That slot is taken. Pick another slot.',
   slot_out_of_range: 'That slot is out of range (must be 0-7).',
   not_found: 'That child is no longer attached to this node. Refresh and try again.',
@@ -2686,38 +2528,70 @@ function _topologyError(err) {
   );
 }
 
-/** Resolve the selected grant for a topology action, or throw. */
-function _requireTopologyTarget(target) {
-  const entry = adminKeys.findAdminNode(target);
-  if (!entry || entry.expiresAt <= Date.now()) {
-    throw new AdminUnavailableError('topology action (grant expired or missing)');
+/**
+ * Designate a child as an administrator of the current admin target. The node
+ * applies it; refusals map to honest topology copy.
+ *
+ * @param {string} childEndpointId
+ * @param {string} [nodeId] Target; defaults to the current admin target.
+ * @returns {Promise<{ status: 'designated', child: string }>}
+ */
+export async function adminDesignate(childEndpointId, nodeId = undefined) {
+  const target = _requireAdminTarget('designate an administrator', nodeId);
+  if (_useMock) {
+    await mockDelay(300);
+    return { status: 'designated', child: childEndpointId };
   }
-  return entry;
+  const node = _requireNode();
+  try {
+    await node.admin_designate(target, childEndpointId);
+  } catch (err) {
+    throw _topologyError(err);
+  }
+  return { status: 'designated', child: childEndpointId };
 }
 
 /**
- * Detach a child from the administered node (topology scope).
- *
- * The browser never holds operator/ledger keys: the node applies the change via
- * the shared senior mutation engine. Refusals map to honest errors.
+ * Revoke a child's administrator designation on the current admin target.
  *
  * @param {string} childEndpointId
- * @param {string} [nodeId] Target; defaults to the current selection.
+ * @param {string} [nodeId] Target; defaults to the current admin target.
+ * @returns {Promise<{ status: 'revoked', child: string }>}
+ */
+export async function adminRevoke(childEndpointId, nodeId = undefined) {
+  const target = _requireAdminTarget('revoke an administrator', nodeId);
+  if (_useMock) {
+    await mockDelay(300);
+    return { status: 'revoked', child: childEndpointId };
+  }
+  const node = _requireNode();
+  try {
+    await node.admin_revoke(target, childEndpointId);
+  } catch (err) {
+    throw _topologyError(err);
+  }
+  return { status: 'revoked', child: childEndpointId };
+}
+
+/**
+ * Detach a child from the current admin target.
+ *
+ * The browser never holds operator/ledger keys: the node applies the change.
+ * Refusals map to honest errors.
+ *
+ * @param {string} childEndpointId
+ * @param {string} [nodeId] Target; defaults to the current admin target.
  * @returns {Promise<{ status: 'detached', child: string }>}
  */
 export async function adminDetachChild(childEndpointId, nodeId = undefined) {
-  const target = _normalizeTarget(nodeId);
+  const target = _requireAdminTarget('detach a child', nodeId);
   if (_useMock) {
     await mockDelay(400);
     return { status: 'detached', child: childEndpointId };
   }
-  if (!canAdministerTopology(administeredNode, adminCapabilities)) {
-    throw new AdminUnavailableError('admin detach child (topology)');
-  }
-  const entry = _requireTopologyTarget(target);
-  const node = _ensureAdminKey(target, entry);
+  const node = _requireNode();
   try {
-    await node.admin_detach_child(target, childEndpointId, entry.nodeAddr ?? null);
+    await node.admin_detach_child(target, childEndpointId);
   } catch (err) {
     throw _topologyError(err);
   }
@@ -2725,47 +2599,43 @@ export async function adminDetachChild(childEndpointId, nodeId = undefined) {
 }
 
 /**
- * Re-slot a `node` child of the administered node (topology scope). `slot` of
- * `null` lets the node pick the lowest free slot.
+ * Re-slot a `node` child of the current admin target. `slot` of `null` lets
+ * the node pick the lowest free slot.
  *
  * @param {string} childEndpointId
  * @param {number|null} slot
- * @param {string} [nodeId] Target; defaults to the current selection.
+ * @param {string} [nodeId] Target; defaults to the current admin target.
  * @returns {Promise<{ status: 'moved', child: string, slot: number|null }>}
  */
 export async function adminMoveChild(childEndpointId, slot = null, nodeId = undefined) {
-  const target = _normalizeTarget(nodeId);
+  const target = _requireAdminTarget('re-slot a child', nodeId);
   if (_useMock) {
     await mockDelay(500);
     return { status: 'moved', child: childEndpointId, slot: slot ?? null };
   }
-  if (!canAdministerTopology(administeredNode, adminCapabilities)) {
-    throw new AdminUnavailableError('admin move child (topology)');
-  }
-  const entry = _requireTopologyTarget(target);
-  const node = _ensureAdminKey(target, entry);
+  const node = _requireNode();
   try {
-    await node.admin_move_child(target, childEndpointId, slot ?? null, entry.nodeAddr ?? null);
+    await node.admin_move_child(target, childEndpointId, slot ?? null);
   } catch (err) {
     throw _topologyError(err);
   }
   return { status: 'moved', child: childEndpointId, slot: slot ?? null };
 }
 
-// ── Delegated value administration (P5) ───────────────────────
+// ── Value administration: issue / burn ────────────────────────
 
 /** localStorage key for the single in-flight value operation. */
 export const VALUE_PENDING_KEY = 'cawala.value.pending.v1';
 
 /**
- * Whether the current administered-node capabilities permit a value operation:
- * a value scope on a **non-self** target. Pure, so it is unit-testable.
+ * Whether the current admin target permits a value operation: an unlocked
+ * admin mode pointed at a non-self ancestor. Pure, so it is unit-testable.
  * @param {{ isSelf?: boolean }|null|undefined} view
- * @param {{ scopes?: { value?: boolean } }|null|undefined} caps
+ * @param {{ canAdminister?: boolean }|null|undefined} caps
  * @returns {boolean}
  */
 export function canAdministerValue(view, caps) {
-  return Boolean(view != null && !view.isSelf && caps?.scopes?.value);
+  return Boolean(view != null && !view.isSelf && caps?.canAdminister);
 }
 
 /** Reject-code → honest user-facing value error copy. */
@@ -2774,7 +2644,7 @@ const VALUE_REJECT_MESSAGES = {
     'This exceeds the operator\u2019s per-request, window, or account limit. Ask the node operator for the current limits, or use a smaller amount.',
   insufficient_balance: 'That burn exceeds the account\u2019s current balance.',
   unauthorized:
-    'Value grant expired or revoked. Ask the node operator to grant value scope.',
+    'The node refused this value operation: this browser is not a designated administrator of that node.',
   not_found: 'That account is no longer a child of this node. Refresh and try again.',
   bad_request:
     'The node refused this value operation (check the amount and reason).',
@@ -2896,7 +2766,7 @@ function _randomRequestId() {
 }
 
 /**
- * Run one delegated value operation (issue or burn), persisting the
+ * Run one value operation (issue or burn), persisting the
  * idempotency key before the call and clearing it only once the node confirms
  * the operation (applied or duplicate).
  * @param {'issue'|'burn'} direction
@@ -2914,7 +2784,7 @@ async function _adminValue(
   nodeId = undefined,
   reuseRequestId = undefined,
 ) {
-  const target = _normalizeTarget(nodeId);
+  const target = _requireAdminTarget('issue or burn value', nodeId);
 
   if (_useMock) {
     await mockDelay(500);
@@ -2935,17 +2805,10 @@ async function _adminValue(
   }
 
   if (!canAdministerValue(administeredNode, adminCapabilities)) {
-    throw new AdminUnavailableError('admin value operation (value)');
+    throw new AdminUnavailableError('admin value operation');
   }
-  // Fail closed on a locked protected seed BEFORE generating a request_id or
-  // writing the pending record (a retry must not burn a fresh id).
-  ensureValueSeedUnlocked(target);
 
-  const entry = adminKeys.findAdminNode(target);
-  if (!entry || entry.expiresAt <= Date.now()) {
-    throw new AdminUnavailableError('admin value operation (grant expired or missing)');
-  }
-  const node = _ensureAdminKey(target, entry);
+  const node = _requireNode();
   const requestId = reuseRequestId ?? _randomRequestId();
   const pending = {
     requestId,
@@ -2962,8 +2825,8 @@ async function _adminValue(
   try {
     const dto =
       direction === 'issue'
-        ? await node.admin_issue(target, requestId, account, amount, reason, entry.nodeAddr ?? null)
-        : await node.admin_burn(target, requestId, account, amount, reason, entry.nodeAddr ?? null);
+        ? await node.admin_issue(target, requestId, account, amount, reason)
+        : await node.admin_burn(target, requestId, account, amount, reason);
     const result = {
       status: dto.duplicate ? 'duplicate' : 'applied',
       requestId: dto.request_id,
@@ -3266,17 +3129,16 @@ function _mockParseInvite(raw) {
 // ── Data fetching ─────────────────────────────────────────────
 
 /**
- * Get the children of the administered node.
+ * Get the children of the current admin target.
  *
  * - mock: the synthetic child list (mock is a data source, not a layout).
- * - `self`: this browser's own local topology snapshot (no grant needed).
- * - a granted node: its `AdminQuery` topology snapshot.
+ * - `self`: this browser's own local topology snapshot.
+ * - an ancestor: its `AdminQuery` topology snapshot.
  *
  * Each row carries `kind` (`node` | `user`) so the UI can infer the target's
- * node kind; `balance` is always null here — no ledger query exists in P1 and
- * balances are never fabricated.
+ * node kind; `balance` is always null here — balances are never fabricated.
  *
- * @param {string} [nodeId] Target; defaults to the current selection.
+ * @param {string} [nodeId] Target; defaults to the current admin target.
  * @returns {Promise<Array>}
  */
 export async function getChildren(nodeId = undefined) {
@@ -3290,6 +3152,8 @@ export async function getChildren(nodeId = undefined) {
   if (target === SELF || target === clientState.endpointId) {
     return _readLocalChildren();
   }
+  // Locked mode hides ancestor state without marking the target unreachable.
+  if (!adminLock.unlocked) return [];
 
   try {
     const data = await _queryAdminSnapshot(target);
@@ -3304,31 +3168,20 @@ export async function getChildren(nodeId = undefined) {
 
 /**
  * Record what an admin query saw about a target (status/kind/address) and
- * refresh the stored view. Failures mark the node unreachable rather than
- * dropping the last known kind.
+ * refresh the stored view. Failures mark the target unreachable rather than
+ * dropping the last observed kind.
  * @param {string} target
  * @param {{ ok: boolean, kind?: string, address?: string|null, error?: any }} outcome
  */
 function _recordQueryOutcome(target, outcome) {
-  if (target === SELF || target === MOCK_NODE_ID) {
+  if (target === SELF || target === clientState.endpointId) {
     if (outcome.kind) {
       _selfKind = outcome.kind;
       _syncAdministeredNode();
     }
     return;
   }
-  const now = Date.now();
-  if (outcome.ok) {
-    adminKeys.updateLastSeen(target, {
-      status: 'active',
-      kind: outcome.kind ?? null,
-      address: outcome.address ?? null,
-      at: now,
-    });
-  } else {
-    adminKeys.updateLastSeen(target, { status: 'unreachable', at: now });
-  }
-  _syncAdministeredNode();
+  _recordTargetProbe(target, outcome);
 }
 
 /**
@@ -3358,24 +3211,24 @@ function withDerivedEquity(accounts) {
 }
 
 /**
- * Whether the current administered-node capabilities permit a value-scoped
- * ledger read. Pure, so it is unit-testable.
- * @param {{ scopes?: { value?: boolean } }|null|undefined} caps
+ * Whether the current admin target permits a ledger read: an unlocked admin
+ * mode pointed at a non-self ancestor. Pure, so it is unit-testable.
+ * @param {{ canAdminister?: boolean }|null|undefined} caps
  * @returns {boolean}
  */
 export function canReadAdminLedger(caps) {
-  return Boolean(caps?.scopes?.value);
+  return Boolean(caps?.canAdminister);
 }
 
 /**
- * Whether the delegated-admin surface permits topology actions: a topology
- * scope on a **non-self** target. Pure, so it is unit-testable.
+ * Whether the admin surface permits topology/designation actions: an unlocked
+ * admin mode pointed at a **non-self** target. Pure, so it is unit-testable.
  * @param {{ isSelf?: boolean }|null|undefined} view
- * @param {{ scopes?: { topology?: boolean } }|null|undefined} caps
+ * @param {{ canAdminister?: boolean }|null|undefined} caps
  * @returns {boolean}
  */
 export function canAdministerTopology(view, caps) {
-  return Boolean(view != null && !view.isSelf && caps?.scopes?.topology);
+  return Boolean(view != null && !view.isSelf && caps?.canAdminister);
 }
 
 /**
@@ -3438,17 +3291,16 @@ export function mapAdminLedgerRows(snapshot) {
 }
 
 /**
- * Get accounts for the administered node.
+ * Get accounts for the current admin target.
  *
  * - mock: the synthetic accounting rows (with derived equity).
  * - `self`: this browser's verified balance, only once a receipt exists (the
  *   cryptographically verified leaf path).
- * - a value-scoped administered node: the node's own read-only accounting
- *   snapshot (`AdminLedgerQuery`), mapped to the same row shape. A joins-only
- *   or topology-only grant cannot read balances and yields `[]`. Balances are
- *   node-asserted and never fabricated here.
+ * - an ancestor: the node's own read-only accounting snapshot
+ *   (`AdminLedgerQuery`), mapped to the same row shape. Admin mode must be
+ *   unlocked; otherwise `[]`. Balances are node-asserted and never fabricated.
  *
- * @param {string} [nodeId] Target; defaults to the current selection.
+ * @param {string} [nodeId] Target; defaults to the current admin target.
  * @returns {Promise<Array>}
  */
 export async function getAccounts(nodeId = undefined) {
@@ -3473,7 +3325,7 @@ export async function getAccounts(nodeId = undefined) {
     ];
   }
 
-  // An administered node: only a value-scoped grant may read its books.
+  // An ancestor's books are only readable once admin mode is unlocked.
   if (!canReadAdminLedger(adminCapabilities)) return [];
 
   try {
@@ -3485,7 +3337,7 @@ export async function getAccounts(nodeId = undefined) {
     _recordQueryOutcome(target, {
       ok: true,
       kind: inferNodeKind(children),
-      address: adminKeys.findAdminNode(target)?.nodeAddr ?? null,
+      address: _adminTargets.find((t) => t.node.toLowerCase() === target)?.address ?? null,
     });
     return rows;
   } catch (err) {
@@ -3496,20 +3348,14 @@ export async function getAccounts(nodeId = undefined) {
 }
 
 /**
- * Run one value-scoped ledger query (direct first, routed fallback inside the
- * wasm `admin_ledger_query`) and read the reply into a plain snapshot object.
+ * Run one admin ledger query (direct first, routed fallback inside the wasm
+ * `admin_ledger_query`) and read the reply into a plain snapshot object.
  * @param {string} target
- * @param {object} [grant]
  * @returns {Promise<object>}
  */
-async function _queryAdminLedger(target, grant = null) {
-  const entry = grant ?? adminKeys.findAdminNode(target);
-  if (!entry) throw new AdminUnavailableError('admin ledger query');
-  if (entry.expiresAt <= Date.now()) {
-    throw new AdminUnavailableError('admin ledger query (grant expired)');
-  }
-  const node = _ensureAdminKey(target, entry);
-  const snapshot = await node.admin_ledger_query(target, entry.nodeAddr ?? null);
+async function _queryAdminLedger(target) {
+  const node = _requireNode();
+  const snapshot = await node.admin_ledger_query(target);
   return _readAdminLedgerSnapshot(snapshot);
 }
 
@@ -3546,14 +3392,14 @@ function _readAdminLedgerSnapshot(snapshot) {
 }
 
 /**
- * Get pending join requests for the administered node.
+ * Get pending join requests for the current admin target.
  *
- * Live mode needs a valid grant over the target (mock always has data).
- * A missing/expired grant yields `[]` — the page decides which empty state to
+ * Live mode needs admin mode unlocked (mock always has data). A locked mode or
+ * this browser's own leaf yields `[]` — the page decides which empty state to
  * show from `adminCapabilities`. An unreachable target records `unreachable`
  * so the context bar can say so.
  *
- * @param {string} [nodeId] Target; defaults to the current selection.
+ * @param {string} [nodeId] Target; defaults to the current admin target.
  * @returns {Promise<Array>}
  */
 export async function getJoinRequests(nodeId = undefined) {
@@ -3563,11 +3409,11 @@ export async function getJoinRequests(nodeId = undefined) {
     return [...MOCK_DATA.joinRequests];
   }
 
-  const grant = adminKeys.findAdminNode(target);
-  if (!grant || grant.expiresAt <= Date.now()) return [];
+  // A browser leaf has no pending joins, and nothing is queryable while locked.
+  if (target === SELF || target === clientState.endpointId || !adminLock.unlocked) return [];
 
   try {
-    const data = await _queryAdminSnapshot(target, grant);
+    const data = await _queryAdminSnapshot(target);
     _recordQueryOutcome(target, { ok: true, kind: inferNodeKind(data.children), address: data.address });
     return data.pendingRows.map((row) => ({
       endpointId: row.endpointId,
@@ -3609,18 +3455,18 @@ function _mapActivityEntry(entry) {
 }
 
 /**
- * Get activity log entries for the administered node.
+ * Get activity log entries for the current admin target.
  *
  * - mock: the synthetic log.
  * - `this browser's leaf`: the locally reported payment/settlement history.
- * - a granted node: `[]` — an administered-node activity log does not exist
- *   in this phase, and this browser's own payments must not be shown under
- *   another node's name.
+ * - an ancestor: `[]` — an ancestor's activity log does not exist in this
+ *   phase, and this browser's own payments must not be shown under another
+ *   node's name.
  *
  * @param {object} [filters]
  * @param {string} [filters.type]
  * @param {string} [filters.address]
- * @param {string} [nodeId] Target; defaults to the current selection.
+ * @param {string} [nodeId] Target; defaults to the current admin target.
  * @returns {Promise<Array>}
  */
 export async function getActivityLog(filters, nodeId = undefined) {

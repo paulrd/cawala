@@ -244,7 +244,7 @@
 
         {#snippet meta()}
           {#if pendingJoins > 0}
-            <button type="button" class="link-btn" onclick={() => navigate(ROUTES.JOINS)}>
+            <button type="button" class="link-btn" onclick={() => navigate(ROUTES.ADMIN)}>
               {pendingJoins} pending join{pendingJoins !== 1 ? 's' : ''}
             </button>
           {:else}
@@ -290,7 +290,7 @@
           ? 'This node has no children in its local topology snapshot.'
           : 'The administered node reports no children in its topology snapshot.'}
         actionLabel={view.isSelf ? 'View Join Requests' : ''}
-        onAction={view.isSelf ? () => navigate(ROUTES.JOINS) : undefined}
+        onAction={view.isSelf ? () => navigate(ROUTES.ADMIN) : undefined}
       />
     </Card>
 

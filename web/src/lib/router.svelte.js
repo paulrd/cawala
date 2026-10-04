@@ -81,6 +81,12 @@ export function activeNavRoute(routes, current) {
  */
 export function initRouter() {
   window.addEventListener('hashchange', notify);
+  // Legacy routes from before the single Admin page (R8): `#/node`,
+  // `#/node/joins`, … all land there instead of on a 404.
+  const legacy = parseRoute();
+  if (legacy === '/node' || legacy.startsWith('/node/')) {
+    window.location.hash = '#' + ROUTES.ADMIN;
+  }
   // Also handle initial state
   notify();
 }

@@ -7,8 +7,6 @@
   import ErrorState from '../shared/ErrorState.svelte';
   import Badge from '../shared/Badge.svelte';
   import ConfirmDialog from '../shared/ConfirmDialog.svelte';
-  import UnlockAdminKeyDialog from '../shared/UnlockAdminKeyDialog.svelte';
-  import GrantEmptyState from '../admin/GrantEmptyState.svelte';
   import {
     nodeState,
     loadingState,
@@ -16,6 +14,7 @@
     ledgerState,
     administeredNode,
     adminCapabilities,
+    adminLock,
     targetEpoch,
     showToast,
   } from '../../lib/stores.svelte.js';
@@ -27,10 +26,6 @@
     readPendingValueOp,
     clearPendingValueOp,
     retryPendingValueOp,
-    AdminLockedError,
-    AdminSeedProtectionRequiredError,
-    ensureAdminUnlocked,
-    protectValueSeed,
   } from '../../lib/api.js';
   import { valueReasonErrorVisible } from '../../lib/adminView.js';
   import { navigate } from '../../lib/router.svelte.js';
@@ -38,9 +33,9 @@
 
   let loaded = $state(false);
   let view = administeredNode;
-  let canQuery = $derived(adminCapabilities.canQueryNode);
-  // Value actions need a non-self target and a value-scoped grant.
+  // Value actions need admin mode unlocked and pointed at a non-self ancestor.
   let canValue = $derived(canAdministerValue(view, adminCapabilities));
+  let locked = $derived(!adminLock.unlocked);
 
   let selectedAccount = $state(null);
   let valueDialog = $state(null); // 'issue' | 'burn' | null
@@ -49,15 +44,6 @@
   let valueReasonTouched = $state(false);
   let valueBusy = $state(false);
   let pendingOp = $state(readPendingValueOp());
-  // Unlock-on-demand for a protected seed, and protect-on-demand for a plain
-  // value seed (required before any value action).
-  let unlockOpen = $state(false);
-  let unlockBusy = $state(false);
-  let unlockError = $state(null);
-  let protectOpen = $state(false);
-  let protectBusy = $state(false);
-  let protectError = $state(null);
-  let pendingValueAction = $state(null); // { direction, accountId, amount, reason } | { retry: true }
 
   let valueAmountValid = $derived(Number.isFinite(valueAmount) && valueAmount > 0);
   let valueReasonValid = $derived(valueReason.trim().length > 0);
@@ -67,7 +53,6 @@
   $effect(() => {
     void targetEpoch.value;
     pendingOp = readPendingValueOp();
-    if (!canQuery) return;
     void loadData();
   });
 
@@ -108,21 +93,9 @@
       selectedAccount = null;
       await loadData();
     } catch (err) {
-      if (err instanceof AdminLockedError) {
-        // Retry once the user unlocks; no toast (the dialog explains).
-        pendingValueAction = { direction, accountId, amount, reason };
-        unlockError = null;
-        unlockOpen = true;
-        return;
-      }
-      if (err instanceof AdminSeedProtectionRequiredError) {
-        // Value actions require a protected key: prompt to wrap, then retry.
-        pendingValueAction = { direction, accountId, amount, reason };
-        protectError = null;
-        protectOpen = true;
-        return;
-      }
       pendingOp = readPendingValueOp();
+      // Locked mode keeps its own gate: the message tells the operator where
+      // to go instead of silently dropping the action.
       showToast(err?.message || 'Value operation failed.', 'danger');
     } finally {
       valueBusy = false;
@@ -144,18 +117,6 @@
       if (result) showToast('Pending value operation applied.', 'ok');
       await loadData();
     } catch (err) {
-      if (err instanceof AdminLockedError) {
-        pendingValueAction = { retry: true };
-        unlockError = null;
-        unlockOpen = true;
-        return;
-      }
-      if (err instanceof AdminSeedProtectionRequiredError) {
-        pendingValueAction = { retry: true };
-        protectError = null;
-        protectOpen = true;
-        return;
-      }
       pendingOp = readPendingValueOp();
       showToast(err?.message || 'Retry failed.', 'danger');
     } finally {
@@ -171,47 +132,6 @@
     clearPendingValueOp();
     pendingOp = null;
     showToast('Pending value operation discarded.', 'warn');
-  }
-
-  /** Retry the action that triggered the unlock/protect dialog (once). */
-  async function runPendingAction(action) {
-    if (action?.retry) {
-      await performRetryPending();
-    } else if (action) {
-      await performValue(action.direction, action.accountId, action.amount, action.reason);
-    }
-  }
-
-  async function handleUnlock(passphrase) {
-    unlockBusy = true;
-    unlockError = null;
-    const action = pendingValueAction;
-    try {
-      await ensureAdminUnlocked(view.nodeId, passphrase);
-      unlockOpen = false;
-      pendingValueAction = null;
-      await runPendingAction(action);
-    } catch (err) {
-      unlockError = err?.message || 'Could not unlock the value key.';
-    } finally {
-      unlockBusy = false;
-    }
-  }
-
-  async function handleProtect(passphrase) {
-    protectBusy = true;
-    protectError = null;
-    const action = pendingValueAction;
-    try {
-      await protectValueSeed(view.nodeId, passphrase);
-      protectOpen = false;
-      pendingValueAction = null;
-      await runPendingAction(action);
-    } catch (err) {
-      protectError = err?.message || 'Could not protect the value key.';
-    } finally {
-      protectBusy = false;
-    }
   }
 
   async function loadData() {
@@ -267,8 +187,11 @@
     if (view.isSelf) {
       return 'Your verified balance will appear here once a receipt arrives from your leaf process.';
     }
-    if (!adminCapabilities.scopes.value) {
-      return 'Reading an administered node\u2019s balances needs a value-scoped grant. This browser holds a joins-only or topology-only grant.';
+    if (locked) {
+      return 'Admin mode is locked, so this ancestor\u2019s books are hidden. Unlock it from the Admin tab to read them.';
+    }
+    if (!canValue) {
+      return 'Step up the ancestor chain on the Admin tab to read and act on this node\u2019s books.';
     }
     return 'This node reported no accounts yet.';
   });
@@ -287,10 +210,10 @@
       </button>
     {/snippet}
 
-    {#if !canQuery}
-      <GrantEmptyState
-        title="Account data needs a delegated admin key"
-        message="This browser cannot query the selected node yet. Generate an admin key in Settings and ask the operator to grant it."
+    {#if locked && !view.isSelf}
+      <EmptyState
+        title="Admin mode is locked"
+        message="This browser is pointed at an ancestor node. Unlock admin mode from the Admin tab to read its books, or step back down to this browser."
       />
     {:else if loadingState.accounts && !loaded}
       <LoadingSkeleton rows={2} />
@@ -355,8 +278,8 @@
   </Card>
 
   <Card title="All Accounts">
-    {#if !canQuery}
-      <p class="text-sm muted">No rows to show for this selection.</p>
+    {#if locked && !view.isSelf}
+      <p class="text-sm muted">No rows to show while admin mode is locked.</p>
     {:else if loadingState.accounts && !loaded}
       <LoadingSkeleton rows={3} />
     {:else if errorState.accounts}
@@ -471,28 +394,6 @@
     </div>
   </ConfirmDialog>
 
-  <UnlockAdminKeyDialog
-    open={unlockOpen}
-    title="Unlock value key"
-    message="This value key is protected by a passphrase. Enter it to unlock the key for this browser session."
-    confirmLabel="Unlock"
-    busy={unlockBusy}
-    error={unlockError}
-    onSubmit={handleUnlock}
-    onCancel={() => { unlockOpen = false; pendingValueAction = null; unlockError = null; }}
-  />
-
-  <UnlockAdminKeyDialog
-    open={protectOpen}
-    title="Protect value key"
-    message="Value actions require the value key to be protected with a passphrase. It is used locally to wrap the key and is never sent anywhere. There is no recovery: if you forget it, remove and re-generate the key."
-    confirmLabel="Protect and continue"
-    busy={protectBusy}
-    error={protectError}
-    requireConfirm={true}
-    onSubmit={handleProtect}
-    onCancel={() => { protectOpen = false; pendingValueAction = null; protectError = null; }}
-  />
 </div>
 
 <style>

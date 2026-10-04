@@ -2,12 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 /**
- * Selector / context-bar view model (P1).
+ * Ancestor target-switcher view helpers (P4).
  *
- * These helpers turn stored grants + target state into the rows the shared
- * `AdminNodeRow` renders. Copy must stay grounded: a badge never claims a
- * connection it has not observed, and a kind is only ever shown when a probe
- * actually recorded one.
+ * Admin targets are a flat ancestor chain `{ node, address, depth }` (depth 1 =
+ * this browser's direct parent, the last entry = the root). These helpers only
+ * describe positions, labels and badges on that chain — there is no dropdown
+ * and no grant data anymore.
  */
 
 const {
@@ -15,47 +15,44 @@ const {
   MOCK_ID,
   ADMIN_STATUS,
   statusBadge,
-  sourceBadge,
   shortId,
-  grantToItem,
-  buildSelectorItems,
-  needsGrantBanner,
+  depthLabel,
+  buildAncestorPath,
+  canStepTarget,
+  valueReasonErrorVisible,
 } = await import('../src/lib/adminView.js');
 
-const NOW = 1_800_000_000_000;
 const NODE_A = 'a1'.repeat(32);
 const NODE_B = 'b2'.repeat(32);
 
-function grant(overrides = {}) {
-  return {
-    nodeId: NODE_A,
-    adminPubHex: 'e5'.repeat(32),
-    scope: 'admin',
-    scopes: ['joins'],
-    grantedAt: NOW - 1000,
-    expiresAt: NOW + 6 * 24 * 3600 * 1000,
-    label: null,
-    nodeAddr: null,
-    lastSeenStatus: null,
-    lastSeenKind: null,
-    lastSeenAddress: null,
-    lastSeenAt: null,
-    active: true,
-    ...overrides,
-  };
-}
+const CHAIN = [
+  { node: NODE_A, address: '0.3.1', depth: 1 },
+  { node: NODE_B, address: '0.3', depth: 2 },
+  { node: 'root'.padEnd(64, '0'), address: '0', depth: 3 },
+];
+
+// ── identity / status constants ──────────────────────────────────────────────
+
+test('view identity constants are stable', () => {
+  assert.equal(SELF_ID, 'self');
+  assert.equal(MOCK_ID, 'mock');
+  assert.deepEqual(ADMIN_STATUS, {
+    MOCK: 'mock',
+    SELF: 'self',
+    ACTIVE: 'active',
+    UNREACHABLE: 'unreachable',
+    UNKNOWN: 'unknown',
+  });
+});
 
 // ── statusBadge ──────────────────────────────────────────────────────────────
 
 test('statuses carry grounded labels — never a claim of connectivity', () => {
   const expected = {
     [ADMIN_STATUS.ACTIVE]: 'Active',
-    [ADMIN_STATUS.EXPIRED]: 'Expired',
     [ADMIN_STATUS.UNREACHABLE]: 'Unreachable',
-    [ADMIN_STATUS.REVOKED]: 'Revoked',
-    [ADMIN_STATUS.NO_GRANT]: 'No admin key',
-    [ADMIN_STATUS.SELF]: 'This browser',
     [ADMIN_STATUS.MOCK]: 'Mock mode',
+    [ADMIN_STATUS.SELF]: 'This browser',
     [ADMIN_STATUS.UNKNOWN]: 'Unknown',
   };
   for (const [status, label] of Object.entries(expected)) {
@@ -72,27 +69,7 @@ test('statuses carry grounded labels — never a claim of connectivity', () => {
   }
 });
 
-test('banner-worthy statuses are the ones that need attention', () => {
-  for (const status of [
-    ADMIN_STATUS.EXPIRED,
-    ADMIN_STATUS.UNREACHABLE,
-    ADMIN_STATUS.REVOKED,
-    ADMIN_STATUS.NO_GRANT,
-  ]) {
-    assert.equal(needsGrantBanner(status), true, status);
-  }
-  for (const status of [
-    ADMIN_STATUS.ACTIVE,
-    ADMIN_STATUS.SELF,
-    ADMIN_STATUS.MOCK,
-    ADMIN_STATUS.UNKNOWN,
-    'flying',
-  ]) {
-    assert.equal(needsGrantBanner(status), false, status);
-  }
-});
-
-// ── shortId / formatTtl feeding the rows ─────────────────────────────────────
+// ── shortId ──────────────────────────────────────────────────────────────────
 
 test('shortId trims a node id to a stable head and tail', () => {
   assert.equal(shortId(NODE_A), 'a1a1a1\u2026a1a1a1');
@@ -101,126 +78,81 @@ test('shortId trims a node id to a stable head and tail', () => {
   assert.equal(shortId('short'), 'short', 'short values are left alone');
 });
 
-// ── grantToItem ──────────────────────────────────────────────────────────────
+// ── depthLabel ───────────────────────────────────────────────────────────────
 
-test('an active grant renders Active with its ttl and scopes', () => {
-  const item = grantToItem(grant({ label: 'Home node', nodeAddr: '203.0.113.7' }), { now: NOW });
-  assert.equal(item.id, NODE_A);
-  assert.equal(item.label, 'Home node');
-  assert.equal(item.sublabel, shortId(NODE_A));
-  assert.equal(item.status, ADMIN_STATUS.ACTIVE);
-  assert.equal(item.statusBadge.label, 'Active');
-  assert.equal(item.ttl, '6d left');
-  assert.equal(item.nodeAddr, '203.0.113.7');
-  assert.deepEqual(item.scopes, ['joins']);
-  assert.equal(item.disabled, false);
-  assert.equal(item.isSelf, false);
+test('depthLabel names the ends of the chain and numbers the middle', () => {
+  assert.equal(depthLabel(1, 3), 'Parent');
+  assert.equal(depthLabel(2, 3), 'Level 2');
+  assert.equal(depthLabel(3, 3), 'Root');
+  // A single-level chain is just the parent, never "Root".
+  assert.equal(depthLabel(1, 1), 'Parent');
+  assert.equal(depthLabel(1, 0), 'Parent');
 });
 
-test('source badge distinguishes operator-signed from provisional grants', () => {
-  assert.equal(sourceBadge('bundle').label, 'Operator-signed');
-  assert.equal(sourceBadge('bundle').variant, 'ok');
-  assert.equal(sourceBadge('manual').label, 'Provisional');
-  assert.equal(sourceBadge('manual').variant, 'warn');
-  // No grant (self/mock) or an unknown source never invents a badge.
-  assert.equal(sourceBadge(null), null);
-  assert.equal(sourceBadge('weird'), null);
+// ── buildAncestorPath ────────────────────────────────────────────────────────
 
-  // A stored grant defaults to `manual` when the row has no source field.
-  assert.equal(grantToItem(grant(), { now: NOW }).grantSource, 'manual');
-  assert.equal(grantToItem(grant(), { now: NOW }).sourceBadge.label, 'Provisional');
-  const signed = grantToItem(grant({ grantSource: 'bundle' }), { now: NOW });
-  assert.equal(signed.grantSource, 'bundle');
-  assert.equal(signed.sourceBadge.label, 'Operator-signed');
-});
-
-test('a probe that saw "unreachable" is shown as unreachable, not active', () => {
-  const item = grantToItem(grant({ lastSeenStatus: 'unreachable' }), { now: NOW });
-  assert.equal(item.status, ADMIN_STATUS.UNREACHABLE);
-  assert.equal(item.statusBadge.label, 'Unreachable');
-  assert.equal(needsGrantBanner(item.status), true);
-});
-
-test('an expired grant is disabled and labelled Expired', () => {
-  const item = grantToItem(grant({ active: false, expiresAt: NOW - 1 }), { now: NOW });
-  assert.equal(item.status, ADMIN_STATUS.EXPIRED);
-  assert.equal(item.ttl, 'expired');
-  assert.equal(item.disabled, true);
-});
-
-test('kind and label are only shown when they were actually observed', () => {
-  const unknown = grantToItem(grant(), { now: NOW });
-  assert.equal(unknown.kind, null, 'no probe -> no kind');
-  assert.equal(unknown.kindLabel, '');
-  assert.equal(unknown.kindVariant, 'muted');
-  assert.equal(unknown.label, shortId(NODE_A), 'unlabelled grants fall back to the id');
-
-  const observed = grantToItem(grant({ lastSeenKind: 'internal' }), { now: NOW });
-  assert.equal(observed.kind, 'internal');
-  assert.equal(observed.kindLabel, 'Internal node');
-  assert.equal(observed.kindVariant, 'info');
-
-  const forged = grantToItem(grant({ lastSeenKind: 'bridge' }), { now: NOW });
-  assert.equal(forged.kindLabel, 'Unknown kind', 'unrecognised kinds are not named');
-});
-
-// ── buildSelectorItems ───────────────────────────────────────────────────────
-
-test('groups are context first, then granted, then expired', () => {
-  const nodes = [
-    grant({ nodeId: NODE_A, active: true }),
-    grant({ nodeId: NODE_B, active: false, expiresAt: NOW - 1 }),
-  ];
-  const { groups } = buildSelectorItems({
-    self: { endpointId: 'c7'.repeat(32) },
-    mock: false,
-    nodes,
-    selected: NODE_A,
-    now: NOW,
-  });
-
+test('buildAncestorPath labels and orders the chain with one current crumb', () => {
+  const path = buildAncestorPath(CHAIN, 2);
   assert.deepEqual(
-    groups.map((g) => g.id),
-    ['context', 'granted', 'expired'],
+    path.map((crumb) => crumb.depth),
+    [1, 2, 3],
+    'sorted by depth',
   );
-  assert.equal(groups[0].items.length, 1);
-  assert.equal(groups[0].items[0].id, SELF_ID);
-  assert.equal(groups[0].items[0].label, 'This browser');
-  assert.equal(groups[0].items[0].status, ADMIN_STATUS.SELF);
-  assert.equal(groups[0].items[0].selected, false);
-
-  assert.deepEqual(groups[1].items.map((i) => i.id), [NODE_A]);
-  assert.equal(groups[1].items[0].selected, true);
-  assert.deepEqual(groups[2].items.map((i) => i.id), [NODE_B]);
-  assert.equal(groups[2].items[0].selected, false);
+  assert.deepEqual(
+    path.map((crumb) => crumb.label),
+    ['Parent', 'Level 2', 'Root'],
+  );
+  assert.equal(path[1].current, true);
+  assert.equal(path[0].current, false);
+  assert.equal(path[2].current, false);
+  assert.equal(path[0].node, NODE_A);
+  assert.equal(path[0].address, '0.3.1');
 });
 
-test('empty state is just this browser — no phantom groups', () => {
-  const { groups } = buildSelectorItems({ mock: false, nodes: [], selected: SELF_ID, now: NOW });
-  assert.equal(groups.length, 1);
-  assert.equal(groups[0].id, 'context');
-  assert.equal(groups[0].items.length, 1);
-  assert.equal(groups[0].items[0].id, SELF_ID);
-  assert.equal(groups[0].items[0].selected, true);
+test('buildAncestorPath tolerates unordered input, missing addresses and empties', () => {
+  const unordered = [
+    { node: NODE_B, address: null, depth: 2 },
+    { node: NODE_A, address: undefined, depth: 1 },
+  ];
+  const path = buildAncestorPath(unordered, 1);
+  assert.deepEqual(
+    path.map((crumb) => crumb.depth),
+    [1, 2],
+  );
+  assert.equal(path[0].address, null, 'undefined address normalizes to null');
+
+  assert.deepEqual(buildAncestorPath(), []);
+  assert.deepEqual(buildAncestorPath(null, 1), []);
 });
 
-test('mock mode adds the synthetic node to the context group', () => {
-  const { groups } = buildSelectorItems({ mock: true, nodes: [], selected: null, now: NOW });
-  const ids = groups[0].items.map((i) => i.id);
-  assert.deepEqual(ids, [SELF_ID, MOCK_ID]);
-  assert.equal(groups[0].items[0].status, ADMIN_STATUS.MOCK, 'self reads as Mock mode');
-  assert.equal(groups[0].items[1].status, ADMIN_STATUS.MOCK);
-  assert.equal(groups[0].items[1].label, 'Mock node');
-  assert.equal(groups.length, 1, 'the mock node does not open a granted group');
+// ── canStepTarget ────────────────────────────────────────────────────────────
+
+test('canStepTarget allows steps that land on a real depth only', () => {
+  // From the direct parent, up to the next level is allowed, down is not.
+  assert.equal(canStepTarget(1, +1, CHAIN), true);
+  assert.equal(canStepTarget(1, -1, CHAIN), false);
+  // From the root, only downwards.
+  assert.equal(canStepTarget(3, +1, CHAIN), false);
+  assert.equal(canStepTarget(3, -1, CHAIN), true);
+  // Missing selection / empty chain never steps.
+  assert.equal(canStepTarget(null, +1, CHAIN), false);
+  assert.equal(canStepTarget(1, +1, []), false);
+  assert.equal(canStepTarget(1, +1, null), false);
+  // A hole in the chain is not steppable either.
+  assert.equal(canStepTarget(1, +2, CHAIN), true, 'a landing on depth 3 is valid');
+  assert.equal(
+    canStepTarget(1, +1, [{ depth: 1 }, { depth: 5 }]),
+    false,
+    'depth 2 is absent',
+  );
 });
 
-test('a selection pointing at a removed grant marks nothing as selected', () => {
-  const { groups } = buildSelectorItems({
-    mock: false,
-    nodes: [grant({ nodeId: NODE_A, active: true })],
-    selected: 'f'.repeat(64),
-    now: NOW,
-  });
-  const selected = groups.flatMap((g) => g.items).filter((i) => i.selected);
-  assert.deepEqual(selected, []);
+// ── valueReasonErrorVisible ──────────────────────────────────────────────────
+
+test('valueReasonErrorVisible only shows after touch and while invalid', () => {
+  assert.equal(valueReasonErrorVisible(false, false), false);
+  assert.equal(valueReasonErrorVisible(false, true), false);
+  assert.equal(valueReasonErrorVisible(true, true), false);
+  assert.equal(valueReasonErrorVisible(true, false), true);
+  assert.equal(valueReasonErrorVisible(undefined, false), false);
 });

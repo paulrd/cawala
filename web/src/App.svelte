@@ -6,10 +6,9 @@
   import { CLIENT_STATUS } from './lib/constants.js';
   import Shell from './components/layout/Shell.svelte';
   import Dashboard from './components/dashboard/Dashboard.svelte';
-  import NodePage from './components/node/NodePage.svelte';
   import AccountsPage from './components/accounts/AccountsPage.svelte';
   import ActivityPage from './components/activity/ActivityPage.svelte';
-  import JoinsPage from './components/joins/JoinsPage.svelte';
+  import AdminPage from './components/admin/AdminPage.svelte';
   import MyAccountPage from './components/account/MyAccountPage.svelte';
   import SettingsPage from './components/settings/SettingsPage.svelte';
   import JoinFlowPage from './components/join-flow/JoinFlowPage.svelte';
@@ -69,10 +68,8 @@
   <Shell>
     {#if route === '/' || route === ''}
       <Dashboard />
-    {:else if route === '/node/joins'}
-      <JoinsPage />
-    {:else if route === '/node' || route.startsWith('/node/')}
-      <NodePage />
+    {:else if route === '/admin'}
+      <AdminPage />
     {:else if route === '/accounts'}
       <AccountsPage />
     {:else if route === '/activity'}

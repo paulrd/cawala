@@ -4,7 +4,6 @@
   import EmptyState from '../shared/EmptyState.svelte';
   import LoadingSkeleton from '../shared/LoadingSkeleton.svelte';
   import ErrorState from '../shared/ErrorState.svelte';
-  import GrantEmptyState from '../admin/GrantEmptyState.svelte';
   import {
     nodeState,
     loadingState,
@@ -12,7 +11,6 @@
     ledgerState,
     apiCapabilities,
     administeredNode,
-    adminCapabilities,
     targetEpoch,
   } from '../../lib/stores.svelte.js';
   import { getActivityLog } from '../../lib/api.js';
@@ -22,14 +20,12 @@
   let loaded = $state(false);
   let filterType = $state('');
   let view = administeredNode;
-  let canQuery = $derived(adminCapabilities.canQueryNode);
 
   $effect(() => {
     void targetEpoch.value;
     // The ledger poller appends entries in live mode: refetch so the table
     // stays current instead of only updating on a manual refresh.
     void ledgerState.activity.length;
-    if (!canQuery) return;
     void loadData();
   });
 
@@ -68,7 +64,7 @@
   let emptyMessage = $derived(
     view.isSelf
       ? 'Your outbound payments will appear here once they are confirmed.'
-      : "This node's own activity log is not shared with delegated keys, and this browser's payments are never listed under another node's name.",
+      : "An ancestor node does not expose its activity log to this client, and this browser's payments are never listed under another node's name.",
   );
 
   const typeBadgeVariant = {
@@ -101,14 +97,14 @@
         type="button"
         class="btn btn--ghost btn--sm"
         onclick={() => { loaded = false; loadData(); }}
-        disabled={loadingState.activity || !canQuery}
+        disabled={loadingState.activity}
       >
         {loadingState.activity ? 'Loading…' : 'Refresh'}
       </button>
     {/snippet}
 
     <div class="toolbar">
-      <select bind:value={filterType} onchange={handleFilter} aria-label="Filter by type" disabled={!canQuery}>
+      <select bind:value={filterType} onchange={handleFilter} aria-label="Filter by type">
         <option value="">All types</option>
         <option value="transfer">Transfers</option>
         <option value="issue">Issues</option>
@@ -126,12 +122,7 @@
       {/if}
     </div>
 
-    {#if !canQuery}
-      <GrantEmptyState
-        title="Activity needs a delegated admin key"
-        message="This browser cannot query the selected node yet. Generate an admin key in Settings and ask the operator to grant it."
-      />
-    {:else if loadingState.activity && !loaded}
+    {#if loadingState.activity && !loaded}
       <LoadingSkeleton rows={5} />
     {:else if errorState.activity}
       <ErrorState message={errorState.activity} onRetry={loadData} />
@@ -179,7 +170,6 @@
       </div>
     {/if}
 
-    {#if canQuery}
     <div class="activity-footnote">
       <Badge variant="muted" label={apiCapabilities.mock ? 'Sample data' : 'Reported by your leaf'} />
       <span class="text-xs muted">
@@ -188,7 +178,6 @@
           : 'Activity data comes from the leaf process and is not independently attested.'}
       </span>
     </div>
-    {/if}
   </Card>
 </div>
 

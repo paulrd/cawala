@@ -17,8 +17,8 @@
 <div class="shell">
   <Sidebar {route} />
   <div class="shell-main">
-    <!-- One header for every route: page title + the administered-node
-         selector/context bar, so the target is always visible. -->
+    <!-- One header for every route: page title + the ancestor target
+         switcher/context bar, so the current target is always visible. -->
     <div class="shell-header">
       <TopBar {route} />
       <NodeContextBar />
