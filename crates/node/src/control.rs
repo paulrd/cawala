@@ -42,6 +42,7 @@ use cawala_control::{
 use cawala_ledger::{LedgerPubKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::{MsgId, PeerRef, Seen, SeenConfig};
 
+use crate::admin_state::AdminState;
 use crate::admin_store::{AdminStore, StoredGrant};
 use crate::control_store::ControlStore;
 use crate::ledger_peers;
@@ -192,6 +193,8 @@ pub struct ControlNode {
     peers: PeerRegistry,
     pending: ControlStore,
     admins: AdminStore,
+    /// Topology-derived admin priority/lease state, reloaded per request.
+    admin_state: AdminState,
     /// Frames to deliver after the current request is answered. Drained by the
     /// `ControlHandler` while it still holds the engine lock.
     outbound: VecDeque<OutboundControl>,
@@ -303,6 +306,7 @@ impl ControlNode {
             peers,
             pending,
             admins,
+            admin_state: AdminState::empty(),
             outbound: VecDeque::new(),
             pending_rebase: VecDeque::new(),
             self_kind: ChildKind::Node,
@@ -332,6 +336,23 @@ impl ControlNode {
             ControlStore::open(&data_dir).map_err(|err| ControlError::Codec(err.to_string()))?;
         let admins = AdminStore::load(&data_dir, node_id, &operator.public())
             .map_err(|err| ControlError::Codec(err.to_string()))?;
+        // Admin state is fail-closed: a corrupt/unknown file leaves remote admin
+        // unavailable (empty state) rather than failing the open, so the local
+        // CLI can still repair it.
+        let admin_state = match AdminState::load(&data_dir) {
+            Ok(state) => state,
+            Err(err) => {
+                warn!(%err, "admin state load failed; serving empty admin authority");
+                crate::audit::append(
+                    &data_dir,
+                    serde_json::json!({
+                        "event": "admin-state-load-failed",
+                        "error": err.to_string(),
+                    }),
+                );
+                AdminState::empty()
+            }
+        };
         let seen = SeenStore::open(&data_dir, CONTROL_SEEN_CONFIG, now_unix_seconds());
         Ok(ControlNode {
             data_dir,
@@ -341,6 +362,7 @@ impl ControlNode {
             peers,
             pending,
             admins,
+            admin_state,
             outbound: VecDeque::new(),
             pending_rebase: VecDeque::new(),
             self_kind: ChildKind::Node,
@@ -756,6 +778,44 @@ impl ControlNode {
         }
     }
 
+    /// Reload the topology-admin state from disk, failing closed to an empty
+    /// state on any load error.
+    ///
+    /// Shared by the direct and routed entry points so an out-of-process edit
+    /// (`control admin priority ...`, `control admin state ...`) is observed
+    /// without a restart. Priority entries that are no longer node children are
+    /// pruned in memory (spec §4.5); the pruned form is written on the next
+    /// mutation. On failure it serves [`AdminState::empty`] and audits
+    /// `admin-state-load-failed`, but never writes over the persisted file, so a
+    /// previously-persisted lease bump survives.
+    fn reload_admin_state(&mut self) {
+        match AdminState::load(&self.data_dir) {
+            Ok(mut state) => {
+                let children: Vec<String> = self
+                    .record
+                    .record()
+                    .children
+                    .iter()
+                    .map(|child| child.child_id.clone())
+                    .collect();
+                if state.prune_missing_children(|id| children.iter().any(|child| child == id)) {
+                    self.audit(serde_json::json!({
+                        "event": "admin-state-pruned",
+                    }));
+                }
+                self.admin_state = state;
+            }
+            Err(err) => {
+                warn!(%err, "admin state reload failed; serving empty admin authority");
+                self.admin_state = AdminState::empty();
+                self.audit(serde_json::json!({
+                    "event": "admin-state-load-failed",
+                    "error": err.to_string(),
+                }));
+            }
+        }
+    }
+
     /// Reload the value policy from disk, failing closed to "no policy" on any
     /// load error.
     ///
@@ -859,6 +919,10 @@ impl ControlNode {
         // process is observed without a restart. On any load failure, serve no
         // delegated authority (fail closed).
         self.reload_admins();
+        // Full reload of the topology-admin priority/lease state so an
+        // out-of-process `control admin priority|state` edit is observed
+        // without a restart (fail closed to empty on error).
+        self.reload_admin_state();
         // Replay guard: per (origin, controller), keyed by the request nonce.
         // Control requests are terminal, so a marked nonce is never unobserved.
         let seen_origin = format!("{}:{}", signed.origin, signed.controller);
@@ -1109,8 +1173,12 @@ impl ControlNode {
         // any record/registry-dependent check below (the `target.addr` match and
         // `verify_forward`/`authorize`). Without this a routed request would be
         // refused against stale state after a CLI rewrite of `node.json` or
-        // `ledger_peers.json`.
+        // `ledger_peers.json`).
         self.refresh_control_plane();
+        // Observe an out-of-process `admin_state.json` rewrite without a restart
+        // (fail closed to empty on error), so authority reflects the seed/demote
+        // an operator just performed.
+        self.reload_admin_state();
         if routed.target.node != self.node_id {
             return Handled::Reply(ControlReply::Rejected(RejectCode::Unauthorized));
         }
