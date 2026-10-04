@@ -371,12 +371,16 @@
   let valueDialog = $state(null); // 'issue' | 'burn' | null
   let valueAmount = $state(0);
   let valueReason = $state('');
+  let valueAmountTouched = $state(false);
   let valueReasonTouched = $state(false);
   let valueBusy = $state(false);
   let pendingOp = $state(readPendingValueOp());
 
-  let valueAmountValid = $derived(Number.isFinite(valueAmount) && valueAmount > 0);
+  // The wasm value calls take the amount as an i64, so only a positive whole
+  // number is valid; anything else is refused before the call.
+  let valueAmountValid = $derived(Number.isInteger(valueAmount) && valueAmount > 0);
   let valueReasonValid = $derived(valueReason.trim().length > 0);
+  let valueAmountError = $derived(valueReasonErrorVisible(valueAmountTouched, valueAmountValid));
   let valueReasonError = $derived(valueReasonErrorVisible(valueReasonTouched, valueReasonValid));
   let valueAccountRow = $derived(valueAccounts.find((row) => row.id === valueAccount) ?? null);
 
@@ -385,11 +389,13 @@
     valueDialog = direction;
     valueAmount = 0;
     valueReason = '';
+    valueAmountTouched = false;
     valueReasonTouched = false;
   }
 
   async function submitValue() {
     if (!valueAccount) return;
+    valueAmountTouched = true;
     valueReasonTouched = true;
     if (!valueAmountValid || !valueReasonValid) return;
     valueBusy = true;
@@ -954,7 +960,19 @@
 >
   <div class="value-form">
     <label class="field-label" for="value-amount">Amount</label>
-    <input id="value-amount" type="number" min="1" class="field-input" bind:value={valueAmount} disabled={valueBusy} />
+    <input
+      id="value-amount"
+      type="number"
+      min="1"
+      step="1"
+      class="field-input"
+      bind:value={valueAmount}
+      oninput={() => { valueAmountTouched = true; }}
+      disabled={valueBusy}
+    />
+    {#if valueAmountError}
+      <span class="text-xs" style="color: var(--danger);">Enter a positive whole number.</span>
+    {/if}
     <label class="field-label" for="value-reason">Reason (required)</label>
     <input
       id="value-reason"

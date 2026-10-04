@@ -1624,13 +1624,16 @@ pub(crate) fn parse_receive_uri_inner(uri: &str) -> Result<ParsedReceiveUri, Str
 ///
 /// Returned by [`crate::ClientNode::discover_admin_targets`] (walk + cache) and
 /// [`crate::ClientNode::admin_targets`] (cache only). `depth` is 1-based: `1`
-/// is the browser's direct parent, and the last entry is the root.
+/// is the browser's direct parent. The walk deliberately stops at the first
+/// undesignated hop, so the last entry is only the *root* when `is_root` is
+/// true; otherwise it is the highest reachable ancestor.
 #[wasm_bindgen]
 #[derive(Clone)]
 pub struct AdminTargetDto {
     node: String,
     address: String,
     depth: f64,
+    is_root: bool,
 }
 
 impl AdminTargetDto {
@@ -1640,6 +1643,7 @@ impl AdminTargetDto {
             node: entry.node.clone(),
             address: entry.addr.to_string(),
             depth: entry.depth as f64,
+            is_root: entry.is_root,
         }
     }
 }
@@ -1663,6 +1667,13 @@ impl AdminTargetDto {
     #[wasm_bindgen(getter)]
     pub fn depth(&self) -> f64 {
         self.depth
+    }
+
+    /// Whether this ancestor is the actual network root. `false` for ordinary
+    /// entries and for a chain truncated at the first undesignated hop.
+    #[wasm_bindgen(getter)]
+    pub fn is_root(&self) -> bool {
+        self.is_root
     }
 }
 
@@ -2249,5 +2260,33 @@ mod tests {
             };
             assert_eq!(SettlementRecordDto::from_record(&record).status, expected);
         }
+    }
+
+    #[test]
+    fn admin_target_dto_maps_the_root_flag() {
+        let parent = AncestorEntry {
+            node: "parent-node".to_string(),
+            addr: "0.1".parse().unwrap(),
+            depth: 1,
+            is_root: false,
+        };
+        let root = AncestorEntry {
+            node: "root-node".to_string(),
+            addr: "0".parse().unwrap(),
+            depth: 2,
+            is_root: true,
+        };
+
+        let parent_dto = AdminTargetDto::from_entry(&parent);
+        assert_eq!(parent_dto.node, "parent-node");
+        assert_eq!(parent_dto.address, "0.1");
+        assert_eq!(parent_dto.depth, 1.0);
+        assert!(!parent_dto.is_root, "an interior hop is not the root");
+
+        let root_dto = AdminTargetDto::from_entry(&root);
+        assert_eq!(root_dto.node, "root-node");
+        assert_eq!(root_dto.address, "0");
+        assert_eq!(root_dto.depth, 2.0);
+        assert!(root_dto.is_root, "the true root is marked");
     }
 }

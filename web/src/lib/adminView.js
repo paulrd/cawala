@@ -51,26 +51,29 @@ export function shortId(id) {
 }
 
 /**
- * What one depth in the chain is called. Depth 1 is this browser's parent, the
- * deepest entry is the root; everything between is a level of the path.
+ * What one depth in the chain is called. Depth 1 is this browser's parent; the
+ * deepest entry is the root only when the walk actually reached it. The walk
+ * deliberately stops at the first undesignated hop (`discover_admin_targets`),
+ * so a truncated top is labelled "Top of chain" rather than falsely "Root".
  *
  * @param {number} depth 1-based depth above this browser
- * @param {number} maxDepth depth of the root
+ * @param {number} maxDepth depth of the reachable top
+ * @param {boolean} [topIsRoot] whether the `maxDepth` entry is the true root
  * @returns {string}
  */
-export function depthLabel(depth, maxDepth) {
+export function depthLabel(depth, maxDepth, topIsRoot = false) {
   if (depth === 1) return 'Parent';
-  if (maxDepth > 1 && depth === maxDepth) return 'Root';
+  if (depth === maxDepth) return topIsRoot ? 'Root' : 'Top of chain';
   return `Level ${depth}`;
 }
 
 /**
  * One row of the ancestor path breadcrumb: the crumbs run from this browser up
- * to the root, and exactly one is marked `current`.
+ * to the highest reachable ancestor, and exactly one is marked `current`.
  *
- * @param {Array<{ node: string, address: string|null, depth: number }>} targets
+ * @param {Array<{ node: string, address: string|null, depth: number, isRoot?: boolean }>} targets
  * @param {number|null} currentDepth the selected target's depth
- * @returns {Array<{ depth: number, node: string, address: string|null, label: string, current: boolean }>}
+ * @returns {Array<{ depth: number, node: string, address: string|null, isRoot: boolean, label: string, current: boolean }>}
  */
 export function buildAncestorPath(targets = [], currentDepth = null) {
   const list = [...(targets || [])].sort((a, b) => a.depth - b.depth);
@@ -79,7 +82,8 @@ export function buildAncestorPath(targets = [], currentDepth = null) {
     depth: target.depth,
     node: target.node,
     address: target.address ?? null,
-    label: depthLabel(target.depth, maxDepth),
+    isRoot: Boolean(target.isRoot),
+    label: depthLabel(target.depth, maxDepth, Boolean(target.isRoot)),
     current: currentDepth === target.depth,
   }));
 }

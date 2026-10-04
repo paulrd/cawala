@@ -26,9 +26,16 @@ const NODE_A = 'a1'.repeat(32);
 const NODE_B = 'b2'.repeat(32);
 
 const CHAIN = [
-  { node: NODE_A, address: '0.3.1', depth: 1 },
-  { node: NODE_B, address: '0.3', depth: 2 },
-  { node: 'root'.padEnd(64, '0'), address: '0', depth: 3 },
+  { node: NODE_A, address: '0.3.1', depth: 1, isRoot: false },
+  { node: NODE_B, address: '0.3', depth: 2, isRoot: false },
+  { node: 'root'.padEnd(64, '0'), address: '0', depth: 3, isRoot: true },
+];
+
+// The same chain as seen when the walk stopped at the first undesignated hop:
+// the top is the highest reachable ancestor, NOT the root.
+const TRUNCATED_CHAIN = [
+  { node: NODE_A, address: '0.3.1', depth: 1, isRoot: false },
+  { node: NODE_B, address: '0.3', depth: 2, isRoot: false },
 ];
 
 // ── identity / status constants ──────────────────────────────────────────────
@@ -83,7 +90,10 @@ test('shortId trims a node id to a stable head and tail', () => {
 test('depthLabel names the ends of the chain and numbers the middle', () => {
   assert.equal(depthLabel(1, 3), 'Parent');
   assert.equal(depthLabel(2, 3), 'Level 2');
-  assert.equal(depthLabel(3, 3), 'Root');
+  // The top is "Root" only when the walk actually reached the root.
+  assert.equal(depthLabel(3, 3, true), 'Root');
+  assert.equal(depthLabel(3, 3, false), 'Top of chain');
+  assert.equal(depthLabel(3, 3), 'Top of chain', 'truncated by default');
   // A single-level chain is just the parent, never "Root".
   assert.equal(depthLabel(1, 1), 'Parent');
   assert.equal(depthLabel(1, 0), 'Parent');
@@ -102,11 +112,25 @@ test('buildAncestorPath labels and orders the chain with one current crumb', () 
     path.map((crumb) => crumb.label),
     ['Parent', 'Level 2', 'Root'],
   );
+  assert.deepEqual(
+    path.map((crumb) => crumb.isRoot),
+    [false, false, true],
+  );
   assert.equal(path[1].current, true);
   assert.equal(path[0].current, false);
   assert.equal(path[2].current, false);
   assert.equal(path[0].node, NODE_A);
   assert.equal(path[0].address, '0.3.1');
+});
+
+test('buildAncestorPath labels a truncated top as "Top of chain", never "Root"', () => {
+  const path = buildAncestorPath(TRUNCATED_CHAIN, 2);
+  assert.deepEqual(
+    path.map((crumb) => crumb.label),
+    ['Parent', 'Top of chain'],
+  );
+  assert.equal(path[1].isRoot, false);
+  assert.ok(!path.some((crumb) => crumb.label === 'Root'));
 });
 
 test('buildAncestorPath tolerates unordered input, missing addresses and empties', () => {

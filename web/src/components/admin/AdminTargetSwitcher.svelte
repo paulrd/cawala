@@ -1,7 +1,7 @@
 <script>
   import { administeredNode, adminLock, targetEpoch } from '../../lib/stores.svelte.js';
   import { getAdminTargets, discoverAdminTargets, stepAdminTarget, adminTargetBounds } from '../../lib/api.js';
-  import { buildAncestorPath, depthLabel, shortId, statusBadge } from '../../lib/adminView.js';
+  import { buildAncestorPath, shortId, statusBadge } from '../../lib/adminView.js';
   import { kindLabel, kindBadgeVariant } from '../../lib/nodeKind.js';
   import Badge from '../shared/Badge.svelte';
   import AdminUnlockDialog from './AdminUnlockDialog.svelte';
@@ -40,7 +40,7 @@
   });
 
   let crumbs = $derived(buildAncestorPath(targets, bounds?.current ?? null));
-  let maxDepth = $derived(crumbs.length ? crumbs[crumbs.length - 1].depth : 0);
+  let currentCrumb = $derived(crumbs.find((crumb) => crumb.current) ?? null);
   let status = $derived(statusBadge(view.status));
 
   let canUp = $derived(!locked && bounds != null && bounds.current != null && bounds.current < bounds.max);
@@ -151,7 +151,7 @@
             class:crumb--current={crumb.current}
             onclick={() => jump(crumb.depth)}
             aria-current={crumb.current ? 'true' : undefined}
-            title="{depthLabel(crumb.depth, maxDepth)} · node {crumb.node}"
+            title="{crumb.label} · node {crumb.node}"
           >
             <span class="crumb-label">{crumb.label}</span>
             {#if crumb.address}
@@ -170,7 +170,7 @@
             Address <code class="mono">{view.address}</code> ·
           {/if}
           Node <code class="mono">{shortId(view.nodeId)}</code> ·
-          {depthLabel(bounds.current ?? 1, maxDepth).toLowerCase()} of {crumbs.length}
+          {(currentCrumb?.label ?? 'Target').toLowerCase()} of {crumbs.length}
           {bounds.count > 1 ? 'levels' : 'level'} above this browser
         </p>
       {/if}

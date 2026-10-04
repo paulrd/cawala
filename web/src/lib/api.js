@@ -39,6 +39,7 @@ import {
   ledgerState,
   apiCapabilities,
   administeredNode,
+  adminCapabilities,
   adminLock,
   applyAdministeredNode,
   applyAdminCapabilities,
@@ -130,6 +131,18 @@ export function isMockMode() {
  */
 export function isIdentityPersistent() {
   return _identityPersistent;
+}
+
+/**
+ * Test-only seam: install a fake wasm client and switch the module into live
+ * mode (`node != null`) without touching the network, wasm, or storage. Passing
+ * `null` restores mock mode. Not used by the app; it exists so the live-call
+ * boundary (e.g. the `bigint` amount) can be unit-tested on plain Node.
+ * @param {object|null} node
+ */
+export function __setClientForTest(node) {
+  _clientNode = node ?? null;
+  _useMock = _clientNode == null;
 }
 
 // ── Initialization ────────────────────────────────────────────
@@ -562,10 +575,11 @@ export async function discoverAdminTargets() {
   if (_useMock) {
     await mockDelay(200);
     // Mock is a data source, not a layout: two ancestors so the up/down
-    // control has both an enabled and a disabled end to exercise.
+    // control has both an enabled and a disabled end to exercise. The walk is
+    // complete, so the synthetic chain reaches the root.
     next = [
-      { node: MOCK_NODE_ID, address: '0.3', depth: 1 },
-      { node: `${MOCK_NODE_ID}-root`, address: '0', depth: 2 },
+      { node: MOCK_NODE_ID, address: '0.3', depth: 1, isRoot: false },
+      { node: `${MOCK_NODE_ID}-root`, address: '0', depth: 2, isRoot: true },
     ];
   } else {
     const node = _requireNode();
@@ -576,6 +590,9 @@ export async function discoverAdminTargets() {
           node: String(dto.node),
           address: dto.address ?? null,
           depth: Number(dto.depth),
+          // The walk stops at the first undesignated hop; only the node that
+          // actually had no parent is the root.
+          isRoot: Boolean(dto.is_root),
         });
       }
     } finally {
@@ -2788,6 +2805,16 @@ async function _adminValue(
 ) {
   const target = _requireAdminTarget('issue or burn value', nodeId);
 
+  // The value dialog validates the same conditions, but this is the hard
+  // boundary: the wasm calls take the amount as an `i64`/`bigint`, so a
+  // fractional or non-positive JS number must be refused here — passing a plain
+  // `Number` would throw `TypeError: Cannot convert … to a BigInt` before any
+  // network call, and the mock short-circuit below would hide it.
+  if (!Number.isInteger(amount) || amount <= 0) {
+    throw new RangeError('Amount must be a positive whole number.');
+  }
+  const wasmAmount = BigInt(amount);
+
   if (_useMock) {
     await mockDelay(500);
     const requestId = reuseRequestId ?? _randomRequestId();
@@ -2827,8 +2854,8 @@ async function _adminValue(
   try {
     const dto =
       direction === 'issue'
-        ? await node.admin_issue(target, requestId, account, amount, reason)
-        : await node.admin_burn(target, requestId, account, amount, reason);
+        ? await node.admin_issue(target, requestId, account, wasmAmount, reason)
+        : await node.admin_burn(target, requestId, account, wasmAmount, reason);
     const result = {
       status: dto.duplicate ? 'duplicate' : 'applied',
       requestId: dto.request_id,

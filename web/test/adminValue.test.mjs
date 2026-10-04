@@ -36,8 +36,14 @@ const {
   valueErrorMessage,
   readPendingValueOp,
   clearPendingValueOp,
+  adminIssue,
+  adminBurn,
+  __setClientForTest,
   VALUE_PENDING_KEY,
 } = await import('../src/lib/api.js');
+const { administeredNode, adminCapabilities, adminLock } = await import(
+  '../src/lib/stores.svelte.js'
+);
 
 // ── canAdministerValue ───────────────────────────────────────────────────────
 
@@ -122,4 +128,88 @@ test('value reject codes map to honest copy', () => {
 
   // A non-marker error message is passed through unchanged.
   assert.equal(valueErrorMessage('network down'), 'network down');
+});
+
+// ── Live wasm boundary: the amount must cross as a bigint ────────────────────
+
+const FAKE_DTO = {
+  request_id: 'ab'.repeat(16),
+  account: 'acct',
+  direction: 'issue',
+  amount: 25,
+  balance_after: 25,
+  seq: 1,
+  entry_hash: '00'.repeat(32),
+  duplicate: false,
+  free() {},
+};
+
+/** Install a fake live client and open the admin-target gates for a test. */
+function enterLiveMode(calls) {
+  administeredNode.isSelf = false;
+  adminCapabilities.canAdminister = true;
+  adminLock.unlocked = true;
+  __setClientForTest({
+    async admin_issue(...args) {
+      calls.push(['issue', ...args]);
+      return FAKE_DTO;
+    },
+    async admin_burn(...args) {
+      calls.push(['burn', ...args]);
+      return FAKE_DTO;
+    },
+  });
+}
+
+function restoreMockMode() {
+  __setClientForTest(null);
+  administeredNode.isSelf = true;
+  adminCapabilities.canAdminister = false;
+  adminLock.unlocked = false;
+}
+
+test('live issue/burn pass the amount as a bigint to wasm', async () => {
+  reset();
+  const calls = [];
+  enterLiveMode(calls);
+  try {
+    await adminIssue('acct', 25, 'top-up', 'target');
+    assert.equal(calls.length, 1);
+    const [kind, target, requestId, account, amount, reason] = calls[0];
+    assert.equal(kind, 'issue');
+    assert.equal(target, 'target');
+    assert.equal(typeof requestId, 'string');
+    assert.equal(account, 'acct');
+    assert.equal(typeof amount, 'bigint', 'the i64 param needs a BigInt');
+    assert.equal(amount, 25n);
+    assert.equal(reason, 'top-up');
+
+    await adminBurn('acct', 7, 'write-off', 'target');
+    assert.equal(calls.length, 2);
+    assert.equal(typeof calls[1][4], 'bigint');
+    assert.equal(calls[1][4], 7n);
+  } finally {
+    restoreMockMode();
+  }
+});
+
+test('live value ops reject a non-integer or non-positive amount before wasm', async () => {
+  reset();
+  const calls = [];
+  enterLiveMode(calls);
+  try {
+    for (const bad of [2.5, 0, -3, Number.NaN, Number.POSITIVE_INFINITY]) {
+      await assert.rejects(
+        () => adminIssue('acct', bad, 'reason', 'target'),
+        /positive whole number/i,
+      );
+      await assert.rejects(
+        () => adminBurn('acct', bad, 'reason', 'target'),
+        /positive whole number/i,
+      );
+    }
+    assert.equal(calls.length, 0, 'no wasm call is made for an invalid amount');
+  } finally {
+    restoreMockMode();
+  }
 });

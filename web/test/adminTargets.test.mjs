@@ -121,6 +121,11 @@ test('unlocking acknowledges the policy and discovers the ancestor chain', async
     targets.map((t) => t.node),
     ['mock', 'mock-root'],
   );
+  // The synthetic walk reaches the root, so the top crumb is the true root.
+  assert.deepEqual(
+    targets.map((t) => t.isRoot),
+    [false, true],
+  );
   // getAdminTargets returns copies, not the live cache.
   targets[0].depth = 99;
   assert.equal(getAdminTargets()[0].depth, 1);

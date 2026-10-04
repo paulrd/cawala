@@ -69,6 +69,11 @@ pub(crate) struct AncestorEntry {
     pub addr: OctAddr,
     /// 1-based depth: `1` is the direct parent, `2` the grandparent, and so on.
     pub depth: usize,
+    /// Whether this ancestor is the actual network root (it answered with no
+    /// parent), rather than merely the highest hop reached before an
+    /// undesignated hop refused the walk. Only the true root entry is `true`;
+    /// ordinary entries and a truncated top are `false`.
+    pub is_root: bool,
 }
 
 /// A completed ancestor walk, keyed on the `(self_addr, parent id)` it was
@@ -675,6 +680,8 @@ pub(crate) fn validate_ancestor_link(
         node: parent.node_id.as_str().to_string(),
         addr: parent.address.clone(),
         depth: next_depth,
+        // The next hop is only known to be the root once it answers.
+        is_root: false,
     }))
 }
 
@@ -712,10 +719,15 @@ pub(crate) fn ancestor_walk_step(
             )?;
             let addr = ancestor_address_at(self_addr, depth)
                 .ok_or_else(|| "ancestor depth is not a strict ancestor of self".to_string())?;
+            // `next == None` means this answered node had no parent, so it is
+            // the true root. A later refusal leaves the last recorded entry
+            // (the highest reachable hop) with `is_root == false`.
+            let is_root = next.is_none();
             entries.push(AncestorEntry {
                 node: expected_node.to_string(),
                 addr,
                 depth,
+                is_root,
             });
             Ok(next)
         }
@@ -1194,6 +1206,7 @@ mod tests {
                 node: "root-node".to_string(),
                 addr: "0".parse().unwrap(),
                 depth: 2,
+                is_root: false,
             })
         );
 
@@ -1296,6 +1309,7 @@ mod tests {
                 node: "root-node".to_string(),
                 addr: "0".parse().unwrap(),
                 depth: 2,
+                is_root: false,
             })
         );
         assert_eq!(
@@ -1304,11 +1318,13 @@ mod tests {
                 node: "parent-node".to_string(),
                 addr: "0.1".parse().unwrap(),
                 depth: 1,
+                is_root: false,
             }]
         );
 
         // Depth 2 refuses (the grandparent has not designated the parent): the
-        // walk terminates with the direct-parent prefix intact.
+        // walk terminates with the direct-parent prefix intact, and the top is
+        // NOT the root.
         let stop = ancestor_walk_step(
             &self_addr,
             2,
@@ -1320,6 +1336,10 @@ mod tests {
         assert_eq!(stop, None);
         assert_eq!(entries.len(), 1, "the direct-parent target is retained");
         assert_eq!(entries[0].node, "parent-node");
+        assert!(
+            !entries[0].is_root,
+            "a truncated top must not claim to be the root"
+        );
 
         // A depth-1 refusal is a hard error and records nothing: there is no
         // admin link at all.
@@ -1335,6 +1355,57 @@ mod tests {
             .is_err()
         );
         assert!(empty.is_empty());
+    }
+
+    /// The top of a completed walk is marked `is_root`; ordinary hops are not.
+    #[test]
+    fn discovery_marks_only_the_true_root() {
+        use cawala_control::ParentSnapshot;
+
+        let self_addr: OctAddr = "0.1.3".parse().expect("sample address parses");
+        let mid_snapshot = NodeSnapshot {
+            node_id: NodeId::from("mid-node"),
+            address: Some("0.1".parse().expect("mid address parses")),
+            parent: Some(ParentSnapshot {
+                node_id: NodeId::from("root-node"),
+                slot: 1,
+                address: "0".parse().expect("root address parses"),
+            }),
+            children: vec![],
+        };
+        let root_snapshot = NodeSnapshot {
+            node_id: NodeId::from("root-node"),
+            address: Some("0".parse().expect("root address parses")),
+            parent: None,
+            children: vec![],
+        };
+
+        let mut entries = Vec::new();
+        // Depth 1: parent answers with a parent link -> not the root.
+        ancestor_walk_step(
+            &self_addr,
+            1,
+            "mid-node",
+            &ControlReply::Snapshot(mid_snapshot),
+            &mut entries,
+        )
+        .expect("depth-1 answer accepted");
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].is_root, "an interior hop is not the root");
+
+        // Depth 2: the true root answers with no parent link -> `is_root`.
+        let root_entry = ancestor_walk_step(
+            &self_addr,
+            2,
+            "root-node",
+            &ControlReply::Snapshot(root_snapshot),
+            &mut entries,
+        )
+        .expect("root answer accepted");
+        assert_eq!(root_entry, None, "the walk stops at the true root");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].node, "root-node");
+        assert!(entries[1].is_root, "the true root must be marked as such");
     }
 
     /// The `ancestor_address` cache branch matches the `(self_addr, parent)`
@@ -1355,11 +1426,13 @@ mod tests {
                     node: "parent-node".to_string(),
                     addr: "0.1".parse().unwrap(),
                     depth: 1,
+                    is_root: false,
                 },
                 AncestorEntry {
                     node: "root-node".to_string(),
                     addr: "0".parse().unwrap(),
                     depth: 2,
+                    is_root: true,
                 },
             ],
         };
