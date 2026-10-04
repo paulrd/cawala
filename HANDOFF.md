@@ -17,7 +17,12 @@ how to verify, and conventions**. Detail lives elsewhere:
 ## Next session brief
 
 The **administration refactor (P1–P5) is DONE, gated, merged to `main`, and
-pushed** (`ec31535`). Authority is an explicit per-node **designation set**: a
+pushed** (`ec31535`), plus a follow-up **value simplification** (`871e4d5`):
+`AdminIssue`/`AdminBurn`/`AdminLedgerQuery` are handled like every other admin
+action (authority and ledger idempotency key on the authenticated last-hop admin
+child), and the `value_policy.json` cap system is removed — issue is **uncapped**,
+burn is bounded by the account balance. Authority is an explicit per-node
+**designation set**: a
 node lists the children (node *or* leaf) allowed to administer it; there is **no
 priority list, TTL, lease, epoch, or automatic failover**, and browsers have no
 automatic authority. All admin is tree-routed; routed
@@ -31,7 +36,7 @@ Next: the optional backlog in "Open items" below (notably the final
 
 ## Current state
 
-- `main` is clean and pushed @ `ec31535` (was `11d7717` before the refactor).
+- `main` is clean and pushed @ `871e4d5` (was `11d7717` before the refactor).
 - **Administration refactor** (merged; the `refactor/topology-admin` branch was
   fast-forwarded in and deleted); P1–P5 done, gated:
   - Control wire: **control format 8** (mint 8; accept 7|8), **routed control 2**
@@ -47,6 +52,9 @@ Next: the optional backlog in "Open items" below (notably the final
     `senior.rs`; browser `cawala.admin.*` store + grant/key UI.
   - Web: admin lock gate (policy acknowledgement of `ADMIN_POLICY.md`), dedicated
     Admin page, ancestor-chain up/down target switcher, simplified nav.
+  - Value: no `value_policy.json`; `AdminIssue`/`AdminBurn`/`AdminLedgerQuery` are
+    uniform admin actions (last-hop authority + ledger idempotency); issue is
+    uncapped, burn is bounded by the account balance.
   - Tests: `CARGO_BUILD_JOBS=1 cargo test --workspace` passes / clippy clean /
     wasm check ok.
 - `web/src/wasm/` is gitignored and generated; run `npm run build:wasm` (or
