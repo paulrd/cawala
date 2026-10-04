@@ -37,16 +37,14 @@ pub mod value_policy;
 
 pub use admin_cli::AdminCliError;
 pub use admin_state::{
-    ADMIN_STATE_FILE, ADMIN_STATE_VERSION, DEFAULT_ADMIN_TTL_SECS, MAX_ADMIN_STATE_TTL_SECS,
-    MAX_PRIORITY, AdminState, AdminStateError,
+    ADMIN_STATE_FILE, ADMIN_STATE_VERSION, MAX_DESIGNATED_ADMINS, AdminState, AdminStateError,
 };
 pub use audit::CONTROL_AUDIT_FILE;
 pub use control::{
-    ADMIN_PROBE_TIMEOUT_SECS, Authority, ControlHandler, ControlNode, Handled,
-    MAX_ADMIN_PROBE_CADENCE_SECS, OutboundControl, OutboundKind, PendingLedgerMutation,
-    PendingLedgerQuery, admin_failover_probe, admin_probe_cadence, spawn_control_node,
-    spawn_control_node_live_with_ledger, spawn_control_node_live_on_with_ledger,
-    spawn_control_node_on, spawn_control_only, spawn_control_only_on,
+    Authority, ControlHandler, ControlNode, Handled, OutboundControl, OutboundKind,
+    PendingLedgerMutation, PendingLedgerQuery, spawn_control_node, spawn_control_node_live_with_ledger,
+    spawn_control_node_live_on_with_ledger, spawn_control_node_on, spawn_control_only,
+    spawn_control_only_on,
 };
 pub use control_store::{ControlStore, OUTBOUND_JOIN_FILE, OutboundJoin, PENDING_JOINS_FILE};
 pub use ledger_keys::{LEDGER_KEY_FILE, load_or_create_ledger_key, persist_ledger_key};

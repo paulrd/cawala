@@ -89,8 +89,8 @@ pub struct ChildEntry {
     pub kind: ChildKind,
     pub slot: u8,
     /// Unix seconds when the child first joined this parent. Kept when a child
-    /// is re-parented (moved) so seniority ("earliest `date_joined`") survives
-    /// address reassignment; slot/address is geography, not seniority.
+    /// is re-parented (moved) so its original join date survives address
+    /// reassignment; slot/address is geography, not join order.
     pub date_joined: u64,
 }
 
@@ -397,7 +397,7 @@ impl RecordStore {
     }
 
     /// Re-slot a direct child in a single validated mutation, preserving its
-    /// kind and `date_joined` (slot/address is geography, not seniority).
+    /// kind and `date_joined` (slot/address is geography, not join order).
     ///
     /// The subtree routing epoch ([`NodeRecord::address_epoch`]) is bumped
     /// **exactly when the effective slot actually changes**: a same-slot move is

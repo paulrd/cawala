@@ -628,33 +628,6 @@ impl AdminValueRequest {
     }
 }
 
-/// A current priority administrator's lease renewal (direct child→parent).
-///
-/// Field order is frozen: postcard encodes positionally. `epoch` must equal the
-/// node's `admin_state.epoch`; `ttl_secs` is the requested duration, which the
-/// node clamps to its configured `ttl_secs`. Added in
-/// [`CONTROL_FORMAT_VERSION`](crate::CONTROL_FORMAT_VERSION) 8 (variant 21).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdminLeaseRequest {
-    /// Must equal the node's `admin_state.epoch`.
-    pub epoch: u64,
-    /// Requested lease duration in seconds; the node clamps to its `ttl_secs`.
-    pub ttl_secs: u64,
-}
-
-/// A node-initiated failover probe to the next priority candidate (direct
-/// parent→child), asking the candidate to confirm liveness. Grants nothing.
-///
-/// Field order is frozen: postcard encodes positionally. Added in
-/// [`CONTROL_FORMAT_VERSION`](crate::CONTROL_FORMAT_VERSION) 8 (variant 22).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdminLeaseProbe {
-    /// The node's current `admin_state.epoch`.
-    pub epoch: u64,
-    /// The priority index being probed.
-    pub index: u8,
-}
-
 /// The v1 control-request payload.
 ///
 /// Variant order is frozen: postcard encodes the discriminant positionally.
@@ -706,12 +679,6 @@ pub enum ControlRequest {
     AdminIssue(AdminValueRequest),
     /// Value-scoped admin burn from a child account (discriminant 20, format 7).
     AdminBurn(AdminValueRequest),
-    /// A current priority administrator's lease renewal, direct child→parent
-    /// (discriminant 21, format 8).
-    AdminLease(AdminLeaseRequest),
-    /// A node-initiated failover probe to the next priority candidate, direct
-    /// parent→child (discriminant 22, format 8).
-    AdminLeaseProbe(AdminLeaseProbe),
 }
 
 impl ControlRequest {
@@ -739,8 +706,6 @@ impl ControlRequest {
             ControlRequest::AdminMoveChild(_) => "admin-move-child",
             ControlRequest::AdminIssue(_) => "admin-issue",
             ControlRequest::AdminBurn(_) => "admin-burn",
-            ControlRequest::AdminLease(_) => "admin-lease",
-            ControlRequest::AdminLeaseProbe(_) => "admin-lease-probe",
         }
     }
 
@@ -748,9 +713,7 @@ impl ControlRequest {
     ///
     /// This is a **class predicate only**: it selects the variants that are
     /// subject to the admin authorization path. The authority itself is
-    /// topology-derived (R4/R5); there is no scope lookup. Lease traffic
-    /// (`AdminLease`/`AdminLeaseProbe`) is deliberately not admin: it is
-    /// authenticated by the priority/lease check, never by an admin class.
+    /// topology-derived (R4/R5); there is no scope lookup.
     pub fn is_admin(&self) -> bool {
         matches!(
             self,
@@ -892,14 +855,6 @@ mod tests {
             }),
             ControlRequest::AdminIssue(value_request()),
             ControlRequest::AdminBurn(value_request()),
-            ControlRequest::AdminLease(AdminLeaseRequest {
-                epoch: 42,
-                ttl_secs: 300,
-            }),
-            ControlRequest::AdminLeaseProbe(AdminLeaseProbe {
-                epoch: 42,
-                index: 1,
-            }),
         ]
     }
 
@@ -930,8 +885,6 @@ mod tests {
                 "admin-move-child",
                 "admin-issue",
                 "admin-burn",
-                "admin-lease",
-                "admin-lease-probe",
             ]
         );
     }
@@ -1197,72 +1150,6 @@ mod tests {
         assert_eq!(move_child[0], 18);
         assert_eq!(issue[0], 19);
         assert_eq!(burn[0], 20);
-    }
-
-    #[test]
-    fn lease_discriminants_are_frozen() {
-        // Variants 21 and 22 (0-based). An insert or reorder would shift
-        // their discriminants.
-        let lease = postcard::to_allocvec(&ControlRequest::AdminLease(AdminLeaseRequest {
-            epoch: 42,
-            ttl_secs: 300,
-        }))
-        .unwrap();
-        let probe =
-            postcard::to_allocvec(&ControlRequest::AdminLeaseProbe(AdminLeaseProbe {
-                epoch: 42,
-                index: 1,
-            }))
-            .unwrap();
-        assert_eq!(lease[0], 21);
-        assert_eq!(probe[0], 22);
-    }
-
-    #[test]
-    fn lease_variants_are_not_admin() {
-        for request in [
-            ControlRequest::AdminLease(AdminLeaseRequest {
-                epoch: 42,
-                ttl_secs: 300,
-            }),
-            ControlRequest::AdminLeaseProbe(AdminLeaseProbe {
-                epoch: 42,
-                index: 1,
-            }),
-        ] {
-            assert!(!request.is_admin(), "{request:?}");
-            assert!(!is_admin_request(&request), "{request:?}");
-        }
-    }
-
-    #[test]
-    fn lease_field_order() {
-        let lease = AdminLeaseRequest {
-            epoch: 42,
-            ttl_secs: 300,
-        };
-        assert_postcard_field_order(
-            &lease,
-            &[
-                postcard::to_allocvec(&lease.epoch).unwrap(),
-                postcard::to_allocvec(&lease.ttl_secs).unwrap(),
-            ],
-        );
-
-        let probe = AdminLeaseProbe { epoch: 42, index: 1 };
-        assert_postcard_field_order(
-            &probe,
-            &[
-                postcard::to_allocvec(&probe.epoch).unwrap(),
-                postcard::to_allocvec(&probe.index).unwrap(),
-            ],
-        );
-        // Both structs lead with `epoch: u64`; the differing second field must
-        // change the encoding, so a reorder would be caught here.
-        assert_ne!(
-            postcard::to_allocvec(&lease).unwrap(),
-            postcard::to_allocvec(&probe).unwrap()
-        );
     }
 
     #[test]

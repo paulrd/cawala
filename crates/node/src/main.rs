@@ -11,8 +11,7 @@ use cawala_control::{
 use cawala_ledger::{AccountRef, Amount, EntryBody, LedgerPubKey, commitment_hash, verify_chain};
 use cawala_msg::{MSG_CONTROL_V1, MSG_LEDGER_V1, MSG_SETTLE_V1};
 use cawala_node::control::{
-    ADMIN_PROBE_TIMEOUT_SECS, admin_failover_probe, admin_probe_cadence, pull_rebase_from_parent,
-    spawn_control_node_live, sweep_pending_rebase,
+    pull_rebase_from_parent, spawn_control_node_live, sweep_pending_rebase,
 };
 use cawala_node::msg::{
     NeighborSource, dispatch_control_envelope, dispatch_ledger_envelope, dispatch_settle_envelope,
@@ -67,8 +66,8 @@ enum Command {
         #[command(subcommand)]
         command: MsgCommand,
     },
-    /// Direct control-plane commands (M4): join handshake and senior-child
-    /// topology control.
+    /// Direct control-plane commands (M4): join handshake and topology
+    /// control.
     Control {
         #[command(subcommand)]
         command: ControlCommand,
@@ -80,8 +79,8 @@ enum Command {
 /// `node`/`parent` are always an iroh `EndpointId` (hex or base32). Commands
 /// that mutate a *neighbor's* topology address that neighbor directly: the
 /// request is self-signed by this node's operator key and authorized at the
-/// target either as self-admin or as its senior child. In v1 control is
-/// direct-only (no tree routing).
+/// target either as self-admin or as one of its designated administrator
+/// children. In v1 control is direct-only (no tree routing).
 #[derive(Subcommand)]
 enum ControlCommand {
     /// Send a self-signed join request to a prospective parent, either by
@@ -251,7 +250,7 @@ enum ControlCommand {
     /// Informational only: one-shot liveness probe of this node's recorded
     /// parent, with no gating and no new persisted state.
     ParentStatus,
-    /// Manage this node's admin grants (operator-signed delegations).
+    /// Manage this node's explicit administrator designation set.
     Admin {
         #[command(subcommand)]
         command: AdminCommand,
@@ -260,69 +259,30 @@ enum ControlCommand {
 
 /// `control admin` subcommands, backed by [`admin_cli`].
 ///
-/// `priority` and `state` are **local** operator commands: they edit
+/// `add`, `remove`, and `list` are **local** operator commands: they edit
 /// `<data-dir>/admin_state.json` directly (no network), and a running node
 /// observes the edit via its per-request admin-state reload. `value-policy`
 /// edits the local value-policy file. The online admin/topology commands are
 /// restricted to this node until P3/P4 reroute them.
 #[derive(Subcommand)]
 enum AdminCommand {
-    /// Show or edit the topology-derived priority list (explicit admin seed).
-    #[command(subcommand)]
-    Priority(PriorityCommand),
-    /// Show or edit the current priority administrator / lease state.
-    #[command(subcommand)]
-    State(StateCommand),
-    /// Show or set the operator value policy (delegated issue/burn caps).
-    #[command(subcommand)]
-    ValuePolicy(ValuePolicyCommand),
-}
-
-/// `control admin priority` subcommands.
-#[derive(Subcommand)]
-enum PriorityCommand {
-    /// Print the priority list and current administrator.
-    Show,
-    /// Add a child to the priority list (bootstraps the first admin).
+    /// Designate a current child as an administrator (bootstraps the first).
     Add {
         /// The child's `EndpointId`.
         #[arg(value_name = "CHILD_NODE_ID")]
         child: String,
-        /// Insert at the child's `(date_joined, id)` join-order position
-        /// instead of appending.
-        #[arg(long)]
-        by_join_order: bool,
     },
-    /// Remove a child from the priority list (demotion).
+    /// Revoke a child's administrator designation.
     Remove {
         /// The child's `EndpointId`.
         #[arg(value_name = "CHILD_NODE_ID")]
         child: String,
     },
-    /// Move a priority entry to a new zero-based index.
-    Move {
-        /// The child's `EndpointId`.
-        #[arg(value_name = "CHILD_NODE_ID")]
-        child: String,
-        /// The target zero-based index.
-        #[arg(long, value_name = "INDEX")]
-        to: usize,
-    },
-}
-
-/// `control admin state` subcommands.
-#[derive(Subcommand)]
-enum StateCommand {
-    /// Print the current priority/lease state.
-    Show,
-    /// Set the current administrator, or `none` to clear it.
-    SetCurrent {
-        /// The child's `EndpointId`, or the literal `none`.
-        #[arg(value_name = "CHILD_NODE_ID|none")]
-        child: String,
-    },
-    /// Clear the priority list and current administrator (bumps the epoch).
-    Reset,
+    /// Print the designated administrator set.
+    List,
+    /// Show or set the operator value policy (delegated issue/burn caps).
+    #[command(subcommand)]
+    ValuePolicy(ValuePolicyCommand),
 }
 
 /// `control admin value-policy` subcommands.
@@ -523,7 +483,7 @@ enum TopoCommand {
         slot: Option<u8>,
         /// Unix seconds the child first joined; omitted defaults to now.
         /// Pass the child's original value when re-attaching a moved child to
-        /// keep its seniority; omit to reset it.
+        /// keep its original join date; omit to reset it.
         #[arg(long, value_name = "EPOCH_SECONDS")]
         date_joined: Option<u64>,
     },
@@ -710,7 +670,6 @@ async fn run(data_dir: PathBuf) -> Result<()> {
         let sweep_node = node_id.clone();
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         let mut tick: u64 = 0;
-        let mut last_admin_probe: u64 = 0;
         loop {
             ticker.tick().await;
             tick = tick.wrapping_add(1);
@@ -728,28 +687,6 @@ async fn run(data_dir: PathBuf) -> Result<()> {
             .await;
             // Retry topology notices whose immediate dial failed.
             sweep_pending_rebase(&sweep_endpoint, &sweep_control).await;
-            // Active admin failover: on a `ttl_secs / 3` cadence (bounded), a
-            // node with an expired/absent lease probes the priority candidates
-            // in order and promotes the first responsive one (spec §5.3 step 2).
-            // Offline harnesses inject liveness via `set_admin_probe_alive`; this
-            // is the live probe sender.
-            let cadence = {
-                let engine = sweep_control.lock().await;
-                admin_probe_cadence(engine.admin_state().ttl_secs())
-            };
-            if last_admin_probe == 0 || now.saturating_sub(last_admin_probe) >= cadence {
-                last_admin_probe = now;
-                if admin_failover_probe(
-                    &sweep_endpoint,
-                    &sweep_control,
-                    Duration::from_secs(ADMIN_PROBE_TIMEOUT_SECS),
-                    now,
-                )
-                .await
-                {
-                    info!("admin failover probe updated the priority lease");
-                }
-            }
             // Low-frequency healing probe: repeated hop rejections are not
             // visible to the control engine (routing lives in the msg layer), so
             // a node with a parent re-asks it for the current prefix every ~30s.
@@ -1955,80 +1892,32 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
     Ok(())
 }
 
-/// Local `control admin priority|state|value-policy`, delegating to [`admin_cli`].
+/// Local `control admin add|remove|list|value-policy`, delegating to
+/// [`admin_cli`].
 fn admin_command(
     data_dir: &std::path::Path,
     node_id: &str,
     operator: &OperatorSecretKey,
     command: AdminCommand,
 ) -> Result<()> {
+    let now = now_unix_seconds();
     match command {
-        AdminCommand::Priority(command) => {
-            priority_command(data_dir, node_id, operator, command)?;
+        AdminCommand::Add { child } => {
+            let state = admin_cli::admin_add(data_dir, node_id, operator, &child, now)
+                .map_err(cli_error)?;
+            print_admin_state(&state);
         }
-        AdminCommand::State(command) => {
-            state_command(data_dir, node_id, operator, command)?;
+        AdminCommand::Remove { child } => {
+            let state = admin_cli::admin_remove(data_dir, node_id, operator, &child, now)
+                .map_err(cli_error)?;
+            print_admin_state(&state);
+        }
+        AdminCommand::List => {
+            let state = admin_cli::admin_list(data_dir).map_err(cli_error)?;
+            print_admin_state(&state);
         }
         AdminCommand::ValuePolicy(command) => {
             value_policy_command(data_dir, command)?;
-        }
-    }
-    Ok(())
-}
-
-/// Local `control admin priority show|add|remove|move`.
-fn priority_command(
-    data_dir: &std::path::Path,
-    node_id: &str,
-    operator: &OperatorSecretKey,
-    command: PriorityCommand,
-) -> Result<()> {
-    let now = now_unix_seconds();
-    let state = match command {
-        PriorityCommand::Show => admin_cli::state_show(data_dir).map_err(cli_error)?,
-        PriorityCommand::Add { child, by_join_order } => {
-            admin_cli::priority_add(data_dir, node_id, operator, &child, by_join_order, now)
-                .map_err(cli_error)?
-        }
-        PriorityCommand::Remove { child } => {
-            admin_cli::priority_remove(data_dir, node_id, operator, &child, now)
-                .map_err(cli_error)?
-        }
-        PriorityCommand::Move { child, to } => {
-            admin_cli::priority_move(data_dir, node_id, operator, &child, to, now)
-                .map_err(cli_error)?
-        }
-    };
-    print_admin_state(&state, now);
-    Ok(())
-}
-
-/// Local `control admin state show|set-current|reset`.
-fn state_command(
-    data_dir: &std::path::Path,
-    node_id: &str,
-    operator: &OperatorSecretKey,
-    command: StateCommand,
-) -> Result<()> {
-    let now = now_unix_seconds();
-    match command {
-        StateCommand::Show => {
-            let state = admin_cli::state_show(data_dir).map_err(cli_error)?;
-            print_admin_state(&state, now);
-        }
-        StateCommand::SetCurrent { child } => {
-            let target = if child == "none" {
-                None
-            } else {
-                Some(child.as_str())
-            };
-            let state = admin_cli::state_set_current(data_dir, node_id, operator, target, now)
-                .map_err(cli_error)?;
-            println!("set-current: {} (epoch {})", current_label(&state), state.epoch());
-        }
-        StateCommand::Reset => {
-            let state = admin_cli::state_reset(data_dir, now).map_err(cli_error)?;
-            println!("reset: current={} epoch={}", state.current_index(), state.epoch());
         }
     }
     Ok(())
@@ -2039,41 +1928,16 @@ fn cli_error(err: cawala_node::AdminCliError) -> anyhow::Error {
     anyhow::anyhow!("{err}")
 }
 
-/// Render the current administrator for one-line output.
-fn current_label(state: &cawala_node::AdminState) -> String {
-    match state.current_id() {
-        Some(id) => format!("{} (index {})", id.as_str(), state.current_index()),
-        None => "none".to_string(),
-    }
-}
-
-/// Print the persisted priority/lease state.
-fn print_admin_state(state: &cawala_node::AdminState, now: u64) {
-    if state.priority().is_empty() {
-        println!("priority: (none)");
+/// Print the persisted administrator designation set.
+fn print_admin_state(state: &cawala_node::AdminState) {
+    if state.list().is_empty() {
+        println!("admins: (none)");
     } else {
-        println!("priority: {} entries", state.priority().len());
-        for (index, id) in state.priority().iter().enumerate() {
-            let marker = if index as i32 == state.current_index() {
-                " (current)"
-            } else {
-                ""
-            };
-            println!("  {index}: {id}{marker}");
+        println!("admins: {} designated", state.list().len());
+        for id in state.list() {
+            println!("  - {id}");
         }
     }
-    println!("current: {}", state.current_index());
-    println!(
-        "lease_until: {}{}",
-        state.lease_until(),
-        if state.lease_valid(now) {
-            " (valid)"
-        } else {
-            " (expired)"
-        }
-    );
-    println!("epoch: {}", state.epoch());
-    println!("ttl_secs: {}", state.ttl_secs());
     println!(
         "updated_at: {} updated_by: {}",
         state.updated_at(),
@@ -2132,7 +1996,8 @@ fn value_policy_command(data_dir: &std::path::Path, command: ValuePolicyCommand)
 ///
 /// Under the topology-authority rules a direct request is authorized only as
 /// `Authority::SelfOperator` at its target, so a client can no longer self-sign
-/// as a senior child of a different node. Until P3/P4 reroute these commands,
+/// as an administrator child of a different node. Until P3/P4 reroute these
+/// commands,
 /// they must be addressed to the local node (`--node` must equal self). The
 /// join approve/reject commands act on this node's own pending store and dial
 /// the applicant directly, so they are already local and are not gated here.
@@ -2245,10 +2110,6 @@ fn print_reply(reply: &ControlReply) {
             applied.seq,
             applied.entry_hash.to_hex(),
             applied.duplicate
-        ),
-        ControlReply::LeaseState(state) => println!(
-            "lease-state: epoch={} lease_until={} current={} priority_len={} mode={:?}",
-            state.epoch, state.lease_until, state.current, state.priority_len, state.mode
         ),
     }
 }

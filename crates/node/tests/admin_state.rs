@@ -1,10 +1,12 @@
 //! Integration tests for `admin_state.json`: schema round-trip, fail-closed
-//! load, validation, and the pruning/epoch guarantees (spec §4, §8.2).
+//! load, validation, and the designation-pruning guarantees (spec §4, §8.2).
 //!
 //! Everything here is offline filesystem + the pure [`AdminState`] helpers; no
 //! network and no wall clock.
 
-use cawala_node::{ADMIN_STATE_FILE, ADMIN_STATE_VERSION, AdminState, AdminStateError};
+use cawala_node::{
+    ADMIN_STATE_FILE, ADMIN_STATE_VERSION, MAX_DESIGNATED_ADMINS, AdminState, AdminStateError,
+};
 
 fn write_json(dir: &std::path::Path, value: &serde_json::Value) {
     std::fs::write(
@@ -19,28 +21,30 @@ fn absent_file_defaults_empty() {
     let dir = tempfile::tempdir().unwrap();
     let state = AdminState::load(dir.path()).unwrap();
     assert_eq!(state, AdminState::empty());
-    assert_eq!(state.current_index(), -1);
-    assert!(!state.lease_valid(0));
-    assert_eq!(state.lease_until(), 0);
-    assert!(state.priority().is_empty());
+    assert!(state.list().is_empty());
+    assert!(!state.has("admin-a"));
 }
 
 #[test]
 fn explicit_seed_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = AdminState::empty();
-    state.set_priority(vec!["admin-a".to_string(), "admin-b".to_string()]);
-    state.set_current(0);
-    state.bump_epoch();
-    state.record_lease(1_000);
+    assert!(state.add("admin-a"));
+    assert!(state.add("admin-b"));
+    // Re-adding an existing entry is a no-op.
+    assert!(!state.add("admin-a"));
+    assert!(state.remove("admin-a"));
+    assert!(!state.remove("admin-a"));
     state.mark_updated(1_000, "local");
     state.save(dir.path()).unwrap();
 
     let loaded = AdminState::load(dir.path()).unwrap();
     assert_eq!(loaded, state);
-    assert_eq!(loaded.current_id().unwrap().as_str(), "admin-a");
-    assert_eq!(loaded.priority_len(), 2);
-    assert!(loaded.lease_valid(1_000 + state.ttl_secs()));
+    assert_eq!(loaded.list(), &["admin-b".to_string()]);
+    assert!(loaded.has("admin-b"));
+    assert!(!loaded.has("admin-a"));
+    assert_eq!(loaded.updated_at(), 1_000);
+    assert_eq!(loaded.updated_by(), "local");
 }
 
 /// A present-but-corrupt document is a hard load error; `ControlNode::open`
@@ -60,63 +64,70 @@ fn corrupt_file_fails_closed_to_none() {
     let operator = cawala_ledger::OperatorSecretKey::from_bytes(secret.to_bytes());
     let engine = cawala_node::ControlNode::open(dir.path(), &node_id, operator).unwrap();
     assert_eq!(engine.admin_state(), &AdminState::empty());
-    assert!(engine.admin_state().current_id().is_none());
+    assert!(engine.admin_state().list().is_empty());
 }
 
 #[test]
-fn current_out_of_range_rejected() {
+fn invalid_duplicate_and_overbound_rejected() {
+    // Unknown version.
+    let dir = tempfile::tempdir().unwrap();
+    write_json(
+        dir.path(),
+        &serde_json::json!({ "version": ADMIN_STATE_VERSION + 1, "admins": [] }),
+    );
+    assert!(matches!(
+        AdminState::load(dir.path()).unwrap_err(),
+        AdminStateError::UnsupportedVersion(_)
+    ));
+
+    // Duplicate ids.
     let dir = tempfile::tempdir().unwrap();
     write_json(
         dir.path(),
         &serde_json::json!({
             "version": ADMIN_STATE_VERSION,
-            "priority": ["admin-a"],
-            "current": 1,
+            "admins": ["dup", "dup"],
         }),
     );
     assert!(matches!(
         AdminState::load(dir.path()).unwrap_err(),
-        AdminStateError::CurrentOutOfRange(1)
+        AdminStateError::DuplicateAdmin(_)
+    ));
+
+    // Empty id.
+    let dir = tempfile::tempdir().unwrap();
+    write_json(
+        dir.path(),
+        &serde_json::json!({ "version": ADMIN_STATE_VERSION, "admins": [""] }),
+    );
+    assert!(matches!(
+        AdminState::load(dir.path()).unwrap_err(),
+        AdminStateError::EmptyAdminId(0)
+    ));
+
+    // Over the bound.
+    let dir = tempfile::tempdir().unwrap();
+    let admins: Vec<String> = (0..=MAX_DESIGNATED_ADMINS)
+        .map(|i| format!("admin-{i}"))
+        .collect();
+    write_json(
+        dir.path(),
+        &serde_json::json!({ "version": ADMIN_STATE_VERSION, "admins": admins }),
+    );
+    assert!(matches!(
+        AdminState::load(dir.path()).unwrap_err(),
+        AdminStateError::TooManyAdmins { .. }
     ));
 }
 
 #[test]
-fn priority_pruned_when_child_missing() {
-    // A missing non-current entry is dropped, keeping the current index valid.
+fn prune_non_child() {
     let mut state = AdminState::empty();
-    state.set_priority(vec!["keep".to_string(), "gone".to_string()]);
-    state.set_current(0);
-    assert!(state.prune_missing_children(|id| id == "keep"));
-    assert_eq!(state.priority(), &["keep".to_string()]);
-    assert_eq!(state.current_index(), 0);
-
-    // Pruning the current entry clamps `current` and clears the lease.
-    let mut state = AdminState::empty();
-    state.set_priority(vec!["gone".to_string()]);
-    state.set_current(0);
-    state.record_lease(500);
-    assert!(state.prune_missing_children(|_| false));
-    assert!(state.priority().is_empty());
-    assert_eq!(state.current_index(), -1);
-    assert_eq!(state.lease_until(), 0);
-}
-
-#[test]
-fn epoch_monotonic_across_reload() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = AdminState::empty();
-    state.set_priority(vec!["admin-a".to_string()]);
-    state.set_current(0);
-    state.bump_epoch();
-    state.bump_epoch();
-    state.save(dir.path()).unwrap();
-
-    let mut reloaded = AdminState::load(dir.path()).unwrap();
-    assert_eq!(reloaded.epoch(), 2);
-    reloaded.bump_epoch();
-    assert_eq!(reloaded.epoch(), 3);
-    reloaded.save(dir.path()).unwrap();
-
-    let again = AdminState::load(dir.path()).unwrap();
-    assert_eq!(again.epoch(), 3, "the epoch never decreases across reload");
+    state.add("keep");
+    state.add("gone");
+    let children = vec!["keep".to_string()];
+    assert!(state.prune(&children));
+    assert_eq!(state.list(), &["keep".to_string()]);
+    // A second prune with no change reports false.
+    assert!(!state.prune(&children));
 }

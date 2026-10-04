@@ -10,6 +10,31 @@ drift.
 
 ---
 
+## v2 amendment (2026-10-04) — explicit designation, no priority/failover
+
+The user replaced the R5 priority/TTL-lease model with an explicit designation
+set. This **supersedes** §0-R5, §1.3–1.4, and §3.1–3.4/§3.8 as they relate to
+ordering, leases, epochs, and automatic failover; everything else (R1 tree-routed
+admin, R3 grant removal, R4 replaced by the designation rule, R6–R9) stands.
+
+- A node persists an explicit set of **designated administrator children**
+  (child *node* or *leaf/browser*; all equal, full rights). Authority = the
+  authenticated last hop is a current child in that set. No priority, TTL,
+  lease, epoch, probe loop, or automatic failover.
+- Browsers have **no automatic authority**; a leaf child is designated like any
+  other child. The old R4 auto-browser-admin rule is removed.
+- **Who may change the set:** local operator via CLI (always) and any currently
+  designated administrator (routed). Local CLI recovers a lockout.
+- Transitive reach remains hop-by-hop; to reach an ancestor each link must have
+  designated the next child. Ancestor-chain + discovery walk unchanged (P3).
+- Wire impact shrinks: `CONTROL_FORMAT_VERSION` and `CONTROL_REPLY_VERSION`
+  revert to baseline (7 and 4); only `ROUTED_CONTROL_VERSION` 1→2 (grant
+  dropped) remains. See `.slim/deepwork/admin-refactor-v2-spec.md`.
+- `senior.rs`/`senior_child` and `ControlNode::seniority()` are deleted (no
+  remaining ordering or authority role).
+
+---
+
 ## 0. Resolved decisions this plan is built on
 
 - **R4**: "leaf" = user/browser only. A browser child has **complete** admin over

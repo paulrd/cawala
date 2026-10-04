@@ -205,7 +205,7 @@ async fn build(defs: Vec<NodeDef>, lookup: &MemoryLookup, config: &MsgConfig) ->
             .set_address(def.address.parse().expect("valid address"))
             .expect("set address");
         for (child_id, slot, kind) in &def.children {
-            // `date_joined = slot` keeps the senior child deterministic:
+            // `date_joined = slot` keeps the child ordering deterministic:
             // lower slot == earlier join.
             record
                 .attach_child(child_id, *kind, Some(*slot), *slot as u64)
@@ -306,7 +306,7 @@ struct World {
     admin_op: OperatorSecretKey,
 }
 
-/// `root = 0`, `A = 0.1` (senior child), `B = 0.2`, `U = 0.1.3` (A's user).
+/// `root = 0`, `A = 0.1`, `B = 0.2`, `U = 0.1.3` (A's user).
 fn world() -> World {
     let root_key = SecretKey::generate();
     let a_key = SecretKey::generate();
@@ -398,29 +398,23 @@ fn peer(addr: &str, id: &str) -> PeerRef {
     }
 }
 
-/// Persist an explicit R5 priority seed directly to `dir`. Routed dispatch
+/// Persist an explicit designation set directly to `dir`. Routed dispatch
 /// reloads `admin_state.json` per request, so the seed is observed without a
 /// restart.
-fn write_priority(dir: &std::path::Path, priority: Vec<String>, current: i32, now: u64) {
+fn write_designation(dir: &std::path::Path, admins: &[&str]) {
     let mut state = AdminState::empty();
-    state.set_priority(priority);
-    state.set_current(current);
-    state.bump_epoch();
-    state.record_lease(now);
+    for id in admins {
+        assert!(state.add(id));
+    }
     state.save(dir).expect("save admin state");
 }
 
-/// Seed the shared world's root with priority `[A, B]` and `A` current: the
-/// last hop of a request relayed by `A` (e.g. from the browser `U`) is then the
-/// root's leased administrator.
-async fn seed_root_priority(root: &TestNode, w: &World) {
+/// Seed the shared world's root designating `A`: the last hop of a request
+/// relayed by `A` (e.g. from the browser `U`) is then a designated administrator
+/// of the root; the sibling `B` is *not* designated.
+async fn seed_root_designation(root: &TestNode, w: &World) {
     let dir = root.control.lock().await.data_dir().to_path_buf();
-    write_priority(
-        &dir,
-        vec![w.a_id.clone(), w.b_id.clone()],
-        0,
-        now_unix_seconds(),
-    );
+    write_designation(&dir, &[&w.a_id]);
 }
 
 /// An admin intent addressed to `root_id` and signed by `admin_op`.
@@ -555,7 +549,7 @@ async fn routed_admin_query_reaches_ancestor_and_reply_verifies() {
         panic!("world shape")
     };
 
-    seed_root_priority(root, &w).await;
+    seed_root_designation(root, &w).await;
 
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
     let forward = own_forward(u, &intent.request).await;
@@ -593,7 +587,7 @@ async fn routed_admin_approve_applies_and_delivers_to_applicant() {
         panic!("world shape")
     };
 
-    seed_root_priority(root, &w).await;
+    seed_root_designation(root, &w).await;
 
     // A control-only applicant starts an outbound join and delivers it directly
     // (join traffic is refused on the routed path).
@@ -704,7 +698,7 @@ async fn routed_value_query_returns_verified_snapshot() {
         .await
         .attach_ledger(Arc::new(Mutex::new(ledger)));
 
-    seed_root_priority(root, &w).await;
+    seed_root_designation(root, &w).await;
 
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminLedgerQuery);
     let forward = own_forward(u, &intent.request).await;
@@ -749,7 +743,7 @@ async fn routed_admin_move_returns_verified_accepted_and_delivers_rebase() {
         panic!("world shape")
     };
 
-    seed_root_priority(root, &w).await;
+    seed_root_designation(root, &w).await;
 
     let intent = admin_intent(
         &w.root_id,
@@ -806,7 +800,7 @@ async fn routed_admin_move_failed_notice_is_requeued() {
         store.save().unwrap();
     }
 
-    seed_root_priority(root, &w).await;
+    seed_root_designation(root, &w).await;
 
     let intent = admin_intent(
         &w.root_id,
@@ -862,7 +856,7 @@ async fn routed_admin_issue_returns_verified_and_retry_dedupes() {
     .save(&dir)
     .unwrap();
 
-    seed_root_priority(root, &w).await;
+    seed_root_designation(root, &w).await;
 
     // The same request id is reused across both attempts (the retry path).
     let issue = || {
@@ -917,7 +911,7 @@ async fn routed_target_and_requester_mismatch_are_refused() {
         panic!("world shape")
     };
 
-    seed_root_priority(root, &w).await;
+    seed_root_designation(root, &w).await;
 
     // `target.node` names someone else though the address is the root's.
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
@@ -951,7 +945,7 @@ async fn routed_expired_intent_and_intent_replay() {
         panic!("world shape")
     };
 
-    seed_root_priority(root, &w).await;
+    seed_root_designation(root, &w).await;
 
     // Expired intent (sent directly, so no relay drops it first).
     let expired = SignedControl::authorize(
@@ -1003,7 +997,7 @@ async fn routed_forged_last_forward_is_refused() {
     let [root, _a, _b, u] = &mut nodes[..] else {
         panic!("world shape")
     };
-    seed_root_priority(root, &w).await;
+    seed_root_designation(root, &w).await;
 
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
     // A forward whose hop names U but whose signature is by an unrelated key.
@@ -1032,10 +1026,10 @@ async fn routed_forged_last_forward_is_refused() {
     );
 }
 
-/// (7) H1 teeth: a topology request from the current, leased priority child is
-/// applied, while the same request from a non-priority child is refused.
+/// (7) H1 teeth: a topology request from a designated child is applied, while
+/// the same request from a non-designated child is refused.
 #[tokio::test]
-async fn routed_priority_allowed_nonsenior_denied() {
+async fn routed_designated_allowed_nondesignated_denied() {
     let w = world();
     let lookup = MemoryLookup::new();
     let mut nodes = build_world(&w, &lookup).await;
@@ -1043,9 +1037,9 @@ async fn routed_priority_allowed_nonsenior_denied() {
         panic!("world shape")
     };
 
-    seed_root_priority(root, &w).await;
+    seed_root_designation(root, &w).await;
 
-    // Priority child A: its own signed Query is dispatched.
+    // Designated child A: its own signed Query is dispatched.
     let query = SignedControl::authorize(
         node(&w.a_id),
         &w.a_op,
@@ -1059,7 +1053,7 @@ async fn routed_priority_allowed_nonsenior_denied() {
     assert_eq!(send_routed(a, "0", request).await.1, AckStatus::Delivered);
     assert!(
         matches!(recv_reply(a).await, ControlReply::Snapshot(_)),
-        "the priority child's topology request must be applied"
+        "the designated child's topology request must be applied"
     );
 
     // A2: the dispatched routed topology request records its routing context.
@@ -1078,7 +1072,7 @@ async fn routed_priority_allowed_nonsenior_denied() {
         "{audit}"
     );
 
-    // Non-priority child B: structurally valid, but not the current priority.
+    // Non-designated child B: structurally valid, but not designated.
     let query = SignedControl::authorize(
         node(&w.b_id),
         &w.b_op,
@@ -1186,7 +1180,7 @@ async fn routed_reply_passes_through_relay_and_undecodable_payload_is_refused() 
     let [root, _a, _b, u] = &mut nodes[..] else {
         panic!("world shape")
     };
-    seed_root_priority(root, &w).await;
+    seed_root_designation(root, &w).await;
 
     // The reply from test (1)'s request has to traverse A to reach U.
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
@@ -1221,7 +1215,7 @@ async fn routed_forward_hop_count_mismatch_rejected() {
     let [root, _a, _b, u] = &mut nodes[..] else {
         panic!("world shape")
     };
-    seed_root_priority(root, &w).await;
+    seed_root_designation(root, &w).await;
 
     // Empty forwards against a one-hop chain.
     let intent = admin_intent(&w.root_id, &w.admin_op, ControlRequest::AdminQuery);
@@ -1274,8 +1268,8 @@ async fn routed_destination_rejects_forged_predecessor_forward() {
 }
 
 /// (A7) A two-hop topology request from a user is answered by the *predecessor's*
-/// control: U's intent alone is not authority, but the relaying priority child
-/// A's signed control is.
+/// control: U's intent alone is not authority, but the relaying designated
+/// child A's signed control is.
 #[tokio::test]
 async fn routed_topology_dispatches_last_hop_control_not_intent() {
     let w = world();
@@ -1285,7 +1279,7 @@ async fn routed_topology_dispatches_last_hop_control_not_intent() {
         panic!("world shape")
     };
 
-    seed_root_priority(root, &w).await;
+    seed_root_designation(root, &w).await;
 
     let intent = SignedControl::authorize(
         node(&w.u_id),
@@ -1300,7 +1294,7 @@ async fn routed_topology_dispatches_last_hop_control_not_intent() {
     assert_eq!(send_routed(u, "0", request).await.1, AckStatus::Delivered);
     assert!(
         matches!(recv_reply(u).await, ControlReply::Snapshot(_)),
-        "the root must dispatch the priority predecessor's control, not the user intent"
+        "the root must dispatch the predecessor's control, not the user intent"
     );
 }
 
@@ -1384,9 +1378,8 @@ async fn routed_observes_externally_rewritten_node_record() {
 
     // A separate process re-parents and re-addresses the node on disk. The
     // address must be cleared before the parent link (a root address is invalid
-    // under a parent). The hop is also attached as a node child and seeded as
-    // the current priority administrator, so the dispatched (last-hop) control
-    // authorizes.
+    // under a parent). The hop is also attached as a node child and designated
+    // as an administrator, so the dispatched (last-hop) control authorizes.
     let mut external = RecordStore::open(dir.path(), &dest_id).unwrap();
     external.unset_address().unwrap();
     external.set_parent("external-parent", 1).unwrap();
@@ -1395,7 +1388,7 @@ async fn routed_observes_externally_rewritten_node_record() {
         .attach_child(&hop_id, ChildKind::Node, Some(0), 1)
         .unwrap();
     external.save().unwrap();
-    write_priority(dir.path(), vec![hop_id.clone()], 0, now_unix_seconds());
+    write_designation(dir.path(), &[&hop_id]);
 
     assert!(
         matches!(
@@ -1414,8 +1407,8 @@ async fn routed_observes_externally_rewritten_node_record() {
 }
 
 /// A routed request must observe a `ledger_peers.json` row written by a
-/// *separate process*. A routed topology request from the current priority
-/// child is refused while the destination's in-memory registry is empty; once
+/// *separate process*. A routed topology request from a designated child is
+/// refused while the destination's in-memory registry is empty; once
 /// the child's row is written to disk the forward verifies and the request is
 /// dispatched.
 #[tokio::test]
@@ -1429,7 +1422,7 @@ async fn routed_observes_externally_written_peer_row() {
     let remote = EndpointId::from(child_secret.public());
 
     let dir = tempfile::tempdir().unwrap();
-    // The destination lists the child as its only (so senior) node child.
+    // The destination lists the child as its only node child.
     let mut record = RecordStore::open(dir.path(), &dest_id).unwrap();
     record.set_address("0".parse().unwrap()).unwrap();
     record
@@ -1446,9 +1439,9 @@ async fn routed_observes_externally_written_peer_row() {
         PeerRegistry::new(),
         ControlStore::open(dir.path()).unwrap(),
     );
-    // The child is the current, leased priority administrator. The destination
-    // reloads `admin_state.json` per request, so the seed is observed.
-    write_priority(dir.path(), vec![child_id.clone()], 0, now_unix_seconds());
+    // The child is designated as an administrator. The destination reloads
+    // `admin_state.json` per request, so the seed is observed.
+    write_designation(dir.path(), &[&child_id]);
 
     let query = || {
         SignedControl::authorize(

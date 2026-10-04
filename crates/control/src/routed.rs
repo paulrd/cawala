@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(bytes.len(), 252);
         assert_eq!(
             blake3::hash(&bytes).to_hex().as_str(),
-            "ba61348f39ee65627c299a2af6a4521eae78a8687946dcf264461075b9e474de"
+            "f2958b0755c4c96f828f2f004509386bcfcc32286ecd6dd866230b5be3d18764"
         );
     }
 

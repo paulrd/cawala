@@ -168,85 +168,58 @@ simplifies both the control plane and the UI.
 - Q2: Keep the existing admin request/reply wire variants with a
   topology-authority check, or replace them?
 
-### R4 — "Leaf node" means the user/browser; leaf children have full admin over their parent
+### R4 — Explicit per-node administrator designation (no priority, no failover)
 
-**Statement.** Disambiguate the term: a **leaf node** is *only* a user/browser
-client. Any leaf (browser) that is a child of a node has **complete** admin
-rights over that parent node.
+**Statement.** Every node maintains an explicit, persisted set of **designated
+administrator children**. A child of **any** kind — a child *node* or a *leaf*
+(browser/user) — may be designated. The node asks exactly one authorization
+question: *is the authenticated direct neighbour that handed me this request one
+of my designated administrators?* There is **no priority order, no TTL, no
+lease, no epoch, and no automatic failover**, and browsers have **no automatic
+authority**.
 
-**Rationale.** "Leaf" is currently overloaded (a node whose children are all
-users vs. a browser user leaf), which is confusing. Making "leaf" == browser
-removes the ambiguity and gives each browser a guaranteed, zero-setup path to
-administer its own parent — no grant required.
+**Rationale.** The delegated-grant model and the priority/lease model both add
+parallel machinery (grants, scopes, ordering, clocks, failover races). An
+explicit designation set is the minimum needed: authority is a property of the
+target's own topology plus the msg-layer-authenticated last hop, and nothing
+more. It also removes the R4 "leaf" special case: a browser is just a child that
+can be designated.
 
-**Scope (to confirm).**
-- Update the kind/terminology model so "leaf" is only the browser/user.
-- A node with leaf (browser) children is administered **only** by those
-  browsers, with full rights. There is **no child-based fallback** for such a
-  node — if its browsers are offline, local CLI administration (R9) is the only
-  path.
-- Supersedes the delegating-grant model and, for such nodes, seniority.
-
-**Open questions.**
-- Q1: If a node has several browser children, do all hold equal, full rights?
-- Q2: What authority, if any, does a browser have over nodes above its parent
-  (ancestors)? See R5 transitivity.
-
-### R5 — Priority-ordered child administration with TTL failover
-
-**Statement.** A node that does **not** have leaf (browser) children keeps a
-**priority-ordered list of its child nodes**. The list is **seeded explicitly**:
-a child gains administration only when the operator (or the current admin)
-explicitly authorizes it — the first admin is bootstrapped via local CLI
-(R9). Join order is used only as a tie-break/stability order among
-already-authorized admins, never as an automatic grant. The node's current
-admin may reorder it at any time. A configurable TTL (e.g. 5 minutes) governs
-failover: if the node cannot connect to the current admin child within the TTL,
-the next child in priority order is permitted to administer it. By transitivity,
-every node always has an administrator, hop-by-hop.
-
-**Rationale.** Browser leaf nodes are frequently offline, so control must not
-depend on them. A priority list plus a liveness TTL guarantees a reachable
-administrator among a node's children.
-
-**Seeding decision (frozen 2026-10-03).** Auto-seeding from join order was
-rejected: it would make the first child ever approved the parent's permanent
-admin (reorder rights, lockout), recoverable only via local CLI. Authority is
-explicitly granted; join order only orders admins that already hold authority.
-See `REFACTOR_PLAN.md` §3.1.
-
-**Applicability.** Only for nodes that do **not** have leaf (browser) children.
-A node with leaf children uses R4 (those browsers only) and falls back to local
-CLI administration (R9) when they are offline.
-
-**Scope (to confirm).**
-- Persist the priority list per node; **explicitly seeded** (empty by default),
-  join order only ordering already-authorized admins; admin-reorderable.
-- TTL is configurable (default 5 min) and acts as a liveness/lease window before
-  failover to the next child.
-- Failover: the next child in priority order becomes admin when the current admin
-  child is unreachable past the TTL.
-- Administration is transitive so the entire tree is coverable. **Frozen
-  2026-10-03:** browser upward reach is the strict ancestor chain, with a
-  discovery walk that learns ancestor node ids over the direct parent link so
-  replies are bound to real ancestor keys (authority stays hop-by-hop).
+**Scope (frozen 2026-10-04).**
+- Persist the set per node (`<data-dir>/admin_state.json`), empty by default;
+  entries must be current children of the node.
+- **Who may change it:** the local operator via CLI (R9) **and** any currently
+  designated administrator (remotely, routed). A locked-out node is recovered via
+  local CLI.
+- No ordering, no failover, no lease: a node with no reachable designated
+  administrator has only local CLI administration (R9).
+- Administration is transitive hop-by-hop: to reach an ancestor, each link on the
+  path must have designated the next child. Browser upward reach remains the
+  strict ancestor chain with the node-id discovery walk (P3), authority still
+  hop-by-hop.
+- Supersedes the R4 auto-browser-admin rule and the entire R5 priority/TTL model.
 
 **Open questions.**
-- Q1: *Resolved:* the priority list is exclusively for nodes **without** leaf
-  children. A node with leaf children is administered only by those browsers
-  (R4), and falls back to local CLI administration (R9) when they are offline.
-- Q2: *Resolved (default):* only the current admin may reorder; a newly
-  failed-over admin may reorder immediately (audited); local CLI may always
-  override.
-- Q3: *Resolved (default):* "cannot connect" = no fresh valid renewal/admin
-  contact from `priority[current]` for `ttl`, then a priority-ordered probe of
-  candidates; every successful contact resets the lease (lease semantics).
-- Q4: *Resolved (default):* priority replaces seniority for authority; the
-  default list is `(date_joined, id)` order among authorized admins, so the
-  senior child is just `priority[0]`. `senior.rs` remains only an ordering
-  helper, with no authority role.
-- Q5: *Resolved (default):* failover is automatic, server-side, on TTL expiry
-  (`epoch += 1`, audited), not a self-claimed takeover.
+- Q1: *Resolved 2026-10-04:* all designated administrators (of either kind) hold
+  equal, full rights.
+- Q2: *Resolved:* upward reach is transitive but bounded by each ancestor's
+  designation set.
+
+### R5 — Superseded: priority list and TTL failover are removed
+
+**Statement.** The priority-ordered child list and the TTL/lease automatic
+failover described in the earlier R5 are **removed**. Authority is exactly the
+explicit designation set in R4. `senior`/join-order no longer carries any
+authority or ordering role; `senior_child` may be deleted. A node whose
+designated administrators are all unreachable has no remote administration until
+one returns or the local operator (R9) intervenes.
+
+**Rationale.** The user decision of 2026-10-04 dropped automatic failover and
+the priority list as unnecessary complexity. The universal local-CLI fallback
+(R9) covers the "all admins offline" case without a clock or election.
+
+**Open question.** None outstanding; retained only to record that the earlier R5
+requirements are void.
 
 ### R6 — Admin mode separated behind a lock gate
 

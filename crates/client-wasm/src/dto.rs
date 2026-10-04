@@ -1612,9 +1612,7 @@ pub(crate) fn parse_receive_uri_inner(uri: &str) -> Result<ParsedReceiveUri, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cawala_control::{
-        AdminMode, ChildKind, Invite, LeaseState, NodeId, OctAddr, OperatorSecretKey,
-    };
+    use cawala_control::{ChildKind, Invite, NodeId, OctAddr, OperatorSecretKey};
 
     use crate::ledger_state::{ActivityEntryV1, SettlementRecordV1, SettlementStateV1};
     use crate::state::{ChildLink, LocalStateV1, ParentLink};
@@ -1786,13 +1784,6 @@ mod tests {
                 desired_slot: Some(2),
                 expiry: 1_700_000_000,
             }],
-            lease: LeaseState {
-                epoch: 0,
-                lease_until: 0,
-                current: -1,
-                priority_len: 0,
-                mode: AdminMode::BrowserChildren,
-            },
         };
 
         let dto = AdminSnapshotDto::from_snapshot(&snapshot);

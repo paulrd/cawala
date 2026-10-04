@@ -45,7 +45,6 @@ pub mod invite;
 pub mod reply;
 pub mod request;
 pub mod routed;
-pub mod senior;
 pub mod sign;
 
 pub use cawala_ledger::{NodeId, OperatorPubKey, OperatorSecretKey, Signature};
@@ -56,23 +55,22 @@ pub use claim::{
 };
 pub use invite::{INVITE_SCHEME, Invite, InviteError};
 pub use reply::{
-    AdminApproved, AdminLedgerAccount, AdminLedgerSnapshot, AdminMode, AdminPendingJoin,
-    AdminRejected, AdminSnapshot, AdminValueApplied, CONTROL_ALPN, CONTROL_REPLY_VERSION,
-    ChildSnapshot, ControlReply, DeliveryStatus, LeaseState, MAX_ADMIN_LEDGER_ACCOUNTS,
-    NodeSnapshot, ParentSnapshot, RejectCode,
+    AdminApproved, AdminLedgerAccount, AdminLedgerSnapshot, AdminPendingJoin, AdminRejected,
+    AdminSnapshot, AdminValueApplied, CONTROL_ALPN, CONTROL_REPLY_VERSION, ChildSnapshot,
+    ControlReply, DeliveryStatus, MAX_ADMIN_LEDGER_ACCOUNTS, NodeSnapshot, ParentSnapshot,
+    RejectCode,
 };
 pub use request::{
-    AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminLeaseProbe, AdminLeaseRequest,
-    AdminMoveChild, AdminRedeliverJoin, AdminValueDirection, AdminValueRequest, ControlRequest,
-    CreateChild, DetachChild, DetachNotice, ExitRequest, JoinApproval, JoinRejection, JoinRequest,
-    MAX_LOCATION_HINT_LEN, MAX_NODE_ID_LEN, MAX_REASON_LEN, MoveChild, RebaseNotice, RebasePull,
-    SetAddress, ValueRequestId, is_admin_request,
+    AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminMoveChild, AdminRedeliverJoin,
+    AdminValueDirection, AdminValueRequest, ControlRequest, CreateChild, DetachChild, DetachNotice,
+    ExitRequest, JoinApproval, JoinRejection, JoinRequest, MAX_LOCATION_HINT_LEN, MAX_NODE_ID_LEN,
+    MAX_REASON_LEN, MoveChild, RebaseNotice, RebasePull, SetAddress, ValueRequestId,
+    is_admin_request,
 };
 pub use routed::{
     MAX_ROUTED_FORWARDS, ROUTED_CONTROL_VERSION, ROUTED_REPLY_CONTEXT, ROUTED_REPLY_VERSION,
     RoutedControlV1, RoutedError, RoutedForward, RoutedReplyV1, SignedRoutedReply,
 };
-pub use senior::senior_child;
 pub use sign::{
     CONTROL_CONTEXT, CONTROL_FORMAT_VERSION, CONTROL_REQUEST_MAX_TTL_SECS,
     CONTROL_REQUEST_TTL_SECS, ControlError, SignedControl, is_supported_control_version,

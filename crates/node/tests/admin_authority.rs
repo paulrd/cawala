@@ -26,7 +26,6 @@ use iroh::{EndpointId, SecretKey};
 use tokio::sync::Mutex;
 
 const NOW: u64 = 1_000;
-const LEASED: u64 = 2_000;
 
 fn fresh_nonce() -> u64 {
     static NONCE: AtomicU64 = AtomicU64::new(1);
@@ -75,16 +74,13 @@ fn sign(origin: &str, op: &OperatorSecretKey, request: ControlRequest) -> Signed
     .unwrap()
 }
 
-/// Persist an explicit priority/lease seed. `receive*` reloads
-/// `admin_state.json` per request, so the seed is observed without a restart.
-fn seed(dir: &Path, priority: &[&str], current: i32, lease_until: u64, epoch: u64) {
+/// Persist an explicit designation set. `receive*` reloads `admin_state.json`
+/// per request, so the seed is observed without a restart.
+fn designate(dir: &Path, admins: &[&str]) {
     let mut state = AdminState::empty();
-    state.set_priority(priority.iter().map(|id| id.to_string()).collect());
-    state.set_current(current);
-    for _ in 0..epoch {
-        state.bump_epoch();
+    for id in admins {
+        assert!(state.add(id));
     }
-    state.set_lease_until(lease_until);
     state.save(dir).unwrap();
 }
 
@@ -143,7 +139,62 @@ fn routed_from(
 }
 
 #[tokio::test]
-async fn non_admin_child_denied_on_admin_and_topology() {
+async fn designated_node_child_allowed() {
+    let parent_key = SecretKey::generate();
+    let admin_key = SecretKey::generate();
+    let parent_op = operator(&parent_key);
+    let admin_op = operator(&admin_key);
+    let admin_id = admin_key.public().to_string();
+
+    let (mut engine, dir) = build(
+        "parent",
+        "0",
+        &[(&admin_id, ChildKind::Node, 0)],
+        vec![node_peer(&admin_id, &admin_op, 3)],
+        parent_op,
+    );
+    designate(dir.path(), &[&admin_id]);
+
+    let remote = EndpointId::from(admin_key.public());
+    let query = sign(&admin_id, &admin_op, ControlRequest::AdminQuery);
+    let routed = routed_from("parent", &query, &admin_id);
+    assert!(matches!(
+        engine.receive_routed_at(remote, routed, NOW).await,
+        ControlReply::AdminSnapshot(_)
+    ));
+}
+
+#[tokio::test]
+async fn designated_leaf_child_allowed() {
+    let parent_key = SecretKey::generate();
+    let browser_key = SecretKey::generate();
+    let parent_op = operator(&parent_key);
+    let browser_op = operator(&browser_key);
+    let browser_id = browser_key.public().to_string();
+
+    let (mut engine, dir) = build(
+        "parent",
+        "0",
+        &[(&browser_id, ChildKind::User, 0)],
+        vec![user_peer(&browser_id, &browser_op)],
+        parent_op,
+    );
+    designate(dir.path(), &[&browser_id]);
+    let remote = EndpointId::from(browser_key.public());
+
+    let query = sign(&browser_id, &browser_op, ControlRequest::AdminQuery);
+    let routed = routed_from("parent", &query, &browser_id);
+    assert!(
+        matches!(
+            engine.receive_routed_at(remote, routed, NOW).await,
+            ControlReply::AdminSnapshot(_)
+        ),
+        "a designated leaf child must administer its parent"
+    );
+}
+
+#[tokio::test]
+async fn non_designated_child_denied_on_admin_and_topology() {
     let parent_key = SecretKey::generate();
     let child_key = SecretKey::generate();
     let parent_op = operator(&parent_key);
@@ -159,10 +210,11 @@ async fn non_admin_child_denied_on_admin_and_topology() {
     );
     let remote = EndpointId::from(child_key.public());
 
-    // No priority/lease seed: the child is not an administrator.
+    // No designation: the child is not an administrator.
     let query = sign(&child_id, &child_op, ControlRequest::AdminQuery);
+    let routed = routed_from("parent", &query, &child_id);
     assert_eq!(
-        engine.receive_at(remote, query, NOW).await,
+        engine.receive_routed_at(remote, routed, NOW).await,
         ControlReply::Rejected(RejectCode::Unauthorized)
     );
 
@@ -178,95 +230,12 @@ async fn non_admin_child_denied_on_admin_and_topology() {
             date_joined: 2,
         }),
     );
+    let routed = routed_from("parent", &create, &child_id);
     assert_eq!(
-        engine.receive_at(remote, create, NOW).await,
+        engine.receive_routed_at(remote, routed, NOW).await,
         ControlReply::Rejected(RejectCode::Unauthorized)
     );
     assert_eq!(engine.record().children.len(), 1, "nothing was attached");
-}
-
-#[tokio::test]
-async fn browser_child_has_full_admin_over_parent() {
-    let parent_key = SecretKey::generate();
-    let browser_key = SecretKey::generate();
-    let parent_op = operator(&parent_key);
-    let browser_op = operator(&browser_key);
-    let browser_id = browser_key.public().to_string();
-
-    let (mut engine, _dir) = build(
-        "parent",
-        "0",
-        &[(&browser_id, ChildKind::User, 0)],
-        vec![user_peer(&browser_id, &browser_op)],
-        parent_op,
-    );
-    let remote = EndpointId::from(browser_key.public());
-
-    // R4: a User child is a full administrator without any priority seed.
-    let query = sign(&browser_id, &browser_op, ControlRequest::AdminQuery);
-    let routed = routed_from("parent", &query, &browser_id);
-    assert!(
-        matches!(
-            engine.receive_routed_at(remote, routed, NOW).await,
-            ControlReply::AdminSnapshot(_)
-        ),
-        "a User child must administer its parent"
-    );
-}
-
-#[tokio::test]
-async fn priority_child_is_admin_only_when_current_and_leased() {
-    let parent_key = SecretKey::generate();
-    let admin_key = SecretKey::generate();
-    let other_key = SecretKey::generate();
-    let parent_op = operator(&parent_key);
-    let admin_op = operator(&admin_key);
-    let other_op = operator(&other_key);
-    let admin_id = admin_key.public().to_string();
-    let other_id = other_key.public().to_string();
-
-    let (mut engine, dir) = build(
-        "parent",
-        "0",
-        &[
-            (&admin_id, ChildKind::Node, 0),
-            (&other_id, ChildKind::Node, 1),
-        ],
-        vec![
-            node_peer(&admin_id, &admin_op, 3),
-            node_peer(&other_id, &other_op, 4),
-        ],
-        parent_op,
-    );
-    let remote = EndpointId::from(admin_key.public());
-
-    // Current + leased: the priority child is an administrator.
-    seed(dir.path(), &[&admin_id], 0, LEASED, 1);
-    let query = sign(&admin_id, &admin_op, ControlRequest::AdminQuery);
-    let routed = routed_from("parent", &query, &admin_id);
-    assert!(matches!(
-        engine.receive_routed_at(remote, routed, NOW).await,
-        ControlReply::AdminSnapshot(_)
-    ));
-
-    // Priority names the child but a *different* entry is current: denied.
-    seed(dir.path(), &[&other_id, &admin_id], 0, LEASED, 2);
-    let query = sign(&admin_id, &admin_op, ControlRequest::AdminQuery);
-    let routed = routed_from("parent", &query, &admin_id);
-    assert_eq!(
-        engine.receive_routed_at(remote, routed, NOW).await,
-        ControlReply::Rejected(RejectCode::Unauthorized)
-    );
-
-    // Current but the lease has expired (no live probe): failover clears it.
-    seed(dir.path(), &[&admin_id], 0, 0, 3);
-    let query = sign(&admin_id, &admin_op, ControlRequest::AdminQuery);
-    let routed = routed_from("parent", &query, &admin_id);
-    assert_eq!(
-        engine.receive_routed_at(remote, routed, NOW).await,
-        ControlReply::Rejected(RejectCode::Unauthorized)
-    );
-    assert_eq!(engine.admin_state().current_index(), -1);
 }
 
 #[tokio::test]
@@ -313,11 +282,11 @@ async fn routed_admin_from_direct_parent_applies() {
         ],
         parent_op,
     );
-    seed(dir.path(), &[&admin_id], 0, LEASED, 1);
+    designate(dir.path(), &[&admin_id]);
     let remote = EndpointId::from(admin_key.public());
 
-    // The last hop (the priority child) is the authority; its topology mutation
-    // is applied.
+    // The last hop (the designated child) is the authority; its topology
+    // mutation is applied.
     let detach = sign(
         &admin_id,
         &admin_op,
@@ -353,15 +322,11 @@ async fn value_policy_keys_on_end_to_end_requester_not_relay() {
     let (mut engine, dir) = build(
         "parent",
         "0",
-        &[
-            (&relay_id, ChildKind::Node, 0),
-            // A Node child, so R4 (browser-only) does not pre-empt R5 here.
-            ("account", ChildKind::Node, 1),
-        ],
+        &[(&relay_id, ChildKind::Node, 0), ("account", ChildKind::Node, 1)],
         vec![node_peer(&relay_id, &relay_op, 3)],
         parent_op,
     );
-    seed(dir.path(), &[&relay_id], 0, LEASED, 1);
+    designate(dir.path(), &[&relay_id]);
 
     // A real ledger handle is required for `prepare_admin_value` to run.
     let ledger_service = LedgerService::open(dir.path(), "parent").unwrap();
@@ -471,8 +436,8 @@ async fn direct_remote_admin_is_refused() {
         vec![node_peer(&admin_id, &admin_op, 3)],
         parent_op,
     );
-    // The child *is* the current, leased administrator...
-    seed(dir.path(), &[&admin_id], 0, LEASED, 1);
+    // The child *is* a designated administrator...
+    designate(dir.path(), &[&admin_id]);
     let remote = EndpointId::from(admin_key.public());
 
     // ...but a direct admin request must still be `SelfOperator` (R1): remote

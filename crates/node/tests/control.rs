@@ -498,15 +498,13 @@ async fn join_idempotent() {
     applicant.shutdown().await;
 }
 
-/// Persist an explicit R5 priority lease naming `priority[current]` as this
-/// node's current administrator. `receive` reloads `admin_state.json` per
-/// request, so the seed must be written to disk.
-fn seed_priority(dir: &Path, priority: &[&str], current: i32, now: u64) {
+/// Persist an explicit administrator designation set. `receive` reloads
+/// `admin_state.json` per request, so the seed must be written to disk.
+fn seed_designation(dir: &Path, admins: &[&str]) {
     let mut state = cawala_node::AdminState::empty();
-    state.set_priority(priority.iter().map(|id| id.to_string()).collect());
-    state.set_current(current);
-    state.bump_epoch();
-    state.record_lease(now);
+    for id in admins {
+        assert!(state.add(id));
+    }
     state.save(dir).expect("save admin state");
 }
 
@@ -564,18 +562,13 @@ async fn non_admin_child_control_rejected() {
     })
     .await;
 
-    // Only the seeded current priority entry is an administrator.
-    seed_priority(
-        parent_dir.path(),
-        &[&admin_id],
-        0,
-        now_unix_seconds(),
-    );
+    // Only the designated child is an administrator.
+    seed_designation(parent_dir.path(), &[&admin_id]);
 
     let sender_key = SecretKey::generate();
     let sender = bind(&sender_key).await;
 
-    // The non-priority child tries to provision a child under the parent.
+    // The non-designated child tries to provision a child under the parent.
     let signed = authorize(
         node(&junior_id),
         &junior_op,
@@ -594,11 +587,10 @@ async fn non_admin_child_control_rejected() {
     parent.shutdown().await;
 }
 
-/// R4: a node with a `ChildKind::User` (browser) child is administered **only**
-/// by that browser, with full rights; the seeded priority list is not consulted
-/// for authority. The node child (even when seeded current) is denied.
+/// A designated `ChildKind::User` (browser) child is a full administrator over
+/// its parent; a sibling node child that is *not* designated is denied.
 #[tokio::test]
-async fn user_child_is_administrator_and_priority_is_not_consulted() {
+async fn designated_user_child_is_administrator_and_others_are_not() {
     let parent_key = SecretKey::generate();
     let user_key = SecretKey::generate();
     let node_child_key = SecretKey::generate();
@@ -646,13 +638,8 @@ async fn user_child_is_administrator_and_priority_is_not_consulted() {
     })
     .await;
 
-    // Seed the node child as the priority administrator; R4 must still win.
-    seed_priority(
-        parent_dir.path(),
-        &[&node_child_id],
-        0,
-        now_unix_seconds(),
-    );
+    // Designate the browser child only.
+    seed_designation(parent_dir.path(), &[&user_id]);
 
     let sender = bind(&SecretKey::generate()).await;
 
@@ -667,8 +654,8 @@ async fn user_child_is_administrator_and_priority_is_not_consulted() {
         ControlReply::Accepted
     );
 
-    // R4 makes the browser the *only* administrator: the seeded priority node
-    // child is denied even though it is current and leased.
+    // The browser is the only designated administrator: the node child is
+    // denied even though it is a current child.
     let node_create = authorize(
         node(&node_child_id),
         &node_child_op,
@@ -690,7 +677,7 @@ async fn user_child_is_administrator_and_priority_is_not_consulted() {
 }
 
 #[tokio::test]
-async fn priority_admin_child_can_control_parent() {
+async fn designated_admin_child_can_control_parent() {
     let parent_key = SecretKey::generate();
     let admin_key = SecretKey::generate();
     let junior_key = SecretKey::generate();
@@ -731,12 +718,7 @@ async fn priority_admin_child_can_control_parent() {
     })
     .await;
 
-    seed_priority(
-        parent_dir.path(),
-        &[&admin_id],
-        0,
-        now_unix_seconds(),
-    );
+    seed_designation(parent_dir.path(), &[&admin_id]);
 
     let sender = bind(&SecretKey::generate()).await;
 
