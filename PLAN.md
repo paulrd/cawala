@@ -135,8 +135,9 @@
     authenticated last hop, over operator-key signing. Operator keys != ledger
     keys.
   - Control = change the designation set, approve joins, create nodes + edit
-    child/parent links (topology), config, value issue/burn (bounded by the
-    operator-side `value_policy.json`), per-child credit limits.
+    child/parent links (topology), config, value issue/burn (bounded per admin
+    child by the operator-side `value_policy.json`, keyed on the requesting
+    child's operator key), per-child credit limits.
   - Every balance mutation is signed + append-only + visible to all children;
     any child can exit/detach.
   - Failed parent: automatic foster-parent recovery is **cut**. Reconnection is
@@ -257,8 +258,9 @@
 
 ## Resolved decisions (2026-10-03 / 2026-10-04)
   - Scopes are dropped; every designated administrator is full-power. Value
-    issue/burn is bounded by the operator-configured, deny-by-default
-    `value_policy.json`.
+    issue/burn is bounded per admin child by the operator-configured,
+    deny-by-default `value_policy.json`, keyed on the requesting child's
+    operator key.
   - Authority is the explicit designation set; no automatic seeding, no
     priority/lease/epoch, no failover. First admin is bootstrapped via local CLI.
   - The format-8 control break (and routed 2 / reply 5) is accepted; lockstep
@@ -299,8 +301,9 @@
      independent of the root cap (via local subdivision).
   3. **Currency model**: single nominal unit + per-node trust limits.
   4. **Balance changes**: any designated administrator (or the local operator)
-     may issue/burn, bounded by `value_policy.json`; mitigated by exit rights +
-     audit trail + key separation. (Supersedes the sole senior-child admin.)
+     may issue/burn, bounded per admin child by `value_policy.json`; mitigated
+     by exit rights + audit trail + key separation. (Supersedes the sole
+     senior-child admin.)
   5. **Overdraw**: prefunded only - no uncollateralized credit.
   6. **Frontend framework**: Svelte (lightest, great PWA support).
   7. **Relay**: public N0 relays for development; self-hosted iroh-relay on a VPS

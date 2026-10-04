@@ -184,14 +184,18 @@ to an admin target.
      mock-only control; live children appear by approving a join request or from
      the node CLI.
    - **Value Issue & Burn** - pick an account, enter an amount and a required
-     reason (posting against the node's equity, bounded by `value_policy.json`).
+     reason (posting against the node's equity, bounded per admin child by
+     `value_policy.json`).
 5. Negative tests: a browser that is **not** in the target's designation set is
    refused (`unauthorized`); `control admin remove <id>` then refresh; a locked
    Admin page shows the policy gate; a reload re-locks.
 6. Value policy is deny-by-default when `value_policy.json` is absent; inspect
    and set caps locally with `control admin value-policy show` /
    `control admin value-policy set --per-request <n> --window-secs <n>
-   --window-max <n> --per-account <n>`.
+   --window-max <n> --per-account <n>`. The `admins` overrides name each
+   **admin child's** operator key (the same id used by `control admin add`),
+   not each browser's: a browser under a relaying admin child shares that
+   child's limits.
 
 ---
 

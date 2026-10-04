@@ -1,4 +1,4 @@
-//! Operator-configured caps for delegated value operations.
+//! Operator-configured caps for value issue/burn operations.
 //!
 //! `AdminIssue`/`AdminBurn` are the only operations with monetary blast radius,
 //! so they are bounded by an unsigned, operator-managed policy file at

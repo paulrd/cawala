@@ -96,7 +96,7 @@ const PENDING_DELIVERY: DeliveryStatus = DeliveryStatus::Unreachable;
 /// Who the msg layer authenticated as the authority for one request.
 ///
 /// The **last hop** of a routed envelope is the only remote authority; the
-/// end-to-end requester is carried separately for audit and value policy. A
+/// end-to-end requester is carried separately for audit only. A
 /// request from this node's own operator key is [`Authority::SelfOperator`];
 /// otherwise authority is derived from `node.json` + `admin_state.json` by
 /// [`ControlNode::is_administrator`] (the last hop must be a current child that
@@ -878,15 +878,8 @@ impl ControlNode {
             self.audit_request(&signed, &reply, now);
             return Handled::Reply(reply);
         }
-        self.dispatch_authorized(
-            remote,
-            &signed,
-            now,
-            authority.as_ref(),
-            signed.controller,
-            None,
-        )
-        .await
+        self.dispatch_authorized(remote, &signed, now, authority.as_ref(), None)
+            .await
     }
 
     /// Version/shape/signature/expiry checks and per-request reloads.
@@ -925,10 +918,10 @@ impl ControlNode {
     ///
     /// `authority` is the pre-computed actor authority: `Some` for every request
     /// that [`needs_authority`] (admin + topology classes), `None` otherwise.
-    /// `e2e_requester` is the end-to-end value-policy key: for direct requests
-    /// it is `signed.controller`; for routed value requests it is the intent
-    /// controller (the browser), never the signing relay. `route` carries the
-    /// routed `(requester, forwarder)` node ids when the request arrived over
+    /// The dispatched `signed` control is always the last hop's own frame
+    /// (direct or routed), so `signed.controller` is the msg-layer-authenticated
+    /// admin child that keys value policy and ledger idempotency. `route` carries
+    /// the routed `(requester, forwarder)` node ids when the request arrived over
     /// the tree, so designation handlers can audit both; it is `None` on the
     /// direct path.
     async fn dispatch_authorized(
@@ -937,7 +930,6 @@ impl ControlNode {
         signed: &SignedControl,
         now: u64,
         authority: Option<&Authority>,
-        e2e_requester: OperatorPubKey,
         route: Option<(&str, &str)>,
     ) -> Handled {
         // Replay guard: per (origin, controller), keyed by the request nonce.
@@ -1018,7 +1010,7 @@ impl ControlNode {
                     return Handled::Ledger(PendingLedgerQuery {
                         record: self.record.record().clone(),
                         origin: signed.origin.clone(),
-                        controller: e2e_requester,
+                        controller: signed.controller,
                     });
                 }
             }
@@ -1035,7 +1027,6 @@ impl ControlNode {
                     request,
                     now,
                     authority.expect("admin authority precomputed"),
-                    e2e_requester,
                 ) {
                     Ok(pending) => return Handled::LedgerMutation(pending),
                     Err(code) => ControlReply::Rejected(code),
@@ -1048,7 +1039,6 @@ impl ControlNode {
                     request,
                     now,
                     authority.expect("admin authority precomputed"),
-                    e2e_requester,
                 ) {
                     Ok(pending) => return Handled::LedgerMutation(pending),
                     Err(code) => ControlReply::Rejected(code),
@@ -1065,20 +1055,20 @@ impl ControlNode {
         Handled::Reply(reply)
     }
 
-    /// Validate a delegated value request, resolving the account kind and the
+    /// Validate an admin value request, resolving the account kind and the
     /// operator limits under the control lock.
     ///
-    /// The caller has already authorized the **actor** (the last hop) and passes
-    /// it explicitly; `requester` is the **end-to-end** requester whose operator
-    /// key keys the value policy and the ledger idempotency record (spec §2.4).
-    /// For a direct request the two coincide; for a routed request the relay
-    /// signs but the browser's key bounds the value. An unused `authority` is
+    /// The caller has already authorized the **admin child** (the last hop) and
+    /// passes its own signed control; `signed.controller` is therefore the
+    /// operator key that keys the value policy and the ledger idempotency
+    /// record. On the direct path that is this node's own operator; on the
+    /// routed path it is the msg-layer-authenticated last-hop admin child, so
+    /// browsers beneath that child share its limits. An unused `authority` is
     /// accepted so the call site carries the full decision.
     ///
     /// Returns a [`PendingLedgerMutation`] for deferred execution, or the
     /// immediate refusal reply. It never reads the ledger (lock ordering) and
     /// never loads key material.
-    #[allow(clippy::too_many_arguments)]
     fn prepare_admin_value(
         &mut self,
         direction: AdminValueDirection,
@@ -1086,7 +1076,6 @@ impl ControlNode {
         request: &AdminValueRequest,
         _now: u64,
         _authority: &Authority,
-        requester: OperatorPubKey,
     ) -> Result<PendingLedgerMutation, RejectCode> {
         if request.validate().is_err() {
             return Err(RejectCode::BadRequest);
@@ -1110,7 +1099,7 @@ impl ControlNode {
         let Some(policy) = &self.value_policy else {
             return Err(RejectCode::Internal);
         };
-        let limits = policy.limits_for(&requester);
+        let limits = policy.limits_for(&signed.controller);
         // Early refusal on the per-request cap (policy-only; the window/account
         // caps need the ledger and are re-enforced by the service).
         if request.amount > limits.per_request_max {
@@ -1124,7 +1113,7 @@ impl ControlNode {
             request_id: request.request_id,
             reason: request.reason.clone(),
             origin: signed.origin.clone(),
-            controller: requester,
+            controller: signed.controller,
             limits,
         })
     }
@@ -1164,17 +1153,15 @@ impl ControlNode {
     /// 4. the carried intent self-verifies and its expiry is inside the TTL cap;
     /// 5. a forward exists, its `hop.node` is the authenticated `remote`, and
     ///    the destination's registry verifies it;
-    /// 6. class gate:
-    ///    - `Join`/`JoinApproved`/`JoinRejected`/exit-rights are refused on the
-    ///      routed path;
-    ///    - value requests (`AdminIssue`/`AdminBurn`/`AdminLedgerQuery`)
-    ///      dispatch the **intent** so the value policy and ledger idempotency
-    ///      key on the end-to-end requester, not the relay;
-    ///    - every other admin/topology request dispatches the **last hop's**
-    ///      signed control, whose origin is the authenticated predecessor;
-    /// 7. authority is derived once from the last hop
+    /// 6. `Join`/`JoinApproved`/`JoinRejected`/exit-rights are refused on the
+    ///    routed path;
+    /// 7. every admin/topology request (including the value class) dispatches
+    ///    the **last hop's** signed control, whose origin and controller are the
+    ///    authenticated predecessor, so value policy and ledger idempotency key
+    ///    on the admin child;
+    /// 8. authority is derived once from the last hop
     ///    ([`ControlNode::authorize_actor`]) and passed explicitly into the
-    ///    dispatch, so a value intent is never re-authorized against the target.
+    ///    dispatch.
     ///
     /// # Non-ledger wrapper
     ///
@@ -1200,10 +1187,11 @@ impl ControlNode {
     /// [`ControlNode::receive_routed_at`], returning a [`Handled`] so the caller
     /// can execute a deferred ledger query after dropping the control lock.
     ///
-    /// The class-level dispatch is unified: value requests dispatch the
-    /// end-to-end intent (keyed on the browser requester), every other
-    /// admin/topology request dispatches the last hop's signed control, and
-    /// authority is computed once from the last hop and passed explicitly into
+    /// Dispatch is uniform across every admin/topology class: the last hop's
+    /// signed control is dispatched, so authority, value policy and ledger
+    /// idempotency all key on the msg-layer-authenticated admin child. The
+    /// end-to-end requester is audit-only. Authority is computed once from the
+    /// last hop and passed explicitly into
     /// [`ControlNode::dispatch_authorized`]. A deferred [`Handled::Ledger`] is
     /// propagated to the caller, which must audit the routed line once the reply
     /// exists; all other paths audit here.
@@ -1288,31 +1276,20 @@ impl ControlNode {
         let hops = routed.forwards.len();
         let kind = routed.intent.request.kind();
 
-        // Class gate: the value class dispatches the end-to-end intent so the
-        // value policy and ledger idempotency key on the browser (`requester`),
-        // not the relay; every other admin/topology class dispatches the last
-        // hop's signed control (spec §2.4–2.5).
-        let is_value = matches!(
-            &routed.intent.request,
-            ControlRequest::AdminIssue(_)
-                | ControlRequest::AdminBurn(_)
-                | ControlRequest::AdminLedgerQuery
-        );
-        let (dispatched, e2e_requester) = if is_value {
-            (routed.intent.clone(), routed.intent.controller)
-        } else {
-            (last.signed.clone(), last.signed.controller)
-        };
+        // Uniform class handling: every admin/topology request (including the
+        // value class) dispatches the last hop's signed control, so authority,
+        // value policy and ledger idempotency all key on the authenticated
+        // admin child. The end-to-end requester is audit-only.
+        let dispatched = last.signed.clone();
 
-        // The same version/shape/signature/expiry/replay rules apply to
-        // whichever frame is actually dispatched.
+        // The same version/shape/signature/expiry/replay rules apply to the
+        // dispatched frame.
         if let Some(reply) = self.precheck(&dispatched, now) {
             self.audit_routed(now, kind, &reply, &requester, &forwarder, hops);
             return Handled::Reply(reply);
         }
         // The last hop is the only remote authority (a current, designated
-        // child); the end-to-end requester is carried separately for audit and
-        // value policy.
+        // child); the end-to-end requester is carried separately for audit.
         let authority = match self.authorize_actor(&last.signed) {
             Ok(authority) => authority,
             Err(code) => {
@@ -1328,7 +1305,6 @@ impl ControlNode {
                 &dispatched,
                 now,
                 Some(&authority),
-                e2e_requester,
                 Some((requester.as_str(), forwarder.as_str())),
             )
             .await

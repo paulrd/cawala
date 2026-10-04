@@ -777,8 +777,10 @@ pub(crate) fn prepare_admin_exchange(
 /// `origin` is the requester and its `controller` is the requester's operator
 /// key). The single first-hop [`RoutedForward`] is signed by that same operator.
 /// The first relay verifies the forward against its own child registry, which
-/// binds the requester node to its operator key; the target re-derives the
-/// end-to-end requester from `intent.origin` for audit/value policy.
+/// binds the requester node to its operator key; each relay appends its own
+/// forward, and the target handles every admin request (including value) under
+/// the msg-layer-authenticated last-hop admin child, keeping the end-to-end
+/// requester for audit only.
 ///
 /// Fails closed if `intent` is not coherent with `requester`/`operator`, so a
 /// caller can never splice a delegated or mixed-key intent into the tree.
