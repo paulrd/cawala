@@ -16,27 +16,24 @@ how to verify, and conventions**. Detail lives elsewhere:
 
 ## Next session brief
 
-The **administration refactor P1–P4 is DONE and passed the gate** on branch
-**`refactor/topology-admin`** (not pushed, not merged). Authority is an explicit
-per-node **designation set**: a node lists the children (node *or* leaf) allowed
-to administer it; there is **no priority list, TTL, lease, epoch, or automatic
-failover**, and browsers have no automatic authority. All admin is tree-routed;
-routed `AdminDesignate`/`AdminRevoke` let a current administrator change the set,
-and local CLI `control admin add|remove|list` always works.
+The **administration refactor (P1–P5) is DONE, gated, merged to `main`, and
+pushed** (`ec31535`). Authority is an explicit per-node **designation set**: a
+node lists the children (node *or* leaf) allowed to administer it; there is **no
+priority list, TTL, lease, epoch, or automatic failover**, and browsers have no
+automatic authority. All admin is tree-routed; routed
+`AdminDesignate`/`AdminRevoke` let a current administrator change the set, and
+local CLI `control admin add|remove|list` always works. Wire: control format 8
+(accept 7|8), routed control 2, reply 5. Web admin is behind a
+policy-acknowledged lock with ancestor-chain up/down.
 
-**P5 (docs, R2) is this consolidation** — `PLAN.md` slimmed to living
-design/roadmap, delivered history moved to `PLAN-ARCHIVE.md`, `REFACTOR.md` and
-`REFACTOR_PLAN.md` folded in and deleted, `README.md`/`web/README.md` corrected.
-
-Next: **merge the lockstep release to `main`** (P1–P4 do not interoperate with
-the old wasm/web; keep each commit compiling on the branch, merge together).
-Then optional backlog in "Open items" below.
+Next: the optional backlog in "Open items" below (notably the final
+`ADMIN_POLICY.md` wording).
 
 ## Current state
 
-- `main` is clean and pushed; baseline before this branch: `11d7717`.
-- **Refactor branch `refactor/topology-admin`** @ `d4b62e8` + this P5 docs
-  commit (not pushed, not merged); P1–P4 done, gated:
+- `main` is clean and pushed @ `ec31535` (was `11d7717` before the refactor).
+- **Administration refactor** (merged; the `refactor/topology-admin` branch was
+  fast-forwarded in and deleted); P1–P5 done, gated:
   - Control wire: **control format 8** (mint 8; accept 7|8), **routed control 2**
     (carried grant dropped), **reply version 5** (`AdminSnapshot` carries
     `admins`), new `AdminDesignate`/`AdminRevoke` gated by the authenticated
@@ -59,10 +56,6 @@ Then optional backlog in "Open items" below.
 
 ## Open items (recorded backlog)
 
-- **Merge** the lockstep P1–P5 release to `main` (next task).
-- **Gate residuals (accepted):** concurrent local-CLI vs engine `admin_state.json`
-  writes are last-writer-wins (single-operator host); a corrupt-file error path
-  audits per request but is local-only and CLI-repairable.
 - **`ADMIN_POLICY.md` is still a stub** — final policy wording / acknowledgement
   versioning is pending (R6-Q1); the P4 gate depends on the file existing.
 - **Foster-parent recovery — cut by decision** (unchanged).
