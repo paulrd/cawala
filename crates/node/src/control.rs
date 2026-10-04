@@ -890,7 +890,7 @@ impl ControlNode {
     /// that [`needs_authority`] (admin + topology classes), `None` otherwise.
     /// The dispatched `signed` control is always the last hop's own frame
     /// (direct or routed), so `signed.controller` is the msg-layer-authenticated
-    /// admin child that keys value policy and ledger idempotency. `route` carries
+    /// admin child that keys ledger idempotency. `route` carries
     /// the routed `(requester, forwarder)` node ids when the request arrived over
     /// the tree, so designation handlers can audit both; it is `None` on the
     /// direct path.
@@ -1116,8 +1116,8 @@ impl ControlNode {
     ///    routed path;
     /// 7. every admin/topology request (including the value class) dispatches
     ///    the **last hop's** signed control, whose origin and controller are the
-    ///    authenticated predecessor, so value policy and ledger idempotency key
-    ///    on the admin child;
+    ///    authenticated predecessor, so ledger idempotency keys on the admin
+    ///    child;
     /// 8. authority is derived once from the last hop
     ///    ([`ControlNode::authorize_actor`]) and passed explicitly into the
     ///    dispatch.
@@ -1147,8 +1147,8 @@ impl ControlNode {
     /// can execute a deferred ledger query after dropping the control lock.
     ///
     /// Dispatch is uniform across every admin/topology class: the last hop's
-    /// signed control is dispatched, so authority, value policy and ledger
-    /// idempotency all key on the msg-layer-authenticated admin child. The
+    /// signed control is dispatched, so authority and ledger idempotency both
+    /// key on the msg-layer-authenticated admin child. The
     /// end-to-end requester is audit-only. Authority is computed once from the
     /// last hop and passed explicitly into
     /// [`ControlNode::dispatch_authorized`]. A deferred [`Handled::Ledger`] is
@@ -1236,9 +1236,9 @@ impl ControlNode {
         let kind = routed.intent.request.kind();
 
         // Uniform class handling: every admin/topology request (including the
-        // value class) dispatches the last hop's signed control, so authority,
-        // value policy and ledger idempotency all key on the authenticated
-        // admin child. The end-to-end requester is audit-only.
+        // value class) dispatches the last hop's signed control, so authority
+        // and ledger idempotency key on the authenticated admin child. The
+        // end-to-end requester is audit-only.
         let dispatched = last.signed.clone();
 
         // The same version/shape/signature/expiry/replay rules apply to the
@@ -6268,6 +6268,97 @@ mod tests {
             engine.receive_at(any_remote(), v7_issue, 0).await,
             ControlReply::Rejected(RejectCode::NotFound)
         );
+    }
+
+    /// (4ee134a) A relayed admin value request binds the deferred mutation's
+    /// controller to the **last-hop** admin child (the relaying forward's
+    /// signer), not the end-to-end requester that signed the intent.
+    #[tokio::test]
+    async fn relayed_value_mutation_binds_controller_to_last_hop() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let relay_op = secret(2);
+        let requester_op = secret(3);
+        let relay_sk = SecretKey::generate();
+        let relay_id = relay_sk.public().to_string();
+
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[
+                (relay_id.as_str(), ChildKind::Node, 0, 1),
+                ("account", ChildKind::Node, 1, 2),
+            ],
+        );
+        let peers = [node_peer(&relay_id, &relay_op, 3)];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+        // A designated, current child is the only authority on the routed path.
+        assert!(engine.admin_state.add(&relay_id));
+        engine.admin_state.save(dir.path()).unwrap();
+        // `prepare_admin_value` requires a ledger handle; it is never executed
+        // or touched by this test.
+        engine.attach_ledger(std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::ledger_service::LedgerService::open(dir.path(), "parent").unwrap(),
+        )));
+
+        // The end-to-end requester signs the intent; the relaying admin child
+        // signs the applied forward (the last hop).
+        let intent = authorize_at(
+            "requester",
+            &requester_op,
+            1,
+            ControlRequest::AdminIssue(AdminValueRequest {
+                request_id: ValueRequestId::from_bytes([7u8; 16]),
+                account: NodeId::from("account"),
+                amount: 1,
+                reason: "last-hop binding".to_string(),
+            }),
+        );
+        let mut forward = intent.clone();
+        forward.origin = NodeId::from(relay_id.clone());
+        forward.controller = relay_op.public();
+        forward.signature = relay_op.sign(forward.signing_hash().as_bytes());
+
+        let routed = RoutedControlV1 {
+            version: cawala_control::ROUTED_CONTROL_VERSION,
+            target: PeerRef {
+                addr: "0".parse().unwrap(),
+                node: "parent".to_string(),
+            },
+            requester: PeerRef {
+                addr: "0.1".parse().unwrap(),
+                node: "requester".to_string(),
+            },
+            intent,
+            forwards: vec![RoutedForward::new(
+                PeerRef {
+                    addr: "0.1".parse().unwrap(),
+                    node: relay_id,
+                },
+                forward,
+            )],
+        };
+
+        match engine
+            .receive_routed_at_handled(EndpointId::from(relay_sk.public()), routed, 0)
+            .await
+        {
+            Handled::LedgerMutation(pending) => {
+                assert_eq!(
+                    pending.controller,
+                    relay_op.public(),
+                    "the deferred mutation must key on the last-hop admin child"
+                );
+                assert_ne!(
+                    pending.controller,
+                    requester_op.public(),
+                    "the end-to-end requester must not govern the mutation"
+                );
+            }
+            other => panic!("expected a deferred value mutation, got {other:?}"),
+        }
     }
 
     /// v6 is below the accepted window; v7 and v8 frames may carry the

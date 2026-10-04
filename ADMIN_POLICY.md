@@ -22,7 +22,7 @@
 ## Responsibilities of an administrator
 
 - Treat topology changes as material changes in trust.
-- Keep the designation set and value policy accurate.
+- Keep the designation set accurate (and the account balances in view).
 - Understand that issuing and burning value is irreversible.
 
 ## TODO (pending human wording)

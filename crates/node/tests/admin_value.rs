@@ -3,8 +3,9 @@
 //!
 //! A designated administrator child (or the node's own operator) issues and
 //! burns value on a child account; the node executes with its own
-//! operator/ledger keys. The tests cover idempotency (including after reopen),
-//! operator caps, deny-by-default policy, audit lines, and the failure modes.
+//! operator/ledger keys. Issue is uncapped; burn is bounded by the account
+//! balance. The tests cover idempotency (including after reopen), request
+//! validation, audit lines, and the failure modes.
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
