@@ -92,13 +92,13 @@ Next: the optional backlog in "Open items" below (notably the final
 - `web/src/wasm/` is gitignored; run `npm run build:wasm` after any
   `crates/client-wasm` change or the JS/wasm arity can desync.
 - Control-plane local state under `<data-dir>`: `admin_state.json`,
-  `value_policy.json`, `control_seen.json`, `control_audit.jsonl`,
+  `control_seen.json`, `control_audit.jsonl`,
   `pending_joins.json`, `outbound_join.json`, `ledger_peers.json`, `node.json`.
   Record and peers are re-read per control request (direct **and** routed).
-- `value_policy.json`'s `admins` map lists each **admin child's** operator key
-  (the same id held in `admin_state.json`, i.e. the designation), **not** each
-  browser's key. Value policy and ledger idempotency key on the last-hop admin
-  child, so browsers beneath a relaying admin child share its limits.
+- Value issue/burn is **uncapped** and authorized solely by the designation set
+  (`admin_state.json`) and the local CLI; burn cannot exceed the account balance.
+  There is no `value_policy.json`. Ledger idempotency keys on the last-hop admin
+  child.
 - Addresses are network-local and topology-true: an exit rebases the subtree onto
   root `0`; moved pointers are **rejected**. The clean path is `control exit`
   then `ledger edge-close` (detached only); `edge-close` forfeits the entire

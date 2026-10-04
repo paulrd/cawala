@@ -24,8 +24,7 @@
 //!
 //! # Crash safety
 //!
-//! Mutations are written with an atomic temp-file + rename, matching
-//! [`ValuePolicy::save`](crate::value_policy::ValuePolicy::save). The caller
+//! Mutations are written with an atomic temp-file + rename. The caller
 //! persists before updating memory.
 
 use std::path::{Path, PathBuf};

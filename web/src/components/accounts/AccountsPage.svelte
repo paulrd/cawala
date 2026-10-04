@@ -341,8 +341,7 @@
             </div>
           {/if}
           <p class="text-xs muted">
-            Operator-configured limits apply (per-request, window, per-account). The node
-            operator can share the current values.
+            Issue is uncapped; burn is limited by the account&rsquo;s current balance.
           </p>
         </div>
       {/if}
@@ -362,7 +361,7 @@
   <ConfirmDialog
     open={valueDialog !== null}
     title={valueDialog === 'burn' ? 'Burn value?' : 'Issue value?'}
-    message={`This ${valueDialog === 'burn' ? 'destroys' : 'creates'} value on ${view.label || view.nodeId || 'this node'} and changes its equity. The operator's per-request/window/account limits apply; this cannot be undone except by a compensating operation.`}
+    message={`This ${valueDialog === 'burn' ? 'destroys' : 'creates'} value on ${view.label || view.nodeId || 'this node'} and changes its equity. Issue is uncapped; burn is limited by the account balance. This cannot be undone except by a compensating operation.`}
     confirmLabel={valueBusy ? 'Working…' : valueDialog === 'burn' ? 'Burn' : 'Issue'}
     variant={valueDialog === 'burn' ? 'danger' : 'default'}
     onConfirm={submitValue}

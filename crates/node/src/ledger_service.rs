@@ -88,7 +88,6 @@ use crate::ledger_keys::load_or_create_ledger_key;
 use crate::ledger_peers::load_peers;
 use crate::ledger_store::{FileLog, LedgerLock, init_ledger, open_ledger};
 use crate::record::{NodeRecord, RecordStore};
-use crate::value_policy::ValueLimits;
 
 /// The result of applying one [`PaymentOrder`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,9 +205,6 @@ pub struct ValueApplied {
 /// Errors from a delegated value operation.
 #[derive(Debug, thiserror::Error)]
 pub enum ValueError {
-    /// The operation exceeds an operator-configured limit.
-    #[error("value operation exceeds a configured limit")]
-    LimitExceeded,
     /// A burn exceeds the account's current balance (or the account is
     /// unopened).
     #[error("burn exceeds the account balance")]
@@ -671,15 +667,15 @@ impl LedgerService {
     /// Apply one delegated value operation under the exclusive ledger lock.
     ///
     /// Steps: exclusive lock -> refresh from disk -> derive the controller-bound
-    /// nonce -> **dedupe** -> caps -> append -> update the value index. A
-    /// duplicate (`request_id` replayed with identical parameters) returns the
-    /// prior `(seq, entry_hash)` with `duplicate: true` and appends nothing; the
-    /// same nonce with different parameters is
+    /// nonce -> **dedupe** -> append -> update the value index. A duplicate
+    /// (`request_id` replayed with identical parameters) returns the prior
+    /// `(seq, entry_hash)` with `duplicate: true` and appends nothing; the same
+    /// nonce with different parameters is
     /// [`ValueError::RequestIdConflict`].
     ///
-    /// The caller (control plane) resolves and pre-checks the limits for an early
-    /// refusal; this method authoritatively re-enforces them against the freshly
-    /// replayed ledger.
+    /// Issue is **uncapped**: authorization is the designation set alone. Burn is
+    /// bounded only by the account's current balance
+    /// ([`ValueError::InsufficientBalance`]).
     #[allow(clippy::too_many_arguments)]
     pub fn admin_value_apply(
         &mut self,
@@ -689,7 +685,6 @@ impl LedgerService {
         amount: u64,
         controller: &OperatorPubKey,
         request_id: ValueRequestId,
-        limits: ValueLimits,
         now: u64,
     ) -> Result<ValueApplied, ValueError> {
         if amount == 0 {
@@ -722,20 +717,8 @@ impl LedgerService {
             return Err(ValueError::RequestIdConflict);
         }
 
-        if amount > limits.per_request_max {
-            return Err(ValueError::LimitExceeded);
-        }
         let applied = match direction {
             AdminValueDirection::Issue => {
-                let balance = self.balance_of(account).get();
-                if balance.saturating_add(amount) > limits.per_account_max {
-                    return Err(ValueError::LimitExceeded);
-                }
-                let window_start = now.saturating_sub(limits.window_secs);
-                let window_sum = self.issue_sum_since(window_start)?;
-                if window_sum.saturating_add(amount) > limits.window_max {
-                    return Err(ValueError::LimitExceeded);
-                }
                 // Mirrors `fund`: open the account first when needed. A crash
                 // between the open and the issue is harmless (the retry applies
                 // once, and the open is idempotent).
@@ -889,28 +872,6 @@ impl LedgerService {
             },
         );
         Ok((seq, hash, self.balance_of(account).get()))
-    }
-
-    /// Sum every `Issue` amount issued at or after `issued_at_or_after`.
-    ///
-    /// Backs the node-wide issuance window. **Fail closed**: a missing or
-    /// unreadable entry is an error, never silently skipped, because an
-    /// undercount would loosen the cap.
-    fn issue_sum_since(&self, issued_at_or_after: u64) -> Result<u64, ValueError> {
-        let mut sum: u64 = 0;
-        for index in 0..self.ledger.len() {
-            let signed = self.ledger.get(index)?.ok_or_else(|| {
-                ValueError::Ledger(anyhow::anyhow!(
-                    "ledger entry {index} missing while summing the value window"
-                ))
-            })?;
-            if signed.entry.issued_at >= issued_at_or_after
-                && let EntryBody::Issue { amount, .. } = &signed.entry.body
-            {
-                sum = sum.saturating_add(amount.get());
-            }
-        }
-        Ok(sum)
     }
 
     /// This node's operator secret key, loaded from the persisted identity.
@@ -2760,15 +2721,6 @@ mod tests {
         OperatorSecretKey::from_bytes([0x5a; 32]).public()
     }
 
-    fn value_limits(per_request: u64, window_secs: u64, window_max: u64, per_account: u64) -> ValueLimits {
-        ValueLimits {
-            per_request_max: per_request,
-            window_secs,
-            window_max,
-            per_account_max: per_account,
-        }
-    }
-
     #[test]
     fn admin_value_issue_opens_account_and_dedupes_under_the_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -2776,7 +2728,6 @@ mod tests {
         let account = user("child-a");
         let controller = value_controller();
         let request_id = ValueRequestId::from_bytes([1u8; 16]);
-        let limits = value_limits(100, 3600, 1000, 500);
         let now = 1_000;
 
         let first = service
@@ -2787,7 +2738,6 @@ mod tests {
                 40,
                 &controller,
                 request_id,
-                limits,
                 now,
             )
             .unwrap();
@@ -2813,7 +2763,6 @@ mod tests {
                 40,
                 &controller,
                 request_id,
-                limits,
                 now + 10,
             )
             .unwrap();
@@ -2832,7 +2781,6 @@ mod tests {
                 41,
                 &controller,
                 request_id,
-                limits,
                 now,
             )
             .unwrap_err();
@@ -2848,7 +2796,6 @@ mod tests {
                 40,
                 &controller,
                 request_id,
-                limits,
                 now + 20,
             )
             .unwrap();
@@ -2903,118 +2850,6 @@ mod tests {
     }
 
     #[test]
-    fn admin_value_apply_enforces_caps() {
-        let account = user("child-a");
-        let controller = value_controller();
-
-        // Per-request: 11 > per_request_max 10.
-        {
-            let dir = tempfile::tempdir().unwrap();
-            let mut service = LedgerService::open(dir.path(), NODE).unwrap();
-            assert!(matches!(
-                service.admin_value_apply(
-                    AdminValueDirection::Issue,
-                    &account,
-                    ChildKind::User,
-                    11,
-                    &controller,
-                    ValueRequestId::from_bytes([1u8; 16]),
-                    value_limits(10, 3600, 1000, 1000),
-                    1_000,
-                ),
-                Err(ValueError::LimitExceeded)
-            ));
-        }
-
-        // Per-account: balance 40 + amount 20 > per_account_max 50.
-        {
-            let dir = tempfile::tempdir().unwrap();
-            let mut service = LedgerService::open(dir.path(), NODE).unwrap();
-            service
-                .admin_value_apply(
-                    AdminValueDirection::Issue,
-                    &account,
-                    ChildKind::User,
-                    40,
-                    &controller,
-                    ValueRequestId::from_bytes([2u8; 16]),
-                    value_limits(100, 3600, 1000, 50),
-                    1_000,
-                )
-                .unwrap();
-            assert!(matches!(
-                service.admin_value_apply(
-                    AdminValueDirection::Issue,
-                    &account,
-                    ChildKind::User,
-                    20,
-                    &controller,
-                    ValueRequestId::from_bytes([3u8; 16]),
-                    value_limits(100, 3600, 1000, 50),
-                    1_000,
-                ),
-                Err(ValueError::LimitExceeded)
-            ));
-        }
-
-        // Node-wide window: an older `fund` outside the window does not count,
-        // but a second in-window issue exceeds window_max.
-        {
-            let dir = tempfile::tempdir().unwrap();
-            let mut service = LedgerService::open(dir.path(), NODE).unwrap();
-            let other = user("child-b");
-            let operator = node_operator(dir.path());
-            service
-                .ensure_account_open(&other, ChildKind::User)
-                .unwrap();
-            service
-                .fund(&other, ChildKind::User, 30, &operator, 10, 500)
-                .unwrap();
-            // now=1000, window 100 s -> the 500 issue is outside; 40 fits 50.
-            service
-                .admin_value_apply(
-                    AdminValueDirection::Issue,
-                    &other,
-                    ChildKind::User,
-                    40,
-                    &controller,
-                    ValueRequestId::from_bytes([4u8; 16]),
-                    value_limits(100, 100, 50, 1000),
-                    1_000,
-                )
-                .unwrap();
-            assert!(matches!(
-                service.admin_value_apply(
-                    AdminValueDirection::Issue,
-                    &other,
-                    ChildKind::User,
-                    20,
-                    &controller,
-                    ValueRequestId::from_bytes([5u8; 16]),
-                    value_limits(100, 100, 50, 1000),
-                    1_000,
-                ),
-                Err(ValueError::LimitExceeded)
-            ));
-
-            // A zero-cap policy denies even a 1-unit issue.
-            assert!(matches!(
-                service.admin_value_apply(
-                    AdminValueDirection::Issue,
-                    &other,
-                    ChildKind::User,
-                    1,
-                    &controller,
-                    ValueRequestId::from_bytes([6u8; 16]),
-                    ValueLimits::deny_all(),
-                    1_000,
-                ),
-                Err(ValueError::LimitExceeded)
-            ));
-        }
-    }
-
-    #[test]
     fn value_index_scans_issue_and_burn_and_ignores_open_account() {
         let dir = tempfile::tempdir().unwrap();
         // OpenAccount only -> the replayed index is empty.
@@ -3049,7 +2884,8 @@ mod tests {
     /// (`controller_pub` bytes then `request_id` bytes), and the little-endian
     /// truncation of the first 8 digest bytes. A change would silently break
     /// cross-version dedupe: an in-flight retry after a binary upgrade would
-    /// derive a different `(node_operator, nonce)` key and re-apply within caps.
+    /// derive a different `(node_operator, nonce)` key and re-apply the same
+    /// request.
     #[test]
     fn derived_value_nonce_golden_is_frozen() {
         let controller = OperatorSecretKey::from_bytes([1u8; 32]).public();

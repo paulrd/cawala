@@ -33,10 +33,7 @@ use cawala_node::msg::{
     send_envelope,
 };
 use cawala_node::record::RecordStore;
-use cawala_node::{
-    AdminState, LedgerService, OutboundKind, VALUE_POLICY_VERSION, ValueLimits,
-    ValuePolicy,
-};
+use cawala_node::{AdminState, LedgerService, OutboundKind};
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
@@ -835,7 +832,8 @@ async fn routed_admin_issue_returns_verified_and_retry_dedupes() {
         panic!("world shape")
     };
 
-    // Persist the root identity, attach a ledger, and write a value policy.
+    // Persist the root identity and attach a ledger. Issue is uncapped, so no
+    // value policy is written.
     let dir = root.control.lock().await.data_dir().to_path_buf();
     cawala_node::identity::persist_secret_key(&dir, &w.root_key).unwrap();
     let ledger = LedgerService::open(&dir, &w.root_id).unwrap();
@@ -843,18 +841,6 @@ async fn routed_admin_issue_returns_verified_and_retry_dedupes() {
         .lock()
         .await
         .attach_ledger(Arc::new(Mutex::new(ledger)));
-    ValuePolicy {
-        version: VALUE_POLICY_VERSION,
-        defaults: ValueLimits {
-            per_request_max: 1_000,
-            window_secs: 86_400,
-            window_max: 1_000,
-            per_account_max: 1_000,
-        },
-        admins: std::collections::BTreeMap::new(),
-    }
-    .save(&dir)
-    .unwrap();
 
     seed_root_designation(root, &w).await;
 

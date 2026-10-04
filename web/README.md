@@ -77,9 +77,10 @@ chain from its own leaf, hop by hop; it has no automatic authority.
   chain** (no dropdown/selector).
 - Admin surfaces: designated administrators (designate/revoke), pending-join
   approve/reject/resend, topology (re-slot/detach a child node), and value
-  issue/burn (issue/burn are gated by the node's operator-side
-  `value_policy.json`). Creating a child is not a live web action - children
-  appear by approving a join request, or from the node CLI.
+  issue/burn (issue is uncapped; burn is limited by the account balance). The
+  action is authorized by the designation set; there is no operator-side value
+  policy. Creating a child is not a live web action - children appear by
+  approving a join request, or from the node CLI.
 - All admin requests are **tree-routed**; the direct `cawala/control/0` link is
   used only for the browser's own leaf (join handshake, payments).
 

@@ -2659,8 +2659,6 @@ export function canAdministerValue(view, caps) {
 
 /** Reject-code → honest user-facing value error copy. */
 const VALUE_REJECT_MESSAGES = {
-  limit_exceeded:
-    'This exceeds the operator\u2019s per-request, window, or account limit. Ask the node operator for the current limits, or use a smaller amount.',
   insufficient_balance: 'That burn exceeds the account\u2019s current balance.',
   unauthorized:
     'The node refused this value operation: this browser is not a designated administrator of that node.',

@@ -125,9 +125,9 @@
     to two accounts and conserve value; only signed issue/burn entries change a
     node's equity.
   - A designated administrator (or the local operator) can issue/burn value on
-    an account (posted against the node's equity), bounded by the operator-side
-    `value_policy.json`; the browser never holds the node's operator or ledger
-    key.
+    an account (posted against the node's equity). Issue is uncapped; burn is
+    limited by the account balance. The browser never holds the node's operator
+    or ledger key.
 # Constraints
   - tech stack is Iroh, Rust, Typescript, Virtual Private Servers
 # Open Questions

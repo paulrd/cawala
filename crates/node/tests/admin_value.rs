@@ -7,7 +7,6 @@
 //! operator caps, deny-by-default policy, audit lines, and the failure modes.
 
 use std::net::Ipv4Addr;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,7 +20,6 @@ use cawala_node::control::{ControlNode, spawn_control_only_on};
 use cawala_node::control_store::ControlStore;
 use cawala_node::ledger_service::LedgerService;
 use cawala_node::record::RecordStore;
-use cawala_node::{VALUE_POLICY_VERSION, ValueLimits, ValuePolicy};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
@@ -64,25 +62,6 @@ async fn bind(secret: &SecretKey) -> Endpoint {
         .expect("bind endpoint")
 }
 
-fn generous_limits() -> ValueLimits {
-    ValueLimits {
-        per_request_max: 1_000_000,
-        window_secs: 86_400,
-        window_max: 1_000_000,
-        per_account_max: 1_000_000,
-    }
-}
-
-fn write_policy(dir: &Path, limits: ValueLimits) {
-    ValuePolicy {
-        version: VALUE_POLICY_VERSION,
-        defaults: limits,
-        admins: std::collections::BTreeMap::new(),
-    }
-    .save(dir)
-    .unwrap();
-}
-
 struct Fixture {
     router: Router,
     engine: Arc<Mutex<ControlNode>>,
@@ -93,20 +72,16 @@ struct Fixture {
     admin_endpoint: Endpoint,
 }
 
-/// Build a node with a running ledger, a policy (unless `policy` is `None`),
-/// and a record that lists `user-a`/`user-b`. Value operations are driven by
-/// the node's own operator (`SelfOperator`); remote child-admin authority is
-/// proven in `admin_authority.rs`.
-async fn fixture(policy: Option<ValueLimits>) -> Fixture {
+/// Build a node with a running ledger and a record that lists
+/// `user-a`/`user-b`. Value operations are driven by the node's own operator
+/// (`SelfOperator`); remote child-admin authority is proven in
+/// `admin_authority.rs`. Issue is uncapped; there is no policy file.
+async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let secret = cawala_node::identity::load_or_create_secret_key(dir.path()).unwrap();
     let node_id = secret.public().to_string();
     let node_op = operator(&secret);
     let now = now_unix_seconds();
-
-    if let Some(limits) = policy {
-        write_policy(dir.path(), limits);
-    }
 
     let mut ledger = LedgerService::open(dir.path(), &node_id).unwrap();
     ledger
@@ -211,7 +186,7 @@ fn request_id(seed: u8) -> ValueRequestId {
 
 #[tokio::test]
 async fn self_operator_issues_burns_and_snapshot_reflects_it() {
-    let f = fixture(Some(generous_limits())).await;
+    let f = fixture().await;
 
     let reply = f
         .send(issue_request(request_id(1), "user-a", 25))
@@ -261,7 +236,7 @@ async fn self_operator_issues_burns_and_snapshot_reflects_it() {
 
 #[tokio::test]
 async fn duplicate_request_id_dedupes_including_after_reopen() {
-    let f = fixture(Some(generous_limits())).await;
+    let f = fixture().await;
     let id = request_id(7);
 
     let first = f.send(issue_request(id, "user-a", 40)).await;
@@ -299,7 +274,6 @@ async fn duplicate_request_id_dedupes_including_after_reopen() {
                 40,
                 &f.node_op.public(),
                 id,
-                generous_limits(),
                 now_unix_seconds(),
             )
             .unwrap();
@@ -317,57 +291,52 @@ async fn duplicate_request_id_dedupes_including_after_reopen() {
     f.shutdown().await;
 }
 
+/// Issue is uncapped: a large amount that the former value policy would have
+/// refused applies, and the account balance reflects it.
 #[tokio::test]
-async fn absent_and_corrupt_policy_fail_closed_internal() {
-    // No policy file at all: every value op is Internal.
-    let f = fixture(None).await;
-    assert_eq!(
-        f.send(issue_request(request_id(1), "user-a", 1)).await,
-        ControlReply::Rejected(RejectCode::Internal)
-    );
-    assert_eq!(f.height().await, 0, "no ledger call without a valid policy");
-    f.shutdown().await;
-
-    // Corrupt policy file: same refusal.
-    let f = fixture(Some(generous_limits())).await;
-    std::fs::write(f.dir.path().join(cawala_node::VALUE_POLICY_FILE), b"{ not json").unwrap();
-    assert_eq!(
-        f.send(issue_request(request_id(2), "user-a", 1)).await,
-        ControlReply::Rejected(RejectCode::Internal)
-    );
-    assert_eq!(f.height().await, 0);
+async fn uncapped_issue_succeeds() {
+    let f = fixture().await;
+    let large = 10_000_000_000_u64;
+    let reply = f.send(issue_request(request_id(1), "user-a", large)).await;
+    let ControlReply::AdminValueApplied(applied) = reply else {
+        panic!("expected AdminValueApplied, got {reply:?}");
+    };
+    assert_eq!(applied.amount, large);
+    assert!(!applied.duplicate);
+    assert_eq!(f.balance("user-a").await, large);
     f.shutdown().await;
 }
 
+/// Burn remains bounded by the account balance: a burn over the balance is
+/// refused, and an exact-balance burn applies.
 #[tokio::test]
-async fn caps_and_overdraw_are_mapped() {
-    // per_request_max 10, issue 11 -> LimitExceeded.
-    let f = fixture(Some(ValueLimits {
-        per_request_max: 10,
-        window_secs: 86_400,
-        window_max: 1_000,
-        per_account_max: 1_000,
-    }))
-    .await;
-    assert_eq!(
-        f.send(issue_request(request_id(1), "user-a", 11)).await,
-        ControlReply::Rejected(RejectCode::LimitExceeded)
-    );
-    assert_eq!(f.height().await, 0);
-    f.shutdown().await;
-
-    // Burn over balance -> InsufficientBalance (unopened user-b -> 0).
-    let f = fixture(Some(generous_limits())).await;
+async fn burn_is_bounded_by_balance() {
+    let f = fixture().await;
+    // Unopened account has balance 0 -> any burn is refused.
     assert_eq!(
         f.send(burn_request(request_id(2), "user-b", 1)).await,
         ControlReply::Rejected(RejectCode::InsufficientBalance)
     );
+
+    // Fund 30, then over-burn 31 -> refused; exact-balance 30 applies.
+    let reply = f.send(issue_request(request_id(3), "user-a", 30)).await;
+    assert!(matches!(reply, ControlReply::AdminValueApplied(_)));
+    assert_eq!(
+        f.send(burn_request(request_id(4), "user-a", 31)).await,
+        ControlReply::Rejected(RejectCode::InsufficientBalance)
+    );
+    let reply = f.send(burn_request(request_id(5), "user-a", 30)).await;
+    let ControlReply::AdminValueApplied(applied) = reply else {
+        panic!("expected AdminValueApplied, got {reply:?}");
+    };
+    assert_eq!(applied.balance_after, 0);
+    assert_eq!(f.balance("user-a").await, 0);
     f.shutdown().await;
 }
 
 #[tokio::test]
 async fn not_a_child_is_not_found_and_bad_request_bounds() {
-    let f = fixture(Some(generous_limits())).await;
+    let f = fixture().await;
     assert_eq!(
         f.send(issue_request(request_id(1), "ghost", 1)).await,
         ControlReply::Rejected(RejectCode::NotFound)
@@ -400,7 +369,7 @@ async fn not_a_child_is_not_found_and_bad_request_bounds() {
 
 #[tokio::test]
 async fn replay_and_expiry_are_enforced() {
-    let f = fixture(Some(generous_limits())).await;
+    let f = fixture().await;
 
     // Frame replay: the byte-identical control frame.
     let signed = SignedControl::authorize(
@@ -439,7 +408,7 @@ async fn replay_and_expiry_are_enforced() {
 
 #[tokio::test]
 async fn audit_intent_failure_refuses_without_appending() {
-    let f = fixture(Some(generous_limits())).await;
+    let f = fixture().await;
     // Make the audit path unwritable: replace the file with a directory so the
     // fail-closed intent append cannot open it.
     let audit_path = f.dir.path().join("control_audit.jsonl");
@@ -466,7 +435,6 @@ async fn missing_ledger_handle_is_internal() {
     let secret = cawala_node::identity::load_or_create_secret_key(dir.path()).unwrap();
     let node_id = secret.public().to_string();
     let node_op = operator(&secret);
-    write_policy(dir.path(), generous_limits());
     let mut record = RecordStore::open(dir.path(), &node_id).unwrap();
     record.set_address("0".parse().unwrap()).unwrap();
     record

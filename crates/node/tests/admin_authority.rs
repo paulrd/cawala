@@ -4,26 +4,20 @@
 //! for direct requests, `receive_routed_at`/`receive_routed_at_handled` for
 //! tree-routed ones. There is no transport and no wall clock.
 
-use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cawala_control::{
-    AdminDetachChild, AdminValueRequest, ChildKind, ControlReply, ControlRequest, CreateChild,
-    DesignationChange, NodeId, OperatorSecretKey, ROUTED_CONTROL_VERSION, RejectCode,
-    RoutedControlV1, RoutedForward, SignedControl, ValueRequestId,
+    AdminDetachChild, ChildKind, ControlReply, ControlRequest, CreateChild, DesignationChange,
+    NodeId, OperatorSecretKey, ROUTED_CONTROL_VERSION, RejectCode, RoutedControlV1, RoutedForward,
+    SignedControl,
 };
 use cawala_ledger::{LedgerSecretKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::PeerRef;
 use cawala_node::control_store::ControlStore;
 use cawala_node::record::RecordStore;
-use cawala_node::{
-    AdminState, ControlNode, Handled, LedgerService, VALUE_POLICY_VERSION, ValueLimits,
-    ValuePolicy,
-};
+use cawala_node::{AdminState, ControlNode};
 use iroh::{EndpointId, SecretKey};
-use tokio::sync::Mutex;
 
 const NOW: u64 = 1_000;
 
@@ -332,188 +326,6 @@ async fn routed_admin_from_direct_child_applies() {
             .iter()
             .any(|c| c.child_id == victim_id)
     );
-}
-
-#[tokio::test]
-async fn value_policy_keys_on_last_hop_admin_child() {
-    let parent_key = SecretKey::generate();
-    let relay_key = SecretKey::generate();
-    let parent_op = operator(&parent_key);
-    let relay_op = operator(&relay_key);
-    let relay_id = relay_key.public().to_string();
-    // The end-to-end requester is a browser/other operator that is *not* the
-    // signing relay and whose key must not govern the policy.
-    let requester_op = OperatorSecretKey::from_bytes([0x33; 32]);
-
-    let (mut engine, dir) = build(
-        "parent",
-        "0",
-        &[(&relay_id, ChildKind::Node, 0), ("account", ChildKind::Node, 1)],
-        vec![node_peer(&relay_id, &relay_op, 3)],
-        parent_op,
-    );
-    designate(dir.path(), &[&relay_id]);
-
-    // A real ledger handle is required for `prepare_admin_value` to run.
-    let ledger_service = LedgerService::open(dir.path(), "parent").unwrap();
-    engine.attach_ledger(Arc::new(Mutex::new(ledger_service)));
-
-    let strict = ValueLimits {
-        per_request_max: 5,
-        window_secs: 86_400,
-        window_max: 5,
-        per_account_max: 5,
-    };
-    let loose = ValueLimits {
-        per_request_max: 1_000,
-        window_secs: 86_400,
-        window_max: 1_000,
-        per_account_max: 1_000,
-    };
-    // A relayed issue: the intent is signed by the browser (`requester`) and the
-    // applied forward by the relaying admin child (the last hop).
-    let relayed = |amount: u64, seed: u8| {
-        let intent = sign(
-            "requester",
-            &requester_op,
-            ControlRequest::AdminIssue(AdminValueRequest {
-                request_id: ValueRequestId::from_bytes([seed; 16]),
-                account: node("account"),
-                amount,
-                reason: "last-hop admin child policy".to_string(),
-            }),
-        );
-        let forward = {
-            let mut f = intent.clone();
-            f.origin = node(&relay_id);
-            f.controller = relay_op.public();
-            f.signature = relay_op.sign(f.signing_hash().as_bytes());
-            f
-        };
-        RoutedControlV1 {
-            version: ROUTED_CONTROL_VERSION,
-            target: peer_ref("0", "parent"),
-            requester: peer_ref("0.1", "requester"),
-            intent,
-            forwards: vec![RoutedForward::new(peer_ref("0.1", &relay_id), forward)],
-        }
-    };
-
-    // Phase 1: the relaying admin child's own entry (loose) governs, and the
-    // *stricter* end-to-end browser entry is ignored.
-    let mut admins = BTreeMap::new();
-    admins.insert(relay_op.public().to_string().to_lowercase(), loose);
-    admins.insert(requester_op.public().to_string().to_lowercase(), strict);
-    ValuePolicy {
-        version: VALUE_POLICY_VERSION,
-        defaults: strict,
-        admins,
-    }
-    .save(dir.path())
-    .unwrap();
-
-    let remote = EndpointId::from(relay_key.public());
-    match engine.receive_routed_at_handled(remote, relayed(50, 1), NOW).await {
-        Handled::LedgerMutation(pending) => {
-            assert_eq!(
-                pending.controller,
-                relay_op.public(),
-                "policy/idempotency must key on the last-hop admin child, not the browser"
-            );
-            assert_eq!(pending.limits.per_request_max, 1_000);
-            assert_eq!(pending.amount, 50);
-        }
-        other => panic!("expected a deferred value mutation, got {other:?}"),
-    }
-
-    // Phase 2: an issue denied for the last hop's key is refused even though the
-    // browser's end-to-end key would be allowed.
-    let mut admins = BTreeMap::new();
-    admins.insert(relay_op.public().to_string().to_lowercase(), strict);
-    admins.insert(requester_op.public().to_string().to_lowercase(), loose);
-    ValuePolicy {
-        version: VALUE_POLICY_VERSION,
-        defaults: loose,
-        admins,
-    }
-    .save(dir.path())
-    .unwrap();
-
-    assert_eq!(
-        engine
-            .receive_routed_at(remote, relayed(50, 2), NOW)
-            .await,
-        ControlReply::Rejected(RejectCode::LimitExceeded),
-        "the last-hop admin child's denial must govern, over any other key"
-    );
-}
-
-/// A value request whose last hop *is* the requester (the browser is the
-/// designated direct child): the policy still keys on that browser.
-#[tokio::test]
-async fn direct_value_policy_keys_on_browser_last_hop() {
-    let parent_key = SecretKey::generate();
-    let browser_key = SecretKey::generate();
-    let parent_op = operator(&parent_key);
-    let browser_op = operator(&browser_key);
-    let browser_id = browser_key.public().to_string();
-
-    let (mut engine, dir) = build(
-        "parent",
-        "0",
-        &[(&browser_id, ChildKind::User, 0), ("account", ChildKind::Node, 1)],
-        vec![user_peer(&browser_id, &browser_op)],
-        parent_op,
-    );
-    designate(dir.path(), &[&browser_id]);
-
-    let ledger_service = LedgerService::open(dir.path(), "parent").unwrap();
-    engine.attach_ledger(Arc::new(Mutex::new(ledger_service)));
-
-    // Strict defaults; only the browser's own operator key is loosened.
-    let mut admins = BTreeMap::new();
-    admins.insert(
-        browser_op.public().to_string().to_lowercase(),
-        ValueLimits {
-            per_request_max: 1_000,
-            window_secs: 86_400,
-            window_max: 1_000,
-            per_account_max: 1_000,
-        },
-    );
-    ValuePolicy {
-        version: VALUE_POLICY_VERSION,
-        defaults: ValueLimits {
-            per_request_max: 5,
-            window_secs: 86_400,
-            window_max: 5,
-            per_account_max: 5,
-        },
-        admins,
-    }
-    .save(dir.path())
-    .unwrap();
-
-    let remote = EndpointId::from(browser_key.public());
-    let issue = sign(
-        &browser_id,
-        &browser_op,
-        ControlRequest::AdminIssue(AdminValueRequest {
-            request_id: ValueRequestId::from_bytes([0x44; 16]),
-            account: node("account"),
-            amount: 50,
-            reason: "direct-parent policy".to_string(),
-        }),
-    );
-    let routed = routed_from("parent", &issue, &browser_id);
-    match engine.receive_routed_at_handled(remote, routed, NOW).await {
-        Handled::LedgerMutation(pending) => {
-            assert_eq!(pending.controller, browser_op.public());
-            assert_eq!(pending.limits.per_request_max, 1_000);
-            assert_eq!(pending.amount, 50);
-        }
-        other => panic!("expected a deferred value mutation, got {other:?}"),
-    }
 }
 
 #[tokio::test]

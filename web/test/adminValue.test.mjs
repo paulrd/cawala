@@ -110,12 +110,6 @@ test('a malformed pending record reads as null', () => {
 // ── Reject-code copy mapping ─────────────────────────────────────────────────
 
 test('value reject codes map to honest copy', () => {
-  const limit = valueErrorMessage('admin request rejected: limit_exceeded');
-  assert.match(limit, /limit/i);
-  // Actionable: point at the operator and a smaller amount (no fabricated numbers).
-  assert.match(limit, /operator/i);
-  assert.match(limit, /smaller amount/i);
-
   const balance = valueErrorMessage('admin request rejected: insufficient_balance');
   assert.match(balance, /exceeds the account/i);
 

@@ -33,7 +33,6 @@ pub mod orders;
 pub mod record;
 pub mod seen_store;
 pub mod settlement;
-pub mod value_policy;
 
 pub use admin_cli::{AdminCliError, AdminListing};
 pub use admin_state::{
@@ -61,9 +60,6 @@ pub use msg::{
 pub use settlement::{
     DerivedHop, MAX_PENDING, MAX_TERMINAL, PendingSettlement, SettlementManager, TerminalRecord,
     derive_hop, expected_signers, route_is_depth_one,
-};
-pub use value_policy::{
-    VALUE_POLICY_FILE, VALUE_POLICY_VERSION, ValueLimits, ValuePolicy, ValuePolicyError,
 };
 
 /// Bind an endpoint with the given persisted [`iroh::SecretKey`] and start the

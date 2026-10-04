@@ -18,10 +18,10 @@ use cawala_node::msg::{
     sweep_settlements,
 };
 use cawala_node::{
-    ControlNode, LedgerService, MsgConfig, RoutableSnapshot, SettlementManager, ValueLimits,
-    ValuePolicy, VALUE_POLICY_FILE, admin_cli, build_envelope, claim_bundle, identity,
-    ledger_commitments, ledger_keys, ledger_service, ledger_store, netting_harness, record,
-    send_envelope, spawn_control_only, spawn_with_secret_key,
+    ControlNode, LedgerService, MsgConfig, RoutableSnapshot, SettlementManager, admin_cli,
+    build_envelope, claim_bundle, identity, ledger_commitments, ledger_keys, ledger_service,
+    ledger_store, netting_harness, record, send_envelope, spawn_control_only,
+    spawn_with_secret_key,
 };
 use cawala_topology::OctAddr;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -261,9 +261,9 @@ enum ControlCommand {
 ///
 /// `add`, `remove`, and `list` are **local** operator commands: they edit
 /// `<data-dir>/admin_state.json` directly (no network), and a running node
-/// observes the edit via its per-request admin-state reload. `value-policy`
-/// edits the local value-policy file. The online admin/topology commands are
-/// restricted to this node until P3/P4 reroute them.
+/// observes the edit via its per-request admin-state reload. The online
+/// admin/topology commands are restricted to this node until P3/P4 reroute
+/// them.
 #[derive(Subcommand)]
 enum AdminCommand {
     /// Designate a current child as an administrator (bootstraps the first).
@@ -280,37 +280,6 @@ enum AdminCommand {
     },
     /// Print the designated administrator set.
     List,
-    /// Show or set the operator value policy (delegated issue/burn caps).
-    #[command(subcommand)]
-    ValuePolicy(ValuePolicyCommand),
-}
-
-/// `control admin value-policy` subcommands.
-///
-/// The policy bounds delegated `AdminIssue`/`AdminBurn`. It is deny-by-default:
-/// until a valid policy is written, every value operation is refused.
-#[derive(Subcommand)]
-enum ValuePolicyCommand {
-    /// Print the on-disk value policy (or state that none exists).
-    Show,
-    /// Set the default limits, or one controller's override with `--admin`.
-    Set {
-        /// Maximum amount for one issue/burn.
-        #[arg(long, value_name = "AMOUNT")]
-        per_request: u64,
-        /// Node-wide issuance window length, in seconds.
-        #[arg(long, value_name = "SECONDS")]
-        window_secs: u64,
-        /// Maximum total issued within the window.
-        #[arg(long, value_name = "AMOUNT")]
-        window_max: u64,
-        /// Maximum post-issue account balance.
-        #[arg(long, value_name = "AMOUNT")]
-        per_account: u64,
-        /// Set an override for this controller key (64 hex) instead of defaults.
-        #[arg(long, value_name = "OPERATOR_HEX")]
-        admin: Option<String>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -1892,8 +1861,7 @@ async fn control_command(data_dir: &std::path::Path, command: ControlCommand) ->
     Ok(())
 }
 
-/// Local `control admin add|remove|list|value-policy`, delegating to
-/// [`admin_cli`].
+/// Local `control admin add|remove|list`, delegating to [`admin_cli`].
 fn admin_command(
     data_dir: &std::path::Path,
     node_id: &str,
@@ -1912,9 +1880,6 @@ fn admin_command(
         }
         AdminCommand::List => {
             print_admin_listing(data_dir, node_id)?;
-        }
-        AdminCommand::ValuePolicy(command) => {
-            value_policy_command(data_dir, command)?;
         }
     }
     Ok(())
@@ -1945,53 +1910,6 @@ fn print_admin_listing(data_dir: &std::path::Path, node_id: &str) -> Result<()> 
         listing.state.updated_at(),
         listing.state.updated_by()
     );
-    Ok(())
-}
-
-/// Local `control admin value-policy show|set`.
-fn value_policy_command(data_dir: &std::path::Path, command: ValuePolicyCommand) -> Result<()> {
-    match command {
-        ValuePolicyCommand::Show => {
-            let path = data_dir.join(VALUE_POLICY_FILE);
-            match std::fs::read_to_string(&path) {
-                Ok(text) => println!("{text}"),
-                Err(_) => println!(
-                    "no value policy at {}; all delegated value operations are denied",
-                    path.display()
-                ),
-            }
-        }
-        ValuePolicyCommand::Set {
-            per_request,
-            window_secs,
-            window_max,
-            per_account,
-            admin,
-        } => {
-            let limits = ValueLimits {
-                per_request_max: per_request,
-                window_secs,
-                window_max,
-                per_account_max: per_account,
-            };
-            // Preserve the other limits when editing one entry.
-            let mut policy = ValuePolicy::load(data_dir).unwrap_or_else(|_| ValuePolicy::deny_all());
-            match admin {
-                Some(hex) => {
-                    let key = parse_operator_pubkey(&hex)?;
-                    policy.admins.insert(key.to_string(), limits);
-                    println!("value policy override saved for {key}");
-                }
-                None => {
-                    policy.defaults = limits;
-                    println!("value policy defaults saved");
-                }
-            }
-            policy
-                .save(data_dir)
-                .map_err(|err| anyhow::anyhow!("{err}"))?;
-        }
-    }
     Ok(())
 }
 

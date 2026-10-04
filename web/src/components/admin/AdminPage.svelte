@@ -790,8 +790,8 @@
       {:else}
         <p class="text-sm muted">
           Issue creates value on the target node and changes its equity; burn destroys it.
-          Operator-configured limits (per-request, window, per-account) apply and are enforced
-          by the node.
+          Issue is uncapped; burn is limited by the account balance. A designated administrator
+          authorizes the action.
         </p>
 
         <div class="value-form">

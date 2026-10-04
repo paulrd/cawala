@@ -51,7 +51,6 @@ use crate::ledger_service::{LedgerService, ValueError};
 use crate::msg::{MSG_ALPN, MsgConfig, MsgHandler, NeighborSource, RoutableSnapshot};
 use crate::record::{NodeRecord, RecordError, RecordStore};
 use crate::seen_store::SeenStore;
-use crate::value_policy::ValuePolicy;
 
 /// Default sink capacity for locally delivered envelopes when control is
 /// co-hosted with messaging.
@@ -225,9 +224,6 @@ pub struct ControlNode {
     /// control handler can clone the handle, drop the control lock, and then
     /// take the ledger lock (control -> ledger ordering; never both at once).
     ledger: Option<Arc<tokio::sync::Mutex<LedgerService>>>,
-    /// The operator-configured value policy, reloaded per value request. `None`
-    /// means "invalid/absent": no value authority (fail closed).
-    value_policy: Option<ValuePolicy>,
 }
 
 /// The result of dispatching one control request.
@@ -282,8 +278,6 @@ pub struct PendingLedgerMutation {
     pub origin: NodeId,
     /// The authenticated controller key.
     pub controller: OperatorPubKey,
-    /// The resolved operator limits for this controller.
-    pub limits: crate::value_policy::ValueLimits,
 }
 
 impl ControlNode {
@@ -317,7 +311,6 @@ impl ControlNode {
             decisions: VecDeque::new(),
             seen: SeenStore::empty(CONTROL_SEEN_CONFIG),
             ledger: None,
-            value_policy: None,
         }
     }
 
@@ -371,7 +364,6 @@ impl ControlNode {
             decisions: VecDeque::new(),
             seen,
             ledger: None,
-            value_policy: None,
         })
     }
 
@@ -777,28 +769,6 @@ impl ControlNode {
         }
     }
 
-    /// Reload the value policy from disk, failing closed to "no policy" on any
-    /// load error.
-    ///
-    /// Called per value request so an operator edit is observed without a
-    /// restart. An absent/corrupt/unknown-version/partial policy leaves
-    /// `value_policy` `None`, which the dispatch refuses as `Internal`; the
-    /// failure is audited (best effort).
-    fn reload_value_policy(&mut self) {
-        match ValuePolicy::load(&self.data_dir) {
-            Ok(policy) => self.value_policy = Some(policy),
-            Err(err) => {
-                warn!(%err, "value policy load failed; refusing value operations");
-                self.value_policy = None;
-                self.audit(serde_json::json!({
-                    "event": "value-policy",
-                    "loaded": false,
-                    "error": err.to_string(),
-                }));
-            }
-        }
-    }
-
     /// Handle one incoming request and produce its reply.
     ///
     /// Uses the system clock for join-expiry checks. Tests that need
@@ -1055,15 +1025,16 @@ impl ControlNode {
         Handled::Reply(reply)
     }
 
-    /// Validate an admin value request, resolving the account kind and the
-    /// operator limits under the control lock.
+    /// Validate an admin value request, resolving the account kind under the
+    /// control lock.
     ///
     /// The caller has already authorized the **admin child** (the last hop) and
     /// passes its own signed control; `signed.controller` is therefore the
-    /// operator key that keys the value policy and the ledger idempotency
-    /// record. On the direct path that is this node's own operator; on the
-    /// routed path it is the msg-layer-authenticated last-hop admin child, so
-    /// browsers beneath that child share its limits. An unused `authority` is
+    /// operator key that keys the ledger idempotency record. On the direct path
+    /// that is this node's own operator; on the routed path it is the
+    /// msg-layer-authenticated last-hop admin child. There is no value cap: an
+    /// authorized admin child may issue unbounded value and burn only up to the
+    /// account balance (enforced by the ledger). An unused `authority` is
     /// accepted so the call site carries the full decision.
     ///
     /// Returns a [`PendingLedgerMutation`] for deferred execution, or the
@@ -1094,17 +1065,6 @@ impl ControlNode {
         if self.ledger.is_none() {
             return Err(RejectCode::Internal);
         }
-        // Deny-by-default: an absent/corrupt policy serves no value authority.
-        self.reload_value_policy();
-        let Some(policy) = &self.value_policy else {
-            return Err(RejectCode::Internal);
-        };
-        let limits = policy.limits_for(&signed.controller);
-        // Early refusal on the per-request cap (policy-only; the window/account
-        // caps need the ledger and are re-enforced by the service).
-        if request.amount > limits.per_request_max {
-            return Err(RejectCode::LimitExceeded);
-        }
         Ok(PendingLedgerMutation {
             direction,
             account: request.account.clone(),
@@ -1114,7 +1074,6 @@ impl ControlNode {
             reason: request.reason.clone(),
             origin: signed.origin.clone(),
             controller: signed.controller,
-            limits,
         })
     }
 
@@ -3526,7 +3485,6 @@ pub(crate) async fn execute_ledger_mutation(
             pending.amount,
             &pending.controller,
             pending.request_id,
-            pending.limits,
             now,
         )
     };
@@ -3565,7 +3523,6 @@ pub(crate) async fn execute_ledger_mutation(
         }
         Err(err) => {
             let reply = match err {
-                ValueError::LimitExceeded => ControlReply::Rejected(RejectCode::LimitExceeded),
                 ValueError::InsufficientBalance => {
                     ControlReply::Rejected(RejectCode::InsufficientBalance)
                 }

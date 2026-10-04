@@ -1081,8 +1081,8 @@ impl ClientNode {
     /// Issue `amount` into `account` at `node` (value authority).
     ///
     /// `request_id_hex` is the client idempotency key (32 hex chars); the node
-    /// derives its ledger nonce. Always routed; the browser's own operator key
-    /// must be listed in the target's `value_policy.json`. See
+    /// derives its ledger nonce. Always routed; the last-hop admin child must be
+    /// designated at the target. Issue is uncapped. See
     /// [`ClientNode::admin_query`].
     pub async fn admin_issue(
         &self,
