@@ -2,7 +2,7 @@
 
   Status: Living design + roadmap. Delivered-phase history (M0-M5 and the
   superseded unified-console P1-P6) lives in `PLAN-ARCHIVE.md`; the short current
-  handoff is `HANDOFF.md`. Last updated 2026-10-04.
+  handoff is `HANDOFF.md`. Last updated 2026-10-12.
 
 # What We Are Building
   A community-owned, hierarchical value-transfer network: Rust/Iroh nodes
@@ -202,14 +202,82 @@
     `pending_joins.json`, `outbound_join.json`, `ledger_peers.json`,
     `node.json`, plus `secret_key`, `ledger_key`, and the ledger store.
     `admins.json` no longer exists.
-  - Wire versions: **control format 8** (mint 8; accept 7|8), **routed control
-    2** (the carried grant was dropped), **reply version 5**
-    (`AdminSnapshot` carries `admins`); ledger entry format 4; node on-disk
-    ledger meta format 3; settlement payload 3; browser ledger payload 3;
-    browser ledger state 4; browser local state 1.
+  - Wire versions: **control format 9** (mint 9; accept 7|8|9 - adds variant 23
+    `Capabilities` and variant 24 `RegisterEthAddress`), **routed control 2**
+    (the carried grant was dropped), **reply version 6** (`AdminSnapshot`
+    carries `admins`; `ControlReply::Capabilities` is discriminant 9); ledger
+    entry format 4; node on-disk ledger meta format 3; settlement payload 3;
+    browser ledger payload 3 + **v4** (the browser sends V4 `OrderV4` with an
+    `EthIdentity`; it still receives V3 `OrderResult`); browser ledger state 4;
+    browser local state 1.
+  - Browser storage keys. **Authoritative-local** (never discard):
+    `cawala.identity.v1` (the Ed25519 transport seed; mnemonic-derived on new
+    installs, a legacy random seed is preserved) and `cawala.user-identity.v1`
+    (the R3 record: EIP-55 address + the derived secp256k1 secret used to sign
+    V4 orders; the **mnemonic is never stored**), plus the TOFU anchor fields
+    `pinned_ledger`/`pinned_leaf_keys` carried inside `cawala.ledger.v1`.
+    **Best-effort cache** (absence tolerated): `cawala.state.v1:<nodeId>` and
+    `cawala.ledger.v1:<nodeId>`. **Non-authoritative local**: `cawala.recovery.v1`,
+    `cawala.admin.policy.v1`, `cawala.value.pending.v1`.
   - Hard breaks: recreate `node-data` and rebuild the wasm bundle when a format
-    changes (control 8 / routed 2 / reply 5 are the current admin-refactor
-    breaks).
+    changes (control 9 / routed 2 / reply 6 / ledger payload v4 are the current
+    portable-client breaks).
+
+# Portable-Client Refactor (R1 / R1b / R2 / R3)
+  The web app is made host-agnostic and identity-portable. Delivered on branch
+  `refactor/portable-client` (9 commits, not yet merged to `main`). The frozen
+  design is `.slim/deepwork/portable-client-refactor-spec.md` (Addenda A/B/C);
+  the phase log is `.slim/deepwork/portable-client-refactor.md`.
+  - **R1 - node as source of truth over a best-effort local cache.**
+    localStorage is reclassified, not removed: the node is authoritative for
+    account balance, ledger height, and admin/topology views (re-validated via
+    `ledger_status()`/`balance_receipt`). `cawala.state.v1:<nodeId>` /
+    `cawala.ledger.v1:<nodeId>` are best-effort cache - a missing or corrupt
+    blob never blocks boot (empty local state, re-validate from the node). The
+    identity seed and the TOFU pins stay **authoritative-local**. New pure wasm
+    read getters (`pending_orders`, `pinned_leaf_keys`, `pending_join_outbound`,
+    `client_state_info`; extended `JoinStatus`, `LedgerStatusDto`,
+    `SettlementRecordDto`) expose locally-held state without a wire change.
+  - **R1b - versioned node client API (partial).** The node-read surface ships
+    as the R1 getters, and the `Capabilities` handshake **types** ship as control
+    variant 23 + `ControlReply::Capabilities` (discriminant 9, reply 6). The
+    **client-side `Capabilities` send is deferred**; `CONTROL_REPLY_VERSION` is
+    inert (the version rides in the payload), and an old node's decode failure is
+    treated as "unsupported".
+  - **R3 - user-level secp256k1 identity.** A secp256k1 key from a BIP-39
+    mnemonic (`m/44'/60'/0'/0/0`; EIP-55 address) is the user's identity, done
+    in Rust wasm (`k256`/`sha3`/`coins-bip39`) so key material never reaches JS
+    for signing. The **transport Ed25519 key is mnemonic-derived** (BLAKE3
+    domain-separated over the BIP-39 seed → Ed25519 seed), so one mnemonic
+    restores both the ETH identity and the iroh NodeId on any host. The user's
+    signature is **additive** to the Ed25519 envelope and rides the msg/ledger
+    plane: a new `LedgerPayloadV4`/`OrderV4 { order, auth, payee_addr, eth }`
+    with an EIP-712 digest (low-`s` + validated recovery id). The address is
+    anchored via control variant 24 `RegisterEthAddress` as a **write-once**
+    `ChildEntry.eth_address`; rotation is verified against the **incumbent**
+    anchor (the old key authorizes). The direct parent enforces a fail-closed,
+    **version-scoped** anchor gate: an anchored sender MUST use V4, V1/V2 orders
+    are rejected (`apply_same_leaf_order`/`handle_settlement_order`, not the
+    downstream forwarders). The derived secret is persisted; the **mnemonic is
+    never persisted**.
+  - **R2 - dual-target packaging.** Wasm is built **release**; a single-file
+    `dist-single/index.html` inlines all JS/CSS + base64 wasm and initializes
+    from **bytes** (never `instantiateStreaming` on `file://`). On `file://` the
+    service worker is skipped and the passkey panel is hidden (mnemonic unlock
+    only). The **served** deployment stays the multi-asset `dist/`; the
+    single-file build is the distributable for `file://`/zip/email/header-less
+    hosts (see `DEPLOYMENT.md` for the CSP caveat).
+  - **Accepted limits:** ETH authorization is not embedded in the frozen ledger
+    `Entry`, so audit/replay of authorization is only verifiable at the live
+    parent (an `ENTRY_FORMAT_VERSION` break is deferred). Passkey unlock (WebAuthn
+    PRF key-wrap) is deferred - a passkey is an unlock factor, never a signer
+    (P-256 ≠ secp256k1). Client-side anchor rotation is deferred.
+  - **Identity/deployment decisions:** identity is user/browser-level only (nodes
+    and iroh NodeIds stay Ed25519); derived secrets are persisted on-device
+    unencrypted so a reload needs no unlock, and the mnemonic (off-device
+    recovery credential) is the only portable restore path. The transport seed is
+    mnemonic-derived **only when no stored seed exists** (a legacy seed is
+    preserved, keeping its NodeId and nodeId-scoped blobs/TOFU pins valid).
 
 # Roadmap
   - Base network M0-M5 is delivered on `main` (records in `PLAN-ARCHIVE.md`).
@@ -220,10 +288,15 @@
     + simplified nav, P5 docs consolidation (R2).
   - Shipped as **one lockstep release** (the format/routed changes do not
     interoperate with the old wasm/web).
+  - **Portable-client refactor (R1 / R1b / R2 / R3) is delivered on branch
+    `refactor/portable-client`** (9 commits; not yet merged). Wire: control
+    format 9, reply 6, ledger payload v4. This is the next lockstep release.
   - Deferred / settled backlog: control version negotiation (single lockstep
     codebase); no `OctAddr` depth cap; foster-parent recovery cut; moved
     pointers rejected; signed topology/registry distribution rejected; browser
-    create-child deferred (provisioning stays invite/CLI).
+    create-child deferred (provisioning stays invite/CLI); portable-client
+    follow-ups (passkey PRF unlock, client anchor rotation, client `Capabilities`
+    send, auto-pin hard fail-closed needs a node change).
 
 # Administration Refactor Requirements (R1-R9 intent)
   1. **R1 - all admin is tree-routed.** Every admin exchange (`AdminQuery`,
@@ -321,12 +394,27 @@
      per-node 8-cap and geographic sense. Mitigate LCA concentration by
      proactively splitting hot levels (see risk 3).
   10. **Signed topology/registry distribution**: **rejected**. The live network
-     topology (each node's authoritative parent/child links, healed by
-     `Rebase`/`RebasePull`) is the source of truth; there is no distributed
-     snapshot to sign, cache, refresh, revoke, or reconcile. Consequence:
-     fabricated non-neighbor hops and address/key substitution remain
-     **detectable** (audit, netting, carried-prefix Phase 2, `EdgeClose`) but
-     not **prevented** - consistent with the accepted risks.
+      topology (each node's authoritative parent/child links, healed by
+      `Rebase`/`RebasePull`) is the source of truth; there is no distributed
+      snapshot to sign, cache, refresh, revoke, or reconcile. Consequence:
+      fabricated non-neighbor hops and address/key substitution remain
+      **detectable** (audit, netting, carried-prefix Phase 2, `EdgeClose`) but
+      not **prevented** - consistent with the accepted risks.
+  11. **Identity scope**: user/browser-level secp256k1 (BIP-39) only; nodes and
+      iroh NodeIds stay Ed25519. The user signature is additive to the Ed25519
+      envelope and rides the msg/ledger plane, not control. (2026-10-12,
+      portable-client refactor.)
+  12. **Key persistence & portability**: persist *derived* secrets on-device
+      unencrypted (transport seed + ETH secret) so a reload needs no unlock; the
+      mnemonic is the root of trust and is **never persisted**. The transport
+      Ed25519 key is mnemonic-derived only when no stored seed exists; a legacy
+      seed is preserved. Passkey is an unlock factor, never a signer. (2026-10-12.)
+  13. **Packaging/deployment**: the served deployment stays the multi-asset
+      `dist/`; `dist-single/index.html` is a distributable single file for
+      `file://`/zip/email/header-less hosts. Do not serve `dist-single` under a
+      host CSP that lacks `script-src 'unsafe-inline'` (header + meta CSP
+      intersect and blank the inline bundle). On `file://` passkeys and service
+      workers are unavailable (mnemonic unlock only). (2026-10-12.)
 
 ## Superseded (recorded for history)
   - **Seniority rule** (earliest `date_joined` = most senior, senior child

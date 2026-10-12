@@ -4,11 +4,16 @@ A place for the community to advertise independent copies of the web app, and
 the format for a machine-readable list served at
 `https://cawala.ca/.well-known/mirrors.json`.
 
-> **Different origin = separate identity.** A mirror on `alice.example` (or
-> `<cid>.ipfs.cawala.ca`) is a distinct browser origin. It is great for
-> availability and bootstrapping, but it does **not** carry a user's existing
-> identity/ledger state. Users move by exporting their identity from the
-> original origin and importing it on the mirror (`Settings → Identity`).
+> **Identity is mnemonic-derived and portable across origins.** A user's account
+> (secp256k1 Ethereum address) *and* the browser's transport NodeId are derived
+> from a 12-word BIP-39 recovery phrase. Entering that phrase on any mirror —
+> `alice.example`, `<cid>.ipfs.cawala.ca`, or a local `file://` copy — restores
+> the **same** account on any origin/host, so a mirror no longer forces an
+> export/import. Only the service worker and the best-effort local cache
+> (`cawala.state.v1:<nodeId>`, `cawala.ledger.v1:<nodeId>`) stay origin-scoped;
+> derived secrets are persisted per-device and the phrase itself is never stored.
+> (`Settings → Identity Portability` still exports the legacy transport-seed
+> bundle for moving an existing install.)
 
 ## Why mirrors
 
@@ -59,7 +64,8 @@ key out-of-band. Suggested schema:
 - `sequence` / `expires` / `prev` let consumers reject rollbacks and stale
   lists.
 - `kind`: `canonical`, `dnslink-ipfs`, `static`, `ipns`, …
-- `readonly`: a mirror that only serves the app (no shared identity).
+- `readonly`: a mirror that only serves the app and shares no local storage with
+  the canonical origin. Users still carry their identity by mnemonic.
 
 ### Signing
 
@@ -104,4 +110,4 @@ _This list is a template. Populate it once mirrors exist._
 | --- | --- | --- | --- | --- |
 | https://cawala.ca/ | canonical | cawala | no | managed host |
 | https://`<cid>`.ipfs.cawala.ca/ | dnslink-ipfs | cawala | yes | update DNSLink per release |
-| _add yours_ | static | — | yes | different origin / separate identity |
+| _add yours_ | static | — | yes | identity restored by mnemonic on any origin |
