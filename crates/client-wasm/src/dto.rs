@@ -17,8 +17,9 @@ use wasm_bindgen::{JsError, prelude::wasm_bindgen};
 
 use crate::control::AncestorEntry;
 use crate::ledger_state::{
-    ActivityEntryV1, LedgerStateV1, OrderResultApplication, SettlementApplication, SettlementRecordV1,
-    VerifiedBalanceV1, hop_role_str, settlement_state_reason, settlement_state_str,
+    ActivityEntryV1, LedgerStateV1, OrderResultApplication, PendingOrderV1, SettlementApplication,
+    SettlementRecordV1, VerifiedBalanceV1, hop_role_str, settlement_state_failed_at,
+    settlement_state_reason, settlement_state_str,
 };
 use crate::state::LocalStateV1;
 use crate::to_js_err;
@@ -228,6 +229,7 @@ pub struct JoinStatus {
     slot: Option<u8>,
     address: Option<String>,
     reason: Option<String>,
+    reject_code: Option<String>,
 }
 
 impl JoinStatus {
@@ -256,6 +258,10 @@ impl JoinStatus {
                 .last_rejection
                 .as_ref()
                 .and_then(|rejection| rejection.reason.clone()),
+            reject_code: state
+                .last_rejection
+                .as_ref()
+                .map(|rejection| rejection.code.clone()),
         }
     }
 }
@@ -290,6 +296,14 @@ impl JoinStatus {
     #[wasm_bindgen(getter)]
     pub fn reason(&self) -> Option<String> {
         self.reason.clone()
+    }
+
+    /// The stable code of the last rejection (`"rejected"`, `"slot_taken"`,
+    /// `"unauthorized"`, ...), if any. Distinct from [`Self::reason`], which is
+    /// the parent's human-readable text.
+    #[wasm_bindgen(getter)]
+    pub fn reject_code(&self) -> Option<String> {
+        self.reject_code.clone()
     }
 }
 
@@ -621,6 +635,7 @@ pub struct LedgerStatusDto {
     parent: Option<String>,
     balance: Option<f64>,
     height: Option<f64>,
+    state_root: Option<String>,
     pinned_ledger: Option<String>,
     pending: u32,
     activity: u32,
@@ -639,6 +654,10 @@ impl LedgerStatusDto {
             parent,
             balance: state.balance.as_ref().map(|balance| balance.amount as f64),
             height: state.balance.as_ref().map(|balance| balance.height as f64),
+            state_root: state
+                .balance
+                .as_ref()
+                .map(|balance| balance.state_root.to_hex()),
             pinned_ledger: state.pinned_ledger.map(|key| key.to_string()),
             pending: state.pending.len() as u32,
             activity: state.activity.len() as u32,
@@ -670,6 +689,13 @@ impl LedgerStatusDto {
     #[wasm_bindgen(getter)]
     pub fn height(&self) -> Option<f64> {
         self.height
+    }
+
+    /// The ledger state root the last verified balance was attested against, as
+    /// 64 lowercase hex characters, if any.
+    #[wasm_bindgen(getter)]
+    pub fn state_root(&self) -> Option<String> {
+        self.state_root.clone()
     }
 
     /// The pinned ledger key as 64 lowercase hex characters, if any.
@@ -785,6 +811,7 @@ pub struct SettlementRecordDto {
     amount: Option<f64>,
     counterparty: Option<String>,
     entry_seq: Option<f64>,
+    failed_at: Option<String>,
 }
 
 impl SettlementRecordDto {
@@ -800,6 +827,8 @@ impl SettlementRecordDto {
                 .as_ref()
                 .map(|id| id.as_str().to_string()),
             entry_seq: record.entry_seq.map(|seq| seq as f64),
+            failed_at: settlement_state_failed_at(&record.state)
+                .map(|id| id.as_str().to_string()),
         }
     }
 }
@@ -841,6 +870,333 @@ impl SettlementRecordDto {
     #[wasm_bindgen(getter)]
     pub fn entry_seq(&self) -> Option<f64> {
         self.entry_seq
+    }
+
+    /// The failing hop's node id, for a `"partial"` settlement; `None`
+    /// otherwise.
+    #[wasm_bindgen(getter)]
+    pub fn failed_at(&self) -> Option<String> {
+        self.failed_at.clone()
+    }
+}
+
+/// One leaf ledger key pinned in the client's local ledger state, exposed to JS
+/// so a reload can surface the authoritative-local TOFU anchors.
+///
+/// The pin maps a leaf node id to the ledger key its terminal inclusion proofs
+/// must verify under. It is installed from an out-of-band receive URI or by
+/// trust-on-first-use on the first verified terminal proof, and it is
+/// **authoritative-local** (never a discardable cache).
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct PinnedLeafKeyDto {
+    node_id: String,
+    ledger: String,
+}
+
+impl PinnedLeafKeyDto {
+    /// Convert one pinned `(node_id, ledger)` pair.
+    pub(crate) fn new(node_id: &NodeId, ledger: LedgerPubKey) -> Self {
+        PinnedLeafKeyDto {
+            node_id: node_id.as_str().to_string(),
+            ledger: ledger.to_string(),
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl PinnedLeafKeyDto {
+    /// The leaf node id.
+    #[wasm_bindgen(getter)]
+    pub fn node_id(&self) -> String {
+        self.node_id.clone()
+    }
+
+    /// The pinned ledger key as 64 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn ledger(&self) -> String {
+        self.ledger.clone()
+    }
+}
+
+/// One in-flight payment order, exposed to JS so a reload can rebuild the
+/// pending view. `u64` fields become `f64` (JavaScript never receives a raw
+/// `u64`/BigInt); hashes, keys, and signatures are lowercase hex; the payee
+/// address is an `OctAddr` string when known.
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct PendingOrderDto {
+    from: String,
+    to: String,
+    amount: f64,
+    nonce: f64,
+    expiry: f64,
+    operator: String,
+    auth_nonce: f64,
+    order_hash: String,
+    signature: String,
+    sent_at: f64,
+    payee_addr: Option<String>,
+    payer_leaf: bool,
+    pinned_leaf: Option<PinnedLeafKeyDto>,
+}
+
+impl PendingOrderDto {
+    /// Convert one persisted pending order (order + auth + terminal-verification
+    /// binding).
+    pub(crate) fn from_pending(pending: &PendingOrderV1) -> Self {
+        PendingOrderDto {
+            from: pending.order.from.as_str().to_string(),
+            to: pending.order.to.as_str().to_string(),
+            amount: pending.order.amount.get() as f64,
+            nonce: pending.order.nonce as f64,
+            expiry: pending.order.expiry as f64,
+            operator: pending.auth.operator.to_string(),
+            auth_nonce: pending.auth.nonce as f64,
+            order_hash: hash_hex(pending.auth.order_hash),
+            signature: pending.auth.signature.to_string(),
+            sent_at: pending.sent_at as f64,
+            payee_addr: pending.payee_addr.as_ref().map(|addr| addr.to_string()),
+            payer_leaf: pending.payer_leaf,
+            pinned_leaf: pending
+                .pinned_leaf
+                .as_ref()
+                .map(|(node, ledger)| PinnedLeafKeyDto::new(node, *ledger)),
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl PendingOrderDto {
+    /// The payer node.
+    #[wasm_bindgen(getter)]
+    pub fn from(&self) -> String {
+        self.from.clone()
+    }
+
+    /// The payee node.
+    #[wasm_bindgen(getter)]
+    pub fn to(&self) -> String {
+        self.to.clone()
+    }
+
+    /// The amount to move.
+    #[wasm_bindgen(getter)]
+    pub fn amount(&self) -> f64 {
+        self.amount
+    }
+
+    /// The per-cascade replay nonce.
+    #[wasm_bindgen(getter)]
+    pub fn nonce(&self) -> f64 {
+        self.nonce
+    }
+
+    /// Unix-seconds expiry (as an `f64`; never a raw `u64`).
+    #[wasm_bindgen(getter)]
+    pub fn expiry(&self) -> f64 {
+        self.expiry
+    }
+
+    /// The authorising operator key as 64 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn operator(&self) -> String {
+        self.operator.clone()
+    }
+
+    /// The order nonce carried in the auth binding.
+    #[wasm_bindgen(getter)]
+    pub fn auth_nonce(&self) -> f64 {
+        self.auth_nonce
+    }
+
+    /// The domain-separated order hash as 64 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn order_hash(&self) -> String {
+        self.order_hash.clone()
+    }
+
+    /// The operator signature over the order as 128 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn signature(&self) -> String {
+        self.signature.clone()
+    }
+
+    /// Unix-seconds send time (as an `f64`; never a raw `u64`).
+    #[wasm_bindgen(getter)]
+    pub fn sent_at(&self) -> f64 {
+        self.sent_at
+    }
+
+    /// The payee's user `OctAddr`, when known.
+    #[wasm_bindgen(getter)]
+    pub fn payee_addr(&self) -> Option<String> {
+        self.payee_addr.clone()
+    }
+
+    /// Whether the terminal hop is a same-leaf `Direct` (`true`) rather than a
+    /// cross-leaf `Descend` (`false`).
+    #[wasm_bindgen(getter)]
+    pub fn payer_leaf(&self) -> bool {
+        self.payer_leaf
+    }
+
+    /// The out-of-band receive-URI leaf pin this order must verify under, if
+    /// any.
+    #[wasm_bindgen(getter)]
+    pub fn pinned_leaf(&self) -> Option<PinnedLeafKeyDto> {
+        self.pinned_leaf.clone()
+    }
+}
+
+/// The in-flight outbound `JoinRequest`, exposed to JS so a reload can rebuild
+/// the pending-join view without decoding the local-state blob.
+///
+/// Returned by [`crate::ClientNode::pending_join_outbound`] only while a join is
+/// outstanding; `None` once it is approved, rejected, or detached.
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct PendingJoinOutboundDto {
+    node: String,
+    kind: String,
+    operator: String,
+    ledger: Option<String>,
+    desired_slot: Option<u8>,
+    location_hint: Option<String>,
+    nonce: f64,
+    expiry: f64,
+    parent: String,
+    pinned_operator: Option<String>,
+    sent_at: f64,
+}
+
+impl PendingJoinOutboundDto {
+    /// Build the DTO from the local state's outbound join, or `None` when there
+    /// is no in-flight join.
+    pub(crate) fn from_state(state: &LocalStateV1) -> Option<Self> {
+        let outbound = state.outbound.as_ref()?;
+        let request = &outbound.request;
+        Some(PendingJoinOutboundDto {
+            node: request.node.as_str().to_string(),
+            kind: child_kind_str(request.kind).to_string(),
+            operator: request.operator.to_string(),
+            ledger: request.ledger.map(|key| key.to_string()),
+            desired_slot: request.desired_slot,
+            location_hint: request.location_hint.clone(),
+            nonce: request.nonce as f64,
+            expiry: request.expiry as f64,
+            parent: outbound.parent.as_str().to_string(),
+            pinned_operator: outbound.pinned_operator.map(|key| key.to_string()),
+            sent_at: outbound.sent_at as f64,
+        })
+    }
+}
+
+#[wasm_bindgen]
+impl PendingJoinOutboundDto {
+    /// The applicant node id.
+    #[wasm_bindgen(getter)]
+    pub fn node(&self) -> String {
+        self.node.clone()
+    }
+
+    /// `"node"` or `"user"`.
+    #[wasm_bindgen(getter)]
+    pub fn kind(&self) -> String {
+        self.kind.clone()
+    }
+
+    /// The applicant's operator key as 64 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn operator(&self) -> String {
+        self.operator.clone()
+    }
+
+    /// The applicant's ledger key as 64 lowercase hex characters, `None` for a
+    /// user leaf.
+    #[wasm_bindgen(getter)]
+    pub fn ledger(&self) -> Option<String> {
+        self.ledger.clone()
+    }
+
+    /// The requested slot (`0..=7`), or `None` when the parent picks.
+    #[wasm_bindgen(getter)]
+    pub fn desired_slot(&self) -> Option<u8> {
+        self.desired_slot
+    }
+
+    /// The untrusted location-service hint, if any.
+    #[wasm_bindgen(getter)]
+    pub fn location_hint(&self) -> Option<String> {
+        self.location_hint.clone()
+    }
+
+    /// The per-request replay nonce.
+    #[wasm_bindgen(getter)]
+    pub fn nonce(&self) -> f64 {
+        self.nonce
+    }
+
+    /// Unix-seconds expiry (as an `f64`; never a raw `u64`).
+    #[wasm_bindgen(getter)]
+    pub fn expiry(&self) -> f64 {
+        self.expiry
+    }
+
+    /// The parent the request was sent to.
+    #[wasm_bindgen(getter)]
+    pub fn parent(&self) -> String {
+        self.parent.clone()
+    }
+
+    /// The parent's operator key pinned out-of-band by an invite, as 64
+    /// lowercase hex characters, if any.
+    #[wasm_bindgen(getter)]
+    pub fn pinned_operator(&self) -> Option<String> {
+        self.pinned_operator.clone()
+    }
+
+    /// Unix-seconds send time (as an `f64`; never a raw `u64`).
+    #[wasm_bindgen(getter)]
+    pub fn sent_at(&self) -> f64 {
+        self.sent_at
+    }
+}
+
+/// The on-disk blob versions this client's state is written at.
+///
+/// Exposed by [`crate::ClientNode::client_state_info`] so a frontend can reason
+/// about the persisted-state format it is importing/exporting. The versions are
+/// the same ones [`crate::ClientNode::export_state`] and
+/// [`crate::ClientNode::export_ledger_state`] stamp into their blobs.
+#[wasm_bindgen]
+pub struct ClientStateInfo {
+    state_version: u8,
+    ledger_version: u8,
+}
+
+impl ClientStateInfo {
+    /// Build a version summary.
+    pub(crate) fn new(state_version: u8, ledger_version: u8) -> Self {
+        ClientStateInfo {
+            state_version,
+            ledger_version,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl ClientStateInfo {
+    /// The version of the `cawala.state.v1` blob.
+    #[wasm_bindgen(getter)]
+    pub fn state_version(&self) -> u8 {
+        self.state_version
+    }
+
+    /// The version of the `cawala.ledger.v1` blob.
+    #[wasm_bindgen(getter)]
+    pub fn ledger_version(&self) -> u8 {
+        self.ledger_version
     }
 }
 
@@ -1682,8 +2038,11 @@ mod tests {
     use super::*;
     use cawala_control::{ChildKind, Invite, NodeId, OctAddr, OperatorSecretKey};
 
-    use crate::ledger_state::{ActivityEntryV1, SettlementRecordV1, SettlementStateV1};
-    use crate::state::{ChildLink, LocalStateV1, ParentLink};
+    use crate::ledger_state::{
+        ActivityEntryV1, LEDGER_STATE_VERSION, PendingOrderV1, SettlementRecordV1,
+        SettlementStateV1, build_payment_order,
+    };
+    use crate::state::{ChildLink, LOCAL_STATE_VERSION, LocalStateV1, ParentLink};
 
     fn operator(seed: u8) -> OperatorSecretKey {
         OperatorSecretKey::from_bytes([seed; 32])
@@ -2288,5 +2647,166 @@ mod tests {
         assert_eq!(root_dto.address, "0");
         assert_eq!(root_dto.depth, 2.0);
         assert!(root_dto.is_root, "the true root is marked");
+    }
+
+    fn pending_order_fixture() -> PendingOrderV1 {
+        let order = build_payment_order(node("n1"), node("n2"), 5, 7, 100);
+        let auth = order.authorize(&operator(1)).unwrap();
+        let leaf_key = cawala_ledger::LedgerSecretKey::from_bytes([7u8; 32]).public();
+        PendingOrderV1 {
+            order,
+            auth,
+            sent_at: 1,
+            payee_addr: Some("0.2.4".parse().unwrap()),
+            payer_leaf: true,
+            pinned_leaf: Some((node("leaf"), leaf_key)),
+        }
+    }
+
+    #[test]
+    fn pending_order_dto_maps_order_auth_and_binding() {
+        let pending = pending_order_fixture();
+        let expected_hash = pending.auth.order_hash.to_hex();
+        let expected_sig = pending.auth.signature.to_string();
+        let expected_operator = operator(1).public().to_string();
+
+        let dto = PendingOrderDto::from_pending(&pending);
+        assert_eq!(dto.from, "n1");
+        assert_eq!(dto.to, "n2");
+        assert_eq!(dto.amount, 5.0);
+        assert_eq!(dto.nonce, 7.0);
+        assert_eq!(dto.expiry, 100.0);
+        assert_eq!(dto.operator, expected_operator);
+        assert_eq!(dto.auth_nonce, 7.0);
+        assert_eq!(dto.order_hash, expected_hash);
+        assert_eq!(dto.signature, expected_sig);
+        assert_eq!(dto.signature.len(), 128);
+        assert_eq!(dto.sent_at, 1.0);
+        assert_eq!(dto.payee_addr.as_deref(), Some("0.2.4"));
+        assert!(dto.payer_leaf);
+
+        let pinned = dto.pinned_leaf.expect("the out-of-band leaf pin is carried");
+        assert_eq!(pinned.node_id, "leaf");
+        assert_eq!(pinned.ledger.len(), 64);
+
+        // The optional binding fields collapse to `None` when absent.
+        let bare = PendingOrderV1 {
+            payee_addr: None,
+            payer_leaf: false,
+            pinned_leaf: None,
+            ..pending_order_fixture()
+        };
+        let dto = PendingOrderDto::from_pending(&bare);
+        assert_eq!(dto.payee_addr, None);
+        assert!(!dto.payer_leaf);
+        assert!(dto.pinned_leaf.is_none());
+    }
+
+    #[test]
+    fn pinned_leaf_key_dto_maps_node_and_key() {
+        let key = cawala_ledger::LedgerSecretKey::from_bytes([9u8; 32]).public();
+        let dto = PinnedLeafKeyDto::new(&node("leaf"), key);
+        assert_eq!(dto.node_id, "leaf");
+        assert_eq!(dto.ledger, key.to_string());
+        assert_eq!(dto.ledger.len(), 64);
+    }
+
+    #[test]
+    fn pending_join_outbound_dto_maps_request_and_metadata() {
+        // No in-flight join yields `None`, not an empty DTO.
+        assert!(PendingJoinOutboundDto::from_state(&LocalStateV1::new()).is_none());
+
+        let operator_key = operator(1).public();
+        let pinned = operator(9).public();
+        let request = cawala_control::JoinRequest {
+            node: node("me"),
+            kind: ChildKind::User,
+            operator: operator_key,
+            ledger: None,
+            desired_slot: Some(3),
+            location_hint: Some("eu-west".to_string()),
+            nonce: 7,
+            expiry: 100,
+        };
+        let mut state = LocalStateV1::new();
+        state.set_outbound(request, node("parent"), Some(pinned), 42);
+
+        let dto = PendingJoinOutboundDto::from_state(&state).expect("an outbound join");
+        let operator_hex = operator_key.to_string();
+        let pinned_hex = pinned.to_string();
+        assert_eq!(dto.node, "me");
+        assert_eq!(dto.kind, "user");
+        assert_eq!(dto.operator, operator_hex);
+        assert_eq!(dto.ledger, None);
+        assert_eq!(dto.desired_slot, Some(3));
+        assert_eq!(dto.location_hint.as_deref(), Some("eu-west"));
+        assert_eq!(dto.nonce, 7.0);
+        assert_eq!(dto.expiry, 100.0);
+        assert_eq!(dto.parent, "parent");
+        assert_eq!(dto.pinned_operator.as_deref(), Some(pinned_hex.as_str()));
+        assert_eq!(dto.sent_at, 42.0);
+    }
+
+    #[test]
+    fn join_status_reports_reject_code_and_reason() {
+        let mut state = LocalStateV1::new();
+        state.reject_outbound("slot_taken", Some("no free slot".to_string()));
+        let status = JoinStatus::from_state(&state);
+        assert_eq!(status.state, "rejected");
+        assert_eq!(status.reject_code.as_deref(), Some("slot_taken"));
+        assert_eq!(status.reason.as_deref(), Some("no free slot"));
+
+        // A pending join has no rejection code.
+        assert_eq!(JoinStatus::from_state(&LocalStateV1::new()).reject_code, None);
+    }
+
+    #[test]
+    fn ledger_status_dto_maps_state_root() {
+        let mut state = LedgerStateV1::new();
+        state.balance = Some(VerifiedBalanceV1 {
+            amount: 10,
+            height: 2,
+            state_root: Hash::from_bytes([0xab; 32]),
+        });
+        let status = LedgerStatusDto::from_state(None, None, &state);
+        let expected = "ab".repeat(32);
+        assert_eq!(status.state_root.as_deref(), Some(expected.as_str()));
+
+        assert_eq!(
+            LedgerStatusDto::from_state(None, None, &LedgerStateV1::new()).state_root,
+            None
+        );
+    }
+
+    #[test]
+    fn settlement_record_dto_maps_failed_at_for_partial_only() {
+        let partial = SettlementRecordV1 {
+            order_hash: Hash::ZERO,
+            state: SettlementStateV1::Partial {
+                failed_at: node("leaf-b"),
+            },
+            amount: Some(5),
+            counterparty: Some(node("n2")),
+            entry_seq: None,
+        };
+        let dto = SettlementRecordDto::from_record(&partial);
+        assert_eq!(dto.status, "partial");
+        assert_eq!(dto.failed_at.as_deref(), Some("leaf-b"));
+
+        let applied = SettlementRecordV1 {
+            order_hash: Hash::ZERO,
+            state: SettlementStateV1::Applied,
+            amount: None,
+            counterparty: None,
+            entry_seq: None,
+        };
+        assert_eq!(SettlementRecordDto::from_record(&applied).failed_at, None);
+    }
+
+    #[test]
+    fn client_state_info_reports_blob_versions() {
+        let info = ClientStateInfo::new(LOCAL_STATE_VERSION, LEDGER_STATE_VERSION);
+        assert_eq!(info.state_version, LOCAL_STATE_VERSION);
+        assert_eq!(info.ledger_version, LEDGER_STATE_VERSION);
     }
 }

@@ -57,8 +57,8 @@ use crate::dto::{
     ControlEventDto, JoinOutcome, JoinStatus, LeaveOutcome, LedgerEventDto, LedgerStatusDto,
     PaymentOutcome, SnapshotDto, parse_operator_hex, parse_request_id_hex, reject_code_str,
 };
-use crate::ledger_state::LedgerStateV1;
-use crate::state::{LocalStateV1, ParentLink, Transition};
+use crate::ledger_state::{LEDGER_STATE_VERSION, LedgerStateV1};
+use crate::state::{LOCAL_STATE_VERSION, LocalStateV1, ParentLink, Transition};
 
 /// WASM entry point, called once when the module is instantiated.
 #[wasm_bindgen(start)]
@@ -836,6 +836,18 @@ impl ClientNode {
         JoinStatus::from_state(&self.control.lock_state())
     }
 
+    /// The in-flight outbound join request, if any.
+    ///
+    /// Returns the full self-signed [`JoinRequest`](cawala_control::JoinRequest)
+    /// fields (node/kind/operator/ledger/slot/hint/nonce/expiry) plus the
+    /// parent, the out-of-band pinned operator key, and the send time — the
+    /// detail that was previously reachable only by decoding the
+    /// `cawala.state.v1` blob. `None` once the join is approved, rejected, or
+    /// detached.
+    pub fn pending_join_outbound(&self) -> Option<dto::PendingJoinOutboundDto> {
+        dto::PendingJoinOutboundDto::from_state(&self.control.lock_state())
+    }
+
     /// Leave the current parent: sign an [`ExitRequest`], best-effort deliver
     /// it to the parent over `cawala/control/0`, then clear the local parent
     /// and address **regardless of the reply**.
@@ -1438,6 +1450,16 @@ impl ClientNode {
         Ok(())
     }
 
+    /// The on-disk blob versions this client writes.
+    ///
+    /// A pure getter over the crate's format constants (no wire change): the
+    /// version stamped into `cawala.state.v1`
+    /// ([`state::LOCAL_STATE_VERSION`]) and `cawala.ledger.v1`
+    /// ([`ledger_state::LEDGER_STATE_VERSION`]).
+    pub fn client_state_info(&self) -> dto::ClientStateInfo {
+        dto::ClientStateInfo::new(LOCAL_STATE_VERSION, LEDGER_STATE_VERSION)
+    }
+
     /// Non-blocking drain of the next queued control event.
     ///
     /// Returns `None` when the queue is empty.
@@ -1903,6 +1925,40 @@ impl ClientNode {
             .settlements
             .iter()
             .map(dto::SettlementRecordDto::from_record)
+            .collect()
+    }
+
+    /// The persisted in-flight payment orders, oldest first, for UI
+    /// reconstruction after a reload.
+    ///
+    /// Each entry carries the full order, its operator auth binding, the send
+    /// time, and the terminal-verification binding (payee address, same-leaf
+    /// flag, and any out-of-band leaf pin) — the detail that was previously
+    /// reachable only by decoding the `cawala.ledger.v1` blob. Bounded by
+    /// [`ledger_state::MAX_PENDING_ORDERS`](crate::ledger_state::MAX_PENDING_ORDERS).
+    pub fn pending_orders(&self) -> Vec<dto::PendingOrderDto> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending
+            .iter()
+            .map(dto::PendingOrderDto::from_pending)
+            .collect()
+    }
+
+    /// The leaf ledger keys pinned in local ledger state, oldest first.
+    ///
+    /// These are the authoritative-local TOFU/out-of-band anchors a terminal
+    /// inclusion proof must verify under; the getter only reads them and does
+    /// **not** change their persistence semantics. Bounded by
+    /// [`ledger_state::MAX_PINNED_LEAF_KEYS`](crate::ledger_state::MAX_PINNED_LEAF_KEYS).
+    pub fn pinned_leaf_keys(&self) -> Vec<dto::PinnedLeafKeyDto> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pinned_leaf_keys
+            .iter()
+            .map(|(node, ledger)| dto::PinnedLeafKeyDto::new(node, *ledger))
             .collect()
     }
 
