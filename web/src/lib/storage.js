@@ -11,8 +11,15 @@
  * - **authoritative-local** — must not be discarded. Losing these loses
  *   information the node cannot re-supply (the identity seed) or resets a
  *   trust decision that must be explicitly re-established (the TOFU anchors).
- *     - `cawala.identity.v1` — the Ed25519 seed (one browser install == one
- *       identity).
+ *     - `cawala.identity.v1` — the Ed25519 transport seed (one browser
+ *       install == one identity). Mnemonic-derived on new installs; a legacy
+ *       random seed present here is preserved, never silently rekeyed.
+ *     - `cawala.user-identity.v1` — the R3 user identity record (EIP-55
+ *       address, the derived secp256k1 secret used to sign V4 orders,
+ *       passkey-enrollment flag, provenance). The **mnemonic is never
+ *       stored**; the record is persisted so a reload needs no unlock, and
+ *       losing it forgets this device's user identity *and* drops the
+ *       passkey-wrap binding that cannot be re-created without the phrase.
  *     - the TOFU anchors `pinned_ledger` / `pinned_leaf_keys` — carried *inside*
  *       the `cawala.ledger.v1` blob today (no key of their own). They are the
  *       authoritative-local trust pins a settlement proof must verify under.
@@ -50,6 +57,7 @@ export const STORAGE_CLASS = Object.freeze({
 /** Exact storage keys (scoped ones are suffixed with `:<nodeId>`). */
 export const STORAGE_KEYS = Object.freeze({
   IDENTITY: 'cawala.identity.v1',
+  USER_IDENTITY: 'cawala.user-identity.v1',
   STATE: 'cawala.state.v1',
   LEDGER: 'cawala.ledger.v1',
   RECOVERY: 'cawala.recovery.v1',
@@ -74,7 +82,15 @@ export const STORAGE_CLASSIFICATION = Object.freeze([
     key: STORAGE_KEYS.IDENTITY,
     class: STORAGE_CLASS.AUTHORITATIVE_LOCAL,
     scope: 'global',
-    description: 'Ed25519 identity seed; one browser install == one identity.',
+    description:
+      'Ed25519 transport seed (NodeId/operator key); one browser install == one identity. Mnemonic-derived on new installs; a legacy random seed is preserved, never silently rekeyed.',
+  },
+  {
+    key: STORAGE_KEYS.USER_IDENTITY,
+    class: STORAGE_CLASS.AUTHORITATIVE_LOCAL,
+    scope: 'global',
+    description:
+      'R3 user identity record (EIP-55 address + the derived secp256k1 secret, passkey-enrolled flag, provenance). The mnemonic itself is never stored; the derived secret is persisted so a reload signs without an unlock.',
   },
   {
     key: 'pinned_ledger',

@@ -180,6 +180,8 @@ export const ROUTES = {
   JOIN_FLOW: '/join',
   /** Not a tab: reached from Home / Accounts. */
   MY_ACCOUNT: '/account',
+  /** Not a tab: reached from Settings — create/restore the user identity. */
+  IDENTITY: '/identity',
 };
 
 /**

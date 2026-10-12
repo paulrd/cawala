@@ -44,8 +44,10 @@ import {
   applyAdministeredNode,
   applyAdminCapabilities,
   applyAdminLock,
+  applyUserIdentity,
   resetDataState,
   bumpTargetEpoch,
+  showToast,
 } from './stores.svelte.js';
 import { NODE_KIND, inferNodeKind } from './nodeKind.js';
 import * as idb from './identityBundle.js';
@@ -62,6 +64,349 @@ import {
   readScopedBlob,
   restoreBlobs,
 } from './storage.js';
+import * as userIdentity from './userIdentity.js';
+
+// ── User identity (R3) — the surface the identity UI calls ────
+//
+// The mnemonic → ETH-address identity (spec §1.1). These functions are thin
+// wrappers over `userIdentity.js`: they keep the reactive
+// `userIdentityState` store in sync after every mutation, so components read
+// the store and only call these on user actions. Address derivation and the
+// derived secret now run the REAL wasm secp256k1 engine, injected into the
+// facade after `initApi` loads wasm (`_wasmIdentityBackend` below). The
+// passkey wrap stays deferred (`PASSKEY_BACKEND_READY === false`).
+//
+// CREATE/RESTORE also do two wasm-side things here (this module owns the
+// ClientNode lifecycle and `cawala.identity.v1`):
+//   1. derive + persist the mnemonic-derived transport seed so one phrase
+//      restores the NodeId; on a fresh install the live node is then
+//      RE-SPAWNED with that seed immediately (see `_reactivateTransportIdentity`)
+//      so its NodeId matches the phrase before any join/registration, and
+//   2. push the derived secp256k1 secret into the live node so V4 orders can
+//      be signed without a reload.
+//
+// ASSUMED API SURFACE (keep names/signatures, swap bodies):
+
+/** Re-exported identity errors + BIP-39 error codes for `instanceof`/mapping. */
+export const {
+  InvalidMnemonicError,
+  PasskeyUnavailableError,
+  IdentityBackendUnavailableError,
+  MNEMONIC_ERRORS,
+} = userIdentity;
+
+/**
+ * Re-read the stored identity into the reactive store. Called at boot and
+ * after every identity mutation; safe to call any time.
+ */
+export function refreshUserIdentity() {
+  applyUserIdentity(userIdentity.getUserIdentity());
+}
+
+/** Whether passkey unlock could work in this context (secure context + WebAuthn). */
+export function isPasskeyAvailable() {
+  return userIdentity.isPasskeyAvailable();
+}
+
+/**
+ * The identity status view: `{ established, address, source,
+ * passkeyEnrolled, preview, createdAt, storagePersistent }`.
+ */
+export function getUserIdentity() {
+  return userIdentity.getUserIdentity();
+}
+
+/** EIP-55 checksummed account address, or null when none exists here. */
+export function getEthAddress() {
+  return userIdentity.getEthAddress();
+}
+
+/**
+ * Generate a fresh 12-word BIP-39 mnemonic (shown once for backup; never
+ * persisted by this module).
+ * @returns {Promise<string>} Space-joined words.
+ */
+export function generateMnemonic() {
+  return userIdentity.generateIdentityMnemonic();
+}
+
+/**
+ * Validate free-typed mnemonic text (async; structured result with
+ * `MNEMONIC_ERRORS.*` codes for word-level feedback).
+ * @param {string} text
+ */
+export function validateMnemonic(text) {
+  return userIdentity.validateIdentityMnemonic(text);
+}
+
+/**
+ * Derive the address from a mnemonic (+ optional BIP-39 passphrase) WITHOUT
+ * persisting — the restore preview / pre-commit check.
+ * @param {string} mnemonic
+ * @param {string} [passphrase='']
+ * @returns {Promise<{ address: string, preview: boolean }>}
+ */
+export function previewIdentity(mnemonic, passphrase = '') {
+  return userIdentity.previewIdentity(mnemonic, passphrase);
+}
+
+/**
+ * Create a new identity (generates the mnemonic when `mnemonic` is omitted).
+ * @param {{ mnemonic?: string, passphrase?: string }} [input]
+ * @returns {Promise<{ status: object, inputMnemonic: string|null }>}
+ */
+export async function createIdentity(input = {}) {
+  const result = await userIdentity.createIdentity(input);
+  refreshUserIdentity();
+  // If this call generated the phrase, `input.mnemonic` is absent; the facade
+  // returns it for backup and that is the phrase the secrets derive from.
+  const mnemonic = input.mnemonic ?? result.inputMnemonic;
+  await _afterIdentityEstablished(mnemonic, input.passphrase ?? '');
+  return result;
+}
+
+/**
+ * Restore an identity from a mnemonic (+ optional passphrase). Replaces the
+ * record on this device; throws `InvalidMnemonicError` without persisting
+ * when the phrase is bad.
+ * @param {string} mnemonic
+ * @param {string} [passphrase='']
+ * @returns {Promise<object>} The status view.
+ */
+export async function restoreIdentity(mnemonic, passphrase = '') {
+  const status = await userIdentity.restoreIdentity(mnemonic, passphrase);
+  refreshUserIdentity();
+  await _afterIdentityEstablished(mnemonic, passphrase);
+  return status;
+}
+
+/** Whether a passkey is enrolled AND passkeys work here. */
+export function hasPasskey() {
+  return userIdentity.hasPasskey();
+}
+
+/**
+ * Set up biometric unlock (WebAuthn PRF key-wrap of the mnemonic).
+ * Throws `PasskeyUnavailableError` outside a secure context and
+ * `IdentityBackendUnavailableError` until the crypto engine lands.
+ * @returns {Promise<object>} The status view.
+ */
+export async function enrollPasskey() {
+  const status = await userIdentity.enrollPasskey();
+  refreshUserIdentity();
+  return status;
+}
+
+/**
+ * Unlock with the enrolled passkey. Same error classes as `enrollPasskey`,
+ * plus a not-enrolled message.
+ * @returns {Promise<object>} The status view.
+ */
+export async function unlockWithPasskey() {
+  const status = await userIdentity.unlockWithPasskey();
+  refreshUserIdentity();
+  return status;
+}
+
+/**
+ * Remove the enrolled passkey (the recovery phrase is unaffected).
+ * @returns {Promise<object>} The status view.
+ */
+export async function removePasskey() {
+  const status = await userIdentity.removePasskey();
+  refreshUserIdentity();
+  return status;
+}
+
+// ── Identity crypto backend (wasm → facade injection) ─────────
+
+/**
+ * Build the wasm-backed operations the identity facade needs and hand them to
+ * `userIdentity.setIdentityBackend` after wasm init. The facade never imports
+ * wasm; tests inject a mock instead.
+ *
+ * @param {object} wasm The loaded `cawala_client.js` module.
+ */
+function _wasmIdentityBackend(wasm) {
+  const withIdentity = (mnemonic, passphrase, extract) => {
+    const identity = wasm.UserIdentity.fromMnemonic(mnemonic, passphrase ?? '');
+    try {
+      return extract(identity);
+    } finally {
+      identity.free?.();
+    }
+  };
+  return {
+    deriveAddress: (mnemonic, passphrase) =>
+      withIdentity(mnemonic, passphrase, (identity) => identity.address()),
+    secretBytes: (mnemonic, passphrase) =>
+      withIdentity(mnemonic, passphrase, (identity) => identity.secretBytes()),
+    transportSeed: (mnemonic, passphrase) =>
+      wasm.transportSeedFromMnemonic(mnemonic, passphrase ?? ''),
+  };
+}
+
+/**
+ * After an explicit create/restore: persist the mnemonic-derived transport
+ * seed (so one phrase restores the NodeId) and push the derived secp256k1
+ * secret into the live node (so V4 orders sign without a reload).
+ *
+ * @param {string|null} mnemonic The phrase the record was derived from.
+ * @param {string} [passphrase='']
+ */
+async function _afterIdentityEstablished(mnemonic, passphrase = '') {
+  await _persistDerivedTransportSeed(mnemonic, passphrase);
+  // Fresh install: the running node was spawned with a random seed and its
+  // live NodeId does not match the phrase yet. Re-spawn with the derived seed
+  // NOW, before any join/registration can happen, so a same-session join's
+  // ChildEntry/anchor is never orphaned by the next reload. A legacy stored
+  // seed is preserved (never stale) so this is a no-op there.
+  if (_transportIdentityIsStale()) {
+    await _reactivateTransportIdentity();
+  } else {
+    _applyStoredUserIdentity(_clientNode);
+  }
+}
+
+/**
+ * Re-spawn the live client with the currently persisted (mnemonic-derived)
+ * transport seed, replacing the fresh-install random-seed node. Keeps the
+ * held identity Web Lock (it is never released/re-acquired mid-session),
+ * clears any stale-seed registration bookkeeping, and leaves the node ready to
+ * join under the mnemonic-derived NodeId.
+ *
+ * Best-effort: on failure the stale flag stays set and `requestJoin` refuses
+ * until a reload, so a join can never occur on the wrong NodeId.
+ *
+ * @returns {Promise<boolean>} Whether the node now runs the derived seed.
+ */
+async function _reactivateTransportIdentity() {
+  if (!_wasmModule) return false;
+  const previous = _clientNode;
+  _stopControlPoller();
+  if (previous) {
+    // Drop the in-memory user identity before freeing, then release the node.
+    try {
+      previous.clear_user_identity?.();
+    } catch {
+      /* ignore */
+    }
+    try {
+      previous.free?.();
+    } catch {
+      /* ignore */
+    }
+    _clientNode = null;
+  }
+  _ethRegisteredFor = null;
+  _ethRegistration = null;
+  _lastControlEvent = null;
+  _trustEstablished = false;
+  try {
+    await _spawnRealNode();
+  } catch (err) {
+    console.warn('[api] could not re-activate the mnemonic-derived transport identity', err);
+    return false;
+  }
+  // Publish the new self endpoint id so the admin self-target keeps matching
+  // the live node (App.svelte set it once at init).
+  try {
+    clientState.endpointId = _clientNode.endpoint_id();
+  } catch {
+    /* ignore */
+  }
+  return true;
+}
+
+/**
+ * Whether the live node's transport seed differs from the currently persisted
+ * one. True only in the fresh-install create/restore window (or if the re-spawn
+ * failed): the persisted seed is now mnemonic-derived but the running node
+ * still holds the random startup seed. Join/registration must not run while
+ * this is true.
+ *
+ * @returns {boolean}
+ */
+function _transportIdentityIsStale() {
+  if (_spawnedSeedHex == null) return false;
+  const currentHex = _readStoredSeedHex();
+  return currentHex != null && currentHex !== _spawnedSeedHex;
+}
+
+/**
+ * Derive the deterministic Ed25519 transport seed from the mnemonic and store
+ * it under `cawala.identity.v1` (hex). Only called at explicit create/restore,
+ * and only when this install had **no stored seed** at boot (fresh install /
+ * session-only): a stored legacy seed is never silently rekeyed, so pinned
+ * nodeId-scoped data is not orphaned (Addendum C §6). The caller then
+ * re-spawns the live node with the new seed (`_reactivateTransportIdentity`)
+ * so the running NodeId matches the mnemonic before any join.
+ *
+ * @param {string|null} mnemonic
+ * @param {string} [passphrase='']
+ */
+async function _persistDerivedTransportSeed(mnemonic, passphrase = '') {
+  if (!mnemonic) return;
+  if (_identitySource === 'stored') {
+    // This install already had a transport seed (legacy random or a previous
+    // derivation): preserve it. Only the ETH identity is adopted.
+    return;
+  }
+  let seed;
+  try {
+    seed = await userIdentity.deriveTransportSeed(mnemonic, passphrase);
+  } catch (err) {
+    _warnOnce(
+      'identity-transport-derive',
+      '[api] could not derive the transport seed from the phrase',
+      err,
+    );
+    return;
+  }
+  if (!(seed instanceof Uint8Array) || seed.length !== SEED_BYTES) {
+    _warnOnce('identity-transport-len', '[api] derived transport seed has the wrong length; ignoring it');
+    return;
+  }
+  _memorySeed = seed;
+  try {
+    window.localStorage.setItem(IDENTITY_KEY, _bytesToHex(seed));
+    _identityPersistent = true;
+  } catch (err) {
+    _identityPersistent = false;
+    _warnOnce(
+      'identity-transport-write',
+      '[api] could not persist the mnemonic-derived transport seed (private mode/quota)',
+      err,
+    );
+  }
+}
+
+/**
+ * Feed the persisted derived secp256k1 secret back into a node so it signs V4
+ * orders and can register its anchor. No-op when the node or secret is absent.
+ * Never throws.
+ *
+ * @param {object|null} node
+ * @returns {boolean} Whether the identity was applied.
+ */
+function _applyStoredUserIdentity(node) {
+  if (!node || typeof node.set_user_identity_from_secret !== 'function') return false;
+  let secret;
+  try {
+    secret = userIdentity.getIdentitySecretBytes();
+  } catch (err) {
+    _warnOnce('user-identity-read', '[api] could not read the stored user identity secret', err);
+    return false;
+  }
+  if (!secret) return false;
+  try {
+    node.set_user_identity_from_secret(secret);
+    return true;
+  } catch (err) {
+    _warnOnce('user-identity-set', '[api] could not set the user identity from the stored secret', err);
+    return false;
+  }
+}
 
 // ── Internal state ────────────────────────────────────────────
 
@@ -97,6 +442,17 @@ const MAX_ACTIVITY_ENTRIES = 200;
 
 let _identityPersistent = false;
 let _memorySeed = null; // in-session fallback when localStorage is unusable
+// Where the active transport seed came from: 'stored' (a seed already on this
+// install — legacy or previously derived: NEVER overwritten) or 'generated'
+// (fresh install / session-only: a create/restore may replace it with the
+// mnemonic-derived seed). Drives Addendum C §6 migration policy.
+let _identitySource = 'memory';
+
+// The transport seed hex the live node was actually spawned with. Compared
+// against the persisted seed to detect the fresh-install create/restore window
+// (running node still on the random startup seed while `cawala.identity.v1`
+// now holds the mnemonic-derived one) so a stale NodeId can never be joined.
+let _spawnedSeedHex = null;
 
 // Control-event poller + last drained event.
 let _controlPoller = null;
@@ -107,6 +463,14 @@ let _lastControlEvent = null;
 // cache): trust is not established, and a later receipt must not be silently
 // treated as TOFU-established. Set once in `_spawnRealNode`.
 let _trustEstablished = false;
+
+// ETH-anchor registration bookkeeping. `_ethRegisteredFor` keys the joined
+// session (`<parent>:<address>`) so `register_eth_address()` is attempted once
+// per join, not on every poller tick; reset on detach/teardown. The last
+// outcome is exposed via `getEthRegistrationStatus()` for the UI.
+let _ethRegisteredFor = null;
+/** @type {{ status: string, address: string|null, trigger: string, at: number, error: string|null }|null} */
+let _ethRegistration = null;
 
 // JS-side in-flight payment map keyed by order hash hex, for UI status.
 const _pendingSends = new Map();
@@ -164,19 +528,28 @@ export function __setClientForTest(node) {
  * exercise the fail-closed trust / pin-preservation boot behavior on plain
  * Node. Not used by the app; call the returned `stop()` so the control poller
  * and injected module do not outlive the test.
+ *
+ * Starts in mock mode exactly like `initApi`, so the boot path itself must flip
+ * `_useMock` off once a live node exists. This keeps the seam faithful to the
+ * runtime ordering: a regression that flips it too late (or a failed spawn)
+ * leaves the module in mock mode and is observable to the test.
  * @param {object} wasm A fake module with `ClientNode.spawn_control` (and,
  *   when no identity is pre-seeded, `generate_secret_key`).
  * @returns {Promise<{ node: object, stop: () => void }>}
  */
 export async function __bootRealNodeForTest(wasm) {
   _wasmModule = wasm;
-  _useMock = false;
+  _useMock = true;
   let node;
   try {
     node = await _spawnRealNode();
-  } finally {
+  } catch (err) {
     _wasmModule = null;
+    throw err;
   }
+  // Keep `_wasmModule` installed until `stop()` so the in-session re-activation
+  // path (`_reactivateTransportIdentity`) behaves exactly as at runtime. The
+  // `stop()` below tears it down.
   return {
     node,
     stop() {
@@ -189,6 +562,11 @@ export async function __bootRealNodeForTest(wasm) {
       _clientNode = null;
       _releaseIdentityLock();
       _trustEstablished = false;
+      _ethRegisteredFor = null;
+      _ethRegistration = null;
+      _identitySource = 'memory';
+      _memorySeed = null;
+      _spawnedSeedHex = null;
       _useMock = true;
       _wasmModule = null;
     },
@@ -205,6 +583,10 @@ export async function __bootRealNodeForTest(wasm) {
  * flips `_useMock` off. On ANY failure it falls back to mock data.
  */
 export async function initApi() {
+  // The user identity is local storage state, readable in every mode: load it
+  // before anything else so the identity UI has a status from the first render.
+  refreshUserIdentity();
+
   // Check URL param for forced mock.
   const params = new URLSearchParams(window.location.search);
   if (params.has('mock')) {
@@ -216,6 +598,9 @@ export async function initApi() {
     const wasm = await import('../wasm/cawala_client.js');
     await wasm.default();
     _wasmModule = wasm;
+    // Hand the real crypto engine to the identity facade: address/secret
+    // derivation and the mnemonic-derived transport seed.
+    userIdentity.setIdentityBackend(_wasmIdentityBackend(wasm));
 
     // Best-effort single-leader guard: avoid binding two live endpoints with
     // the same endpoint id from concurrent tabs.
@@ -225,8 +610,9 @@ export async function initApi() {
       return;
     }
 
+    // `_spawnRealNode` flips `_useMock` off itself once a real node is live
+    // (before its post-spawn syncs), so there is no live-order gap here.
     await _spawnRealNode();
-    _useMock = false;
   } catch (err) {
     console.warn('[api] wasm init failed, using mock data', err);
     _stopControlPoller();
@@ -248,7 +634,9 @@ export async function initApi() {
 /**
  * Restore the persisted 32-byte seed, or generate and persist a fresh one.
  * Falls back to an in-memory seed (with a visible warning flag) when storage
- * throws (Safari private mode / quota).
+ * throws (Safari private mode / quota). The load path never derives from a
+ * mnemonic and never rekeys: a stored seed (legacy pre-R3 random, or a
+ * previously mnemonic-derived one) is preserved (Addendum C §6).
  * @param {object} wasm
  * @returns {Uint8Array}
  */
@@ -265,6 +653,7 @@ function _loadOrCreateIdentity(wasm) {
       const bytes = _hexToBytes(storedHex);
       if (bytes.length === SEED_BYTES) {
         _identityPersistent = true;
+        _identitySource = 'stored';
         return bytes;
       }
       _warnOnce('identity-len', '[api] stored identity has the wrong length; generating a new one');
@@ -274,10 +663,14 @@ function _loadOrCreateIdentity(wasm) {
   }
 
   // Reuse the in-session fallback if we already generated one.
-  if (_memorySeed) return _memorySeed;
+  if (_memorySeed) {
+    _identitySource = 'generated';
+    return _memorySeed;
+  }
 
   const seed = wasm.generate_secret_key(); // may throw → initApi falls back to mock
   _memorySeed = seed;
+  _identitySource = 'generated';
 
   try {
     window.localStorage.setItem(IDENTITY_KEY, _bytesToHex(seed));
@@ -402,6 +795,9 @@ function _hasRestoredAnchors(node) {
 async function _spawnRealNode() {
   const seed = _loadOrCreateIdentity(_wasmModule);
   const node = await _wasmModule.ClientNode.spawn_control(seed);
+  // Record only after the spawn succeeded: a thrown spawn must leave the
+  // previous seed in place so a stale NodeId stays detectably stale.
+  _spawnedSeedHex = _bytesToHex(seed);
   const nodeId = node.endpoint_id();
 
   // Boot is tolerant of a missing/corrupt cache: the state/ledger blobs are
@@ -434,6 +830,18 @@ async function _spawnRealNode() {
   _rebuildActivityFromState(node);
 
   _clientNode = node;
+  // A real node is now live and assigned: reflect that immediately, before the
+  // post-spawn syncs below (store mirrors, balance pull, join-state sync, and
+  // `_maybeRegisterEthAddress('boot')` at the end). Setting this only in
+  // `initApi`'s caller (after this function returned) left the flag true during
+  // those syncs, so they ran as no-ops on a real boot. A failed `spawn_control`
+  // never reaches this line, so a mock/failed boot still leaves it true (and
+  // `initApi`'s catch resets it on any later failure).
+  _useMock = false;
+  // Reload path: a persisted derived secp256k1 secret (never the mnemonic)
+  // restores the user's ETH identity so V4 orders sign without an unlock. The
+  // transport seed was already consumed by `_loadOrCreateIdentity` above.
+  _applyStoredUserIdentity(node);
   _persistState();
   // Pin safety: never overwrite a ledger blob whose import failed. The blob
   // carries the authoritative-local TOFU anchors (pinned_ledger /
@@ -461,6 +869,9 @@ async function _spawnRealNode() {
   _syncAdministeredNode();
   // (Re)verify the persisted balance as soon as an address is known.
   _requestBalanceIfJoined();
+  // Already joined on load + an identity exists → register the ETH anchor
+  // (quietly; `getEthRegistrationStatus()` carries the outcome).
+  void _maybeRegisterEthAddress('boot');
   return node;
 }
 
@@ -1243,6 +1654,8 @@ function _drainControlEvents() {
         // UI drops out of the joined view ("Left network") immediately.
         clientState.address = null;
         parentChanged = true;
+        // A later re-join must register the ETH anchor again.
+        _ethRegisteredFor = null;
       }
       ev.free?.();
       drained = true;
@@ -1261,7 +1674,11 @@ function _drainControlEvents() {
   }
   if (drained) _persistState();
   // A fresh approval means an address now exists: verify its balance.
-  if (accepted) _requestBalanceIfJoined();
+  if (accepted) {
+    _requestBalanceIfJoined();
+    // Now joined: register the user's ETH anchor with the parent (once).
+    void _maybeRegisterEthAddress('join');
+  }
 }
 
 /**
@@ -1269,6 +1686,114 @@ function _drainControlEvents() {
  */
 export function getLastControlEvent() {
   return _lastControlEvent ? { ..._lastControlEvent } : null;
+}
+
+// ── ETH anchor registration (control variant 24) ──────────────
+
+/**
+ * The last `register_eth_address()` outcome, or null. `status` is the wasm
+ * reply bucket (`accepted` / `rejected:<code>` / `unexpected`) or `error` for
+ * a transport/JS failure; `trigger` is `boot` or `join`.
+ *
+ * NOTE (structure scan): no component reads this today. The join-time outcome
+ * is surfaced by `_surfaceEthRegistration`'s toast; this getter exists so a
+ * future surface can show the (silent) boot-time outcome without another
+ * plumbing pass. A component consumer is the only missing piece.
+ *
+ * @returns {object|null}
+ */
+export function getEthRegistrationStatus() {
+  return _ethRegistration ? { ..._ethRegistration } : null;
+}
+
+/**
+ * Register this leaf's ETH anchor with its direct parent (once per joined
+ * session), when a joined client has a user identity set. Idempotent: keyed by
+ * the parent + assigned address, so the 2 s poller cannot spam the parent.
+ *
+ * Surfaces the outcome as a concise toast on a fresh join (accepted/rejected);
+ * on boot the outcome is only recorded (no toast) so a reload is not noisy.
+ * A transport failure clears the guard so a later tick can retry.
+ *
+ * @param {'boot'|'join'} trigger
+ */
+async function _maybeRegisterEthAddress(trigger) {
+  const node = _clientNode;
+  if (_useMock || !node) return;
+  if (typeof node.register_eth_address !== 'function') return;
+  // A stale NodeId must not register the ETH anchor: the parent would record
+  // it against the random startup leaf and orphan it on the next reload.
+  if (_transportIdentityIsStale()) return;
+
+  let join = null;
+  try {
+    join = _readJoinStatus(node);
+  } catch (err) {
+    _warnOnce('eth-register-join', '[api] could not read join status before ETH registration', err);
+    return;
+  }
+  if (!join?.address) return; // not joined yet
+
+  let ethAddress = null;
+  try {
+    ethAddress = node.user_eth_address?.() ?? null;
+  } catch (err) {
+    _warnOnce('eth-register-identity', '[api] could not read the user ETH address', err);
+    return;
+  }
+  if (!ethAddress) return; // no user identity set on this node
+
+  const key = `${join.parent ?? ''}:${join.address}`;
+  if (_ethRegisteredFor === key) return;
+  _ethRegisteredFor = key;
+
+  try {
+    const bucket = await node.register_eth_address();
+    _ethRegistration = {
+      status: String(bucket ?? 'unexpected'),
+      address: ethAddress,
+      trigger,
+      at: Date.now(),
+      error: null,
+    };
+    _surfaceEthRegistration(_ethRegistration);
+  } catch (err) {
+    // Missing join/identity or an unreachable parent: not fatal — the identity
+    // still signs; allow a later join/poller tick to retry.
+    _ethRegisteredFor = null;
+    _ethRegistration = {
+      status: 'error',
+      address: ethAddress,
+      trigger,
+      at: Date.now(),
+      error: err?.message || String(err),
+    };
+    _warnOnce('eth-register', '[api] ETH address registration failed', err);
+  }
+}
+
+/**
+ * Surface an ETH-registration outcome once, on a fresh join. Boot-time
+ * registration stays silent (recorded via `getEthRegistrationStatus()`).
+ * @param {{ status: string, address: string|null, trigger: string }} outcome
+ */
+function _surfaceEthRegistration(outcome) {
+  if (outcome.trigger !== 'join') return;
+  const status = outcome.status;
+  if (status === 'accepted') {
+    showToast('Account address registered with the network.', 'ok');
+  } else if (status.startsWith('rejected')) {
+    const code = status.includes(':') ? status.slice(status.indexOf(':') + 1) : '';
+    showToast(
+      code
+        ? `The network did not accept your account address (${code}).`
+        : 'The network did not accept your account address.',
+      'warn',
+      6000,
+    );
+  } else {
+    showToast('Account address registration returned an unexpected reply.', 'warn', 6000);
+  }
 }
 
 // ── Ledger-event poller ───────────────────────────────────────
@@ -1951,6 +2476,8 @@ export function destroyClient() {
     _clientNode = null;
   }
   _pendingSends.clear();
+  _ethRegisteredFor = null;
+  _spawnedSeedHex = null;
   _releaseIdentityLock();
 }
 
@@ -1964,6 +2491,13 @@ export function destroyClient() {
 function _teardownClient() {
   _stopControlPoller();
   if (_clientNode) {
+    // Drop the in-memory user identity before the node is freed so no further
+    // V4 order can be signed on a torn-down/being-replaced identity.
+    try {
+      _clientNode.clear_user_identity?.();
+    } catch {
+      /* ignore */
+    }
     try {
       _clientNode.free?.();
     } catch {
@@ -1971,8 +2505,11 @@ function _teardownClient() {
     }
     _clientNode = null;
   }
+  _ethRegisteredFor = null;
   _releaseIdentityLock();
   _memorySeed = null;
+  _identitySource = 'memory';
+  _spawnedSeedHex = null;
 }
 
 /**
@@ -2152,6 +2689,12 @@ export async function wipeIdentity() {
   }
 
   _teardownClient();
+
+  // Drop the R3 user-identity record too: "remove identity from this device"
+  // means this device forgets both identities. The recovery phrase (never
+  // stored) still restores the user identity elsewhere.
+  userIdentity.clearUserIdentity();
+  refreshUserIdentity();
 
   try {
     window.localStorage.removeItem(IDENTITY_KEY);
@@ -2671,6 +3214,16 @@ export async function requestJoin(parsed, addressHint) {
   if (_useMock) {
     await mockDelay(600);
     return { status: JOIN_OUTCOME.PENDING };
+  }
+
+  // Never join while the node is still on its pre-identity random NodeId: the
+  // next reload would switch to the mnemonic-derived NodeId and orphan the
+  // join. Normally create/restore re-activates before returning; this catches
+  // a failed re-activation (or a race) and tells the user to reload.
+  if (_transportIdentityIsStale()) {
+    throw new Error(
+      'Your account key changed but this browser\u2019s node has not switched to it yet. Reload the page before joining.',
+    );
   }
 
   const node = _requireNode();

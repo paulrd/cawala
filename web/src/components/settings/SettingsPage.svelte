@@ -26,6 +26,7 @@
     lockAdminMode,
   } from '../../lib/api.js';
   import AdminUnlockDialog from '../admin/AdminUnlockDialog.svelte';
+  import UserIdentityCard from '../identity/UserIdentityCard.svelte';
 
   let caps = $derived(getCapabilities());
   let mock = $derived(isMockMode());
@@ -188,6 +189,10 @@
       {/if}
     </div>
   </Card>
+
+  <!-- The user identity (mnemonic → account address) sits above the transport
+       identity: it is the root of trust, the transport keys are context. -->
+  <UserIdentityCard />
 
   <Card title="Identity">
     <div class="settings-section">

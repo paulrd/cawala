@@ -18,6 +18,38 @@ export const clientState = $state({
   error: null,
 });
 
+// ── User identity (R3: mnemonic → ETH address) ───────────────
+
+/**
+ * The R3 user identity view, published by the api layer.
+ *
+ * `established` is false until a mnemonic has been created or restored here;
+ * `address` is the real EIP-55 checksummed account address (derived in wasm);
+ * `passkeyEnrolled` tracks whether biometric unlock was set up (it only
+ * *unlocks* — the recovery phrase remains the sole recovery credential);
+ * `preview` is retained for shape compatibility and is always false now that
+ * derivation is real.
+ *
+ * @type {{ established: boolean, address: string|null, source: 'created'|'restored'|null, passkeyEnrolled: boolean, preview: boolean, createdAt: number|null, storagePersistent: boolean }}
+ */
+export const userIdentityState = $state({
+  established: false,
+  address: null,
+  source: null,
+  passkeyEnrolled: false,
+  preview: false,
+  createdAt: null,
+  storagePersistent: true,
+});
+
+/**
+ * Replace the user-identity view in place (keeps one reactive object).
+ * @param {Partial<typeof userIdentityState>} next
+ */
+export function applyUserIdentity(next) {
+  Object.assign(userIdentityState, next);
+}
+
 // ── Live-mode capabilities & control events ──────────────────
 
 /** @type {{ mock: boolean, canAdmin: boolean, canQueryPeers: boolean, canQueryNode: boolean, identityPersistent: boolean, multiTabLeader: boolean, multiTabWarning: string|null }} */

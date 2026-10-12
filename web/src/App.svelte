@@ -12,6 +12,7 @@
   import MyAccountPage from './components/account/MyAccountPage.svelte';
   import SettingsPage from './components/settings/SettingsPage.svelte';
   import JoinFlowPage from './components/join-flow/JoinFlowPage.svelte';
+  import IdentitySetupPage from './components/identity/IdentitySetupPage.svelte';
 
   let ready = $state(false);
   let initError = $state(null);
@@ -80,6 +81,8 @@
       <SettingsPage />
     {:else if route === '/join'}
       <JoinFlowPage />
+    {:else if route === '/identity'}
+      <IdentitySetupPage />
     {:else}
       <!-- 404 -->
       <div class="not-found">
