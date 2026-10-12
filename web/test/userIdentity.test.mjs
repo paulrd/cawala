@@ -82,6 +82,7 @@ const {
   removePasskey,
   refreshUserIdentity,
   wipeIdentity,
+  rotateUserEthIdentity,
   __bootRealNodeForTest,
   getEthRegistrationStatus,
   isMockMode,
@@ -294,6 +295,7 @@ test('wipeIdentity clears the record, the stored secret and the published view',
 function makeJoinedBootWasm(opts = {}) {
   const applied = [];
   const registered = [];
+  const rotated = [];
   const node = {
     endpoint_id: () => 'boot-node',
     import_state() {},
@@ -307,6 +309,11 @@ function makeJoinedBootWasm(opts = {}) {
     async register_eth_address() {
       registered.push(true);
       return opts.registerReply ?? 'accepted';
+    },
+    async rotate_eth_address(secret) {
+      rotated.push(Uint8Array.from(secret));
+      if (opts.rotateThrows) throw new Error(opts.rotateThrows);
+      return opts.rotateReply ?? 'accepted';
     },
     ledger_status: () => ({
       address: '0.3.1',
@@ -343,7 +350,7 @@ function makeJoinedBootWasm(opts = {}) {
     ClientNode: { spawn_control: async () => node },
     generate_secret_key: () => new Uint8Array(32),
   };
-  return { wasm, node, applied, registered };
+  return { wasm, node, applied, registered, rotated };
 }
 
 test('reload: the stored derived secret is pushed to the node and the anchor registers', async () => {
@@ -384,6 +391,151 @@ test('reload: a rejected registration is recorded, not thrown', async () => {
     const reg = getEthRegistrationStatus();
     assert.equal(reg.status, 'rejected:write_once');
     assert.equal(reg.trigger, 'boot');
+  } finally {
+    stop();
+  }
+});
+
+// ── ETH anchor rotation (control variant 24, incumbent-authorized) ─────────
+
+/** A second valid BIP-39 vector, distinct from GOOD_12 (official test seed). */
+const NEW_12 =
+  'legal winner thank year wave sausage worth useful legal winner thank yellow';
+
+test('rotateUserEthIdentity: the incumbent authorizes the move and the new secret is persisted', async () => {
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+  const incumbentAddress = getEthAddress();
+  const incumbentSecretHex = hex(getIdentitySecretBytes());
+
+  const expectedNewAddress = await mockBackend.deriveAddress(NEW_12, '');
+  const expectedNewSecret = await mockBackend.secretBytes(NEW_12, '');
+
+  const { wasm, rotated } = makeJoinedBootWasm();
+  const { stop } = await __bootRealNodeForTest(wasm);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const result = await rotateUserEthIdentity(NEW_12);
+    assert.equal(result.status, 'accepted');
+    assert.equal(result.previousAddress, incumbentAddress);
+    assert.equal(result.address, expectedNewAddress);
+
+    // The wasm node is handed the NEW derived secret; it builds the
+    // incumbent-authorized rotation proof internally.
+    assert.equal(rotated.length, 1, 'rotate_eth_address called once');
+    assert.deepEqual(rotated[0], Uint8Array.from(expectedNewSecret));
+
+    // Persisted: the new address + secret replace the incumbent.
+    assert.equal(getEthAddress(), expectedNewAddress);
+    assert.equal(hex(getIdentitySecretBytes()), hex(expectedNewSecret));
+    assert.notEqual(getEthAddress(), incumbentAddress);
+    assert.notEqual(hex(getIdentitySecretBytes()), incumbentSecretHex);
+    assert.equal(userIdentityState.address, expectedNewAddress, 'reactive store republished');
+  } finally {
+    stop();
+  }
+});
+
+test('rotateUserEthIdentity: a rotation the client reconciled as already-applied persists the new secret', async () => {
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+  const incumbentAddress = getEthAddress();
+
+  const expectedNewAddress = await mockBackend.deriveAddress(NEW_12, '');
+  const expectedNewSecret = await mockBackend.secretBytes(NEW_12, '');
+
+  // The wasm client owns the idempotent commit: it resends the identical frame
+  // after a lost reply and treats a `Replay` as already-applied, reporting that
+  // reconciled outcome as the ordinary `accepted` bucket. The web layer must
+  // persist exactly as on a first-attempt acceptance — this is what stops a
+  // lost reply from leaving the device on the incumbent while the parent anchor
+  // moved.
+  const { wasm } = makeJoinedBootWasm({ rotateReply: 'accepted' });
+  const { stop } = await __bootRealNodeForTest(wasm);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const result = await rotateUserEthIdentity(NEW_12);
+    assert.equal(result.status, 'accepted');
+    assert.equal(result.previousAddress, incumbentAddress);
+    assert.equal(result.address, expectedNewAddress);
+    assert.equal(getEthAddress(), expectedNewAddress, 'reconciled acceptance persists the new address');
+    assert.equal(
+      hex(getIdentitySecretBytes()),
+      hex(expectedNewSecret),
+      'reconciled acceptance persists the new secret',
+    );
+    assert.equal(userIdentityState.address, expectedNewAddress, 'reactive store republished');
+  } finally {
+    stop();
+  }
+});
+
+test('rotateUserEthIdentity: a parent rejection leaves the incumbent identity unchanged', async () => {
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+  const incumbentAddress = getEthAddress();
+  const incumbentSecretHex = hex(getIdentitySecretBytes());
+
+  const { wasm, rotated } = makeJoinedBootWasm({ rotateReply: 'rejected:unauthorized' });
+  const { stop } = await __bootRealNodeForTest(wasm);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const result = await rotateUserEthIdentity(NEW_12);
+    assert.equal(result.status, 'rejected:unauthorized');
+    assert.equal(result.address, incumbentAddress);
+    assert.equal(rotated.length, 1, 'the node was asked to rotate');
+    assert.equal(getEthAddress(), incumbentAddress, 'incumbent address kept');
+    assert.equal(hex(getIdentitySecretBytes()), incumbentSecretHex, 'incumbent secret kept');
+  } finally {
+    stop();
+  }
+});
+
+test('rotateUserEthIdentity: a transport failure leaves the incumbent identity unchanged', async () => {
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+  const incumbentAddress = getEthAddress();
+  const incumbentSecretHex = hex(getIdentitySecretBytes());
+
+  const { wasm } = makeJoinedBootWasm({ rotateThrows: 'rotate eth address: parent unreachable' });
+  const { stop } = await __bootRealNodeForTest(wasm);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await assert.rejects(
+      () => rotateUserEthIdentity(NEW_12),
+      /parent unreachable/,
+      'the transport error propagates',
+    );
+    assert.equal(getEthAddress(), incumbentAddress, 'incumbent address kept');
+    assert.equal(hex(getIdentitySecretBytes()), incumbentSecretHex, 'incumbent secret kept');
+  } finally {
+    stop();
+  }
+});
+
+test('rotateUserEthIdentity: an invalid new phrase sends nothing and persists nothing', async () => {
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+  const incumbentAddress = getEthAddress();
+  const incumbentSecretHex = hex(getIdentitySecretBytes());
+
+  const { wasm, rotated } = makeJoinedBootWasm();
+  const { stop } = await __bootRealNodeForTest(wasm);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await assert.rejects(
+      () => rotateUserEthIdentity('not a phrase'),
+      (err) => err instanceof InvalidMnemonicError,
+      'the invalid phrase is rejected',
+    );
+    assert.equal(rotated.length, 0, 'no rotation request was sent');
+    assert.equal(getEthAddress(), incumbentAddress);
+    assert.equal(hex(getIdentitySecretBytes()), incumbentSecretHex);
   } finally {
     stop();
   }

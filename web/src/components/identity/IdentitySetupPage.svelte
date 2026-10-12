@@ -11,6 +11,7 @@
     previewIdentity,
     createIdentity,
     restoreIdentity,
+    rotateUserEthIdentity,
     isPasskeyAvailable,
     InvalidMnemonicError,
   } from '../../lib/api.js';
@@ -25,7 +26,7 @@
    * One route (`#/identity`), one step machine:
    *   intro → create-words → create-confirm → create-done
    *        ↘ restore-form → restore-done
-   *   established on arrival → manage
+   *   established on arrival → manage → rotate-form
    *
    * The recovery phrase is shown exactly once, behind a deliberate reveal,
    * and the create flow cannot finish until the user ticks a written-down
@@ -58,6 +59,22 @@
   let previewAddress = $state(null);
   let restoreConfirmOpen = $state(false);
 
+  // ── Rotate flow (manage → rotate-form) ─────────────────────
+  let rotateSource = $state('enter'); // 'enter' | 'generate'
+  let rotateText = $state('');
+  let rotatePassphrase = $state('');
+  let showRotatePassphrase = $state(false);
+  let rotateRevealed = $state(false); // a generated phrase is shown once, on purpose
+  let rotateBackedUp = $state(false); // "I wrote the new phrase down"
+  let rotateGenError = $state(null);
+  let rotateValidation = $state(null);
+  let rotateValidating = $state(false);
+  let rotatePreviewAddress = $state(null);
+  let rotateConfirmOpen = $state(false);
+  let rotateError = $state(null);
+  let rotating = $state(false);
+  let rotateDone = $state(false); // success note shown on the manage step
+
   let passkeyAvailable = $derived(isPasskeyAvailable());
   let phraseWords = $derived(phrase ? phrase.split(' ') : []);
   let restoreWordCount = $derived(
@@ -68,6 +85,20 @@
   let canFinishCreate = $derived(
     revealed && backedUp && phraseWords.length > 0 && confirmInputs.every((v, i) => matchesConfirm(i, v)),
   );
+
+  let rotateWordCount = $derived(
+    rotateText.trim() === '' ? 0 : rotateText.trim().split(/\s+/).length,
+  );
+  let rotateValid = $derived(rotateValidation?.ok === true);
+  let rotateInvalid = $derived(
+    rotateValidation != null && !rotateValidation.ok && rotateValidation.error.code !== 'empty',
+  );
+  let rotateWords = $derived(rotateText.trim() === '' ? [] : rotateText.trim().split(/\s+/));
+  let rotateReady = $derived(rotateValid && rotatePreviewAddress != null);
+  // The write-down checkbox only exists once there is something to write down.
+  let rotateAckVisible = $derived(rotateSource === 'enter' || rotateRevealed);
+  let canRotate = $derived(rotateReady && rotateBackedUp && !rotating);
+  let rotateNeedsAck = $derived(rotateReady && rotateAckVisible && !rotateBackedUp);
 
   let stepEl = $state(null);
   // Where the generic step-focus should land instead of the container
@@ -116,6 +147,36 @@
       cancelled = true;
       clearTimeout(timer);
       validating = false;
+    };
+  });
+
+  // Live validation + address preview for the new rotation phrase (debounced).
+  $effect(() => {
+    const text = rotateText;
+    const passphrase = rotatePassphrase;
+    rotateValidation = null;
+    rotatePreviewAddress = null;
+    if (text.trim() === '') return undefined;
+    let cancelled = false;
+    rotateValidating = true;
+    const timer = setTimeout(async () => {
+      const result = await validateMnemonic(text);
+      if (cancelled) return;
+      rotateValidation = result;
+      rotateValidating = false;
+      if (result.ok) {
+        try {
+          const preview = await previewIdentity(result.normalized, passphrase);
+          if (!cancelled) rotatePreviewAddress = preview.address;
+        } catch {
+          if (!cancelled) rotatePreviewAddress = null;
+        }
+      }
+    }, 280);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      rotateValidating = false;
     };
   });
 
@@ -228,6 +289,94 @@
 
   function manageRestoreAnother() {
     startRestore('manage');
+  }
+
+  // ── Rotate (manage → rotate-form) ──────────────────────────
+
+  function resetRotateForm() {
+    rotateSource = 'enter';
+    rotateText = '';
+    rotatePassphrase = '';
+    showRotatePassphrase = false;
+    rotateRevealed = false;
+    rotateBackedUp = false;
+    rotateGenError = null;
+    rotateValidation = null;
+    rotatePreviewAddress = null;
+    rotateError = null;
+  }
+
+  function startRotate() {
+    resetRotateForm();
+    pendingFocus = 'rotate-phrase';
+    step = 'rotate-form';
+  }
+
+  function leaveRotate() {
+    resetRotateForm();
+    step = 'manage';
+  }
+
+  // Swap where the new phrase comes from. Each source starts from a clean
+  // slate so a phrase typed for one path can't silently carry into the other.
+  async function setRotateSource(source) {
+    if (source === rotateSource || rotating) return;
+    rotateSource = source;
+    rotateBackedUp = false;
+    rotateRevealed = false;
+    rotateError = null;
+    if (source === 'enter') {
+      rotateText = '';
+      rotatePassphrase = '';
+      showRotatePassphrase = false;
+      rotateGenError = null;
+      await tick();
+      document.getElementById('rotate-phrase')?.focus();
+    } else {
+      void makeRotatePhrase();
+      await tick();
+      document.getElementById('rotate-generated')?.focus();
+    }
+  }
+
+  // A fresh 12-word phrase for the generate path: revealed deliberately,
+  // never persisted until the network accepts the rotation.
+  async function makeRotatePhrase() {
+    rotateGenError = null;
+    rotateText = '';
+    rotateRevealed = false;
+    rotateBackedUp = false;
+    try {
+      rotateText = await generateMnemonic();
+    } catch (err) {
+      rotateGenError = err?.message || 'Could not generate a recovery phrase. Try again.';
+    }
+  }
+
+  async function doRotate() {
+    rotateConfirmOpen = false;
+    if (!canRotate) return;
+    rotating = true;
+    rotateError = null;
+    try {
+      const result = await rotateUserEthIdentity(rotateValidation.normalized, rotatePassphrase);
+      if (result.status === 'accepted') {
+        rotateDone = true;
+        leaveRotate();
+        showToast('Identity rotated. Your account now uses the new phrase and address.', 'ok');
+      } else if (result.status === 'unsupported') {
+        rotateError =
+          'This network node does not support rotating an account identity yet. Your current identity is unchanged.';
+      } else {
+        rotateError =
+          `The network did not accept the rotation (${result.status}). Your current identity is unchanged.`;
+      }
+    } catch (err) {
+      rotateError =
+        err?.message || 'Could not rotate the identity. Your current identity is unchanged.';
+    } finally {
+      rotating = false;
+    }
   }
 </script>
 
@@ -574,6 +723,201 @@
           </div>
         </Card>
 
+      <!-- ── Rotate: its own surface, reached from manage ──────── -->
+      {:else if step === 'rotate-form'}
+        <Card title="Rotate identity">
+          <div class="stack">
+            <h3 class="step-heading">Switch this account to a new phrase</h3>
+            <p class="body-text">
+              Your current phrase signs for the change, so nothing moves until the
+              network accepts it. If the network refuses, your identity stays exactly
+              as it is.
+            </p>
+
+            <div class="warn-box">
+              <span class="warn-icon" aria-hidden="true">!</span>
+              <span>
+                This is a one-way change. Once the network accepts it, your current
+                phrase stops controlling this account and cannot be used to get it
+                back — the new phrase becomes the only way to recover the account,
+                and your address changes to the one the new phrase gives.
+              </span>
+            </div>
+
+            <div class="source-grid" role="group" aria-label="Where the new phrase comes from">
+              <button
+                type="button"
+                class="source-tile"
+                class:source-tile--on={rotateSource === 'enter'}
+                aria-pressed={rotateSource === 'enter'}
+                disabled={rotating}
+                onclick={() => setRotateSource('enter')}
+              >
+                {#if rotateSource === 'enter'}
+                  <span class="source-check" aria-hidden="true">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+                  </span>
+                {/if}
+                <span class="source-title">Enter a phrase I already have</span>
+                <span class="source-desc">Type in words you wrote down somewhere safe.</span>
+              </button>
+              <button
+                type="button"
+                class="source-tile"
+                class:source-tile--on={rotateSource === 'generate'}
+                aria-pressed={rotateSource === 'generate'}
+                disabled={rotating}
+                onclick={() => setRotateSource('generate')}
+              >
+                {#if rotateSource === 'generate'}
+                  <span class="source-check" aria-hidden="true">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+                  </span>
+                {/if}
+                <span class="source-title">Generate a fresh phrase</span>
+                <span class="source-desc">We make 12 new words for you to write down first.</span>
+              </button>
+            </div>
+
+            {#if rotateSource === 'enter'}
+              <div class="field">
+                <label class="field-label" for="rotate-phrase">New recovery phrase</label>
+                <textarea
+                  id="rotate-phrase"
+                  class="field-input field-input--textarea"
+                  class:field-input--bad={rotateInvalid}
+                  rows="3"
+                  placeholder="Type or paste your new words, separated by spaces"
+                  bind:value={rotateText}
+                  autocomplete="off"
+                  autocapitalize="none"
+                  spellcheck="false"
+                  disabled={rotating}
+                ></textarea>
+                <div class="field-meta">
+                  <span class="text-xs muted">
+                    {#if rotateWordCount === 0}
+                      12, 15, 18, 21 or 24 words
+                    {:else}
+                      {rotateWordCount} {rotateWordCount === 1 ? 'word' : 'words'}
+                    {/if}
+                  </span>
+                  {#if rotateValidating}
+                    <span class="text-xs muted">Checking…</span>
+                  {:else if rotateValid}
+                    <span class="field-ok text-xs">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6L9 17l-5-5"/></svg>
+                      Phrase checks out
+                    </span>
+                  {/if}
+                </div>
+                {#if rotateInvalid && rotateValidation?.error}
+                  <p class="field-error" role="alert">{rotateValidation.error.message}</p>
+                {/if}
+              </div>
+
+              {#if !showRotatePassphrase}
+                <button
+                  type="button"
+                  class="link-btn"
+                  onclick={() => (showRotatePassphrase = true)}
+                >
+                  Passphrase (optional) — add if you used one
+                </button>
+              {:else}
+                <div class="field">
+                  <label class="field-label" for="rotate-passphrase">Passphrase</label>
+                  <input
+                    id="rotate-passphrase"
+                    type="password"
+                    class="field-input"
+                    placeholder="Leave empty if you never set one"
+                    bind:value={rotatePassphrase}
+                    autocomplete="off"
+                    disabled={rotating}
+                  />
+                  <p class="text-xs muted field-help">
+                    The same words with a different passphrase are a different
+                    account. Leave this empty if you never set one.
+                  </p>
+                </div>
+              {/if}
+            {:else}
+              <div class="rotate-generated" id="rotate-generated" tabindex="-1">
+                <span class="field-label">Your new recovery phrase</span>
+                {#if rotateGenError}
+                  <p class="field-error" role="alert">{rotateGenError}</p>
+                  <button type="button" class="btn btn--ghost" onclick={() => void makeRotatePhrase()}>
+                    Try again
+                  </button>
+                {:else if rotateWords.length === 0}
+                  <div class="generating" aria-live="polite">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span class="text-sm muted">Making a fresh phrase…</span>
+                  </div>
+                {:else}
+                  <MnemonicPhrase
+                    words={rotateWords}
+                    revealed={rotateRevealed}
+                    onReveal={() => (rotateRevealed = true)}
+                  />
+                  {#if !rotateRevealed}
+                    <button type="button" class="link-btn" onclick={() => void makeRotatePhrase()}>
+                      Make a different phrase
+                    </button>
+                  {/if}
+                {/if}
+              </div>
+            {/if}
+
+            {#if rotateReady}
+              <div class="preview-panel">
+                <span class="field-label">The new phrase gives</span>
+                <EthAddressBlock
+                  address={rotatePreviewAddress}
+                  explanation="This becomes your account address once the network accepts the rotation. Share it with anyone who sends to you."
+                  animate={false}
+                />
+              </div>
+            {/if}
+
+            {#if rotateAckVisible}
+              <label class="check-row">
+                <input type="checkbox" bind:checked={rotateBackedUp} disabled={rotating} />
+                <span>
+                  {#if rotateSource === 'generate'}
+                    I’ve written these 12 words down and stored them somewhere safe.
+                  {:else}
+                    I’ve written this phrase down somewhere safe — after the rotation
+                    it is the only way back into this account.
+                  {/if}
+                </span>
+              </label>
+            {/if}
+
+            {#if rotateError}
+              <p class="field-error" role="alert">{rotateError}</p>
+            {/if}
+
+            <div class="actions">
+              <button type="button" class="btn btn--ghost" onclick={leaveRotate} disabled={rotating}>
+                Back
+              </button>
+              <button
+                type="button"
+                class="btn btn--danger-outline"
+                disabled={!canRotate}
+                onclick={() => (rotateConfirmOpen = true)}
+              >
+                {#if rotating}Rotating…{:else}Rotate identity{/if}
+              </button>
+            </div>
+            {#if rotateNeedsAck}
+              <p class="hint text-xs muted">Tick the box above to continue.</p>
+            {/if}
+          </div>
+        </Card>
+
       <!-- ── Manage: already established ──────────────────────── -->
       {:else if step === 'manage'}
         <Card title="Your identity">
@@ -594,6 +938,39 @@
                   on {new Date(userIdentityState.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
                 {/if}
               </span>
+            </div>
+
+            {#if rotateDone}
+              <p class="rotate-done" role="status">
+                Rotated. Your account now uses the new phrase, and the address above
+                is the one to share from now on.
+              </p>
+            {/if}
+
+            <div class="rotate-block">
+              <div class="rotate-head">
+                <span class="rotate-icon" aria-hidden="true">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="23 4 23 10 17 10" />
+                    <polyline points="1 20 1 14 7 14" />
+                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10" />
+                    <path d="M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+                  </svg>
+                </span>
+                <div class="rotate-head-text">
+                  <h4 class="rotate-heading">Rotate to a new recovery phrase</h4>
+                  <p class="rotate-desc text-xs muted">
+                    Switches the account to a new phrase — and to the address that
+                    phrase gives. Your current phrase signs for the change; once the
+                    network accepts it, that phrase stops controlling the account and
+                    cannot be used to get it back. Restoring a different phrase,
+                    below, replaces the identity stored on this device instead.
+                  </p>
+                </div>
+              </div>
+              <button type="button" class="btn btn--danger-outline" onclick={startRotate}>
+                Rotate to a new phrase
+              </button>
             </div>
 
             {#if passkeyAvailable}
@@ -634,6 +1011,32 @@
   onConfirm={doRestore}
   onCancel={() => (restoreConfirmOpen = false)}
 />
+
+<!-- Rotation switches which phrase controls the account — and with it the
+     address: one explicit confirm, showing exactly what changes. -->
+<ConfirmDialog
+  open={rotateConfirmOpen}
+  title="Rotate to this new phrase?"
+  message="Your current phrase signs for this change. Once the network accepts it, that phrase stops controlling this account and cannot take it back — the new phrase becomes the only way to recover it. Your address becomes the one below, so share it with anyone who sends to you. If the network refuses, nothing changes."
+  confirmLabel="Rotate identity"
+  variant="danger"
+  onConfirm={doRotate}
+  onCancel={() => (rotateConfirmOpen = false)}
+>
+  <div class="rotate-diff">
+    <div class="diff-part">
+      <span class="diff-label">Current address</span>
+      <span class="diff-value">{userIdentityState.address}</span>
+    </div>
+    <span class="diff-arrow" aria-hidden="true">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>
+    </span>
+    <div class="diff-part diff-part--next">
+      <span class="diff-label">New address</span>
+      <span class="diff-value">{rotatePreviewAddress}</span>
+    </div>
+  </div>
+</ConfirmDialog>
 
 {#snippet stepRail(current)}
   <ol class="rail" aria-label="Setup progress">
@@ -1054,6 +1457,160 @@
     color: var(--muted);
   }
 
+  /* ── Rotate (manage → rotate-form) ──────────── */
+  /* The account-level action gets its own framed block: danger-tinted the
+     same way Settings frames its destructive identity actions. */
+  .rotate-block {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+    padding: var(--sp-4);
+    background: var(--bg);
+    border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--border));
+    border-radius: var(--radius-lg);
+  }
+  .rotate-head {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--sp-3);
+  }
+  .rotate-icon {
+    display: flex;
+    flex-shrink: 0;
+    color: var(--danger);
+    margin-top: 1px;
+  }
+  .rotate-head-text {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+    min-width: 0;
+  }
+  .rotate-heading {
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--fg);
+  }
+  .rotate-desc {
+    line-height: var(--leading-normal);
+  }
+  .rotate-block .btn {
+    align-self: flex-start;
+  }
+
+  /* Success note left behind on the manage step after a rotation. */
+  .rotate-done {
+    padding: var(--sp-2) var(--sp-3);
+    background: var(--ok-dim);
+    border: 1px solid color-mix(in srgb, var(--ok) 30%, transparent);
+    border-radius: var(--radius-md);
+    font-size: var(--text-xs);
+    color: var(--ok);
+    line-height: var(--leading-normal);
+  }
+
+  /* ── Rotate: where the new phrase comes from ── */
+  .source-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--sp-3);
+  }
+  .source-tile {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--sp-1);
+    padding: var(--sp-3);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: border-color var(--duration-normal) var(--ease),
+                background var(--duration-normal) var(--ease);
+  }
+  .source-tile:hover:not(:disabled) {
+    border-color: var(--accent);
+    background: var(--bg-hover);
+  }
+  .source-tile:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .source-tile--on,
+  .source-tile--on:hover:not(:disabled) {
+    border-color: var(--accent);
+    background: var(--bg-hover);
+  }
+  .source-title {
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--fg);
+    padding-right: var(--sp-6);
+  }
+  .source-desc {
+    font-size: var(--text-xs);
+    color: var(--muted);
+    line-height: var(--leading-normal);
+  }
+  .source-check {
+    position: absolute;
+    top: var(--sp-3);
+    right: var(--sp-3);
+    display: flex;
+    color: var(--accent);
+    animation: mark-pop 180ms var(--ease) both;
+  }
+
+  /* Home for the generated phrase: focus target + label + controls. */
+  .rotate-generated {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+    outline: none;
+  }
+
+  /* ── Rotate confirm: the address that changes ─ */
+  .rotate-diff {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+    padding: var(--sp-3);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+  }
+  .diff-part {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .diff-label {
+    font-size: var(--text-xs);
+    font-weight: 500;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .diff-part--next .diff-label {
+    color: var(--accent);
+  }
+  .diff-value {
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--fg);
+    letter-spacing: 0.03em;
+    overflow-wrap: anywhere;
+  }
+  .diff-arrow {
+    display: flex;
+    justify-content: center;
+    color: var(--muted);
+  }
+
   /* ── Actions ────────────────────────────────── */
   .actions {
     display: flex;
@@ -1157,6 +1714,7 @@
   /* ── Responsive ─────────────────────────────── */
   @media (max-width: 560px) {
     .choice-grid,
+    .source-grid,
     .confirm-grid {
       grid-template-columns: 1fr;
     }

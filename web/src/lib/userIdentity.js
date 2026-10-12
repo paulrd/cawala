@@ -507,7 +507,7 @@ async function _deriveEthAddress(mnemonic, passphrase) {
  *
  * @param {string} mnemonic
  * @param {string} passphrase
- * @returns {Promise<{ address: string, secretHex: string }>}
+ * @returns {Promise<{ address: string, secretHex: string, secretBytes: Uint8Array }>}
  * @throws {InvalidMnemonicError|IdentityBackendUnavailableError}
  */
 async function _deriveAddressAndSecret(mnemonic, passphrase) {
@@ -531,7 +531,24 @@ async function _deriveAddressAndSecret(mnemonic, passphrase) {
   if (!(secret instanceof Uint8Array) || secret.length !== 32) {
     throw new Error('The crypto engine returned an unexpected secret length.');
   }
-  return { address, secretHex: _bytesToHex(secret) };
+  return { address, secretHex: _bytesToHex(secret), secretBytes: secret };
+}
+
+/**
+ * Derive a mnemonic's EIP-55 address AND its raw secp256k1 secret WITHOUT
+ * persisting anything.
+ *
+ * The rotation flow needs both: the address names the new anchor and the secret
+ * is handed to the wasm node so it can prove control. Nothing is written here,
+ * so a rejected rotation leaves the incumbent identity intact.
+ *
+ * @param {string} mnemonic
+ * @param {string} [passphrase='']
+ * @returns {Promise<{ address: string, secretHex: string, secretBytes: Uint8Array }>}
+ * @throws {InvalidMnemonicError|IdentityBackendUnavailableError}
+ */
+export async function deriveIdentityAddressAndSecret(mnemonic, passphrase = '') {
+  return _deriveAddressAndSecret(mnemonic, passphrase);
 }
 
 // ── Storage (guarded; memory fallback keeps tests/Node working) ─────────

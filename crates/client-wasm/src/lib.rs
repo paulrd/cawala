@@ -35,6 +35,7 @@ use cawala_msg::{
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{EndpointAddr, EndpointId};
+use k256::ecdsa::SigningKey;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tracing::info;
@@ -49,8 +50,9 @@ pub mod ledger_state;
 pub mod state;
 
 use crate::control::{
-    AncestorCache, AncestorEntry, ControlHandler, JOIN_TTL_SECONDS, ROUTED_REPLY_TIMEOUT_SECS,
-    SharedControl, ancestor_walk_step, build_routed_control, exchange_control, invite_endpoint_addr,
+    AncestorCache, AncestorEntry, CONTROL_COMMIT_ATTEMPTS, CommitOutcome, ControlHandler,
+    JOIN_TTL_SECONDS, ROUTED_REPLY_TIMEOUT_SECS, SharedControl, ancestor_walk_step,
+    build_routed_control, commit_control_idempotent, exchange_control, invite_endpoint_addr,
     prepare_admin_exchange, routed_request_envelope, sign_own_control, verify_routed_reply_bytes,
 };
 use crate::dto::{
@@ -1843,6 +1845,131 @@ impl ClientNode {
             ControlReply::Rejected(code) => format!("rejected:{}", reject_code_str(code)),
             _ => "unexpected".to_string(),
         })
+    }
+
+    /// Rotate this leaf's Ethereum anchor to `new_secret`'s address,
+    /// authorized by the **incumbent** (currently set) identity.
+    ///
+    /// `new_secret` is the raw 32-byte secp256k1 secret the new identity should
+    /// use (in the app, the derived secret of a new BIP-39 phrase). The
+    /// incumbent key — the identity currently installed via
+    /// [`ClientNode::set_user_identity`] / [`ClientNode::set_user_identity_from_secret`] —
+    /// signs `eth_rotation_digest(node_id, incumbent_addr, new_addr)` and the
+    /// resulting `EthProof` (`old_address: Some(incumbent)`) rides control
+    /// variant 24 `RegisterEthAddress { address: new_addr, proof }` to the
+    /// parent, exactly like [`ClientNode::register_eth_address`]. The parent
+    /// accepts it only when the signature recovers to its recorded incumbent
+    /// anchor, so a transport-key-only holder cannot swap the anchor.
+    ///
+    /// On `"accepted"` (or a reconciled replay, see below), the in-memory user
+    /// identity is **replaced** with the new key (ready to sign V4 orders under
+    /// the new address); on a definitive rejection the incumbent is left
+    /// untouched. Returns the reply bucket
+    /// (`"accepted"` / `"rejected:<code>"` / `"unexpected"`). A missing
+    /// identity, a missing join, or a persistent unreachable parent is a JS
+    /// error, as is a malformed `new_secret`.
+    ///
+    /// # Idempotency (Addendum C §8)
+    ///
+    /// The signed frame is built **once** and resent unchanged on an ambiguous
+    /// transport failure (timeout/lost reply), so its nonce stays identical
+    /// across attempts. A `Replay` reply to that unique nonce proves an earlier
+    /// attempt already applied the rotation, so it is treated exactly like an
+    /// `Accepted` reply: the slot is swapped and `"accepted"` is returned. This
+    /// closes the divergence window where the parent anchor moved but the reply
+    /// was lost, which would otherwise fail-close the next boot's
+    /// re-registration as `Unauthorized`. Only a definitive `Rejected(code)` is
+    /// returned as-is, leaving the incumbent in place.
+    pub async fn rotate_eth_address(&self, new_secret: &[u8]) -> Result<String, JsError> {
+        let new_key = crate::eth_identity::signing_key_from_bytes(new_secret).map_err(to_js_err)?;
+        self.rotate_eth_address_with_key(new_key).await
+    }
+
+    /// Mnemonic convenience over [`ClientNode::rotate_eth_address`]: derive the
+    /// new key at the standard `m/44'/60'/0'/0/0` path (optional BIP-39
+    /// passphrase) and rotate the anchor to its address, authorized by the
+    /// incumbent identity.
+    pub async fn rotate_eth_address_from_mnemonic(
+        &self,
+        mnemonic: &str,
+        passphrase: Option<String>,
+    ) -> Result<String, JsError> {
+        let new_key = crate::eth_identity::derive_signing_key(
+            mnemonic,
+            passphrase.as_deref(),
+            crate::eth_identity::DEFAULT_ACCOUNT_INDEX,
+        )
+        .map_err(to_js_err)?;
+        self.rotate_eth_address_with_key(new_key).await
+    }
+
+    /// Shared rotation path: build the incumbent-authorized proof once, sign the
+    /// control variant 24 frame once, then commit it idempotently against the
+    /// direct parent, swapping the in-memory identity only on a reconciled
+    /// acceptance (a definitive rejection leaves the incumbent in place).
+    async fn rotate_eth_address_with_key(&self, new_key: SigningKey) -> Result<String, JsError> {
+        let operator = self
+            .control
+            .operator
+            .clone()
+            .ok_or_else(|| JsError::new("client has no control identity; use spawn_control"))?;
+        let (_self_addr, parent) = self.joined_context()?;
+        let node_id = self.control.node_id().to_string();
+        let new_address = crate::eth_identity::address_from_signing_key(&new_key);
+
+        // The incumbent identity (currently in the slot) signs the rotation
+        // challenge. Erroring here means there is nothing to rotate from.
+        let (_incumbent, proof) = self
+            .user_identity
+            .rotation(&node_id, &new_address)
+            .map_err(to_js_err)?
+            .ok_or_else(|| JsError::new("no user identity set; call set_user_identity"))?;
+
+        // Build the signed frame ONCE. Its nonce is unique to this rotation and
+        // every resend must be byte-identical: rebuilding would mint a fresh
+        // nonce, which would both defeat the node's replay guard as an
+        // idempotency key and make a `Replay` reply ambiguous instead of proof
+        // that our earlier attempt already landed.
+        let mut nonce_bytes = [0u8; 8];
+        getrandom::fill(&mut nonce_bytes).map_err(to_js_err)?;
+        let signed = SignedControl::authorize(
+            NodeId::from(node_id),
+            &operator,
+            u64::from_le_bytes(nonce_bytes),
+            now_unix_seconds().saturating_add(CONTROL_REQUEST_TTL_SECS),
+            ControlRequest::RegisterEthAddress(RegisterEthAddress {
+                address: new_address,
+                proof,
+            }),
+        )
+        .map_err(to_js_err)?;
+
+        // Direct to the parent, exactly like the join/leave exchange; the parent
+        // is the sole holder of this leaf's `ChildEntry`.
+        let target: EndpointId = parent.node_id.as_str().parse().map_err(to_js_err)?;
+        let endpoint = self.router.endpoint();
+        let target_addr = EndpointAddr::from(target);
+        // The frame is built once above; the closure closes over it so every
+        // resend is byte-identical.
+        let (signed_ref, target_ref) = (&signed, &target_addr);
+        let outcome = commit_control_idempotent(
+            move || async move { exchange_control(endpoint, target_ref.clone(), signed_ref).await },
+            CONTROL_COMMIT_ATTEMPTS,
+        )
+        .await
+        .map_err(|_| JsError::new("rotate eth address: parent unreachable"))?;
+
+        match outcome {
+            CommitOutcome::Applied => {
+                // The parent's anchor moved (or provably already had on a
+                // reconciled replay); adopt the new key so V4 orders and any
+                // future rotation sign with the new identity.
+                self.user_identity.set_from_key(new_key);
+                Ok("accepted".to_string())
+            }
+            CommitOutcome::Rejected(code) => Ok(format!("rejected:{}", reject_code_str(code))),
+            CommitOutcome::Unexpected => Ok("unexpected".to_string()),
+        }
     }
 
     /// Perform the R1b node-client API `Capabilities` handshake with the direct

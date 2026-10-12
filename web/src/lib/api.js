@@ -1922,6 +1922,131 @@ function _surfaceEthRegistration(outcome) {
   }
 }
 
+/**
+ * Rotate this device's ETH account identity to a new recovery phrase,
+ * authorized by the **incumbent** identity.
+ *
+ * Derives the new address + secp256k1 secret from `newMnemonic` (validated
+ * first; nothing is persisted until the parent accepts), asks the live node to
+ * send an incumbent-authorized `RegisterEthAddress` rotation proof, and on
+ * `"accepted"` persists the NEW derived secret + address and republishes the
+ * reactive identity store. The incumbent record is left untouched on a
+ * definitive rejection; a persistent transport error is thrown before any
+ * persistence.
+ *
+ * The node's rotation commit is **idempotent** (Addendum C §8): it resends the
+ * identical signed frame (same nonce) after a lost reply/timeout and reconciles
+ * a `Replay` reply as "already applied". Such a reconciled rotation is reported
+ * as the ordinary `"accepted"` bucket, so the persistence below is identical
+ * whether the parent answered on the first attempt or an earlier attempt had
+ * already landed. This is what stops a lost reply from leaving the device on
+ * the incumbent while the parent anchor moved — which would fail-close the next
+ * boot's re-registration as `Unauthorized`.
+ *
+ * Never touches the transport seed: the NodeId stays the same, only the ETH
+ * anchor moves.
+ *
+ * @param {string} newMnemonic The new recovery phrase.
+ * @param {string} [passphrase=''] Optional BIP-39 passphrase for the new phrase.
+ * @returns {Promise<{ status: string, address: string, previousAddress: string, error: string|null }>}
+ *   `status` is the node reply bucket (`accepted` / `rejected:<code>` /
+ *   `unexpected`) or `unsupported` when the node advertises no ETH-identity
+ *   feature (nothing is sent). `accepted` includes a replay reconciled by the
+ *   idempotent resend.
+ * @throws {Error|InvalidMnemonicError} On no live client, no incumbent
+ *   identity, an invalid new phrase, or a persistent transport failure. Nothing
+ *   is persisted in any of these cases.
+ */
+export async function rotateUserEthIdentity(newMnemonic, passphrase = '') {
+  const node = _requireNode();
+  if (typeof node.rotate_eth_address !== 'function') {
+    throw new Error('This client build cannot rotate the account identity.');
+  }
+  const current = userIdentity.getUserIdentity();
+  if (!current.established || !current.address) {
+    throw new Error('There is no account identity on this device to rotate.');
+  }
+  // A stale transport identity must not rotate an anchor under a NodeId that is
+  // about to change; registration refuses for the same reason.
+  if (_transportIdentityIsStale()) {
+    throw new Error('The account key is still being activated; reload and try again.');
+  }
+
+  // Validate + derive the new identity now. This persists nothing, so a
+  // rejection or transport failure leaves the incumbent in place.
+  const { address: newAddress, secretHex, secretBytes } =
+    await userIdentity.deriveIdentityAddressAndSecret(newMnemonic, passphrase);
+
+  if (newAddress.toLowerCase() === current.address.toLowerCase()) {
+    throw new Error('That phrase already controls this account; nothing to rotate.');
+  }
+
+  // R1b gating: an old node (capabilities available but no ETH feature) cannot
+  // accept variant 24. Report honestly without sending. Unavailable
+  // capabilities keep the legacy best-effort attempt.
+  if (_nodeCapabilities && !_nodeCapabilities.supportsEthIdentity) {
+    return {
+      status: 'unsupported',
+      address: current.address,
+      previousAddress: current.address,
+      error: null,
+    };
+  }
+
+  let bucket;
+  try {
+    bucket = await node.rotate_eth_address(secretBytes);
+  } catch (err) {
+    // Transport/join/identity failure: the incumbent is untouched.
+    _ethRegistration = {
+      status: 'error',
+      address: current.address,
+      trigger: 'rotate',
+      at: Date.now(),
+      error: err?.message || String(err),
+    };
+    throw err;
+  }
+
+  const status = String(bucket ?? 'unexpected');
+  if (status !== 'accepted') {
+    // The parent refused (or the reply was unexpected): keep the incumbent.
+    _ethRegistration = {
+      status,
+      address: current.address,
+      trigger: 'rotate',
+      at: Date.now(),
+      error: null,
+    };
+    return {
+      status,
+      address: current.address,
+      previousAddress: current.address,
+      error: null,
+    };
+  }
+
+  // Accepted: the parent's anchor and the live node's in-memory key already
+  // moved. Persist the NEW derived secret + address; the incumbent session
+  // registration key is unchanged (parent + assigned address), so the poller
+  // will not re-register against the now-rotated anchor.
+  userIdentity.adoptIdentity({ address: newAddress, secretHex });
+  refreshUserIdentity();
+  _ethRegistration = {
+    status,
+    address: newAddress,
+    trigger: 'rotate',
+    at: Date.now(),
+    error: null,
+  };
+  return {
+    status,
+    address: newAddress,
+    previousAddress: current.address,
+    error: null,
+  };
+}
+
 // ── Ledger-event poller ───────────────────────────────────────
 
 /**
