@@ -3,7 +3,8 @@
 Svelte 5 + Vite static PWA. The wasm-bindgen client (`cawala-client`) spawns an
 iroh endpoint in the browser and talks to Rust nodes over the N0 public relay
 (browsers cannot dial UDP directly). The browser is a **user leaf**: it holds an
-Ed25519 operator identity but never a node operator or ledger key.
+Ed25519 operator identity and a user-level secp256k1 (Ethereum) identity, but
+never a node operator or ledger key.
 
 Project-wide context lives in the root `README.md`, `PLAN.md` (living design +
 roadmap), `PLAN-ARCHIVE.md` (delivered history), and `HANDOFF.md` (current
@@ -21,6 +22,12 @@ state). This file covers only how to build and run the web app.
 A second tab in the same profile runs in mock by design (the identity lock is
 held by the first tab).
 
+Live mode also adapts to the origin: on a secure origin (`https` or `localhost`)
+passkey unlock is offered; on `file://` the passkey panel is **hidden** (passkeys
+need a real secure origin - `file://` is "potentially trustworthy" but has no
+WebAuthn origin), the service worker is skipped, and unlock is **mnemonic only**.
+This is the degraded `file://` distribution build (see below).
+
 ## Prerequisites
 
 - Node.js (v24 used) and npm; run `npm install` from `web/`.
@@ -34,16 +41,27 @@ held by the first tab).
 
 ```sh
 cd web
-npm run dev        # builds the wasm glue, then starts Vite
-npm run build      # build:wasm + vite build -> web/dist/
-npm run preview    # serve the production build
-npm test           # node test runner over web/test/*.test.mjs
+npm run dev              # builds debug wasm glue, then starts Vite
+npm run build            # release wasm + vite build + stamp sw.js -> web/dist/
+npm run build:singlefile # release wasm + single self-contained dist-single/index.html
+npm run preview          # serve the production build
+npm test                 # node test runner over web/test/*.test.mjs
 ```
 
 `npm run build:wasm` runs `cargo build --target wasm32-unknown-unknown -p
 cawala-client` (artifacts in `web/.cargo-target`) and `wasm-bindgen` (output to
 `web/src/wasm/`). `web/src/wasm/` is generated and gitignored: **rebuild it
 after any `crates/client-wasm` change**, or the JS/wasm arity can desync.
+`npm run build` and `npm run build:singlefile` use the **release** profile
+(`build:wasm:release`; ~6 MB vs ~24 MB debug).
+
+`npm run build:singlefile` writes **one** `dist-single/index.html` with all
+JS/CSS inlined and the wasm embedded as base64, initialized from **bytes** (no
+`file://` fetch). It then runs `scripts/check-singlefile.mjs` to assert
+self-containment (no external `src=`/`href=`, no dynamic-import chunks). This is
+the artifact for `file://`/zip/email. **Do not serve it under a host CSP without
+`script-src 'unsafe-inline'`** - the file's meta CSP and the host header CSP
+intersect and blank the inline bundle (see `../DEPLOYMENT.md`).
 
 The build uses `base: './'` so `web/dist/` deploys as-is under the GitHub Pages
 subpath `/cawala/`.
@@ -77,7 +95,7 @@ Hash routes (`web/src/lib/constants.js`):
 | Join | `#/join` | only while this browser is unjoined |
 | Accounts | `#/accounts` | balances / accounting |
 | Activity | `#/activity` | transfer and settlement history |
-| Settings | `#/settings` | identity export/import |
+| Settings | `#/settings` | identity create/restore + transport export/import |
 | Admin | `#/admin` | locked by default (below) |
 
 My Account (`#/account`) is not a tab.
@@ -103,14 +121,35 @@ chain from its own leaf, hop by hop; it has no automatic authority.
 - All admin requests are **tree-routed**; the direct `cawala/control/0` link is
   used only for the browser's own leaf (join handshake, payments).
 
-## Identity portability
+## Identity
 
-**Settings -> Identity** exports/imports a passphrase-encrypted
-`IdentityBundleV1` (PBKDF2-SHA-256 600k + AES-256-GCM) carrying the 32-byte seed
-plus the secret-free join/ledger state. The seed is both the iroh endpoint id and
-the account's operator key, so exporting/importing moves the account. Concurrent
-use of one identity on two devices is **not** prevented; run one device at a
-time. Lost-seed recovery is not available in v1.
+The user identity (R3) is a secp256k1 Ethereum account derived from a 12-word
+BIP-39 recovery phrase (`m/44'/60'/0'/0/0`; EIP-55 address). Derivation runs the
+**real wasm** engine (`UserIdentity.fromMnemonic`), injected by `api.js` after
+wasm init; the UI under `components/identity/` never imports wasm itself.
+
+**Settings -> Your Account Identity** lets you **create** a new phrase (back it
+up + confirm) or **restore** an existing one (with an address preview). Because
+the same phrase also derives the browser's Ed25519 transport key (its iroh
+NodeId), **one phrase restores both the account and the transport identity on any
+host**. The derived secrets are persisted on-device - the transport seed in
+`cawala.identity.v1`, the ETH secret in `cawala.user-identity.v1` (both
+authoritative-local) - so a reload needs no unlock; the **phrase itself is never
+stored**.
+
+The **passkey panel** (WebAuthn unlock) is shown only on a **secure origin**
+(`https`/`localhost`). On `file://` it is **hidden**, because `file://` has no
+WebAuthn origin, and the phrase is the only unlock path. The WebAuthn PRF
+key-wrap backend is still deferred (`PASSKEY_BACKEND_READY = false`), so passkey
+actions report honestly as unavailable; a passkey is an **unlock factor, never a
+signer** (P-256 ≠ secp256k1).
+
+**Settings -> Identity Portability** separately exports/imports the legacy
+passphrase-encrypted `IdentityBundleV1` (PBKDF2-SHA-256 600k + AES-256-GCM)
+carrying the 32-byte transport seed plus the secret-free join/ledger state - use
+it to move an existing install's transport seed. The mnemonic remains the
+portable account credential. Concurrent use of one identity on two devices is
+**not** prevented; run one device at a time.
 
 ## Smoke scripts (network-dependent)
 
@@ -134,14 +173,18 @@ node scripts/smoke-admin.mjs      # tree-routed admin (query/approve/designate/r
 web/
 ├── index.html               # app shell, links manifest
 ├── vite.config.js           # base './', svelte plugin
-├── scripts/build-wasm.mjs   # cargo + wasm-bindgen (cwd-robust)
-├── public/                  # manifest.webmanifest, sw.js
+├── vite.config.singlefile.js# self-contained dist-single/index.html build
+├── scripts/build-wasm.mjs   # cargo + wasm-bindgen (cwd-robust; --release)
+├── scripts/check-singlefile.mjs  # self-containment assertions
+├── scripts/stamp-sw.mjs     # per-deploy sw.js versioning
+├── public/                  # manifest.webmanifest, sw.js, _headers
 ├── test/                    # *.test.mjs (node test runner)
 └── src/
-    ├── main.js              # entry; registers SW in prod
+    ├── main.js              # entry; registers SW in prod (skipped on file://)
     ├── App.svelte           # hash router + layout
     ├── components/          # account, accounts, activity, admin, dashboard,
-    │                        # join-flow, layout, settings, shared
-    ├── lib/                 # api.js, stores, router, adminPolicy, ...
+    │                        # identity, join-flow, layout, settings, shared
+    ├── lib/                 # api.js, storage.js, userIdentity.js, bip39.js,
+    │                        # stores, router, adminPolicy, wasm/
     └── wasm/                # GENERATED by build:wasm (gitignored)
 ```

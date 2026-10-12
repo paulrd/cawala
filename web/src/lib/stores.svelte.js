@@ -18,6 +18,38 @@ export const clientState = $state({
   error: null,
 });
 
+// ── User identity (R3: mnemonic → ETH address) ───────────────
+
+/**
+ * The R3 user identity view, published by the api layer.
+ *
+ * `established` is false until a mnemonic has been created or restored here;
+ * `address` is the real EIP-55 checksummed account address (derived in wasm);
+ * `passkeyEnrolled` tracks whether biometric unlock was set up (it only
+ * *unlocks* — the recovery phrase remains the sole recovery credential);
+ * `preview` is retained for shape compatibility and is always false now that
+ * derivation is real.
+ *
+ * @type {{ established: boolean, address: string|null, source: 'created'|'restored'|null, passkeyEnrolled: boolean, preview: boolean, createdAt: number|null, storagePersistent: boolean }}
+ */
+export const userIdentityState = $state({
+  established: false,
+  address: null,
+  source: null,
+  passkeyEnrolled: false,
+  preview: false,
+  createdAt: null,
+  storagePersistent: true,
+});
+
+/**
+ * Replace the user-identity view in place (keeps one reactive object).
+ * @param {Partial<typeof userIdentityState>} next
+ */
+export function applyUserIdentity(next) {
+  Object.assign(userIdentityState, next);
+}
+
 // ── Live-mode capabilities & control events ──────────────────
 
 /** @type {{ mock: boolean, canAdmin: boolean, canQueryPeers: boolean, canQueryNode: boolean, identityPersistent: boolean, multiTabLeader: boolean, multiTabWarning: string|null }} */
@@ -40,15 +72,21 @@ export const lastControlEvent = $state({ value: null });
  * `balance`/`height`/`pinnedLedger` mirror the wasm `ledger_status()`; `activity`
  * is the JS-side UI-shaped transfer list built from drained ledger events
  * (capped like the Rust `MAX_ACTIVITY_ENTRIES`); `pending` counts in-flight
- * orders; `verifiedAt` is the local ms timestamp of the last verified receipt.
+ * orders; `stateRoot` is the ledger state root the last verified balance was
+ * attested against; `trustEstablished` is whether the TOFU anchors
+ * (`pinnedLedger`/pinned leaf keys) were restored from the persisted cache at
+ * boot (false on a fresh origin — see `getTrustState()`); `verifiedAt` is the
+ * local ms timestamp of the last verified receipt.
  * An `invalid` ledger event sets `error` and never mutates `balance`.
  *
- * @type {{ balance: number|null, height: number|null, pinnedLedger: string|null, activity: Array, pending: number, verifiedAt: number|null, error: string|null }}
+ * @type {{ balance: number|null, height: number|null, pinnedLedger: string|null, stateRoot: string|null, trustEstablished: boolean, activity: Array, pending: number, verifiedAt: number|null, error: string|null }}
  */
 export const ledgerState = $state({
   balance: null,
   height: null,
   pinnedLedger: null,
+  stateRoot: null,
+  trustEstablished: false,
   activity: [],
   pending: 0,
   verifiedAt: null,

@@ -223,6 +223,18 @@ pub fn settlement_state_reason(state: &SettlementStateV1) -> Option<&str> {
     }
 }
 
+/// The failing hop carried by a persisted [`SettlementStateV1`]::`Partial`, if
+/// any.
+///
+/// This is the node whose hop was refused (so the payee was never credited);
+/// every other variant has no failing hop.
+pub fn settlement_state_failed_at(state: &SettlementStateV1) -> Option<&NodeId> {
+    match state {
+        SettlementStateV1::Partial { failed_at } => Some(failed_at),
+        _ => None,
+    }
+}
+
 /// The versioned, postcard-serializable ledger state blob.
 ///
 /// This is exactly what [`crate::ClientNode::export_ledger_state`] emits and

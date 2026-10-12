@@ -7,6 +7,7 @@ members = [
     "crates/control",
     "crates/ledger",
     "crates/msg",
+    "crates/eth",
 ]
 # resolver 3 keeps tokio's `net` feature from unifying across targets, so the
 # wasm32 build does not try to compile mio (which hard-errors on wasm).

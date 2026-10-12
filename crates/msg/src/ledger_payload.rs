@@ -31,6 +31,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use cawala_eth::EthIdentity;
 use cawala_ledger::{
     Amount, AuthRef, BalanceAttestation, Hash, HopRole, LedgerPubKey, NodeId, PaymentOrder,
     SignedCommitment,
@@ -60,6 +61,14 @@ pub const LEDGER_PAYLOAD_V2_VERSION: u8 = 2;
 /// untouched: an old client reads a v3 frame's first byte and cleanly rejects it
 /// with [`LedgerPayloadError::UnsupportedVersion`].
 pub const LEDGER_PAYLOAD_V3_VERSION: u8 = 3;
+
+/// Wire version of the v4 ledger payload, prefixed to every
+/// [`LedgerPayloadV4::to_bytes`] encoding.
+///
+/// A separate constant (and prefix byte) keeps the frozen v1/v2/v3 bytes
+/// untouched: an old client reads a v4 frame's first byte and cleanly rejects it
+/// with [`LedgerPayloadError::UnsupportedVersion`].
+pub const LEDGER_PAYLOAD_V4_VERSION: u8 = 4;
 
 /// Maximum receipt history length a caller should accept, in `ValueNoticeV1`
 /// entries. This is a use-site bound; decoding never truncates.
@@ -435,6 +444,77 @@ pub enum SettlementStatusV2 {
     },
 }
 
+/// A versioned **v4** ledger payload.
+///
+/// Variant order is frozen. v4 exists because a user order that carries the
+/// user's Ethereum signature ([`EthIdentity`]) and the payee address needs a
+/// dedicated wire shape (Addendum B/C): the signature rides the msg plane, not
+/// control. v4 is currently **order-only** — the browser still receives results
+/// as [`LedgerPayloadV3::OrderResult`] (the v3 result is unchanged).
+///
+/// The single variant is [`OrderV4`] (discriminant 0).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LedgerPayloadV4 {
+    /// Browser -> leaf: an operator-signed order plus the payee address and the
+    /// user's ETH identity.
+    Order(OrderV4),
+}
+
+impl LedgerPayloadV4 {
+    /// Encode with the [`LEDGER_PAYLOAD_V4_VERSION`] prefix followed by the
+    /// postcard body.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, LedgerPayloadError> {
+        let body = postcard::to_allocvec(self).map_err(codec_error)?;
+        let mut out = Vec::with_capacity(body.len() + 1);
+        out.push(LEDGER_PAYLOAD_V4_VERSION);
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Decode a version-prefixed v4 payload.
+    ///
+    /// Rejects an empty buffer, a non-v4 version, a truncated or invalid body,
+    /// and any trailing bytes after the body. Never panics on arbitrary input.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, LedgerPayloadError> {
+        let (version, body) = bytes
+            .split_first()
+            .ok_or_else(|| LedgerPayloadError::Codec("empty ledger payload".to_string()))?;
+        if *version != LEDGER_PAYLOAD_V4_VERSION {
+            return Err(LedgerPayloadError::UnsupportedVersion(*version));
+        }
+        decode_body(body)
+    }
+}
+
+/// Browser -> leaf: an operator-signed order plus the payee address and the
+/// user's ETH identity (v4).
+///
+/// Field order is frozen. `payee_addr` lets the leaf derive the settlement
+/// route; `eth` carries the user's address and its signature over the canonical
+/// EIP-712 order digest ([`OrderV4::eth_digest`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderV4 {
+    /// The order the payer's operator signed.
+    pub order: PaymentOrder,
+    /// The operator binding that travels with the order.
+    pub auth: AuthRef,
+    /// The payee's user `OctAddr`, needed to derive the settlement route.
+    pub payee_addr: OctAddr,
+    /// The user's Ethereum identity (address + EIP-712 order signature).
+    pub eth: EthIdentity,
+}
+
+impl OrderV4 {
+    /// The canonical EIP-712 digest the user signs (and the node recovers).
+    ///
+    /// Delegates to the shared [`cawala_eth::order_digest`] so the browser and
+    /// node can never diverge on the authorization formula.
+    #[must_use]
+    pub fn eth_digest(&self) -> [u8; 32] {
+        cawala_eth::order_digest(&self.order, &self.payee_addr)
+    }
+}
+
 /// A ledger payload of any known version, for version-dispatching callers.
 // Non-wire Rust wrapper; variant sizes differ, so allow the sized-difference lint.
 #[allow(clippy::large_enum_variant)]
@@ -446,6 +526,8 @@ pub enum VersionedLedgerPayload {
     V2(LedgerPayloadV2),
     /// A [`LEDGER_PAYLOAD_V3_VERSION`] payload.
     V3(LedgerPayloadV3),
+    /// A [`LEDGER_PAYLOAD_V4_VERSION`] payload.
+    V4(LedgerPayloadV4),
 }
 
 /// Decode a version-prefixed ledger payload of any known version.
@@ -461,6 +543,7 @@ pub fn decode_versioned(bytes: &[u8]) -> Result<VersionedLedgerPayload, LedgerPa
         LEDGER_PAYLOAD_VERSION => Ok(VersionedLedgerPayload::V1(decode_body(body)?)),
         LEDGER_PAYLOAD_V2_VERSION => Ok(VersionedLedgerPayload::V2(decode_body(body)?)),
         LEDGER_PAYLOAD_V3_VERSION => Ok(VersionedLedgerPayload::V3(decode_body(body)?)),
+        LEDGER_PAYLOAD_V4_VERSION => Ok(VersionedLedgerPayload::V4(decode_body(body)?)),
         other => Err(LedgerPayloadError::UnsupportedVersion(other)),
     }
 }
@@ -592,6 +675,29 @@ mod tests {
             status,
             balance: None,
             proof,
+        }
+    }
+
+    /// A v4 order whose ETH signature is valid over its own canonical digest.
+    fn sample_order_v4() -> OrderV4 {
+        let key = cawala_eth::signing_key_from_bytes(&[0x11; 32]).expect("valid scalar");
+        let order = PaymentOrder {
+            from: node("alice"),
+            to: node("bob"),
+            amount: Amount::new(7),
+            nonce: 5,
+            expiry: 100,
+        };
+        let payee_addr: OctAddr = "0.2.4".parse().expect("valid octal address");
+        let digest = cawala_eth::order_digest(&order, &payee_addr);
+        OrderV4 {
+            order,
+            auth: auth(),
+            payee_addr,
+            eth: EthIdentity {
+                address: cawala_eth::address_from_signing_key(&key),
+                signature: cawala_eth::sign_digest(&key, &digest).expect("sign"),
+            },
         }
     }
 
@@ -855,8 +961,10 @@ mod tests {
 
         // Unknown / future version and empty buffer are rejected.
         assert_eq!(
-            decode_versioned(&[LEDGER_PAYLOAD_V3_VERSION + 1]),
-            Err(LedgerPayloadError::UnsupportedVersion(4))
+            decode_versioned(&[LEDGER_PAYLOAD_V4_VERSION + 1]),
+            Err(LedgerPayloadError::UnsupportedVersion(
+                LEDGER_PAYLOAD_V4_VERSION + 1
+            ))
         );
         assert!(decode_versioned(&[]).is_err());
 
@@ -960,6 +1068,128 @@ mod tests {
             None,
         ));
         assert_eq!(result.to_bytes().unwrap()[1], 0);
+    }
+
+    #[test]
+    fn v4_order_round_trips_and_is_versioned_separately() {
+        let payload = LedgerPayloadV4::Order(sample_order_v4());
+        let bytes = payload.to_bytes().unwrap();
+        assert_eq!(bytes[0], LEDGER_PAYLOAD_V4_VERSION);
+        assert_eq!(LedgerPayloadV4::from_bytes(&bytes).unwrap(), payload);
+
+        // Every old reader rejects a v4 frame cleanly with the v4 version byte.
+        assert_eq!(
+            LedgerPayloadV1::from_bytes(&bytes),
+            Err(LedgerPayloadError::UnsupportedVersion(LEDGER_PAYLOAD_V4_VERSION))
+        );
+        assert_eq!(
+            LedgerPayloadV2::from_bytes(&bytes),
+            Err(LedgerPayloadError::UnsupportedVersion(LEDGER_PAYLOAD_V4_VERSION))
+        );
+        assert_eq!(
+            LedgerPayloadV3::from_bytes(&bytes),
+            Err(LedgerPayloadError::UnsupportedVersion(LEDGER_PAYLOAD_V4_VERSION))
+        );
+        // A v4 reader rejects older frames cleanly.
+        let v3 = LedgerPayloadV3::OrderResult(sample_order_result_v3(
+            SettlementStatusV2::Rejected {
+                reason: OrderRejectV1::Internal,
+            },
+            None,
+        ))
+        .to_bytes()
+        .unwrap();
+        assert_eq!(
+            LedgerPayloadV4::from_bytes(&v3),
+            Err(LedgerPayloadError::UnsupportedVersion(
+                LEDGER_PAYLOAD_V3_VERSION
+            ))
+        );
+
+        // Every strict prefix fails; trailing bytes are rejected.
+        for cut in 0..bytes.len() {
+            assert!(
+                LedgerPayloadV4::from_bytes(&bytes[..cut]).is_err(),
+                "prefix of length {cut} unexpectedly decoded"
+            );
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(LedgerPayloadV4::from_bytes(&trailing).is_err());
+    }
+
+    #[test]
+    fn v4_discriminant_order_is_frozen() {
+        let order = LedgerPayloadV4::Order(sample_order_v4());
+        assert_eq!(order.to_bytes().unwrap()[1], 0);
+    }
+
+    #[test]
+    fn v4_eth_digest_round_trips_its_own_signature() {
+        let order = sample_order_v4();
+        let digest = order.eth_digest();
+        assert_eq!(order.eth.verify_for(&digest), Ok(()));
+    }
+
+    #[test]
+    fn decode_versioned_dispatches_v4_and_preserves_v1_v2_v3_discriminants() {
+        let v4 = LedgerPayloadV4::Order(sample_order_v4());
+        assert_eq!(
+            decode_versioned(&v4.to_bytes().unwrap()).unwrap(),
+            VersionedLedgerPayload::V4(v4)
+        );
+
+        // Frozen V1 discriminants: Order=0, OrderResult=1, BalanceQuery=2,
+        // BalanceReceipt=3.
+        assert_eq!(
+            LedgerPayloadV1::Order(sample_order()).to_bytes().unwrap()[1],
+            0
+        );
+        assert_eq!(
+            LedgerPayloadV1::OrderResult(result(OrderStatusV1::Applied, None))
+                .to_bytes()
+                .unwrap()[1],
+            1
+        );
+        assert_eq!(
+            LedgerPayloadV1::BalanceQuery(BalanceQueryV1 { query_id: 1 })
+                .to_bytes()
+                .unwrap()[1],
+            2
+        );
+        assert_eq!(
+            LedgerPayloadV1::BalanceReceipt(sample_receipt(vec![], None))
+                .to_bytes()
+                .unwrap()[1],
+            3
+        );
+
+        // Frozen V2 discriminants: Order=0, OrderResult=1.
+        assert_eq!(
+            LedgerPayloadV2::Order(sample_order_v2()).to_bytes().unwrap()[1],
+            0
+        );
+        assert_eq!(
+            LedgerPayloadV2::OrderResult(sample_order_result_v2(SettlementStatusV2::Rejected {
+                reason: OrderRejectV1::BadRequest,
+            }))
+            .to_bytes()
+            .unwrap()[1],
+            1
+        );
+
+        // Frozen V3 discriminant: OrderResult=0.
+        assert_eq!(
+            LedgerPayloadV3::OrderResult(sample_order_result_v3(
+                SettlementStatusV2::Rejected {
+                    reason: OrderRejectV1::BadRequest,
+                },
+                None,
+            ))
+            .to_bytes()
+            .unwrap()[1],
+            0
+        );
     }
 
     #[test]

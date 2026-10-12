@@ -57,16 +57,19 @@ pub use invite::{INVITE_SCHEME, Invite, InviteError};
 pub use reply::{
     AdminApproved, AdminLedgerAccount, AdminLedgerSnapshot, AdminPendingJoin, AdminRejected,
     AdminSnapshot, AdminValueApplied, CONTROL_ALPN, CONTROL_REPLY_VERSION, ChildSnapshot,
-    ControlReply, DeliveryStatus, MAX_ADMIN_LEDGER_ACCOUNTS, NodeSnapshot, ParentSnapshot,
-    RejectCode,
+    ControlReply, DeliveryStatus, MAX_ADMIN_LEDGER_ACCOUNTS, NodeCapabilities, NodeSnapshot,
+    ParentSnapshot, RejectCode,
 };
 pub use request::{
     AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminMoveChild, AdminRedeliverJoin,
-    AdminValueDirection, AdminValueRequest, ControlRequest, CreateChild, DesignationChange,
-    DetachChild, DetachNotice, ExitRequest, JoinApproval, JoinRejection, JoinRequest,
-    MAX_LOCATION_HINT_LEN, MAX_NODE_ID_LEN, MAX_REASON_LEN, MoveChild, RebaseNotice, RebasePull,
-    SetAddress, ValueRequestId, is_admin_request,
+    AdminValueDirection, AdminValueRequest, Capabilities, ControlRequest, CreateChild,
+    DesignationChange, DetachChild, DetachNotice, ExitRequest, JoinApproval, JoinRejection,
+    JoinRequest, MAX_LOCATION_HINT_LEN, MAX_NODE_ID_LEN, MAX_REASON_LEN, MoveChild, RebaseNotice,
+    RebasePull, RegisterEthAddress, SetAddress, ValueRequestId, is_admin_request,
 };
+// The ETH proof type carried by `RegisterEthAddress` is defined in the shared
+// crypto crate; re-export it so control consumers name it from one place.
+pub use cawala_eth::EthProof;
 pub use routed::{
     MAX_ROUTED_FORWARDS, ROUTED_CONTROL_VERSION, ROUTED_REPLY_CONTEXT, ROUTED_REPLY_VERSION,
     RoutedControlV1, RoutedError, RoutedForward, RoutedReplyV1, SignedRoutedReply,

@@ -44,8 +44,10 @@ import {
   applyAdministeredNode,
   applyAdminCapabilities,
   applyAdminLock,
+  applyUserIdentity,
   resetDataState,
   bumpTargetEpoch,
+  showToast,
 } from './stores.svelte.js';
 import { NODE_KIND, inferNodeKind } from './nodeKind.js';
 import * as idb from './identityBundle.js';
@@ -57,6 +59,354 @@ import {
   readAcknowledgedPolicy,
   writeAcknowledgedPolicy,
 } from './adminPolicy.js';
+import {
+  STORAGE_KEYS,
+  readScopedBlob,
+  restoreBlobs,
+} from './storage.js';
+import * as userIdentity from './userIdentity.js';
+
+// ── User identity (R3) — the surface the identity UI calls ────
+//
+// The mnemonic → ETH-address identity (spec §1.1). These functions are thin
+// wrappers over `userIdentity.js`: they keep the reactive
+// `userIdentityState` store in sync after every mutation, so components read
+// the store and only call these on user actions. Address derivation and the
+// derived secret now run the REAL wasm secp256k1 engine, injected into the
+// facade after `initApi` loads wasm (`_wasmIdentityBackend` below). The
+// passkey wrap stays deferred (`PASSKEY_BACKEND_READY === false`).
+//
+// CREATE/RESTORE also do two wasm-side things here (this module owns the
+// ClientNode lifecycle and `cawala.identity.v1`):
+//   1. derive + persist the mnemonic-derived transport seed so one phrase
+//      restores the NodeId; on a fresh install the live node is then
+//      RE-SPAWNED with that seed immediately (see `_reactivateTransportIdentity`)
+//      so its NodeId matches the phrase before any join/registration, and
+//   2. push the derived secp256k1 secret into the live node so V4 orders can
+//      be signed without a reload.
+//
+// ASSUMED API SURFACE (keep names/signatures, swap bodies):
+
+/** Re-exported identity errors + BIP-39 error codes for `instanceof`/mapping. */
+export const {
+  InvalidMnemonicError,
+  PasskeyUnavailableError,
+  IdentityBackendUnavailableError,
+  MNEMONIC_ERRORS,
+} = userIdentity;
+
+/**
+ * Re-read the stored identity into the reactive store. Called at boot and
+ * after every identity mutation; safe to call any time.
+ */
+export function refreshUserIdentity() {
+  applyUserIdentity(userIdentity.getUserIdentity());
+}
+
+/** Whether passkey unlock could work in this context (secure context + WebAuthn). */
+export function isPasskeyAvailable() {
+  return userIdentity.isPasskeyAvailable();
+}
+
+/**
+ * The identity status view: `{ established, address, source,
+ * passkeyEnrolled, preview, createdAt, storagePersistent }`.
+ */
+export function getUserIdentity() {
+  return userIdentity.getUserIdentity();
+}
+
+/** EIP-55 checksummed account address, or null when none exists here. */
+export function getEthAddress() {
+  return userIdentity.getEthAddress();
+}
+
+/**
+ * Generate a fresh 12-word BIP-39 mnemonic (shown once for backup; never
+ * persisted by this module).
+ * @returns {Promise<string>} Space-joined words.
+ */
+export function generateMnemonic() {
+  return userIdentity.generateIdentityMnemonic();
+}
+
+/**
+ * Validate free-typed mnemonic text (async; structured result with
+ * `MNEMONIC_ERRORS.*` codes for word-level feedback).
+ * @param {string} text
+ */
+export function validateMnemonic(text) {
+  return userIdentity.validateIdentityMnemonic(text);
+}
+
+/**
+ * Derive the address from a mnemonic (+ optional BIP-39 passphrase) WITHOUT
+ * persisting — the restore preview / pre-commit check.
+ * @param {string} mnemonic
+ * @param {string} [passphrase='']
+ * @returns {Promise<{ address: string, preview: boolean }>}
+ */
+export function previewIdentity(mnemonic, passphrase = '') {
+  return userIdentity.previewIdentity(mnemonic, passphrase);
+}
+
+/**
+ * Create a new identity (generates the mnemonic when `mnemonic` is omitted).
+ * @param {{ mnemonic?: string, passphrase?: string }} [input]
+ * @returns {Promise<{ status: object, inputMnemonic: string|null }>}
+ */
+export async function createIdentity(input = {}) {
+  const result = await userIdentity.createIdentity(input);
+  refreshUserIdentity();
+  // If this call generated the phrase, `input.mnemonic` is absent; the facade
+  // returns it for backup and that is the phrase the secrets derive from.
+  const mnemonic = input.mnemonic ?? result.inputMnemonic;
+  await _afterIdentityEstablished(mnemonic, input.passphrase ?? '');
+  return result;
+}
+
+/**
+ * Restore an identity from a mnemonic (+ optional passphrase). Replaces the
+ * record on this device; throws `InvalidMnemonicError` without persisting
+ * when the phrase is bad.
+ * @param {string} mnemonic
+ * @param {string} [passphrase='']
+ * @returns {Promise<object>} The status view.
+ */
+export async function restoreIdentity(mnemonic, passphrase = '') {
+  const status = await userIdentity.restoreIdentity(mnemonic, passphrase);
+  refreshUserIdentity();
+  await _afterIdentityEstablished(mnemonic, passphrase);
+  return status;
+}
+
+/** Whether a passkey is enrolled AND passkeys work here. */
+export function hasPasskey() {
+  return userIdentity.hasPasskey();
+}
+
+/**
+ * Set up biometric unlock (WebAuthn PRF key-wrap of the mnemonic).
+ * Throws `PasskeyUnavailableError` outside a secure context and
+ * `IdentityBackendUnavailableError` until the crypto engine lands.
+ * @returns {Promise<object>} The status view.
+ */
+export async function enrollPasskey() {
+  const status = await userIdentity.enrollPasskey();
+  refreshUserIdentity();
+  return status;
+}
+
+/**
+ * Unlock with the enrolled passkey. Same error classes as `enrollPasskey`,
+ * plus a not-enrolled message.
+ * @returns {Promise<object>} The status view.
+ */
+export async function unlockWithPasskey() {
+  const status = await userIdentity.unlockWithPasskey();
+  refreshUserIdentity();
+  return status;
+}
+
+/**
+ * Remove the enrolled passkey (the recovery phrase is unaffected).
+ * @returns {Promise<object>} The status view.
+ */
+export async function removePasskey() {
+  const status = await userIdentity.removePasskey();
+  refreshUserIdentity();
+  return status;
+}
+
+// ── Identity crypto backend (wasm → facade injection) ─────────
+
+/**
+ * Build the wasm-backed operations the identity facade needs and hand them to
+ * `userIdentity.setIdentityBackend` after wasm init. The facade never imports
+ * wasm; tests inject a mock instead.
+ *
+ * @param {object} wasm The loaded `cawala_client.js` module.
+ */
+function _wasmIdentityBackend(wasm) {
+  const withIdentity = (mnemonic, passphrase, extract) => {
+    const identity = wasm.UserIdentity.fromMnemonic(mnemonic, passphrase ?? '');
+    try {
+      return extract(identity);
+    } finally {
+      identity.free?.();
+    }
+  };
+  return {
+    deriveAddress: (mnemonic, passphrase) =>
+      withIdentity(mnemonic, passphrase, (identity) => identity.address()),
+    secretBytes: (mnemonic, passphrase) =>
+      withIdentity(mnemonic, passphrase, (identity) => identity.secretBytes()),
+    transportSeed: (mnemonic, passphrase) =>
+      wasm.transportSeedFromMnemonic(mnemonic, passphrase ?? ''),
+  };
+}
+
+/**
+ * After an explicit create/restore: persist the mnemonic-derived transport
+ * seed (so one phrase restores the NodeId) and push the derived secp256k1
+ * secret into the live node (so V4 orders sign without a reload).
+ *
+ * @param {string|null} mnemonic The phrase the record was derived from.
+ * @param {string} [passphrase='']
+ */
+async function _afterIdentityEstablished(mnemonic, passphrase = '') {
+  await _persistDerivedTransportSeed(mnemonic, passphrase);
+  // Fresh install: the running node was spawned with a random seed and its
+  // live NodeId does not match the phrase yet. Re-spawn with the derived seed
+  // NOW, before any join/registration can happen, so a same-session join's
+  // ChildEntry/anchor is never orphaned by the next reload. A legacy stored
+  // seed is preserved (never stale) so this is a no-op there.
+  if (_transportIdentityIsStale()) {
+    await _reactivateTransportIdentity();
+  } else {
+    _applyStoredUserIdentity(_clientNode);
+  }
+}
+
+/**
+ * Re-spawn the live client with the currently persisted (mnemonic-derived)
+ * transport seed, replacing the fresh-install random-seed node. Keeps the
+ * held identity Web Lock (it is never released/re-acquired mid-session),
+ * clears any stale-seed registration bookkeeping, and leaves the node ready to
+ * join under the mnemonic-derived NodeId.
+ *
+ * Best-effort: on failure the stale flag stays set and `requestJoin` refuses
+ * until a reload, so a join can never occur on the wrong NodeId.
+ *
+ * @returns {Promise<boolean>} Whether the node now runs the derived seed.
+ */
+async function _reactivateTransportIdentity() {
+  if (!_wasmModule) return false;
+  const previous = _clientNode;
+  _stopControlPoller();
+  if (previous) {
+    // Drop the in-memory user identity before freeing, then release the node.
+    try {
+      previous.clear_user_identity?.();
+    } catch {
+      /* ignore */
+    }
+    try {
+      previous.free?.();
+    } catch {
+      /* ignore */
+    }
+    _clientNode = null;
+  }
+  _ethRegisteredFor = null;
+  _ethRegistration = null;
+  _lastControlEvent = null;
+  _trustEstablished = false;
+  try {
+    await _spawnRealNode();
+  } catch (err) {
+    console.warn('[api] could not re-activate the mnemonic-derived transport identity', err);
+    return false;
+  }
+  // Publish the new self endpoint id so the admin self-target keeps matching
+  // the live node (App.svelte set it once at init).
+  try {
+    clientState.endpointId = _clientNode.endpoint_id();
+  } catch {
+    /* ignore */
+  }
+  return true;
+}
+
+/**
+ * Whether the live node's transport seed differs from the currently persisted
+ * one. True only in the fresh-install create/restore window (or if the re-spawn
+ * failed): the persisted seed is now mnemonic-derived but the running node
+ * still holds the random startup seed. Join/registration must not run while
+ * this is true.
+ *
+ * @returns {boolean}
+ */
+function _transportIdentityIsStale() {
+  if (_spawnedSeedHex == null) return false;
+  const currentHex = _readStoredSeedHex();
+  return currentHex != null && currentHex !== _spawnedSeedHex;
+}
+
+/**
+ * Derive the deterministic Ed25519 transport seed from the mnemonic and store
+ * it under `cawala.identity.v1` (hex). Only called at explicit create/restore,
+ * and only when this install had **no stored seed** at boot (fresh install /
+ * session-only): a stored legacy seed is never silently rekeyed, so pinned
+ * nodeId-scoped data is not orphaned (Addendum C §6). The caller then
+ * re-spawns the live node with the new seed (`_reactivateTransportIdentity`)
+ * so the running NodeId matches the mnemonic before any join.
+ *
+ * @param {string|null} mnemonic
+ * @param {string} [passphrase='']
+ */
+async function _persistDerivedTransportSeed(mnemonic, passphrase = '') {
+  if (!mnemonic) return;
+  if (_identitySource === 'stored') {
+    // This install already had a transport seed (legacy random or a previous
+    // derivation): preserve it. Only the ETH identity is adopted.
+    return;
+  }
+  let seed;
+  try {
+    seed = await userIdentity.deriveTransportSeed(mnemonic, passphrase);
+  } catch (err) {
+    _warnOnce(
+      'identity-transport-derive',
+      '[api] could not derive the transport seed from the phrase',
+      err,
+    );
+    return;
+  }
+  if (!(seed instanceof Uint8Array) || seed.length !== SEED_BYTES) {
+    _warnOnce('identity-transport-len', '[api] derived transport seed has the wrong length; ignoring it');
+    return;
+  }
+  _memorySeed = seed;
+  try {
+    window.localStorage.setItem(IDENTITY_KEY, _bytesToHex(seed));
+    _identityPersistent = true;
+  } catch (err) {
+    _identityPersistent = false;
+    _warnOnce(
+      'identity-transport-write',
+      '[api] could not persist the mnemonic-derived transport seed (private mode/quota)',
+      err,
+    );
+  }
+}
+
+/**
+ * Feed the persisted derived secp256k1 secret back into a node so it signs V4
+ * orders and can register its anchor. No-op when the node or secret is absent.
+ * Never throws.
+ *
+ * @param {object|null} node
+ * @returns {boolean} Whether the identity was applied.
+ */
+function _applyStoredUserIdentity(node) {
+  if (!node || typeof node.set_user_identity_from_secret !== 'function') return false;
+  let secret;
+  try {
+    secret = userIdentity.getIdentitySecretBytes();
+  } catch (err) {
+    _warnOnce('user-identity-read', '[api] could not read the stored user identity secret', err);
+    return false;
+  }
+  if (!secret) return false;
+  try {
+    node.set_user_identity_from_secret(secret);
+    return true;
+  } catch (err) {
+    _warnOnce('user-identity-set', '[api] could not set the user identity from the stored secret', err);
+    return false;
+  }
+}
 
 // ── Internal state ────────────────────────────────────────────
 
@@ -64,15 +414,17 @@ let _useMock = true;
 let _wasmModule = null;
 let _clientNode = null;
 
-// Identity/state storage keys.
+// Identity/state storage keys. Classification of every key (which are
+// authoritative-local, best-effort cache, or non-authoritative) lives in
+// `storage.js`; these are the concrete key names that module documents.
 // The identity seed stays global (one browser install == one identity). The
 // state/ledger blobs are identity-scoped: `${STATE_KEY}:<nodeId>`. The
 // un-suffixed keys are the legacy (pre-portability) locations and are read once
 // as a backward-compat fallback on load.
-const IDENTITY_KEY = 'cawala.identity.v1';
-const STATE_KEY = 'cawala.state.v1';
+const IDENTITY_KEY = STORAGE_KEYS.IDENTITY;
+const STATE_KEY = STORAGE_KEYS.STATE;
 // Distinct key for the secret-free ledger blob (balance/activity/pending).
-const LEDGER_KEY = 'cawala.ledger.v1';
+const LEDGER_KEY = STORAGE_KEYS.LEDGER;
 const SEED_BYTES = 32;
 
 /**
@@ -90,10 +442,35 @@ const MAX_ACTIVITY_ENTRIES = 200;
 
 let _identityPersistent = false;
 let _memorySeed = null; // in-session fallback when localStorage is unusable
+// Where the active transport seed came from: 'stored' (a seed already on this
+// install — legacy or previously derived: NEVER overwritten) or 'generated'
+// (fresh install / session-only: a create/restore may replace it with the
+// mnemonic-derived seed). Drives Addendum C §6 migration policy.
+let _identitySource = 'memory';
+
+// The transport seed hex the live node was actually spawned with. Compared
+// against the persisted seed to detect the fresh-install create/restore window
+// (running node still on the random startup seed while `cawala.identity.v1`
+// now holds the mnemonic-derived one) so a stale NodeId can never be joined.
+let _spawnedSeedHex = null;
 
 // Control-event poller + last drained event.
 let _controlPoller = null;
 let _lastControlEvent = null;
+
+// Whether the TOFU trust anchors (pinned_ledger / pinned_leaf_keys) were
+// restored from a persisted ledger cache at boot. False on a fresh origin (no
+// cache): trust is not established, and a later receipt must not be silently
+// treated as TOFU-established. Set once in `_spawnRealNode`.
+let _trustEstablished = false;
+
+// ETH-anchor registration bookkeeping. `_ethRegisteredFor` keys the joined
+// session (`<parent>:<address>`) so `register_eth_address()` is attempted once
+// per join, not on every poller tick; reset on detach/teardown. The last
+// outcome is exposed via `getEthRegistrationStatus()` for the UI.
+let _ethRegisteredFor = null;
+/** @type {{ status: string, address: string|null, trigger: string, at: number, error: string|null }|null} */
+let _ethRegistration = null;
 
 // JS-side in-flight payment map keyed by order hash hex, for UI status.
 const _pendingSends = new Map();
@@ -145,6 +522,57 @@ export function __setClientForTest(node) {
   _useMock = _clientNode == null;
 }
 
+/**
+ * Test-only seam: drive the real boot path (`_spawnRealNode`) against an
+ * injected fake wasm module — no wasm build, network, or Web Locks. Used to
+ * exercise the fail-closed trust / pin-preservation boot behavior on plain
+ * Node. Not used by the app; call the returned `stop()` so the control poller
+ * and injected module do not outlive the test.
+ *
+ * Starts in mock mode exactly like `initApi`, so the boot path itself must flip
+ * `_useMock` off once a live node exists. This keeps the seam faithful to the
+ * runtime ordering: a regression that flips it too late (or a failed spawn)
+ * leaves the module in mock mode and is observable to the test.
+ * @param {object} wasm A fake module with `ClientNode.spawn_control` (and,
+ *   when no identity is pre-seeded, `generate_secret_key`).
+ * @returns {Promise<{ node: object, stop: () => void }>}
+ */
+export async function __bootRealNodeForTest(wasm) {
+  _wasmModule = wasm;
+  _useMock = true;
+  let node;
+  try {
+    node = await _spawnRealNode();
+  } catch (err) {
+    _wasmModule = null;
+    throw err;
+  }
+  // Keep `_wasmModule` installed until `stop()` so the in-session re-activation
+  // path (`_reactivateTransportIdentity`) behaves exactly as at runtime. The
+  // `stop()` below tears it down.
+  return {
+    node,
+    stop() {
+      _stopControlPoller();
+      try {
+        _clientNode?.free?.();
+      } catch {
+        /* ignore */
+      }
+      _clientNode = null;
+      _releaseIdentityLock();
+      _trustEstablished = false;
+      _ethRegisteredFor = null;
+      _ethRegistration = null;
+      _identitySource = 'memory';
+      _memorySeed = null;
+      _spawnedSeedHex = null;
+      _useMock = true;
+      _wasmModule = null;
+    },
+  };
+}
+
 // ── Initialization ────────────────────────────────────────────
 
 /**
@@ -155,6 +583,10 @@ export function __setClientForTest(node) {
  * flips `_useMock` off. On ANY failure it falls back to mock data.
  */
 export async function initApi() {
+  // The user identity is local storage state, readable in every mode: load it
+  // before anything else so the identity UI has a status from the first render.
+  refreshUserIdentity();
+
   // Check URL param for forced mock.
   const params = new URLSearchParams(window.location.search);
   if (params.has('mock')) {
@@ -163,9 +595,14 @@ export async function initApi() {
   }
 
   try {
-    const wasm = await import('../wasm/cawala_client.js');
-    await wasm.default();
+    // The wasm init seam differs per build target (served asset URL vs
+    // embedded bytes for the single-file `file://` target); see wasmLoader.js.
+    const { loadWasmClient } = await import('./wasmLoader.js');
+    const wasm = await loadWasmClient();
     _wasmModule = wasm;
+    // Hand the real crypto engine to the identity facade: address/secret
+    // derivation and the mnemonic-derived transport seed.
+    userIdentity.setIdentityBackend(_wasmIdentityBackend(wasm));
 
     // Best-effort single-leader guard: avoid binding two live endpoints with
     // the same endpoint id from concurrent tabs.
@@ -175,8 +612,9 @@ export async function initApi() {
       return;
     }
 
+    // `_spawnRealNode` flips `_useMock` off itself once a real node is live
+    // (before its post-spawn syncs), so there is no live-order gap here.
     await _spawnRealNode();
-    _useMock = false;
   } catch (err) {
     console.warn('[api] wasm init failed, using mock data', err);
     _stopControlPoller();
@@ -198,7 +636,9 @@ export async function initApi() {
 /**
  * Restore the persisted 32-byte seed, or generate and persist a fresh one.
  * Falls back to an in-memory seed (with a visible warning flag) when storage
- * throws (Safari private mode / quota).
+ * throws (Safari private mode / quota). The load path never derives from a
+ * mnemonic and never rekeys: a stored seed (legacy pre-R3 random, or a
+ * previously mnemonic-derived one) is preserved (Addendum C §6).
  * @param {object} wasm
  * @returns {Uint8Array}
  */
@@ -215,6 +655,7 @@ function _loadOrCreateIdentity(wasm) {
       const bytes = _hexToBytes(storedHex);
       if (bytes.length === SEED_BYTES) {
         _identityPersistent = true;
+        _identitySource = 'stored';
         return bytes;
       }
       _warnOnce('identity-len', '[api] stored identity has the wrong length; generating a new one');
@@ -224,10 +665,14 @@ function _loadOrCreateIdentity(wasm) {
   }
 
   // Reuse the in-session fallback if we already generated one.
-  if (_memorySeed) return _memorySeed;
+  if (_memorySeed) {
+    _identitySource = 'generated';
+    return _memorySeed;
+  }
 
   const seed = wasm.generate_secret_key(); // may throw → initApi falls back to mock
   _memorySeed = seed;
+  _identitySource = 'generated';
 
   try {
     window.localStorage.setItem(IDENTITY_KEY, _bytesToHex(seed));
@@ -242,31 +687,22 @@ function _loadOrCreateIdentity(wasm) {
 /**
  * Read a base64 blob from an identity-scoped key, falling back once to the
  * legacy un-namespaced key for installs predating identity portability.
+ * Best-effort: a missing, unreadable, or corrupt blob reads as null.
  * @param {string} base
  * @param {string} nodeId
  * @param {string} warnKey
  * @returns {Uint8Array|null}
  */
 function _loadScopedBlob(base, nodeId, warnKey) {
-  let b64 = null;
-  try {
-    b64 = window.localStorage.getItem(_scopedKey(base, nodeId));
-    if (b64 == null) {
-      // One-time backward compat: pre-portability installs stored the blob
-      // under the un-suffixed key.
-      b64 = window.localStorage.getItem(base);
-    }
-  } catch (err) {
-    _warnOnce(warnKey, `[api] localStorage unavailable for ${base} read`, err);
-    return null;
-  }
-  if (!b64) return null;
-  try {
-    return _base64ToBytes(b64);
-  } catch (err) {
-    _warnOnce(`${warnKey}-decode`, `[api] persisted ${base} is malformed; ignoring it`, err);
-    return null;
-  }
+  return readScopedBlob(base, nodeId, {
+    onWarn(kind, err) {
+      if (kind === 'decode') {
+        _warnOnce(`${warnKey}-decode`, `[api] persisted ${base} is malformed; ignoring it`, err);
+      } else {
+        _warnOnce(warnKey, `[api] localStorage unavailable for ${base} read`, err);
+      }
+    },
+  });
 }
 
 /**
@@ -336,39 +772,94 @@ function _persistLedgerState() {
 }
 
 /**
+ * Whether the live node currently holds at least one authoritative-local TOFU
+ * anchor: a non-empty `pinned_ledger` or a non-empty `pinned_leaf_keys` set.
+ * Both live only inside the `cawala.ledger.v1` blob, so a non-empty set *after*
+ * a successful import means the blob actually carried a trust pin.
+ * @param {object} node
+ * @returns {boolean}
+ */
+function _hasRestoredAnchors(node) {
+  if (!node) return false;
+  try {
+    const pinnedLedger = _readLedgerStatus(node).pinnedLedger;
+    if (typeof pinnedLedger === 'string' && pinnedLedger.length > 0) return true;
+  } catch (err) {
+    _warnOnce('trust-anchor-ledger', '[api] could not read pinned_ledger after restore', err);
+  }
+  return _readPinnedLeafKeys(node).length > 0;
+}
+
+/**
  * Spawn the real control client, restore state, and start the event poller.
  * @returns {Promise<import('../wasm/cawala_client.js').ClientNode>}
  */
 async function _spawnRealNode() {
   const seed = _loadOrCreateIdentity(_wasmModule);
   const node = await _wasmModule.ClientNode.spawn_control(seed);
+  // Record only after the spawn succeeded: a thrown spawn must leave the
+  // previous seed in place so a stale NodeId stays detectably stale.
+  _spawnedSeedHex = _bytesToHex(seed);
   const nodeId = node.endpoint_id();
 
+  // Boot is tolerant of a missing/corrupt cache: the state/ledger blobs are
+  // best-effort (see `storage.js`). A missing or bad blob starts us from empty
+  // local state instead of failing; balance/height are re-validated from the
+  // node via `request_balance`/`ledger_status` below.
   const stateBytes = _loadState(nodeId);
-  if (stateBytes) {
-    try {
-      node.import_state(stateBytes);
-    } catch (err) {
-      console.warn('[api] import_state failed; starting from a fresh local state', err);
-    }
-  }
-
   const ledgerBytes = _loadLedgerState(nodeId);
-  if (ledgerBytes) {
-    try {
-      node.import_ledger_state(ledgerBytes);
-    } catch (err) {
-      console.warn('[api] import_ledger_state failed; starting from a fresh ledger state', err);
-    }
-  }
+  const restoreResult = restoreBlobs(node, {
+    stateBytes,
+    ledgerBytes,
+    onWarn(kind, err) {
+      console.warn(
+        `[api] import_${kind === 'state' ? 'state' : 'ledger_state'} failed; starting from a fresh local state`,
+        err,
+      );
+    },
+  });
+
+  // Trust anchors (pinned_ledger / pinned_leaf_keys) live inside the ledger
+  // blob. Trust is established ONLY when that blob actually imported AND at
+  // least one anchor was restored from it. A corrupt or version-bumped blob
+  // leaves `ledgerImported === false` (its `import_ledger_state` threw), so a
+  // later receipt must never be silently treated as TOFU-established even
+  // though the bytes were present. Fail-closed; see `getTrustState()`.
+  _trustEstablished = restoreResult.ledgerImported && _hasRestoredAnchors(node);
 
   // Rebuild the UI activity list from the restored state (persisted value
   // notices + terminal settlement records) so past activity survives a reload.
   _rebuildActivityFromState(node);
 
   _clientNode = node;
+  // A real node is now live and assigned: reflect that immediately, before the
+  // post-spawn syncs below (store mirrors, balance pull, join-state sync, and
+  // `_maybeRegisterEthAddress('boot')` at the end). Setting this only in
+  // `initApi`'s caller (after this function returned) left the flag true during
+  // those syncs, so they ran as no-ops on a real boot. A failed `spawn_control`
+  // never reaches this line, so a mock/failed boot still leaves it true (and
+  // `initApi`'s catch resets it on any later failure).
+  _useMock = false;
+  // Reload path: a persisted derived secp256k1 secret (never the mnemonic)
+  // restores the user's ETH identity so V4 orders sign without an unlock. The
+  // transport seed was already consumed by `_loadOrCreateIdentity` above.
+  _applyStoredUserIdentity(node);
   _persistState();
-  _persistLedgerState();
+  // Pin safety: never overwrite a ledger blob whose import failed. The blob
+  // carries the authoritative-local TOFU anchors (pinned_ledger /
+  // pinned_leaf_keys), which the node cannot re-supply. Re-exporting the now
+  // empty in-memory ledger state would clobber the only trusted copy with no
+  // recovery path, so preserve the original bytes when a blob was present but
+  // unreadable. A fresh origin (no blob) and a successful import both persist.
+  const hadLedgerBlob = Boolean(ledgerBytes && ledgerBytes.length > 0);
+  if (!hadLedgerBlob || restoreResult.ledgerImported) {
+    _persistLedgerState();
+  } else {
+    _warnOnce(
+      'ledger-preserve',
+      '[api] ledger blob failed to import; preserving the original bytes so the authoritative-local TOFU anchors are not destroyed',
+    );
+  }
   // Reflect any restored verified balance in the reactive store immediately.
   _syncLedgerStoreFromStatus();
   _startControlPoller();
@@ -380,6 +871,9 @@ async function _spawnRealNode() {
   _syncAdministeredNode();
   // (Re)verify the persisted balance as soon as an address is known.
   _requestBalanceIfJoined();
+  // Already joined on load + an identity exists → register the ETH anchor
+  // (quietly; `getEthRegistrationStatus()` carries the outcome).
+  void _maybeRegisterEthAddress('boot');
   return node;
 }
 
@@ -1162,6 +1656,8 @@ function _drainControlEvents() {
         // UI drops out of the joined view ("Left network") immediately.
         clientState.address = null;
         parentChanged = true;
+        // A later re-join must register the ETH anchor again.
+        _ethRegisteredFor = null;
       }
       ev.free?.();
       drained = true;
@@ -1180,7 +1676,11 @@ function _drainControlEvents() {
   }
   if (drained) _persistState();
   // A fresh approval means an address now exists: verify its balance.
-  if (accepted) _requestBalanceIfJoined();
+  if (accepted) {
+    _requestBalanceIfJoined();
+    // Now joined: register the user's ETH anchor with the parent (once).
+    void _maybeRegisterEthAddress('join');
+  }
 }
 
 /**
@@ -1188,6 +1688,114 @@ function _drainControlEvents() {
  */
 export function getLastControlEvent() {
   return _lastControlEvent ? { ..._lastControlEvent } : null;
+}
+
+// ── ETH anchor registration (control variant 24) ──────────────
+
+/**
+ * The last `register_eth_address()` outcome, or null. `status` is the wasm
+ * reply bucket (`accepted` / `rejected:<code>` / `unexpected`) or `error` for
+ * a transport/JS failure; `trigger` is `boot` or `join`.
+ *
+ * NOTE (structure scan): no component reads this today. The join-time outcome
+ * is surfaced by `_surfaceEthRegistration`'s toast; this getter exists so a
+ * future surface can show the (silent) boot-time outcome without another
+ * plumbing pass. A component consumer is the only missing piece.
+ *
+ * @returns {object|null}
+ */
+export function getEthRegistrationStatus() {
+  return _ethRegistration ? { ..._ethRegistration } : null;
+}
+
+/**
+ * Register this leaf's ETH anchor with its direct parent (once per joined
+ * session), when a joined client has a user identity set. Idempotent: keyed by
+ * the parent + assigned address, so the 2 s poller cannot spam the parent.
+ *
+ * Surfaces the outcome as a concise toast on a fresh join (accepted/rejected);
+ * on boot the outcome is only recorded (no toast) so a reload is not noisy.
+ * A transport failure clears the guard so a later tick can retry.
+ *
+ * @param {'boot'|'join'} trigger
+ */
+async function _maybeRegisterEthAddress(trigger) {
+  const node = _clientNode;
+  if (_useMock || !node) return;
+  if (typeof node.register_eth_address !== 'function') return;
+  // A stale NodeId must not register the ETH anchor: the parent would record
+  // it against the random startup leaf and orphan it on the next reload.
+  if (_transportIdentityIsStale()) return;
+
+  let join = null;
+  try {
+    join = _readJoinStatus(node);
+  } catch (err) {
+    _warnOnce('eth-register-join', '[api] could not read join status before ETH registration', err);
+    return;
+  }
+  if (!join?.address) return; // not joined yet
+
+  let ethAddress = null;
+  try {
+    ethAddress = node.user_eth_address?.() ?? null;
+  } catch (err) {
+    _warnOnce('eth-register-identity', '[api] could not read the user ETH address', err);
+    return;
+  }
+  if (!ethAddress) return; // no user identity set on this node
+
+  const key = `${join.parent ?? ''}:${join.address}`;
+  if (_ethRegisteredFor === key) return;
+  _ethRegisteredFor = key;
+
+  try {
+    const bucket = await node.register_eth_address();
+    _ethRegistration = {
+      status: String(bucket ?? 'unexpected'),
+      address: ethAddress,
+      trigger,
+      at: Date.now(),
+      error: null,
+    };
+    _surfaceEthRegistration(_ethRegistration);
+  } catch (err) {
+    // Missing join/identity or an unreachable parent: not fatal — the identity
+    // still signs; allow a later join/poller tick to retry.
+    _ethRegisteredFor = null;
+    _ethRegistration = {
+      status: 'error',
+      address: ethAddress,
+      trigger,
+      at: Date.now(),
+      error: err?.message || String(err),
+    };
+    _warnOnce('eth-register', '[api] ETH address registration failed', err);
+  }
+}
+
+/**
+ * Surface an ETH-registration outcome once, on a fresh join. Boot-time
+ * registration stays silent (recorded via `getEthRegistrationStatus()`).
+ * @param {{ status: string, address: string|null, trigger: string }} outcome
+ */
+function _surfaceEthRegistration(outcome) {
+  if (outcome.trigger !== 'join') return;
+  const status = outcome.status;
+  if (status === 'accepted') {
+    showToast('Account address registered with the network.', 'ok');
+  } else if (status.startsWith('rejected')) {
+    const code = status.includes(':') ? status.slice(status.indexOf(':') + 1) : '';
+    showToast(
+      code
+        ? `The network did not accept your account address (${code}).`
+        : 'The network did not accept your account address.',
+      'warn',
+      6000,
+    );
+  } else {
+    showToast('Account address registration returned an unexpected reply.', 'warn', 6000);
+  }
 }
 
 // ── Ledger-event poller ───────────────────────────────────────
@@ -1446,6 +2054,8 @@ function _rebuildActivityFromState(node = _clientNode) {
           amount: typeof record.amount === 'number' ? record.amount : null,
           status: record.status ?? null,
           reason: record.reason ?? null,
+          // The failing hop for a `partial` settlement; null otherwise.
+          failedAt: record.failed_at ?? null,
           orderHash,
           timestamp,
           entrySeq: record.entry_seq ?? null,
@@ -1471,6 +2081,10 @@ function _rebuildActivityFromState(node = _clientNode) {
 /**
  * Resync the balance/height/pin/pending fields of `ledgerState` from the
  * authoritative wasm `ledger_status()` snapshot.
+ *
+ * The in-flight count is read from `pending_orders()` (the explicit getter)
+ * when available, falling back to `ledger_status().pending`; the two describe
+ * the same set, so behavior is unchanged.
  */
 function _syncLedgerStoreFromStatus() {
   if (_useMock || !_clientNode) return;
@@ -1481,10 +2095,13 @@ function _syncLedgerStoreFromStatus() {
     _warnOnce('ledger-status', '[api] ledger status read failed', err);
     return;
   }
+  const pendingOrders = _readPendingOrders(_clientNode);
   ledgerState.balance = status.balance;
   ledgerState.height = status.height;
   ledgerState.pinnedLedger = status.pinnedLedger;
-  ledgerState.pending = status.pending;
+  ledgerState.stateRoot = status.stateRoot;
+  ledgerState.pending = pendingOrders != null ? pendingOrders.length : status.pending;
+  ledgerState.trustEstablished = _trustEstablished;
   if (status.balance != null && ledgerState.verifiedAt == null) {
     // A balance restored from persisted state is still verified; stamp it.
     ledgerState.verifiedAt = Date.now();
@@ -1494,7 +2111,7 @@ function _syncLedgerStoreFromStatus() {
 /**
  * Copy a wasm `LedgerStatusDto` to a plain object and free it.
  * @param {object} node
- * @returns {{ address: string|null, parent: string|null, balance: number|null, height: number|null, pinnedLedger: string|null, pending: number, activity: number }}
+ * @returns {{ address: string|null, parent: string|null, balance: number|null, height: number|null, pinnedLedger: string|null, stateRoot: string|null, pending: number, activity: number }}
  */
 function _readLedgerStatus(node) {
   const dto = node.ledger_status();
@@ -1505,12 +2122,238 @@ function _readLedgerStatus(node) {
       balance: dto.balance ?? null,
       height: dto.height ?? null,
       pinnedLedger: dto.pinned_ledger ?? null,
+      stateRoot: dto.state_root ?? null,
       pending: dto.pending,
       activity: dto.activity,
     };
   } finally {
     dto.free?.();
   }
+}
+
+// ── Blob-derived read getters (R1) ────────────────────────────
+//
+// These wasm getters expose detail that used to be reachable only by decoding
+// the `cawala.state.v1` / `cawala.ledger.v1` blobs. They are pure reads: each
+// helper copies the DTO to a plain object and frees every wasm handle it
+// created. Tolerates an older build without the getter.
+
+/**
+ * Copy one `PendingOrderDto` to a plain object and free it (including its
+ * nested `pinned_leaf` handle). Read-once/free-once.
+ * @param {object} dto
+ * @returns {object}
+ */
+function _readPendingOrder(dto) {
+  const pinnedLeaf = dto.pinned_leaf ?? null;
+  try {
+    return {
+      from: dto.from,
+      to: dto.to,
+      amount: dto.amount,
+      nonce: dto.nonce,
+      expiry: dto.expiry,
+      operator: dto.operator,
+      authNonce: dto.auth_nonce,
+      orderHash: dto.order_hash,
+      signature: dto.signature,
+      sentAt: dto.sent_at,
+      payeeAddr: dto.payee_addr ?? null,
+      payerLeaf: Boolean(dto.payer_leaf),
+      pinnedLeaf: pinnedLeaf
+        ? { nodeId: pinnedLeaf.node_id, ledger: pinnedLeaf.ledger }
+        : null,
+    };
+  } finally {
+    pinnedLeaf?.free?.();
+    dto.free?.();
+  }
+}
+
+/**
+ * The persisted in-flight payment orders, as plain objects. `null` when this
+ * client build has no `pending_orders()` getter (so callers can fall back to
+ * the aggregate count rather than reading it as an empty set).
+ * @param {object|null} [node]
+ * @returns {Array<object>|null}
+ */
+function _readPendingOrders(node = _clientNode) {
+  if (!node || typeof node.pending_orders !== 'function') return null;
+  let dtos = [];
+  try {
+    dtos = node.pending_orders() ?? [];
+  } catch (err) {
+    _warnOnce('pending-orders', '[api] pending_orders read failed', err);
+    // Null (not empty) so the count falls back to `ledger_status().pending`.
+    return null;
+  }
+  // Each `_readPendingOrder` frees its own DTO (and nested pin).
+  return dtos.map(_readPendingOrder);
+}
+
+/**
+ * The leaf ledger keys pinned in local ledger state, as plain objects
+ * (`{ nodeId, ledger }`). Empty when the getter is unavailable.
+ * @param {object|null} [node]
+ * @returns {Array<{ nodeId: string, ledger: string }>}
+ */
+function _readPinnedLeafKeys(node = _clientNode) {
+  if (!node || typeof node.pinned_leaf_keys !== 'function') return [];
+  let dtos = [];
+  try {
+    dtos = node.pinned_leaf_keys() ?? [];
+    return dtos.map((dto) => {
+      try {
+        return { nodeId: dto.node_id, ledger: dto.ledger };
+      } finally {
+        dto.free?.();
+      }
+    });
+  } catch (err) {
+    _warnOnce('pinned-leaf-keys', '[api] pinned_leaf_keys read failed', err);
+    return [];
+  }
+}
+
+/**
+ * The in-flight outbound join request, as a plain object, or null.
+ * @param {object|null} [node]
+ * @returns {object|null}
+ */
+function _readPendingJoinOutbound(node = _clientNode) {
+  if (!node || typeof node.pending_join_outbound !== 'function') return null;
+  let dto;
+  try {
+    dto = node.pending_join_outbound();
+  } catch (err) {
+    _warnOnce('pending-join-outbound', '[api] pending_join_outbound read failed', err);
+    return null;
+  }
+  if (!dto) return null;
+  try {
+    return {
+      node: dto.node,
+      kind: dto.kind,
+      operator: dto.operator,
+      ledger: dto.ledger ?? null,
+      desiredSlot: dto.desired_slot ?? null,
+      locationHint: dto.location_hint ?? null,
+      nonce: dto.nonce,
+      expiry: dto.expiry,
+      parent: dto.parent,
+      pinnedOperator: dto.pinned_operator ?? null,
+      sentAt: dto.sent_at,
+    };
+  } finally {
+    dto.free?.();
+  }
+}
+
+/**
+ * The on-disk blob versions this client writes, or nulls when unavailable.
+ * @param {object|null} [node]
+ * @returns {{ stateVersion: number|null, ledgerVersion: number|null }}
+ */
+function _readClientStateInfo(node = _clientNode) {
+  if (!node || typeof node.client_state_info !== 'function') {
+    return { stateVersion: null, ledgerVersion: null };
+  }
+  let info;
+  try {
+    info = node.client_state_info();
+  } catch (err) {
+    _warnOnce('client-state-info', '[api] client_state_info read failed', err);
+    return { stateVersion: null, ledgerVersion: null };
+  }
+  if (!info) return { stateVersion: null, ledgerVersion: null };
+  try {
+    return {
+      stateVersion: info.state_version ?? null,
+      ledgerVersion: info.ledger_version ?? null,
+    };
+  } finally {
+    info.free?.();
+  }
+}
+
+/**
+ * The persisted in-flight payment orders (full detail), for UI reconstruction
+ * after a reload. Empty when unavailable.
+ * @returns {Array<object>}
+ */
+export function getPendingOrders() {
+  return _readPendingOrders() ?? [];
+}
+
+/**
+ * The authoritative-local TOFU leaf pins, for the trust surface.
+ * @returns {Array<{ nodeId: string, ledger: string }>}
+ */
+export function getPinnedLeafKeys() {
+  if (_useMock || !_clientNode) return [];
+  return _readPinnedLeafKeys();
+}
+
+/**
+ * The in-flight outbound join request, if any.
+ * @returns {object|null}
+ */
+export function getPendingJoinOutbound() {
+  if (_useMock || !_clientNode) return null;
+  return _readPendingJoinOutbound();
+}
+
+/**
+ * The current on-disk state/ledger blob versions.
+ * @returns {{ stateVersion: number|null, ledgerVersion: number|null }}
+ */
+export function getClientStateInfo() {
+  if (_useMock || !_clientNode) return { stateVersion: null, ledgerVersion: null };
+  return _readClientStateInfo();
+}
+
+/**
+ * Whether TOFU trust anchors were restored from the persisted ledger cache at
+ * boot. False on a fresh origin (no cache): trust is not established.
+ * @returns {boolean}
+ */
+export function isTrustEstablished() {
+  return _trustEstablished;
+}
+
+/**
+ * The trust-anchor surface. `established` is whether pins were restored from
+ * the persisted cache; `needsReestablish` is the complement in live mode.
+ *
+ * Fail-closed: when `needsReestablish` is true the UI must not present a pin as
+ * TOFU-established, even if one appears in-session. Preventing the wasm layer
+ * from auto-pinning in the first place needs a node change (follow-up).
+ *
+ * @returns {{ established: boolean, needsReestablish: boolean, pinnedLedger: string|null, pinnedLeafKeys: Array<{ nodeId: string, ledger: string }>, mock: boolean }}
+ */
+export function getTrustState() {
+  if (_useMock || !_clientNode) {
+    return {
+      established: false,
+      needsReestablish: false,
+      pinnedLedger: null,
+      pinnedLeafKeys: [],
+      mock: true,
+    };
+  }
+  let pinnedLedger = null;
+  try {
+    pinnedLedger = _readLedgerStatus(_clientNode).pinnedLedger;
+  } catch (err) {
+    _warnOnce('trust-ledger', '[api] trust state ledger read failed', err);
+  }
+  return {
+    established: _trustEstablished,
+    needsReestablish: !_trustEstablished,
+    pinnedLedger,
+    pinnedLeafKeys: _readPinnedLeafKeys(_clientNode),
+    mock: false,
+  };
 }
 
 /**
@@ -1635,6 +2478,8 @@ export function destroyClient() {
     _clientNode = null;
   }
   _pendingSends.clear();
+  _ethRegisteredFor = null;
+  _spawnedSeedHex = null;
   _releaseIdentityLock();
 }
 
@@ -1648,6 +2493,13 @@ export function destroyClient() {
 function _teardownClient() {
   _stopControlPoller();
   if (_clientNode) {
+    // Drop the in-memory user identity before the node is freed so no further
+    // V4 order can be signed on a torn-down/being-replaced identity.
+    try {
+      _clientNode.clear_user_identity?.();
+    } catch {
+      /* ignore */
+    }
     try {
       _clientNode.free?.();
     } catch {
@@ -1655,8 +2507,11 @@ function _teardownClient() {
     }
     _clientNode = null;
   }
+  _ethRegisteredFor = null;
   _releaseIdentityLock();
   _memorySeed = null;
+  _identitySource = 'memory';
+  _spawnedSeedHex = null;
 }
 
 /**
@@ -1836,6 +2691,12 @@ export async function wipeIdentity() {
   }
 
   _teardownClient();
+
+  // Drop the R3 user-identity record too: "remove identity from this device"
+  // means this device forgets both identities. The recovery phrase (never
+  // stored) still restores the user identity elsewhere.
+  userIdentity.clearUserIdentity();
+  refreshUserIdentity();
 
   try {
     window.localStorage.removeItem(IDENTITY_KEY);
@@ -2180,7 +3041,7 @@ export function parentStatus() {
  * the reactive `ledgerState` store. `activity` is the number of recorded
  * entries; the entries themselves live in `ledgerState.activity`.
  *
- * @returns {{ address: string|null, parent: string|null, balance: number|null, height: number|null, pinnedLedger: string|null, pending: number, activity: number }}
+ * @returns {{ address: string|null, parent: string|null, balance: number|null, height: number|null, pinnedLedger: string|null, stateRoot: string|null, pending: number, activity: number }}
  */
 export function getLedgerStatus() {
   if (!_useMock && _clientNode) {
@@ -2192,6 +3053,7 @@ export function getLedgerStatus() {
     balance: ledgerState.balance,
     height: ledgerState.height,
     pinnedLedger: ledgerState.pinnedLedger,
+    stateRoot: ledgerState.stateRoot,
     pending: ledgerState.pending,
     activity: ledgerState.activity.length,
   };
@@ -2348,12 +3210,22 @@ export class AdminUnavailableError extends Error {
  * a raw invite URI string, or a bare parent endpoint id.
  * @param {string|{ parent?: string, raw?: string, slot?: number, expiry?: number, operator?: string }} parsed
  * @param {string|null} [addressHint] Backward-compat unused hint.
- * @returns {Promise<{ status: string, reason?: string }>}
+ * @returns {Promise<{ status: string, reason?: string, rejectCode?: string }>}
  */
 export async function requestJoin(parsed, addressHint) {
   if (_useMock) {
     await mockDelay(600);
     return { status: JOIN_OUTCOME.PENDING };
+  }
+
+  // Never join while the node is still on its pre-identity random NodeId: the
+  // next reload would switch to the mnemonic-derived NodeId and orphan the
+  // join. Normally create/restore re-activates before returning; this catches
+  // a failed re-activation (or a race) and tells the user to reload.
+  if (_transportIdentityIsStale()) {
+    throw new Error(
+      'Your account key changed but this browser\u2019s node has not switched to it yet. Reload the page before joining.',
+    );
   }
 
   const node = _requireNode();
@@ -2389,10 +3261,14 @@ export async function requestJoin(parsed, addressHint) {
 
   const status = outcome.status;
   const reason = outcome.reason;
+  const rejectCode = outcome.reject_code ?? null;
   outcome.free?.();
   _persistState();
   _drainControlEvents();
-  return reason ? { status, reason } : { status };
+  const result = { status };
+  if (reason) result.reason = reason;
+  if (rejectCode) result.rejectCode = rejectCode;
+  return result;
 }
 
 /**
@@ -2644,7 +3520,7 @@ export async function adminMoveChild(childEndpointId, slot = null, nodeId = unde
 // ── Value administration: issue / burn ────────────────────────
 
 /** localStorage key for the single in-flight value operation. */
-export const VALUE_PENDING_KEY = 'cawala.value.pending.v1';
+export const VALUE_PENDING_KEY = STORAGE_KEYS.VALUE_PENDING;
 
 /**
  * Whether the current admin target permits a value operation: an unlocked
@@ -3515,6 +4391,7 @@ function _mapActivityEntry(entry) {
     reported: true,
     status: isSettlement ? entry.status : (entry.status ?? null),
     reason: isSettlement ? entry.reason : (entry.reason ?? null),
+    failedAt: isSettlement ? (entry.failedAt ?? null) : null,
     orderHash: isSettlement ? entry.orderHash : (entry.orderHash ?? null),
   };
 }
@@ -3571,7 +4448,13 @@ export async function getActivityLog(filters, nodeId = undefined) {
 
 /**
  * Live join-handshake status.
- * @returns {{ state: string, parent: string|null, slot: number|null, address: string|null, reason: string|null }}
+ *
+ * `rejectCode` is the stable machine code of the last rejection
+ * (`JoinStatus.reject_code`), distinct from the human-readable `reason`. When a
+ * join is outstanding, `pendingJoin` carries the full outbound request
+ * (`pending_join_outbound()`).
+ *
+ * @returns {{ state: string, parent: string|null, slot: number|null, address: string|null, reason: string|null, rejectCode: string|null, pendingJoin: object|null }}
  */
 export function getJoinStatus() {
   if (_useMock) {
@@ -3581,17 +4464,31 @@ export function getJoinStatus() {
       slot: null,
       address: '0.3.1',
       reason: null,
+      rejectCode: null,
+      pendingJoin: null,
     };
   }
   if (!_clientNode) {
-    return { state: JOIN_STATE.NONE, parent: null, slot: null, address: null, reason: null };
+    return {
+      state: JOIN_STATE.NONE,
+      parent: null,
+      slot: null,
+      address: null,
+      reason: null,
+      rejectCode: null,
+      pendingJoin: null,
+    };
   }
-  return _readJoinStatus(_clientNode);
+  return {
+    ..._readJoinStatus(_clientNode),
+    pendingJoin: _readPendingJoinOutbound(_clientNode),
+  };
 }
 
 /**
  * Copy a wasm `JoinStatus` DTO to a plain object and free it.
  * @param {object} node
+ * @returns {{ state: string, parent: string|null, slot: number|null, address: string|null, reason: string|null, rejectCode: string|null }}
  */
 function _readJoinStatus(node) {
   const status = node.join_status();
@@ -3602,6 +4499,7 @@ function _readJoinStatus(node) {
       slot: status.slot ?? null,
       address: status.address ?? null,
       reason: status.reason ?? null,
+      rejectCode: status.reject_code ?? null,
     };
   } finally {
     status.free?.();
@@ -3675,19 +4573,6 @@ function _bytesToBase64(bytes) {
     binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
   }
   return btoa(binary);
-}
-
-/**
- * @param {string} b64
- * @returns {Uint8Array}
- */
-function _base64ToBytes(b64) {
-  const binary = atob(b64);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    out[i] = binary.charCodeAt(i);
-  }
-  return out;
 }
 
 /**

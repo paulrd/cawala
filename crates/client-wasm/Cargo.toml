@@ -16,6 +16,13 @@ crate-type = ["cdylib", "rlib"]
 cawala-control = { path = "../control" }
 cawala-ledger = { path = "../ledger" }
 cawala-msg = { path = "../msg" }
+# Shared Ethereum crypto (P2c, Addendum C §1). `cawala-eth` owns the EIP-712
+# digest + ecrecover used by both the node and this wasm client; the `bip39`
+# feature (default) adds the browser-only mnemonic/HD derivation.
+cawala-eth = { path = "../eth" }
+# `k256` is retained for the `UserIdentity` handle's key type; the crypto
+# primitives themselves live in `cawala-eth`.
+k256 = { version = "0.14", default-features = false, features = ["ecdsa", "precomputed-tables"] }
 console_error_panic_hook = "0.1.7"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring"] }

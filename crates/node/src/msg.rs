@@ -36,13 +36,12 @@ use cawala_ledger::{
 };
 use cawala_control::{ControlReply, RejectCode, RoutedControlV1, SignedRoutedReply};
 use cawala_msg::{
-    Ack, AckStatus, Envelope, EntryProofV1, Hop, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
-    MSG_CONTROL_V1, MSG_LEDGER_V1, MSG_SETTLE_V1, MessageType, MsgError, MsgId, Neighbor,
-    NeighborKind, OrderRejectV1, OrderResultV1, OrderResultV2, OrderResultV3, OrderStatusV1, PeerRef,
-    RejectReason, Routable,
-    RouteDecision, RouteError, Seen, SeenConfig, SeenSet, SettleForwardV3, SettleHopV3,
-    SettleOutcomeV3, SettlePayloadV3, SettleRejectV1, SettleResultV3, SettlementStatusV2,
-    ValueNoticeV1, VersionedLedgerPayload, decode_versioned,
+    Ack, AckStatus, EntryProofV1, Envelope, Hop, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
+    LedgerPayloadV4, MSG_CONTROL_V1, MSG_LEDGER_V1, MSG_SETTLE_V1, MessageType, MsgError, MsgId,
+    Neighbor, NeighborKind, OrderRejectV1, OrderResultV1, OrderResultV2, OrderResultV3,
+    OrderStatusV1, PeerRef, RejectReason, Routable, RouteDecision, RouteError, Seen, SeenConfig,
+    SeenSet, SettleForwardV3, SettleHopV3, SettleOutcomeV3, SettlePayloadV3, SettleRejectV1,
+    SettleResultV3, SettlementStatusV2, ValueNoticeV1, VersionedLedgerPayload, decode_versioned,
 };
 use cawala_topology::ChildKind;
 
@@ -912,6 +911,7 @@ pub async fn dispatch_ledger_envelope(
             if payee_is_local {
                 apply_same_leaf_order(
                     endpoint, source, config, ledger, data_dir, &env, &record, &order, &auth, true,
+                    None,
                 )
                 .await;
             } else {
@@ -927,6 +927,7 @@ pub async fn dispatch_ledger_envelope(
                     &order,
                     &auth,
                     &payee_addr,
+                    None,
                 )
                 .await;
             }
@@ -943,6 +944,102 @@ pub async fn dispatch_ledger_envelope(
                 "ignoring browser-directed v3 order result at a leaf node"
             );
         }
+        Ok(VersionedLedgerPayload::V4(LedgerPayloadV4::Order(order_v4))) => {
+            // Pure recovery first: the user's ETH signature must recover to the
+            // claimed address over the canonical EIP-712 order digest. The
+            // authoritative anchor comparison is applied fail-closed in the
+            // direct-parent handlers below (they hold the payer's `ChildEntry`).
+            let Some(recovered) = v4_recovered_address(&order_v4) else {
+                tracing::warn!(
+                    msg_id = %env.msg_id.to_hex(),
+                    "v4 order ETH signature does not recover to the claimed address; rejecting"
+                );
+                send_settlement_reply(
+                    endpoint,
+                    source,
+                    config,
+                    &env.src,
+                    env.msg_id,
+                    order_v4.order.hash(),
+                    SettlementStatusV2::Rejected {
+                        reason: OrderRejectV1::Unauthorized,
+                    },
+                    None,
+                    None,
+                )
+                .await;
+                return;
+            };
+
+            let order = order_v4.order;
+            let auth = order_v4.auth;
+            let payee_addr = order_v4.payee_addr;
+
+            let record = match RecordStore::open(data_dir, node_id) {
+                Ok(store) => store.record().clone(),
+                Err(err) => {
+                    tracing::warn!(%err, "cannot reload node record to apply a v4 order; skipping");
+                    return;
+                }
+            };
+
+            // Mirror the V2 sender check: the sender must be a local `User`
+            // child at the address it claims.
+            if user_child_address(&record, &env.src.node) != Some(env.src.addr.clone()) {
+                send_settlement_reply(
+                    endpoint,
+                    source,
+                    config,
+                    &env.src,
+                    env.msg_id,
+                    order.hash(),
+                    SettlementStatusV2::Rejected {
+                        reason: OrderRejectV1::NotAChild,
+                    },
+                    None,
+                    None,
+                )
+                .await;
+                return;
+            }
+
+            let payee_is_local = record
+                .children
+                .iter()
+                .any(|child| child.kind == ChildKind::User && child.child_id == order.to.as_str());
+            if payee_is_local {
+                apply_same_leaf_order(
+                    endpoint,
+                    source,
+                    config,
+                    ledger,
+                    data_dir,
+                    &env,
+                    &record,
+                    &order,
+                    &auth,
+                    true,
+                    Some(recovered),
+                )
+                .await;
+            } else {
+                handle_settlement_order(
+                    endpoint,
+                    source,
+                    config,
+                    ledger,
+                    manager,
+                    data_dir,
+                    &env,
+                    &record,
+                    &order,
+                    &auth,
+                    &payee_addr,
+                    Some(recovered),
+                )
+                .await;
+            }
+        }
         Err(err) => {
             tracing::warn!(
                 msg_id = %env.msg_id.to_hex(),
@@ -953,7 +1050,61 @@ pub async fn dispatch_ledger_envelope(
     }
 }
 
-/// Apply the existing same-leaf `Direct` order path (v1 and local-payee v2).
+/// Pure v4 recovery check: the user's ETH signature must recover to the claimed
+/// address over the canonical EIP-712 order digest.
+///
+/// Returns the recovered address when it matches [`EthIdentity::address`], and
+/// `None` otherwise (a malformed signature, a high-`s` signature, or a
+/// recovered address that differs from the claim). This is the **pure recovery**
+/// half of the split in Addendum A; the authoritative anchor comparison is the
+/// separate [`anchor_gate`].
+fn v4_recovered_address(order: &cawala_msg::OrderV4) -> Option<[u8; 20]> {
+    match order.eth.recovered_address(&order.eth_digest()) {
+        Ok(recovered) if recovered == order.eth.address => Some(recovered),
+        _ => None,
+    }
+}
+
+/// Fail-closed ETH anchor gate for a direct-parent order (Addendum C §4).
+///
+/// The **direct parent** is the only holder of the sending user leaf's
+/// [`ChildEntry`](crate::record::ChildEntry), so this gate must live in the
+/// direct-parent order handlers ([`apply_same_leaf_order`] /
+/// [`handle_settlement_order`]) and **not** in
+/// [`apply_order`](crate::ledger_service::LedgerService::apply_order) /
+/// [`apply_hop`](crate::ledger_service::LedgerService::apply_hop), where the
+/// downstream forwarder lacks the payer's `ChildEntry`.
+///
+/// - An **anchored** sender (`ChildEntry.eth_address == Some`) must send a v4
+///   order whose recovered ETH address matches the anchor; a v1/v2 order
+///   (`recovered == None`) is rejected — this is the downgrade defence.
+/// - An **unanchored** sender keeps legacy v1/v2 behaviour (the ETH guarantee
+///   applies only once an anchor is registered).
+///
+/// `recovered` is `Some` only for a v4 order whose pure `ecrecover` already
+/// matched [`EthIdentity::address`](cawala_msg::EthIdentity), so the version
+/// scoping is expressed by this `Option` rather than by re-decoding the payload.
+fn anchor_gate(
+    record: &NodeRecord,
+    sender: &str,
+    recovered: Option<[u8; 20]>,
+) -> Result<(), OrderRejectV1> {
+    let anchor = record
+        .children
+        .iter()
+        .find(|child| child.child_id == sender)
+        .and_then(|child| child.eth_address);
+    match (anchor, recovered) {
+        (Some(anchor), Some(recovered)) if anchor == recovered => Ok(()),
+        // Anchored but not a matching v4 order: a downgrade attempt or an
+        // anchor mismatch. Fail closed.
+        (Some(_), _) => Err(OrderRejectV1::Unauthorized),
+        // No anchor: legacy behaviour.
+        (None, _) => Ok(()),
+    }
+}
+
+/// Apply the existing same-leaf `Direct` order path (v1 and local-payee v2/v4).
 #[allow(clippy::too_many_arguments)]
 async fn apply_same_leaf_order(
     endpoint: &Endpoint,
@@ -966,6 +1117,7 @@ async fn apply_same_leaf_order(
     order: &PaymentOrder,
     auth: &AuthRef,
     reply_v2: bool,
+    eth_recovered: Option<[u8; 20]>,
 ) {
     let order = order.clone();
     let order_record = order.clone();
@@ -989,6 +1141,20 @@ async fn apply_same_leaf_order(
                     entry_seq: None,
                     entry_hash: None,
                     reason: Some(OrderRejectV1::NotAChild),
+                },
+                None,
+                None,
+            );
+        }
+        // Downgrade-resistant anchor gate: an anchored sender must present a v4
+        // order matching its anchor; v1/v2 from an anchored sender is refused.
+        if let Err(reason) = anchor_gate(&record, &sender, eth_recovered) {
+            return (
+                ApplyOutcome {
+                    status: OrderStatusV1::Rejected,
+                    entry_seq: None,
+                    entry_hash: None,
+                    reason: Some(reason),
                 },
                 None,
                 None,
@@ -1171,6 +1337,7 @@ async fn dispatch_ledger_payload_v1(
                 &order_v1.order,
                 &order_v1.auth,
                 false,
+                None,
             )
             .await;
         }
@@ -1244,9 +1411,18 @@ async fn handle_settlement_order(
     order: &PaymentOrder,
     auth: &AuthRef,
     payee_addr: &cawala_msg::OctAddr,
+    eth_recovered: Option<[u8; 20]>,
 ) {
     let payment_id = order.hash();
     let now = unix_now();
+
+    // Downgrade-resistant anchor gate (see `anchor_gate`): an anchored payer
+    // must present a v4 order matching its anchor; v2 from an anchored sender is
+    // refused before any hop is reserved.
+    if let Err(reason) = anchor_gate(record, &env.src.node, eth_recovered) {
+        send_settlement_reject(endpoint, source, config, env, order.hash(), reason).await;
+        return;
+    }
 
     let Some(payer_addr) = user_child_address(record, &env.src.node) else {
         return;
@@ -3235,6 +3411,7 @@ mod tests {
                     kind,
                     slot,
                     date_joined: 0,
+                    eth_address: None,
                 })
                 .collect(),
             address_epoch: 0,
@@ -4771,5 +4948,306 @@ mod tests {
         );
         hop.proof.as_mut().unwrap().commitment.commitment.ledger_pubkey = decoy.public();
         assert_degraded(&fx, &[hop], "intermediate_proof_commitment");
+    }
+
+    // -----------------------------------------------------------------------
+    // P2c-B: v4 ETH order dispatch + downgrade-resistant anchor gate
+    // -----------------------------------------------------------------------
+
+    /// A record whose single `User` child `sender` optionally carries an anchor.
+    fn anchored_record(sender: &str, anchor: Option<[u8; 20]>) -> NodeRecord {
+        let mut rec = record("parent", "0", None, vec![(sender, 3, ChildKind::User)]);
+        rec.children[0].eth_address = anchor;
+        rec
+    }
+
+    #[test]
+    fn anchor_gate_rejects_v1_v2_from_an_anchored_sender() {
+        let anchor = [0x11u8; 20];
+        let anchored = anchored_record("u", Some(anchor));
+        // v1/v2 (no recovered address) from an anchored sender is a downgrade.
+        assert_eq!(
+            anchor_gate(&anchored, "u", None),
+            Err(OrderRejectV1::Unauthorized)
+        );
+        // v4 matching the anchor is allowed.
+        assert_eq!(anchor_gate(&anchored, "u", Some(anchor)), Ok(()));
+        // v4 with a mismatched recovered address is refused.
+        assert_eq!(
+            anchor_gate(&anchored, "u", Some([0x22; 20])),
+            Err(OrderRejectV1::Unauthorized)
+        );
+        // An unanchored sender keeps legacy v1/v2 (and may also send v4).
+        let legacy = anchored_record("u", None);
+        assert_eq!(anchor_gate(&legacy, "u", None), Ok(()));
+        assert_eq!(anchor_gate(&legacy, "u", Some([0x33; 20])), Ok(()));
+    }
+
+    /// A structurally valid v4 order and the address its signature recovers.
+    fn sample_v4_order() -> (cawala_msg::OrderV4, [u8; 20]) {
+        use cawala_ledger::Amount;
+
+        let key = cawala_eth::signing_key_from_bytes(&[0x11; 32]).unwrap();
+        let operator = OperatorSecretKey::from_bytes([0x33; 32]);
+        let order = PaymentOrder {
+            from: NodeId::from("alice"),
+            to: NodeId::from("bob"),
+            amount: Amount::new(7),
+            nonce: 5,
+            expiry: 100,
+        };
+        let payee_addr: cawala_msg::OctAddr = "0.2.4".parse().unwrap();
+        let digest = cawala_eth::order_digest(&order, &payee_addr);
+        let auth = order.authorize(&operator).unwrap();
+        let address = cawala_eth::address_from_signing_key(&key);
+        (
+            cawala_msg::OrderV4 {
+                order,
+                auth,
+                payee_addr,
+                eth: cawala_msg::EthIdentity {
+                    address,
+                    signature: cawala_eth::sign_digest(&key, &digest).unwrap(),
+                },
+            },
+            address,
+        )
+    }
+
+    #[test]
+    fn v4_recovery_happy_path_and_wrong_recovery() {
+        let (order, address) = sample_v4_order();
+        assert_eq!(v4_recovered_address(&order), Some(address));
+
+        // Tamper the payee address: the recomputed digest no longer matches the
+        // signature, so pure recovery does not reproduce the claimed address.
+        let mut tampered = order.clone();
+        tampered.payee_addr = "0.2.5".parse().unwrap();
+        assert_eq!(v4_recovered_address(&tampered), None);
+
+        // A signature over a different digest recovers to a different address
+        // than the claimed one.
+        let mut claimed = order.clone();
+        claimed.eth.address = [0x99; 20];
+        assert_eq!(v4_recovered_address(&claimed), None);
+    }
+
+    /// Build a v2 `Order` envelope from `snap`'s node to `dst`.
+    fn v2_order_envelope(
+        snap: &RoutableSnapshot,
+        order: &cawala_ledger::PaymentOrder,
+        operator: &OperatorSecretKey,
+        payee_addr: cawala_msg::OctAddr,
+        config: &MsgConfig,
+        dst: cawala_msg::OctAddr,
+    ) -> Envelope {
+        let auth = order.authorize(operator).unwrap();
+        let payload = LedgerPayloadV2::Order(cawala_msg::OrderV2 {
+            order: order.clone(),
+            auth,
+            payee_addr,
+        })
+        .to_bytes()
+        .unwrap();
+        build_envelope(&snap.routable.this, dst, MSG_LEDGER_V1, payload, config.ttl).unwrap()
+    }
+
+    /// Build a v4 `Order` envelope from `snap`'s node to `dst`.
+    fn v4_order_envelope(
+        snap: &RoutableSnapshot,
+        order: &cawala_ledger::PaymentOrder,
+        operator: &OperatorSecretKey,
+        eth_key: &cawala_eth::SigningKey,
+        payee_addr: cawala_msg::OctAddr,
+        config: &MsgConfig,
+        dst: cawala_msg::OctAddr,
+    ) -> Envelope {
+        let auth = order.authorize(operator).unwrap();
+        let digest = cawala_eth::order_digest(order, &payee_addr);
+        let payload = LedgerPayloadV4::Order(cawala_msg::OrderV4 {
+            order: order.clone(),
+            auth,
+            payee_addr,
+            eth: cawala_msg::EthIdentity {
+                address: cawala_eth::address_from_signing_key(eth_key),
+                signature: cawala_eth::sign_digest(eth_key, &digest).unwrap(),
+            },
+        })
+        .to_bytes()
+        .unwrap();
+        build_envelope(&snap.routable.this, dst, MSG_LEDGER_V1, payload, config.ttl).unwrap()
+    }
+
+    /// End-to-end: a v2 order from an **anchored** payer is refused (downgrade),
+    /// while a v4 order matching the anchor applies. Also exercises the V4
+    /// happy path through the real dispatch + anchor gate.
+    #[tokio::test]
+    async fn v4_order_applies_and_anchored_sender_rejects_v2_downgrade() {
+        use cawala_ledger::{Amount, NodeId, OperatorSecretKey};
+
+        let dir = tempfile::tempdir().unwrap();
+        let node_secret = crate::identity::load_or_create_secret_key(dir.path()).unwrap();
+        let node_id = node_secret.public().to_string();
+
+        let payer_secret = SecretKey::generate();
+        let payer_id = payer_secret.public().to_string();
+        let payer_op = OperatorSecretKey::from_bytes([31u8; 32]);
+        let payee_id = SecretKey::generate().public().to_string();
+        let payee_op = OperatorSecretKey::from_bytes([32u8; 32]);
+        let payer = NodeId::from(payer_id.clone());
+        let payee = NodeId::from(payee_id.clone());
+
+        let eth_key = cawala_eth::signing_key_from_bytes(&[0x11; 32]).unwrap();
+        let anchor = cawala_eth::address_from_signing_key(&eth_key);
+
+        // Leaf record: address "0", payer at slot 3 (anchored), payee at slot 4.
+        let mut store = RecordStore::open(dir.path(), &node_id).unwrap();
+        store.set_address("0".parse().unwrap()).unwrap();
+        store
+            .attach_child(payer_id.clone(), ChildKind::User, Some(3), 1)
+            .unwrap();
+        store
+            .attach_child(payee_id.clone(), ChildKind::User, Some(4), 1)
+            .unwrap();
+        store.set_child_eth_address(&payer_id, anchor).unwrap();
+        store.save().unwrap();
+        register_user_peer(dir.path(), &payer_id, &payer_op);
+        register_user_peer(dir.path(), &payee_id, &payee_op);
+
+        let mut service = LedgerService::open(dir.path(), &node_id).unwrap();
+        service
+            .ensure_account_open(&payer, ChildKind::User)
+            .unwrap();
+        service
+            .ensure_account_open(&payee, ChildKind::User)
+            .unwrap();
+        let node_operator = OperatorSecretKey::from_bytes(node_secret.to_bytes());
+        service
+            .fund(&payer, ChildKind::User, 100, &node_operator, 1, 1_000)
+            .unwrap();
+
+        let leaf_endpoint = hermetic_endpoint(&node_secret).await;
+        let payer_endpoint = hermetic_endpoint(&payer_secret).await;
+
+        let leaf_record = RecordStore::open(dir.path(), &node_id).unwrap();
+        let mut leaf_snap = RoutableSnapshot::from_record(leaf_record.record()).unwrap();
+        leaf_snap
+            .hints
+            .insert(payer_id.clone(), payer_endpoint.addr());
+        let source = NeighborSource::Static(leaf_snap);
+
+        let config = ledger_test_config();
+        let (leaf_router, mut leaf_rx) =
+            spawn_msg_node_with_source_on(leaf_endpoint.clone(), source.clone(), config.clone());
+
+        let ledger = Arc::new(tokio::sync::Mutex::new(service));
+        let manager = Arc::new(tokio::sync::Mutex::new(SettlementManager::new()));
+        let dispatch_manager = Arc::clone(&manager);
+        let dispatch_dir = dir.path().to_path_buf();
+        let dispatch_node = node_id.clone();
+        let dispatch_source = source;
+        let dispatch_ledger = Arc::clone(&ledger);
+        let dispatch_endpoint = leaf_endpoint.clone();
+        let dispatch_config = config.clone();
+        tokio::spawn(async move {
+            while let Some(env) = leaf_rx.recv().await {
+                dispatch_ledger_envelope(
+                    &dispatch_endpoint,
+                    &dispatch_source,
+                    &dispatch_config,
+                    &dispatch_ledger,
+                    &dispatch_manager,
+                    &dispatch_dir,
+                    &dispatch_node,
+                    env,
+                )
+                .await;
+            }
+        });
+
+        let payer_record = record(&payer_id, "0.3", Some((&node_id, 3)), vec![]);
+        let mut payer_snap = RoutableSnapshot::from_record(&payer_record).unwrap();
+        payer_snap
+            .hints
+            .insert(node_id.clone(), leaf_endpoint.addr());
+        let (_payer_router, mut payer_rx) =
+            spawn_msg_node_on(payer_endpoint.clone(), payer_snap.clone(), config.clone());
+
+        let leaf_addr: cawala_msg::OctAddr = "0".parse().unwrap();
+        let payee_addr: cawala_msg::OctAddr = "0.4".parse().unwrap();
+        let expiry = unix_now() + 3_600;
+        let order = PaymentOrder {
+            from: payer.clone(),
+            to: payee.clone(),
+            amount: Amount::new(30),
+            nonce: 7,
+            expiry,
+        };
+
+        // 1. A v2 order from the anchored payer is a downgrade attempt: refused,
+        //    and no value moves.
+        let v2 = v2_order_envelope(
+            &payer_snap,
+            &order,
+            &payer_op,
+            payee_addr.clone(),
+            &config,
+            leaf_addr.clone(),
+        );
+        let ack = send_envelope(&payer_endpoint, &payer_snap, &v2, config.hop_timeout)
+            .await
+            .unwrap();
+        assert_eq!(ack.status, AckStatus::Delivered);
+        let reply = tokio::time::timeout(Duration::from_secs(5), payer_rx.recv())
+            .await
+            .expect("v2 reply within timeout")
+            .expect("v2 reply envelope");
+        let LedgerPayloadV2::OrderResult(result) =
+            LedgerPayloadV2::from_bytes(&reply.payload).unwrap()
+        else {
+            panic!("expected a v2 OrderResult");
+        };
+        assert_eq!(result.reply_to, v2.msg_id);
+        assert_eq!(
+            result.status,
+            SettlementStatusV2::Rejected {
+                reason: OrderRejectV1::Unauthorized
+            }
+        );
+        {
+            let svc = ledger.lock().await;
+            assert_eq!(svc.balance_of(&payer), Amount::new(100));
+        }
+
+        // 2. A v4 order matching the anchor applies.
+        let v4 = v4_order_envelope(
+            &payer_snap,
+            &order,
+            &payer_op,
+            &eth_key,
+            payee_addr,
+            &config,
+            leaf_addr,
+        );
+        let ack = send_envelope(&payer_endpoint, &payer_snap, &v4, config.hop_timeout)
+            .await
+            .unwrap();
+        assert_eq!(ack.status, AckStatus::Delivered);
+        let reply = tokio::time::timeout(Duration::from_secs(5), payer_rx.recv())
+            .await
+            .expect("v4 reply within timeout")
+            .expect("v4 reply envelope");
+        let LedgerPayloadV3::OrderResult(result) =
+            LedgerPayloadV3::from_bytes(&reply.payload).unwrap();
+        assert_eq!(result.reply_to, v4.msg_id);
+        assert_eq!(result.order_hash, order.hash());
+        assert!(matches!(result.status, SettlementStatusV2::Applied { .. }));
+        {
+            let svc = ledger.lock().await;
+            assert_eq!(svc.balance_of(&payer), Amount::new(70));
+            assert_eq!(svc.balance_of(&payee), Amount::new(30));
+        }
+
+        leaf_router.shutdown().await.unwrap();
     }
 }

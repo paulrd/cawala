@@ -92,6 +92,7 @@ fn record(
                 kind: *kind,
                 slot: *slot,
                 date_joined: 0,
+                eth_address: None,
             })
             .collect(),
         address_epoch: 0,

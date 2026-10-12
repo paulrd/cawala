@@ -16,6 +16,8 @@
     isMockMode,
     isIdentityPersistent,
     getCapabilities,
+    getClientStateInfo,
+    getTrustState,
     exportIdentityBundle,
     inspectIdentityBundle,
     importIdentityBundle,
@@ -24,10 +26,26 @@
     lockAdminMode,
   } from '../../lib/api.js';
   import AdminUnlockDialog from '../admin/AdminUnlockDialog.svelte';
+  import UserIdentityCard from '../identity/UserIdentityCard.svelte';
 
   let caps = $derived(getCapabilities());
   let mock = $derived(isMockMode());
   let liveNoSeed = $derived(!mock && !caps.identityPersistent);
+  // The on-disk blob versions this client writes. Re-derived when live mode is
+  // (un)set, since Settings can mount after `initApi()`.
+  let clientInfo = $derived.by(() => {
+    void apiCapabilities.mock;
+    return getClientStateInfo();
+  });
+
+  // The trust-anchor surface, via the advertised API rather than reaching into
+  // `ledgerState` directly. Re-derived when live mode or the synced ledger
+  // snapshot changes (the API itself is non-reactive module state).
+  let trust = $derived.by(() => {
+    void apiCapabilities.mock;
+    void ledgerState.trustEstablished;
+    return getTrustState();
+  });
 
   // ── Export state ──────────────────────────────────────────
   let exportPassphrase = $state('');
@@ -163,8 +181,18 @@
         <span class="setting-label">Mode</span>
         <Badge variant={isMockMode() ? 'warn' : 'ok'} label={isMockMode() ? 'Mock (no live node)' : 'Live'} />
       </div>
+      {#if !mock && clientInfo.stateVersion != null}
+        <div class="setting-row">
+          <span class="setting-label">State format</span>
+          <span class="text-sm muted">state v{clientInfo.stateVersion} &middot; ledger v{clientInfo.ledgerVersion}</span>
+        </div>
+      {/if}
     </div>
   </Card>
+
+  <!-- The user identity (mnemonic → account address) sits above the transport
+       identity: it is the root of trust, the transport keys are context. -->
+  <UserIdentityCard />
 
   <Card title="Identity">
     <div class="settings-section">
@@ -196,18 +224,27 @@
     </div>
   </Card>
 
-  {#if !isMockMode() && ledgerState.pinnedLedger}
-    <Card title="Leaf Ledger Trust">
+  {#if !isMockMode() && trust.pinnedLedger}
+    <Card title="Leaf Ledger Trust" variant={trust.established ? undefined : 'warn'}>
       <div class="settings-section">
         <div class="setting-row">
           <span class="setting-label">Pinned ledger</span>
           <code class="text-sm" style="word-break: break-all; font-family: var(--mono);">
-            {ledgerState.pinnedLedger}
+            {trust.pinnedLedger}
           </code>
         </div>
-        <p class="muted text-sm" style="margin-top: var(--sp-1);">
-          This is the leaf's ledger public key, pinned on first use (TOFU). Your balance and payment receipts are verified against this key.
-        </p>
+        {#if trust.established}
+          <p class="muted text-sm" style="margin-top: var(--sp-1);">
+            This is the leaf's ledger public key, pinned on first use (TOFU). Your balance and payment receipts are verified against this key.
+          </p>
+        {:else}
+          <p class="text-sm" style="margin-top: var(--sp-1); color: var(--warn);">
+            Trust not established: no leaf ledger key was restored from this origin's local
+            cache, so this pin was accepted on first use in this session without a previously
+            trusted copy. If you moved this identity to a new device or host, re-establish
+            trust before relying on payment verification.
+          </p>
+        {/if}
       </div>
     </Card>
   {/if}

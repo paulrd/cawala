@@ -18,6 +18,19 @@ how to verify, and conventions**. Detail lives elsewhere:
 
 ## Next session brief
 
+The **portable-client refactor (R1 / R1b / R2 / R3) is DONE and gated on branch
+`refactor/portable-client`** (9 commits, not yet merged to `main`). It makes the
+web app host-agnostic and identity-portable: localStorage is a best-effort cache
+with the node as source of truth (R1); a user-level secp256k1/BIP-39 identity
+whose transport Ed25519 key is mnemonic-derived, with a shared EIP-712 `EthIdentity`
+carried in a new `LedgerPayloadV4`/`OrderV4` and a write-once, ETH-authorized
+`ChildEntry.eth_address` anchor enforced fail-closed at the direct parent (R3);
+and dual-target packaging - a self-contained `dist-single/index.html` for
+`file://`/zip/email alongside the served multi-asset `dist/` (R2). Next: merge
+when ready (a lockstep wire break: control 9, reply 6, ledger payload v4), then
+the follow-ups below. The frozen design is
+`.slim/deepwork/portable-client-refactor-spec.md`.
+
 The **administration refactor (P1–P5) is DONE, gated, merged to `main`, and
 pushed** (`ec31535`), plus a follow-up **value simplification** (`871e4d5`):
 `AdminIssue`/`AdminBurn`/`AdminLedgerQuery` are handled like every other admin
@@ -33,11 +46,31 @@ local CLI `control admin add|remove|list` always works. Wire: control format 8
 (accept 7|8), routed control 2, reply 5. Web admin is behind a
 policy-acknowledged lock with ancestor-chain up/down.
 
-Next: the optional backlog in "Open items" below (notably the final
+On `main`, next: the optional backlog in "Open items" below (notably the final
 `ADMIN_POLICY.md` wording).
 
 ## Current state
 
+- **`refactor/portable-client` (9 commits, working tree clean; NOT merged):**
+  `1627114` wasm read getters → `f2fa30b` web best-effort cache → `848b457`
+  BIP-39/secp256k1/EIP-712 primitives → `4712e33` shared `cawala-eth` crate +
+  control v9 (`Capabilities` 23, `RegisterEthAddress` 24) + `LedgerPayloadV4` →
+  `cf448ce` node write-once ETH anchor enforcement → `4a8b746` client ETH wiring
+  → `1d79e09` ETH secret export → `204cb94` identity UI → `35c7d08` single-file
+  build + `file://`.
+  - **R1 delivered:** node is source of truth; `cawala.state.v1`/`cawala.ledger.v1`
+    are best-effort cache; identity + TOFU pins authoritative-local; pure wasm
+    read getters.
+  - **R3 delivered:** mnemonic-derived ETH identity + transport NodeId; EIP-712
+    `LedgerPayloadV4`; write-once `RegisterEthAddress` anchor (incumbent-verified
+    rotation); fail-closed version-scoped anchor gate at the direct parent;
+    derived secret persisted, mnemonic never stored.
+  - **R2 delivered:** release wasm; `dist-single/index.html` (bytes-inlined wasm,
+    no `file://` fetch); SW + passkey hidden on `file://`.
+  - **Deferred:** passkey PRF unlock (passkey is an unlock factor only); client
+    anchor rotation; R1b client-side `Capabilities` send; wasm auto-pin hard
+    fail-closed (needs a node-side change - today it only *surfaces*
+    not-established trust).
 - `main` is clean and pushed @ `871e4d5` (was `11d7717` before the refactor).
 - **Administration refactor** (merged; the `refactor/topology-admin` branch was
   fast-forwarded in and deleted); P1–P5 done, gated:
@@ -82,7 +115,8 @@ Next: the optional backlog in "Open items" below (notably the final
 - `CARGO_BUILD_JOBS=1 cargo test --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo check -p cawala-client --target wasm32-unknown-unknown`
-- `cd web && npm run build`
+- `cd web && npm run build` (now builds **release** wasm, then `vite build`)
+- `cd web && npm run build:singlefile` (-> `web/dist-single/index.html`, self-containment check)
 - `cd web && npm test`
 - Targeted node suites: `--test admin_authority`, `--test admin_state`,
   `--test local_admin_cli`, `--test control_admin`, `--test routed_control`,
@@ -103,6 +137,9 @@ Next: the optional backlog in "Open items" below (notably the final
   format 3, settlement payload 3, browser ledger payload 3.
   `ROUTED_CONTROL_VERSION=2` drops the carried grant; there is no `admins.json`
   (replaced by `admin_state.json`).
+  On `refactor/portable-client` these become **control 9** (accept 7|8|9),
+  **reply 6**, and browser ledger payload **v4** — a lockstep break relative to
+  `main`.
 - `web/src/wasm/` is gitignored; run `npm run build:wasm` after any
   `crates/client-wasm` change or the JS/wasm arity can desync.
 - Control-plane local state under `<data-dir>`: `admin_state.json`,

@@ -6,11 +6,13 @@ canonical operator is never the only path to the app.
 
 ## Constraints that drive the design
 
-1. **Stable origin.** Browser identity/ledger state (`cawala.identity.v1`,
-   `cawala.state.v1:<nodeId>`, …) and the service-worker scope are
-   **origin-scoped**. Changing hostname (a different `github.io` path, a new IPFS
-   CID subdomain, a mirror hostname) forces identity export/import. Failover that
-   preserves identity must keep `https://cawala.ca`.
+1. **Origin stability for the service worker and local cache.** The
+   service-worker scope and the best-effort cache blobs (`cawala.state.v1:<nodeId>`,
+   `cawala.ledger.v1:<nodeId>`) remain **origin-scoped**. Identity itself is now
+   **mnemonic-derived and portable** (R3): the same BIP-39 mnemonic restores the
+   user's ETH account *and* the transport NodeId on any host, so a new hostname
+   does **not** force an identity export/import. Same-origin failover (Layer 2)
+   still preserves the SW and cache.
 2. **Custom response headers.** CSP, HSTS, and cache-control are required.
    GitHub Pages cannot set response headers; the host must honor `_headers`,
    `netlify.toml` `[[headers]]`, or `vercel.json`.
@@ -23,7 +25,7 @@ canonical operator is never the only path to the app.
 ## Recommended topology
 
 ```
-                    cawala.ca  (apex, stable origin, identity anchor)
+                    cawala.ca  (apex; stable origin for SW + local cache)
                          │
      ┌───────────────────┼──────────────────────────┐
      │                   │                          │
@@ -31,25 +33,29 @@ canonical operator is never the only path to the app.
 Cloudflare        health-checked second       different origins:
 Pages / Workers   origin (VPS nginx/Caddy,    <cid>.ipfs.cawala.ca,
 Static Assets     S3+CloudFront) same cert   community domains, IPFS
-  _headers        + same headers  ~$0–5/mo    read-only / fresh identity
+  _headers        + same headers  ~$0–5/mo    identity-portable
      │                   │                          │
   full PWA           full PWA                  bootstrap + availability
 ```
 
-- **Layer 0 — source/artifacts.** `web/dist` is the deployment unit. CI builds a
-  deterministic tarball per tag and attests it. This is what makes mirrors
-  possible.
-- **Layer 1 — canonical origin.** One stable hostname (`cawala.ca`) carrying
-  identity and the service worker, on a header-capable managed host.
+- **Layer 0 — source/artifacts.** `web/dist` is the served deployment unit; the
+  single-file `web/dist-single/index.html` is also produced for offline/email/zip
+  distribution. CI builds a deterministic tarball per tag and attests it. This is
+  what makes mirrors possible.
+- **Layer 1 — canonical origin.** One stable hostname (`cawala.ca`) carrying the
+  service worker and local cache, on a header-capable managed host. (Identity is
+  portable by mnemonic, so it is no longer tied to the origin.)
 - **Layer 2 — same-origin failover.** A health-checked second origin that also
   serves `cawala.ca` with a valid cert and the same headers. Removes the *host*
   as a SPOF while keeping the origin.
 - **Layer 3 — independent mirrors.** Content-addressed IPFS and community-hosted
-  copies on their own domains. Different origins, so read-only bootstrap/demo —
-  but they remove any single host or pinner as a SPOF.
+  copies on their own domains. Different origins, but identity is now portable:
+  a user restores the same account by entering their mnemonic on any mirror. They
+  remove any single host or pinner as a SPOF.
 
-**Same-origin redundancy protects identity; different-origin mirrors protect
-availability.** You want both.
+**Same-origin redundancy preserves the service worker and local cache;
+different-origin mirrors protect availability. Identity rides the mnemonic, not
+the origin.** You want both.
 
 ## Self-host in 5 minutes
 
@@ -87,6 +93,28 @@ mkdir site && tar -xzf "cawala-web-$tag.tar.gz" -C site   # extracts the site ro
 Then serve `site/` (or `web/dist/`) on any static host with the headers below.
 Never re-pack the tarball — re-archiving changes the bytes and invalidates the
 digest.
+
+## Single-file distribution (`dist-single/index.html`)
+
+`npm run build:singlefile` produces **one self-contained file**,
+`web/dist-single/index.html`, with all JS/CSS inlined and the wasm embedded as
+base64 and initialized from bytes. It is the distributable for `file://`, zip,
+email, and header-less hosts — anywhere the multi-asset `dist/` is inconvenient.
+
+- **Do NOT serve `dist-single` from the canonical origin.** The served deployment
+  stays the multi-asset `dist/`. A host that sends the standard CSP header
+  (`script-src 'self' 'wasm-unsafe-eval'` — no `'unsafe-inline'`) would **blank
+  the page**: the single file carries its own `<meta http-equiv="Content-Security-Policy">`
+  that permits the inline bundle, and when both a header and a meta CSP are
+  present the browser enforces their **intersection**, so the inline `<script>`
+  is blocked.
+- Use `dist-single` only where no conflicting header CSP is applied, or with a
+  relaxed policy that includes `script-src 'unsafe-inline'` (and
+  `'wasm-unsafe-eval'`). Publish it as a release asset / zip, not as the main site.
+- **On `file://`** passkeys and service workers are unavailable (no secure
+  origin / scope), so the app runs in degraded mode: **mnemonic unlock only**,
+  no passkey panel, no SW, best-effort storage. Everything else (app logic, wasm,
+  `crypto.subtle`) works.
 
 ## Per-host header recipes
 
@@ -244,8 +272,11 @@ reject rollbacks. Format and template: `MIRRORS.md`.
   redundancy (Layer 2) needs shared control of the domain/DNS across ≥2
   operators. If you can't arrange that, the escape hatch is:
   1. **Different-origin mirrors** for availability, and
-  2. **Identity export/import** (`Settings → Identity`) so users can move to a
-     mirror and restore their account.
+  2. **Mnemonic restore** — the user's ETH identity *and* transport NodeId are
+     derived from their BIP-39 mnemonic, so entering it on any mirror restores
+     the account (the old "different origin = separate identity" limitation is
+     gone). Derived secrets are persisted per-device; the mnemonic is never
+     stored.
 - **The protocol doesn't depend on the web app.** Nodes are independent; the app
   is a stateless client except for local identity. If the canonical origin
   vanished, the network keeps running and users can load any mirror.
@@ -262,9 +293,9 @@ itself. Where it can help:
 - **Local preview** of the production build with real headers (`npm run build`
   then serve `dist/`, not `vite preview`).
 
-It does **not** help with: origin-scoped identity, custom-header support beyond
-what your web server already does, or the relay architecture. Keep it to the
-failover/mirror role; the managed primary (Cloudflare) remains simpler.
+It does **not** help with: origin-scoped service-worker/cache scope, custom-header
+support beyond what your web server already does, or the relay architecture. Keep
+it to the failover/mirror role; the managed primary (Cloudflare) remains simpler.
 
 ## Repo artifacts
 
@@ -272,6 +303,8 @@ failover/mirror role; the managed primary (Cloudflare) remains simpler.
 - `web/netlify.toml` — Netlify build + `[[headers]]`.
 - `web/vercel.json` — Vercel headers.
 - `web/public/sw.js` + `web/scripts/stamp-sw.mjs` — per-deploy SW versioning.
+- `web/vite.config.singlefile.js` + `web/scripts/check-singlefile.mjs` — the
+  self-contained `dist-single/index.html` build and its self-containment check.
 - `.github/workflows/release.yml` — node binaries, packaging assets, and the
   checksummed + attested web artifact.
 - `.github/workflows/ipfs.yml` — optional IPFS publish/pin on `v*` tags.

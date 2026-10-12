@@ -92,6 +92,15 @@ pub struct ChildEntry {
     /// is re-parented (moved) so its original join date survives address
     /// reassignment; slot/address is geography, not join order.
     pub date_joined: u64,
+    /// The child's user-level Ethereum anchor, once registered.
+    ///
+    /// Persisted in `node.json` (JSON) only; `None` until a user leaf registers
+    /// via `RegisterEthAddress`. `#[serde(default)]` keeps a pre-anchor
+    /// `node.json` loadable. Deliberately **not** part of
+    /// `cawala_ledger::PeerKeys`, which is postcard-persisted inside
+    /// `SettleForwardV3` (that layout is frozen).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eth_address: Option<[u8; 20]>,
 }
 
 /// Errors raised by record validation, mutations, and (de)serialization.
@@ -378,6 +387,7 @@ impl RecordStore {
             kind,
             slot,
             date_joined,
+            eth_address: None,
         });
         self.record.validate()?;
         Ok(())
@@ -412,12 +422,12 @@ impl RecordStore {
         child_id: &str,
         slot: u8,
     ) -> Result<Option<u8>, RecordError> {
-        let Some((kind, old_slot, date_joined)) = self
+        let Some((kind, old_slot, date_joined, eth_address)) = self
             .record
             .children
             .iter()
             .find(|child| child.child_id == child_id)
-            .map(|child| (child.kind, child.slot, child.date_joined))
+            .map(|child| (child.kind, child.slot, child.date_joined, child.eth_address))
         else {
             return Err(RecordError::ChildNotFound(child_id.to_string()));
         };
@@ -432,12 +442,47 @@ impl RecordStore {
         };
         candidate.detach_child(child_id)?;
         candidate.attach_child(child_id, kind, Some(slot), date_joined)?;
+        // The ETH anchor is slot-independent and write-once: preserve it across
+        // the re-slot rather than silently dropping it.
+        if let Some(address) = eth_address {
+            candidate.set_child_eth_address(child_id, address)?;
+        }
         // A re-slot moves the child's whole subtree onto a new address, so the
         // epoch advances even though this node's own address is unchanged.
         candidate.record.address_epoch = candidate.record.address_epoch.saturating_add(1);
         candidate.record.validate()?;
         self.record = candidate.record;
         Ok(Some(old_slot))
+    }
+
+    /// The registered Ethereum anchor for a direct child, if any.
+    pub fn child_eth_address(&self, child_id: &str) -> Option<[u8; 20]> {
+        self.record
+            .children
+            .iter()
+            .find(|child| child.child_id == child_id)
+            .and_then(|child| child.eth_address)
+    }
+
+    /// Set a direct child's Ethereum anchor.
+    ///
+    /// The write-once/rotation policy (registration proof, incumbent-key
+    /// rotation) is enforced by the `RegisterEthAddress` handler; this only
+    /// persists the value. Returns [`RecordError::ChildNotFound`] when
+    /// `child_id` is not a current direct child.
+    pub fn set_child_eth_address(
+        &mut self,
+        child_id: &str,
+        address: [u8; 20],
+    ) -> Result<(), RecordError> {
+        let child = self
+            .record
+            .children
+            .iter_mut()
+            .find(|child| child.child_id == child_id)
+            .ok_or_else(|| RecordError::ChildNotFound(child_id.to_string()))?;
+        child.eth_address = Some(address);
+        Ok(())
     }
 
     /// Set this node's parent link.
@@ -1110,5 +1155,71 @@ mod tests {
         root.unset_parent().unwrap();
         assert_eq!(root.record().address, Some("0".parse().unwrap()));
         root.record().validate().unwrap();
+    }
+
+    #[test]
+    fn child_eth_address_json_round_trip_and_backcompat() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(dir.path());
+        store
+            .attach_child("c1", ChildKind::User, Some(0), JOINED)
+            .unwrap();
+        store
+            .attach_child("c2", ChildKind::Node, Some(1), JOINED)
+            .unwrap();
+        assert_eq!(store.child_eth_address("c1"), None);
+        assert_eq!(store.child_eth_address("nope"), None);
+        assert_eq!(
+            store.set_child_eth_address("nope", [0u8; 20]),
+            Err(RecordError::ChildNotFound("nope".into()))
+        );
+
+        store.set_child_eth_address("c1", [0xab; 20]).unwrap();
+        assert_eq!(store.child_eth_address("c1"), Some([0xab; 20]));
+        store.save().unwrap();
+
+        let json = std::fs::read_to_string(dir.path().join(NODE_RECORD_FILE)).unwrap();
+        assert!(json.contains("eth_address"), "anchor must be serialized");
+        let loaded = RecordStore::open(dir.path(), "node-a").unwrap();
+        assert_eq!(loaded.child_eth_address("c1"), Some([0xab; 20]));
+        assert_eq!(loaded.child_eth_address("c2"), None);
+        assert_eq!(loaded.record(), store.record());
+    }
+
+    #[test]
+    fn child_eth_address_omitted_when_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(dir.path());
+        store
+            .attach_child("c1", ChildKind::User, Some(0), JOINED)
+            .unwrap();
+        store.save().unwrap();
+        let json = std::fs::read_to_string(dir.path().join(NODE_RECORD_FILE)).unwrap();
+        assert!(
+            !json.contains("eth_address"),
+            "a child without an anchor must not serialize the field"
+        );
+    }
+
+    #[test]
+    fn old_node_json_without_eth_address_loads_with_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{"node_id":"node-a","address":null,"parent":null,"children":[{"child_id":"c1","kind":"user","slot":0,"date_joined":0}]}"#;
+        std::fs::write(dir.path().join(NODE_RECORD_FILE), json).unwrap();
+        let store = RecordStore::open(dir.path(), "node-a").unwrap();
+        assert_eq!(store.child_eth_address("c1"), None);
+    }
+
+    #[test]
+    fn move_child_slot_preserves_eth_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(dir.path());
+        store
+            .attach_child("c1", ChildKind::User, Some(0), JOINED)
+            .unwrap();
+        store.set_child_eth_address("c1", [0xcd; 20]).unwrap();
+
+        assert_eq!(store.move_child_slot("c1", 5), Ok(Some(0)));
+        assert_eq!(store.child_eth_address("c1"), Some([0xcd; 20]));
     }
 }

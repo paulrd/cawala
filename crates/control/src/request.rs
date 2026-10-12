@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use cawala_ledger::{LedgerPubKey, NodeId, OperatorPubKey};
 use cawala_topology::{ChildKind, MAX_SLOT, OctAddr};
 
+use cawala_eth::EthProof;
+
 use crate::sign::ControlError;
 
 /// Maximum accepted length, in bytes, of a node id string (`JoinRequest::node`,
@@ -654,6 +656,36 @@ impl AdminValueRequest {
     }
 }
 
+/// A client's advertised node-client API version (R1b `Capabilities`
+/// handshake).
+///
+/// Added in [`CONTROL_FORMAT_VERSION`](crate::CONTROL_FORMAT_VERSION) 9
+/// (variant 23). Read-only and non-authoritative: the node must **not** route
+/// it through `needs_authority`/`is_admin_request`/`authorize_actor`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capabilities {
+    /// The client's node-client API version.
+    pub client_api_version: u16,
+}
+
+/// A user leaf's registration (or rotation) of its Ethereum anchor.
+///
+/// Added in [`CONTROL_FORMAT_VERSION`](crate::CONTROL_FORMAT_VERSION) 9
+/// (variant 24). The enclosing [`SignedControl`](crate::SignedControl) is
+/// signed by the leaf's operator key **and** the request carries the user's ETH
+/// [`EthProof`]; the direct parent validates the proof before persisting
+/// `ChildEntry.eth_address`. Registration is write-once; a rotation carries the
+/// incumbent address in [`EthProof::old_address`] and is authorized by the old
+/// key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterEthAddress {
+    /// The new Ethereum address (20 bytes, un-checksummed).
+    pub address: [u8; 20],
+    /// The ETH signature proving control of `address` (and, for a rotation, of
+    /// the incumbent address in [`EthProof::old_address`]).
+    pub proof: EthProof,
+}
+
 /// The v1 control-request payload.
 ///
 /// Variant order is frozen: postcard encodes the discriminant positionally.
@@ -711,6 +743,14 @@ pub enum ControlRequest {
     /// A designated administrator's request to remove a child from this node's
     /// designation set (discriminant 22, format 8).
     AdminRevoke(DesignationChange),
+    /// A client's supported-API handshake (discriminant 23, format 9).
+    ///
+    /// Read-only and non-admin; the node replies with
+    /// [`ControlReply::Capabilities`](crate::ControlReply::Capabilities).
+    Capabilities(Capabilities),
+    /// A user leaf's registration/rotation of its ETH anchor (discriminant 24,
+    /// format 9).
+    RegisterEthAddress(RegisterEthAddress),
 }
 
 impl ControlRequest {
@@ -740,6 +780,8 @@ impl ControlRequest {
             ControlRequest::AdminBurn(_) => "admin-burn",
             ControlRequest::AdminDesignate(_) => "admin-designate",
             ControlRequest::AdminRevoke(_) => "admin-revoke",
+            ControlRequest::Capabilities(_) => "capabilities",
+            ControlRequest::RegisterEthAddress(_) => "register-eth-address",
         }
     }
 
@@ -897,6 +939,16 @@ mod tests {
             ControlRequest::AdminRevoke(DesignationChange {
                 child: "applicant".to_string(),
             }),
+            ControlRequest::Capabilities(Capabilities {
+                client_api_version: 1,
+            }),
+            ControlRequest::RegisterEthAddress(RegisterEthAddress {
+                address: [0xab; 20],
+                proof: EthProof {
+                    signature: [0xcd; 65],
+                    old_address: Some([0xef; 20]),
+                },
+            }),
         ]
     }
 
@@ -929,6 +981,8 @@ mod tests {
                 "admin-burn",
                 "admin-designate",
                 "admin-revoke",
+                "capabilities",
+                "register-eth-address",
             ]
         );
     }
@@ -1206,6 +1260,49 @@ mod tests {
         assert_eq!(burn[0], 20);
         assert_eq!(designate[0], 21);
         assert_eq!(revoke[0], 22);
+    }
+
+    #[test]
+    fn v9_discriminants_are_frozen() {
+        // The two appended v9 variants must stay discriminants 23 and 24.
+        let caps = postcard::to_allocvec(&ControlRequest::Capabilities(Capabilities {
+            client_api_version: 1,
+        }))
+        .unwrap();
+        let register = postcard::to_allocvec(&ControlRequest::RegisterEthAddress(
+            RegisterEthAddress {
+                address: [0xab; 20],
+                proof: EthProof {
+                    signature: [0xcd; 65],
+                    old_address: None,
+                },
+            },
+        ))
+        .unwrap();
+        assert_eq!(caps[0], 23);
+        assert_eq!(register[0], 24);
+    }
+
+    #[test]
+    fn v9_variants_round_trip_and_are_not_admin() {
+        let v9: Vec<ControlRequest> = sample_requests()
+            .into_iter()
+            .filter(|request| {
+                matches!(
+                    request,
+                    ControlRequest::Capabilities(_) | ControlRequest::RegisterEthAddress(_)
+                )
+            })
+            .collect();
+        assert_eq!(v9.len(), 2, "expected both v9 variants in the sample");
+        for request in v9 {
+            let bytes = postcard::to_allocvec(&request).unwrap();
+            let back: ControlRequest = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(back, request);
+            assert!(!request.is_admin(), "{request:?}");
+            assert!(!is_admin_request(&request), "{request:?}");
+            assert!(!request.kind().is_empty());
+        }
     }
 
     #[test]
