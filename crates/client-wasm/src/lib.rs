@@ -44,6 +44,7 @@ use wasm_bindgen::{JsError, prelude::wasm_bindgen};
 
 mod control;
 pub mod dto;
+pub mod eth_identity;
 pub mod ledger_state;
 pub mod state;
 

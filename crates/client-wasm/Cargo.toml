@@ -16,6 +16,15 @@ crate-type = ["cdylib", "rlib"]
 cawala-control = { path = "../control" }
 cawala-ledger = { path = "../ledger" }
 cawala-msg = { path = "../msg" }
+# R3 user identity (P2a): all pure-Rust, wasm32-clean. `k256` is configured
+# without `std`/`getrandom` so it does not pull an RNG; BIP-32 derivation and
+# ECDSA signing are deterministic, so no entropy is needed (and web crypto has
+# no secp256k1 anyway). Key material stays in wasm and zeroizes on drop.
+coins-bip32 = "0.14"
+coins-bip39 = { version = "0.14", default-features = false, features = ["english"] }
+k256 = { version = "0.14", default-features = false, features = ["ecdsa", "precomputed-tables"] }
+sha3 = "0.12"
+zeroize = "1.8"
 console_error_panic_hook = "0.1.7"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring"] }
