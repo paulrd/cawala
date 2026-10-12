@@ -12,7 +12,7 @@
     getJoinStatus,
     getLastControlEvent,
   } from '../../lib/api.js';
-  import { JOIN_STATE } from '../../lib/constants.js';
+  import { JOIN_STATE, JOIN_REJECT_LABELS } from '../../lib/constants.js';
   import { truncateMiddle, copyToClipboard } from '../../lib/utils.js';
 
   // ── State ───────────────────────────────────────────────────
@@ -65,6 +65,17 @@
     }
   }
 
+  /**
+   * Honest rejection copy: prefer the stable reject code (JoinStatus.rejectCode),
+   * then the parent's human-readable reason, then a generic fallback.
+   * @param {{ rejectCode?: string|null, reason?: string|null }|null} status
+   * @returns {string}
+   */
+  function _rejectionText(status) {
+    const mapped = status?.rejectCode ? JOIN_REJECT_LABELS[status.rejectCode] : null;
+    return mapped || status?.reason || 'The operator declined your join request.';
+  }
+
   function _pollJoinStatus() {
     if (isMockMode()) return;
     const status = getJoinStatus();
@@ -77,7 +88,7 @@
     } else if (status.state === JOIN_STATE.REJECTED) {
       _stopPolling();
       flowState = 'rejected';
-      rejectReason = status.reason || 'The operator declined your join request.';
+      rejectReason = _rejectionText(status);
       // Also check for a last control event with more detail.
       const ev = getLastControlEvent();
       if (ev?.kind === 'rejected' && ev.reason) {
@@ -100,7 +111,7 @@
       clientState.address = status.address;
     } else if (status.state === JOIN_STATE.REJECTED) {
       flowState = 'rejected';
-      rejectReason = status.reason || 'The operator declined your join request.';
+      rejectReason = _rejectionText(status);
     } else if (status.state === JOIN_STATE.PENDING) {
       flowState = 'waiting';
       showToast('Join request is pending. Waiting for approval.', 'info');
@@ -156,7 +167,7 @@
         _startPolling();
       } else if (result.status === 'rejected') {
         flowState = 'rejected';
-        rejectReason = result.reason || 'The operator declined your join request.';
+        rejectReason = _rejectionText(result);
         showToast('Join request was rejected.', 'danger');
       } else {
         flowState = 'error';

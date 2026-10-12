@@ -57,6 +57,11 @@ import {
   readAcknowledgedPolicy,
   writeAcknowledgedPolicy,
 } from './adminPolicy.js';
+import {
+  STORAGE_KEYS,
+  readScopedBlob,
+  restoreBlobs,
+} from './storage.js';
 
 // ── Internal state ────────────────────────────────────────────
 
@@ -64,15 +69,17 @@ let _useMock = true;
 let _wasmModule = null;
 let _clientNode = null;
 
-// Identity/state storage keys.
+// Identity/state storage keys. Classification of every key (which are
+// authoritative-local, best-effort cache, or non-authoritative) lives in
+// `storage.js`; these are the concrete key names that module documents.
 // The identity seed stays global (one browser install == one identity). The
 // state/ledger blobs are identity-scoped: `${STATE_KEY}:<nodeId>`. The
 // un-suffixed keys are the legacy (pre-portability) locations and are read once
 // as a backward-compat fallback on load.
-const IDENTITY_KEY = 'cawala.identity.v1';
-const STATE_KEY = 'cawala.state.v1';
+const IDENTITY_KEY = STORAGE_KEYS.IDENTITY;
+const STATE_KEY = STORAGE_KEYS.STATE;
 // Distinct key for the secret-free ledger blob (balance/activity/pending).
-const LEDGER_KEY = 'cawala.ledger.v1';
+const LEDGER_KEY = STORAGE_KEYS.LEDGER;
 const SEED_BYTES = 32;
 
 /**
@@ -94,6 +101,12 @@ let _memorySeed = null; // in-session fallback when localStorage is unusable
 // Control-event poller + last drained event.
 let _controlPoller = null;
 let _lastControlEvent = null;
+
+// Whether the TOFU trust anchors (pinned_ledger / pinned_leaf_keys) were
+// restored from a persisted ledger cache at boot. False on a fresh origin (no
+// cache): trust is not established, and a later receipt must not be silently
+// treated as TOFU-established. Set once in `_spawnRealNode`.
+let _trustEstablished = false;
 
 // JS-side in-flight payment map keyed by order hash hex, for UI status.
 const _pendingSends = new Map();
@@ -143,6 +156,43 @@ export function isIdentityPersistent() {
 export function __setClientForTest(node) {
   _clientNode = node ?? null;
   _useMock = _clientNode == null;
+}
+
+/**
+ * Test-only seam: drive the real boot path (`_spawnRealNode`) against an
+ * injected fake wasm module — no wasm build, network, or Web Locks. Used to
+ * exercise the fail-closed trust / pin-preservation boot behavior on plain
+ * Node. Not used by the app; call the returned `stop()` so the control poller
+ * and injected module do not outlive the test.
+ * @param {object} wasm A fake module with `ClientNode.spawn_control` (and,
+ *   when no identity is pre-seeded, `generate_secret_key`).
+ * @returns {Promise<{ node: object, stop: () => void }>}
+ */
+export async function __bootRealNodeForTest(wasm) {
+  _wasmModule = wasm;
+  _useMock = false;
+  let node;
+  try {
+    node = await _spawnRealNode();
+  } finally {
+    _wasmModule = null;
+  }
+  return {
+    node,
+    stop() {
+      _stopControlPoller();
+      try {
+        _clientNode?.free?.();
+      } catch {
+        /* ignore */
+      }
+      _clientNode = null;
+      _releaseIdentityLock();
+      _trustEstablished = false;
+      _useMock = true;
+      _wasmModule = null;
+    },
+  };
 }
 
 // ── Initialization ────────────────────────────────────────────
@@ -242,31 +292,22 @@ function _loadOrCreateIdentity(wasm) {
 /**
  * Read a base64 blob from an identity-scoped key, falling back once to the
  * legacy un-namespaced key for installs predating identity portability.
+ * Best-effort: a missing, unreadable, or corrupt blob reads as null.
  * @param {string} base
  * @param {string} nodeId
  * @param {string} warnKey
  * @returns {Uint8Array|null}
  */
 function _loadScopedBlob(base, nodeId, warnKey) {
-  let b64 = null;
-  try {
-    b64 = window.localStorage.getItem(_scopedKey(base, nodeId));
-    if (b64 == null) {
-      // One-time backward compat: pre-portability installs stored the blob
-      // under the un-suffixed key.
-      b64 = window.localStorage.getItem(base);
-    }
-  } catch (err) {
-    _warnOnce(warnKey, `[api] localStorage unavailable for ${base} read`, err);
-    return null;
-  }
-  if (!b64) return null;
-  try {
-    return _base64ToBytes(b64);
-  } catch (err) {
-    _warnOnce(`${warnKey}-decode`, `[api] persisted ${base} is malformed; ignoring it`, err);
-    return null;
-  }
+  return readScopedBlob(base, nodeId, {
+    onWarn(kind, err) {
+      if (kind === 'decode') {
+        _warnOnce(`${warnKey}-decode`, `[api] persisted ${base} is malformed; ignoring it`, err);
+      } else {
+        _warnOnce(warnKey, `[api] localStorage unavailable for ${base} read`, err);
+      }
+    },
+  });
 }
 
 /**
@@ -336,6 +377,25 @@ function _persistLedgerState() {
 }
 
 /**
+ * Whether the live node currently holds at least one authoritative-local TOFU
+ * anchor: a non-empty `pinned_ledger` or a non-empty `pinned_leaf_keys` set.
+ * Both live only inside the `cawala.ledger.v1` blob, so a non-empty set *after*
+ * a successful import means the blob actually carried a trust pin.
+ * @param {object} node
+ * @returns {boolean}
+ */
+function _hasRestoredAnchors(node) {
+  if (!node) return false;
+  try {
+    const pinnedLedger = _readLedgerStatus(node).pinnedLedger;
+    if (typeof pinnedLedger === 'string' && pinnedLedger.length > 0) return true;
+  } catch (err) {
+    _warnOnce('trust-anchor-ledger', '[api] could not read pinned_ledger after restore', err);
+  }
+  return _readPinnedLeafKeys(node).length > 0;
+}
+
+/**
  * Spawn the real control client, restore state, and start the event poller.
  * @returns {Promise<import('../wasm/cawala_client.js').ClientNode>}
  */
@@ -344,23 +404,30 @@ async function _spawnRealNode() {
   const node = await _wasmModule.ClientNode.spawn_control(seed);
   const nodeId = node.endpoint_id();
 
+  // Boot is tolerant of a missing/corrupt cache: the state/ledger blobs are
+  // best-effort (see `storage.js`). A missing or bad blob starts us from empty
+  // local state instead of failing; balance/height are re-validated from the
+  // node via `request_balance`/`ledger_status` below.
   const stateBytes = _loadState(nodeId);
-  if (stateBytes) {
-    try {
-      node.import_state(stateBytes);
-    } catch (err) {
-      console.warn('[api] import_state failed; starting from a fresh local state', err);
-    }
-  }
-
   const ledgerBytes = _loadLedgerState(nodeId);
-  if (ledgerBytes) {
-    try {
-      node.import_ledger_state(ledgerBytes);
-    } catch (err) {
-      console.warn('[api] import_ledger_state failed; starting from a fresh ledger state', err);
-    }
-  }
+  const restoreResult = restoreBlobs(node, {
+    stateBytes,
+    ledgerBytes,
+    onWarn(kind, err) {
+      console.warn(
+        `[api] import_${kind === 'state' ? 'state' : 'ledger_state'} failed; starting from a fresh local state`,
+        err,
+      );
+    },
+  });
+
+  // Trust anchors (pinned_ledger / pinned_leaf_keys) live inside the ledger
+  // blob. Trust is established ONLY when that blob actually imported AND at
+  // least one anchor was restored from it. A corrupt or version-bumped blob
+  // leaves `ledgerImported === false` (its `import_ledger_state` threw), so a
+  // later receipt must never be silently treated as TOFU-established even
+  // though the bytes were present. Fail-closed; see `getTrustState()`.
+  _trustEstablished = restoreResult.ledgerImported && _hasRestoredAnchors(node);
 
   // Rebuild the UI activity list from the restored state (persisted value
   // notices + terminal settlement records) so past activity survives a reload.
@@ -368,7 +435,21 @@ async function _spawnRealNode() {
 
   _clientNode = node;
   _persistState();
-  _persistLedgerState();
+  // Pin safety: never overwrite a ledger blob whose import failed. The blob
+  // carries the authoritative-local TOFU anchors (pinned_ledger /
+  // pinned_leaf_keys), which the node cannot re-supply. Re-exporting the now
+  // empty in-memory ledger state would clobber the only trusted copy with no
+  // recovery path, so preserve the original bytes when a blob was present but
+  // unreadable. A fresh origin (no blob) and a successful import both persist.
+  const hadLedgerBlob = Boolean(ledgerBytes && ledgerBytes.length > 0);
+  if (!hadLedgerBlob || restoreResult.ledgerImported) {
+    _persistLedgerState();
+  } else {
+    _warnOnce(
+      'ledger-preserve',
+      '[api] ledger blob failed to import; preserving the original bytes so the authoritative-local TOFU anchors are not destroyed',
+    );
+  }
   // Reflect any restored verified balance in the reactive store immediately.
   _syncLedgerStoreFromStatus();
   _startControlPoller();
@@ -1446,6 +1527,8 @@ function _rebuildActivityFromState(node = _clientNode) {
           amount: typeof record.amount === 'number' ? record.amount : null,
           status: record.status ?? null,
           reason: record.reason ?? null,
+          // The failing hop for a `partial` settlement; null otherwise.
+          failedAt: record.failed_at ?? null,
           orderHash,
           timestamp,
           entrySeq: record.entry_seq ?? null,
@@ -1471,6 +1554,10 @@ function _rebuildActivityFromState(node = _clientNode) {
 /**
  * Resync the balance/height/pin/pending fields of `ledgerState` from the
  * authoritative wasm `ledger_status()` snapshot.
+ *
+ * The in-flight count is read from `pending_orders()` (the explicit getter)
+ * when available, falling back to `ledger_status().pending`; the two describe
+ * the same set, so behavior is unchanged.
  */
 function _syncLedgerStoreFromStatus() {
   if (_useMock || !_clientNode) return;
@@ -1481,10 +1568,13 @@ function _syncLedgerStoreFromStatus() {
     _warnOnce('ledger-status', '[api] ledger status read failed', err);
     return;
   }
+  const pendingOrders = _readPendingOrders(_clientNode);
   ledgerState.balance = status.balance;
   ledgerState.height = status.height;
   ledgerState.pinnedLedger = status.pinnedLedger;
-  ledgerState.pending = status.pending;
+  ledgerState.stateRoot = status.stateRoot;
+  ledgerState.pending = pendingOrders != null ? pendingOrders.length : status.pending;
+  ledgerState.trustEstablished = _trustEstablished;
   if (status.balance != null && ledgerState.verifiedAt == null) {
     // A balance restored from persisted state is still verified; stamp it.
     ledgerState.verifiedAt = Date.now();
@@ -1494,7 +1584,7 @@ function _syncLedgerStoreFromStatus() {
 /**
  * Copy a wasm `LedgerStatusDto` to a plain object and free it.
  * @param {object} node
- * @returns {{ address: string|null, parent: string|null, balance: number|null, height: number|null, pinnedLedger: string|null, pending: number, activity: number }}
+ * @returns {{ address: string|null, parent: string|null, balance: number|null, height: number|null, pinnedLedger: string|null, stateRoot: string|null, pending: number, activity: number }}
  */
 function _readLedgerStatus(node) {
   const dto = node.ledger_status();
@@ -1505,12 +1595,238 @@ function _readLedgerStatus(node) {
       balance: dto.balance ?? null,
       height: dto.height ?? null,
       pinnedLedger: dto.pinned_ledger ?? null,
+      stateRoot: dto.state_root ?? null,
       pending: dto.pending,
       activity: dto.activity,
     };
   } finally {
     dto.free?.();
   }
+}
+
+// ── Blob-derived read getters (R1) ────────────────────────────
+//
+// These wasm getters expose detail that used to be reachable only by decoding
+// the `cawala.state.v1` / `cawala.ledger.v1` blobs. They are pure reads: each
+// helper copies the DTO to a plain object and frees every wasm handle it
+// created. Tolerates an older build without the getter.
+
+/**
+ * Copy one `PendingOrderDto` to a plain object and free it (including its
+ * nested `pinned_leaf` handle). Read-once/free-once.
+ * @param {object} dto
+ * @returns {object}
+ */
+function _readPendingOrder(dto) {
+  const pinnedLeaf = dto.pinned_leaf ?? null;
+  try {
+    return {
+      from: dto.from,
+      to: dto.to,
+      amount: dto.amount,
+      nonce: dto.nonce,
+      expiry: dto.expiry,
+      operator: dto.operator,
+      authNonce: dto.auth_nonce,
+      orderHash: dto.order_hash,
+      signature: dto.signature,
+      sentAt: dto.sent_at,
+      payeeAddr: dto.payee_addr ?? null,
+      payerLeaf: Boolean(dto.payer_leaf),
+      pinnedLeaf: pinnedLeaf
+        ? { nodeId: pinnedLeaf.node_id, ledger: pinnedLeaf.ledger }
+        : null,
+    };
+  } finally {
+    pinnedLeaf?.free?.();
+    dto.free?.();
+  }
+}
+
+/**
+ * The persisted in-flight payment orders, as plain objects. `null` when this
+ * client build has no `pending_orders()` getter (so callers can fall back to
+ * the aggregate count rather than reading it as an empty set).
+ * @param {object|null} [node]
+ * @returns {Array<object>|null}
+ */
+function _readPendingOrders(node = _clientNode) {
+  if (!node || typeof node.pending_orders !== 'function') return null;
+  let dtos = [];
+  try {
+    dtos = node.pending_orders() ?? [];
+  } catch (err) {
+    _warnOnce('pending-orders', '[api] pending_orders read failed', err);
+    // Null (not empty) so the count falls back to `ledger_status().pending`.
+    return null;
+  }
+  // Each `_readPendingOrder` frees its own DTO (and nested pin).
+  return dtos.map(_readPendingOrder);
+}
+
+/**
+ * The leaf ledger keys pinned in local ledger state, as plain objects
+ * (`{ nodeId, ledger }`). Empty when the getter is unavailable.
+ * @param {object|null} [node]
+ * @returns {Array<{ nodeId: string, ledger: string }>}
+ */
+function _readPinnedLeafKeys(node = _clientNode) {
+  if (!node || typeof node.pinned_leaf_keys !== 'function') return [];
+  let dtos = [];
+  try {
+    dtos = node.pinned_leaf_keys() ?? [];
+    return dtos.map((dto) => {
+      try {
+        return { nodeId: dto.node_id, ledger: dto.ledger };
+      } finally {
+        dto.free?.();
+      }
+    });
+  } catch (err) {
+    _warnOnce('pinned-leaf-keys', '[api] pinned_leaf_keys read failed', err);
+    return [];
+  }
+}
+
+/**
+ * The in-flight outbound join request, as a plain object, or null.
+ * @param {object|null} [node]
+ * @returns {object|null}
+ */
+function _readPendingJoinOutbound(node = _clientNode) {
+  if (!node || typeof node.pending_join_outbound !== 'function') return null;
+  let dto;
+  try {
+    dto = node.pending_join_outbound();
+  } catch (err) {
+    _warnOnce('pending-join-outbound', '[api] pending_join_outbound read failed', err);
+    return null;
+  }
+  if (!dto) return null;
+  try {
+    return {
+      node: dto.node,
+      kind: dto.kind,
+      operator: dto.operator,
+      ledger: dto.ledger ?? null,
+      desiredSlot: dto.desired_slot ?? null,
+      locationHint: dto.location_hint ?? null,
+      nonce: dto.nonce,
+      expiry: dto.expiry,
+      parent: dto.parent,
+      pinnedOperator: dto.pinned_operator ?? null,
+      sentAt: dto.sent_at,
+    };
+  } finally {
+    dto.free?.();
+  }
+}
+
+/**
+ * The on-disk blob versions this client writes, or nulls when unavailable.
+ * @param {object|null} [node]
+ * @returns {{ stateVersion: number|null, ledgerVersion: number|null }}
+ */
+function _readClientStateInfo(node = _clientNode) {
+  if (!node || typeof node.client_state_info !== 'function') {
+    return { stateVersion: null, ledgerVersion: null };
+  }
+  let info;
+  try {
+    info = node.client_state_info();
+  } catch (err) {
+    _warnOnce('client-state-info', '[api] client_state_info read failed', err);
+    return { stateVersion: null, ledgerVersion: null };
+  }
+  if (!info) return { stateVersion: null, ledgerVersion: null };
+  try {
+    return {
+      stateVersion: info.state_version ?? null,
+      ledgerVersion: info.ledger_version ?? null,
+    };
+  } finally {
+    info.free?.();
+  }
+}
+
+/**
+ * The persisted in-flight payment orders (full detail), for UI reconstruction
+ * after a reload. Empty when unavailable.
+ * @returns {Array<object>}
+ */
+export function getPendingOrders() {
+  return _readPendingOrders() ?? [];
+}
+
+/**
+ * The authoritative-local TOFU leaf pins, for the trust surface.
+ * @returns {Array<{ nodeId: string, ledger: string }>}
+ */
+export function getPinnedLeafKeys() {
+  if (_useMock || !_clientNode) return [];
+  return _readPinnedLeafKeys();
+}
+
+/**
+ * The in-flight outbound join request, if any.
+ * @returns {object|null}
+ */
+export function getPendingJoinOutbound() {
+  if (_useMock || !_clientNode) return null;
+  return _readPendingJoinOutbound();
+}
+
+/**
+ * The current on-disk state/ledger blob versions.
+ * @returns {{ stateVersion: number|null, ledgerVersion: number|null }}
+ */
+export function getClientStateInfo() {
+  if (_useMock || !_clientNode) return { stateVersion: null, ledgerVersion: null };
+  return _readClientStateInfo();
+}
+
+/**
+ * Whether TOFU trust anchors were restored from the persisted ledger cache at
+ * boot. False on a fresh origin (no cache): trust is not established.
+ * @returns {boolean}
+ */
+export function isTrustEstablished() {
+  return _trustEstablished;
+}
+
+/**
+ * The trust-anchor surface. `established` is whether pins were restored from
+ * the persisted cache; `needsReestablish` is the complement in live mode.
+ *
+ * Fail-closed: when `needsReestablish` is true the UI must not present a pin as
+ * TOFU-established, even if one appears in-session. Preventing the wasm layer
+ * from auto-pinning in the first place needs a node change (follow-up).
+ *
+ * @returns {{ established: boolean, needsReestablish: boolean, pinnedLedger: string|null, pinnedLeafKeys: Array<{ nodeId: string, ledger: string }>, mock: boolean }}
+ */
+export function getTrustState() {
+  if (_useMock || !_clientNode) {
+    return {
+      established: false,
+      needsReestablish: false,
+      pinnedLedger: null,
+      pinnedLeafKeys: [],
+      mock: true,
+    };
+  }
+  let pinnedLedger = null;
+  try {
+    pinnedLedger = _readLedgerStatus(_clientNode).pinnedLedger;
+  } catch (err) {
+    _warnOnce('trust-ledger', '[api] trust state ledger read failed', err);
+  }
+  return {
+    established: _trustEstablished,
+    needsReestablish: !_trustEstablished,
+    pinnedLedger,
+    pinnedLeafKeys: _readPinnedLeafKeys(_clientNode),
+    mock: false,
+  };
 }
 
 /**
@@ -2180,7 +2496,7 @@ export function parentStatus() {
  * the reactive `ledgerState` store. `activity` is the number of recorded
  * entries; the entries themselves live in `ledgerState.activity`.
  *
- * @returns {{ address: string|null, parent: string|null, balance: number|null, height: number|null, pinnedLedger: string|null, pending: number, activity: number }}
+ * @returns {{ address: string|null, parent: string|null, balance: number|null, height: number|null, pinnedLedger: string|null, stateRoot: string|null, pending: number, activity: number }}
  */
 export function getLedgerStatus() {
   if (!_useMock && _clientNode) {
@@ -2192,6 +2508,7 @@ export function getLedgerStatus() {
     balance: ledgerState.balance,
     height: ledgerState.height,
     pinnedLedger: ledgerState.pinnedLedger,
+    stateRoot: ledgerState.stateRoot,
     pending: ledgerState.pending,
     activity: ledgerState.activity.length,
   };
@@ -2348,7 +2665,7 @@ export class AdminUnavailableError extends Error {
  * a raw invite URI string, or a bare parent endpoint id.
  * @param {string|{ parent?: string, raw?: string, slot?: number, expiry?: number, operator?: string }} parsed
  * @param {string|null} [addressHint] Backward-compat unused hint.
- * @returns {Promise<{ status: string, reason?: string }>}
+ * @returns {Promise<{ status: string, reason?: string, rejectCode?: string }>}
  */
 export async function requestJoin(parsed, addressHint) {
   if (_useMock) {
@@ -2389,10 +2706,14 @@ export async function requestJoin(parsed, addressHint) {
 
   const status = outcome.status;
   const reason = outcome.reason;
+  const rejectCode = outcome.reject_code ?? null;
   outcome.free?.();
   _persistState();
   _drainControlEvents();
-  return reason ? { status, reason } : { status };
+  const result = { status };
+  if (reason) result.reason = reason;
+  if (rejectCode) result.rejectCode = rejectCode;
+  return result;
 }
 
 /**
@@ -2644,7 +2965,7 @@ export async function adminMoveChild(childEndpointId, slot = null, nodeId = unde
 // ── Value administration: issue / burn ────────────────────────
 
 /** localStorage key for the single in-flight value operation. */
-export const VALUE_PENDING_KEY = 'cawala.value.pending.v1';
+export const VALUE_PENDING_KEY = STORAGE_KEYS.VALUE_PENDING;
 
 /**
  * Whether the current admin target permits a value operation: an unlocked
@@ -3515,6 +3836,7 @@ function _mapActivityEntry(entry) {
     reported: true,
     status: isSettlement ? entry.status : (entry.status ?? null),
     reason: isSettlement ? entry.reason : (entry.reason ?? null),
+    failedAt: isSettlement ? (entry.failedAt ?? null) : null,
     orderHash: isSettlement ? entry.orderHash : (entry.orderHash ?? null),
   };
 }
@@ -3571,7 +3893,13 @@ export async function getActivityLog(filters, nodeId = undefined) {
 
 /**
  * Live join-handshake status.
- * @returns {{ state: string, parent: string|null, slot: number|null, address: string|null, reason: string|null }}
+ *
+ * `rejectCode` is the stable machine code of the last rejection
+ * (`JoinStatus.reject_code`), distinct from the human-readable `reason`. When a
+ * join is outstanding, `pendingJoin` carries the full outbound request
+ * (`pending_join_outbound()`).
+ *
+ * @returns {{ state: string, parent: string|null, slot: number|null, address: string|null, reason: string|null, rejectCode: string|null, pendingJoin: object|null }}
  */
 export function getJoinStatus() {
   if (_useMock) {
@@ -3581,17 +3909,31 @@ export function getJoinStatus() {
       slot: null,
       address: '0.3.1',
       reason: null,
+      rejectCode: null,
+      pendingJoin: null,
     };
   }
   if (!_clientNode) {
-    return { state: JOIN_STATE.NONE, parent: null, slot: null, address: null, reason: null };
+    return {
+      state: JOIN_STATE.NONE,
+      parent: null,
+      slot: null,
+      address: null,
+      reason: null,
+      rejectCode: null,
+      pendingJoin: null,
+    };
   }
-  return _readJoinStatus(_clientNode);
+  return {
+    ..._readJoinStatus(_clientNode),
+    pendingJoin: _readPendingJoinOutbound(_clientNode),
+  };
 }
 
 /**
  * Copy a wasm `JoinStatus` DTO to a plain object and free it.
  * @param {object} node
+ * @returns {{ state: string, parent: string|null, slot: number|null, address: string|null, reason: string|null, rejectCode: string|null }}
  */
 function _readJoinStatus(node) {
   const status = node.join_status();
@@ -3602,6 +3944,7 @@ function _readJoinStatus(node) {
       slot: status.slot ?? null,
       address: status.address ?? null,
       reason: status.reason ?? null,
+      rejectCode: status.reject_code ?? null,
     };
   } finally {
     status.free?.();
@@ -3675,19 +4018,6 @@ function _bytesToBase64(bytes) {
     binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
   }
   return btoa(binary);
-}
-
-/**
- * @param {string} b64
- * @returns {Uint8Array}
- */
-function _base64ToBytes(b64) {
-  const binary = atob(b64);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    out[i] = binary.charCodeAt(i);
-  }
-  return out;
 }
 
 /**

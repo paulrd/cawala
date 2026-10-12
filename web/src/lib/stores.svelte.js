@@ -40,15 +40,21 @@ export const lastControlEvent = $state({ value: null });
  * `balance`/`height`/`pinnedLedger` mirror the wasm `ledger_status()`; `activity`
  * is the JS-side UI-shaped transfer list built from drained ledger events
  * (capped like the Rust `MAX_ACTIVITY_ENTRIES`); `pending` counts in-flight
- * orders; `verifiedAt` is the local ms timestamp of the last verified receipt.
+ * orders; `stateRoot` is the ledger state root the last verified balance was
+ * attested against; `trustEstablished` is whether the TOFU anchors
+ * (`pinnedLedger`/pinned leaf keys) were restored from the persisted cache at
+ * boot (false on a fresh origin — see `getTrustState()`); `verifiedAt` is the
+ * local ms timestamp of the last verified receipt.
  * An `invalid` ledger event sets `error` and never mutates `balance`.
  *
- * @type {{ balance: number|null, height: number|null, pinnedLedger: string|null, activity: Array, pending: number, verifiedAt: number|null, error: string|null }}
+ * @type {{ balance: number|null, height: number|null, pinnedLedger: string|null, stateRoot: string|null, trustEstablished: boolean, activity: Array, pending: number, verifiedAt: number|null, error: string|null }}
  */
 export const ledgerState = $state({
   balance: null,
   height: null,
   pinnedLedger: null,
+  stateRoot: null,
+  trustEstablished: false,
   activity: [],
   pending: 0,
   verifiedAt: null,

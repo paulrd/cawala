@@ -58,6 +58,21 @@ export const JOIN_OUTCOME = {
   REJECTED: 'rejected',
 };
 
+/**
+ * Stable join-reject codes (`JoinStatus.reject_code` / `JoinOutcome.reject_code`,
+ * Rust `reject_code_str`) → honest user-facing copy. Distinct from the
+ * human-readable `reason` the parent supplies.
+ */
+export const JOIN_REJECT_LABELS = {
+  unauthorized: 'That node did not accept your operator key.',
+  slot_taken: 'That slot is already taken. Try another invite or ask for a different slot.',
+  slot_out_of_range: 'The requested slot is out of range (must be 0–7).',
+  not_attached: 'That parent detached the request. Ask the operator to re-send the invite.',
+  expired: 'The join request expired before it reached the parent. Try again.',
+  replay: 'A duplicate join request was refused. Try a fresh invite.',
+  internal: 'The parent could not process the join request (internal error).',
+};
+
 /** Real kinds of control events drained from the live wasm control loop. */
 export const CONTROL_EVENT = {
   ACCEPTED: 'accepted',
