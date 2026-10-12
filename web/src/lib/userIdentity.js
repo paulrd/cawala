@@ -153,16 +153,41 @@ export async function deriveTransportSeed(mnemonic, passphrase = '') {
 // ── Feature detection ─────────────────────────────────────────
 
 /**
- * Whether passkey unlock *could* work here: a secure context (https or
- * localhost) exposing the WebAuthn API. On `file://` (and plain http on a
- * non-localhost host) this is false and the passkey UI stays hidden.
+ * Whether passkey unlock *could* work here, decided by an explicit origin
+ * check rather than `isSecureContext` alone.
+ *
+ * Per the Secure Contexts spec `file://` is a *potentially trustworthy*
+ * origin, so modern browsers set `isSecureContext === true` there and expose
+ * `PublicKeyCredential`. WebAuthn still has no valid RP ID for the null
+ * `file://` origin, so gating on the secure-context flag alone would render
+ * the passkey affordance and then fail inside `enrollPasskey`/
+ * `unlockWithPasskey`. Passkeys are therefore limited to `https:` anywhere, or
+ * `http:` on a loopback host; on `file://` the mnemonic is the sole unlock
+ * path (portable-client refactor spec §1.1/§4).
  *
  * @returns {boolean}
  */
 export function isPasskeyAvailable() {
   if (typeof window === 'undefined') return false;
-  if (window.isSecureContext !== true) return false;
-  return typeof window.PublicKeyCredential === 'function';
+  if (typeof window.PublicKeyCredential !== 'function') return false;
+  return _isPasskeyOriginAllowed(window.location);
+}
+
+/**
+ * The origin predicate behind {@link isPasskeyAvailable}: a WebAuthn RP ID is
+ * only well-defined for `https:` (any host) or `http:` on loopback
+ * (`localhost` / `127.0.0.1` / `[::1]`). Everything else — including `file:`
+ * despite its trustworthy secure-context status — is false.
+ *
+ * @param {Location|undefined|null} location
+ * @returns {boolean}
+ */
+function _isPasskeyOriginAllowed(location) {
+  if (!location) return false;
+  const { protocol, hostname } = location;
+  if (protocol === 'https:') return true;
+  if (protocol !== 'http:') return false;
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
 }
 
 // ── Status ────────────────────────────────────────────────────

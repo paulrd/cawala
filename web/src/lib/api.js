@@ -595,8 +595,10 @@ export async function initApi() {
   }
 
   try {
-    const wasm = await import('../wasm/cawala_client.js');
-    await wasm.default();
+    // The wasm init seam differs per build target (served asset URL vs
+    // embedded bytes for the single-file `file://` target); see wasmLoader.js.
+    const { loadWasmClient } = await import('./wasmLoader.js');
+    const wasm = await loadWasmClient();
     _wasmModule = wasm;
     // Hand the real crypto engine to the identity facade: address/secret
     // derivation and the mnemonic-derived transport seed.

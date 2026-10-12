@@ -6,7 +6,9 @@
   "description": "Cawala M0 web harness: Svelte 5 + Vite static app, wasm-bindgen client wired to the iroh relay",
   "scripts": {
     "build:wasm": "node scripts/build-wasm.mjs",
-    "build": "npm run build:wasm && vite build && node scripts/stamp-sw.mjs",
+    "build:wasm:release": "node scripts/build-wasm.mjs --release",
+    "build": "npm run build:wasm:release && vite build && node scripts/stamp-sw.mjs",
+    "build:singlefile": "npm run build:wasm:release && vite build --config vite.config.singlefile.js && node scripts/check-singlefile.mjs",
     "dev": "npm run build:wasm && vite",
     "preview": "vite preview",
     "test": "node --import ./test/loaders/register-raw.mjs --test test/*.test.mjs"
@@ -14,6 +16,7 @@
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.0",
     "svelte": "^5.56.10",
-    "vite": "^8.2.2"
+    "vite": "^8.2.2",
+    "vite-plugin-singlefile": "2.3.3"
   }
 }

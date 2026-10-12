@@ -422,18 +422,71 @@ test('boot: a failed boot leaves mock mode and never registers the anchor', asyn
 
 // ── Passkey (still deferred) ───────────────────────────────────────────────
 
+/** A window mock at a specific origin (all four fields the predicate reads). */
+function windowAtOrigin(protocol, hostname, isSecureContext) {
+  return {
+    localStorage: memory,
+    isSecureContext,
+    PublicKeyCredential: function PublicKeyCredential() {},
+    location: { protocol, hostname },
+  };
+}
+
+test('isPasskeyAvailable gates on the origin, not isSecureContext (file:// stays hidden)', () => {
+  const previousWindow = globalThis.window;
+  try {
+    // `file://` IS a trustworthy secure context that exposes WebAuthn, yet
+    // WebAuthn has no valid RP ID for a null origin: the affordance must stay
+    // hidden so the mnemonic is the sole unlock path (spec §1.1/§4).
+    globalThis.window = windowAtOrigin('file:', '', true);
+    assert.equal(isPasskeyAvailable(), false, 'file:// hidden despite isSecureContext');
+
+    // Plain http on a non-loopback host: neither secure nor a valid RP ID.
+    globalThis.window = windowAtOrigin('http:', 'example.com', false);
+    assert.equal(isPasskeyAvailable(), false, 'plain http://example.com hidden');
+
+    // https anywhere is a valid RP ID.
+    globalThis.window = windowAtOrigin('https:', 'example.com', true);
+    assert.equal(isPasskeyAvailable(), true, 'https://example.com allowed');
+
+    // http on loopback (Vite dev server) is potentially trustworthy.
+    globalThis.window = windowAtOrigin('http:', 'localhost', true);
+    assert.equal(isPasskeyAvailable(), true, 'http://localhost:5173 allowed');
+    globalThis.window = windowAtOrigin('http:', '127.0.0.1', true);
+    assert.equal(isPasskeyAvailable(), true, 'http://127.0.0.1 allowed');
+    globalThis.window = windowAtOrigin('http:', '[::1]', true);
+    assert.equal(isPasskeyAvailable(), true, 'http://[::1] allowed');
+
+    // Missing location / missing WebAuthn API both stay hidden.
+    globalThis.window = {
+      localStorage: memory,
+      PublicKeyCredential: function PublicKeyCredential() {},
+    };
+    assert.equal(isPasskeyAvailable(), false, 'no location → hidden');
+    globalThis.window = {
+      localStorage: memory,
+      location: { protocol: 'https:', hostname: 'example.com' },
+    };
+    assert.equal(isPasskeyAvailable(), false, 'no PublicKeyCredential → hidden');
+  } finally {
+    globalThis.window = previousWindow;
+  }
+  assert.equal(isPasskeyAvailable(), false, 'default mock window stays hidden');
+});
+
 test('passkey: unavailable contexts hide it, enroll/unlock stay honest', async () => {
   // Established identity from the previous test.
   assert.equal(await hasPasskey(), false);
   await assert.rejects(() => enrollPasskey(), (err) => err instanceof PasskeyUnavailableError);
   await assert.rejects(() => unlockWithPasskey(), (err) => err instanceof PasskeyUnavailableError);
 
-  // A secure context with WebAuthn flips feature detection on…
+  // A secure-context https origin with WebAuthn flips feature detection on…
   const previousWindow = globalThis.window;
   globalThis.window = {
     ...previousWindow,
     isSecureContext: true,
     PublicKeyCredential: function PublicKeyCredential() {},
+    location: { protocol: 'https:', hostname: 'example.com' },
   };
   try {
     assert.equal(isPasskeyAvailable(), true);
