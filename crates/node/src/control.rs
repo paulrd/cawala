@@ -34,12 +34,12 @@ use cawala_control::{
     AdminValueDirection, AdminValueRequest, CONTROL_ALPN, CONTROL_REQUEST_MAX_TTL_SECS,
     CONTROL_REQUEST_TTL_SECS, ChildKind, ChildSnapshot, ControlError, ControlReply, ControlRequest,
     CreateChild, DeliveryStatus, DesignationChange, DetachChild, DetachNotice, ExitRequest, Invite,
-    JoinApproval,
-    JoinRejection, JoinRequest, MAX_CONTROL_FRAME, MoveChild, NodeId, NodeSnapshot, OctAddr,
-    OperatorPubKey, OperatorSecretKey, ParentSnapshot, ROUTED_REPLY_VERSION, RebaseNotice,
-    RebasePull, RejectCode, RoutedControlV1, RoutedForward, RoutedReplyV1, SetAddress,
-    SignedControl, SignedRoutedReply, ValueRequestId, is_admin_request,
-    is_supported_control_version, min_control_version, verify_control,
+    JoinApproval, JoinRejection, JoinRequest, MAX_CONTROL_FRAME, MoveChild, NodeCapabilities,
+    NodeId, NodeSnapshot, OctAddr, OperatorPubKey, OperatorSecretKey, ParentSnapshot,
+    ROUTED_REPLY_VERSION, RebaseNotice, RebasePull, RegisterEthAddress, RejectCode,
+    RoutedControlV1, RoutedForward, RoutedReplyV1, SetAddress, SignedControl, SignedRoutedReply,
+    ValueRequestId, is_admin_request, is_supported_control_version, min_control_version,
+    verify_control,
 };
 use cawala_ledger::{LedgerPubKey, PeerKeys, PeerRegistry, PeerRole};
 use cawala_msg::{MsgId, PeerRef, Seen, SeenConfig};
@@ -91,6 +91,15 @@ const MAX_PENDING_REBASE: usize = 32;
 /// Placeholder delivery status in a reply produced by the engine; the
 /// [`ControlHandler`] patches it after dialing the applicant.
 const PENDING_DELIVERY: DeliveryStatus = DeliveryStatus::Unreachable;
+
+/// The node's advertised node-client API version (R1b `Capabilities`).
+///
+/// Bump when the versioned client-facing read surface changes incompatibly.
+pub const NODE_CLIENT_API_VERSION: u16 = 1;
+
+/// Feature bit: this node enforces the v4 user ETH identity (registration +
+/// rotation anchor and downgrade-resistant orders).
+pub const NODE_FEATURE_ETH_IDENTITY: u64 = 1 << 0;
 
 /// Who the msg layer authenticated as the authority for one request.
 ///
@@ -1020,11 +1029,15 @@ impl ControlNode {
             ControlRequest::AdminRevoke(change) => {
                 self.handle_admin_revoke(signed, change, now, route)
             }
-            // v9 wire types are added in P2c-A; the node-side handling (the
-            // `Capabilities` reply and the `RegisterEthAddress` anchor gate)
-            // lands in P2c-B. Until then, reject closed.
-            ControlRequest::Capabilities(_) | ControlRequest::RegisterEthAddress(_) => {
-                ControlReply::Rejected(RejectCode::BadRequest)
+            // v9 wire types (R1b `Capabilities` + the R3 ETH anchor). The
+            // `Capabilities` handshake is read-only; `RegisterEthAddress` is
+            // self-signed by a current `User` child and ETH-proof-gated.
+            ControlRequest::Capabilities(_) => ControlReply::Capabilities(NodeCapabilities {
+                client_api_version: NODE_CLIENT_API_VERSION,
+                features: NODE_FEATURE_ETH_IDENTITY,
+            }),
+            ControlRequest::RegisterEthAddress(register) => {
+                self.handle_register_eth_address(signed, register, now)
             }
         };
         self.audit_request(signed, &reply, now);
@@ -2151,6 +2164,91 @@ impl ControlNode {
             "parent": self.node_id,
             "subtree_nodes": exit.subtree_nodes,
             "removed": listed,
+        }));
+        ControlReply::Accepted
+    }
+
+    /// Handle a user leaf's ETH anchor registration or rotation (v9, variant
+    /// 24, Addendum C §3/§5).
+    ///
+    /// Contract:
+    /// 1. The frame must be self-signed by the origin's registered operator key
+    ///    ([`verify_control`] binds `origin` to `controller`).
+    /// 2. `signed.origin` must be a **current `User` child** of this parent.
+    /// 3. The anchor is **write-once**:
+    ///    - no incumbent ⇒ a fresh **registration** proof, verified against the
+    ///      new address (proof of control);
+    ///    - an incumbent ⇒ a **rotation** proof, verified against the
+    ///      **incumbent** address (the old key authorizes the change). An
+    ///      operator-key-only assertion (a thief with the transport seed but not
+    ///      the old ETH key) therefore cannot swap the anchor.
+    /// 4. On success the address is persisted in `node.json` via
+    ///    [`RecordStore::set_child_eth_address`].
+    ///
+    /// The request is already replay-guarded by the `(origin, controller)`
+    /// nonce+expiry guard in [`ControlNode::dispatch_authorized`].
+    fn handle_register_eth_address(
+        &mut self,
+        signed: &SignedControl,
+        register: &RegisterEthAddress,
+        now: u64,
+    ) -> ControlReply {
+        // Self-signed: bind the origin node id to its registered operator key.
+        // A user leaf is a child, never this node itself, so `SelfOperator`
+        // cannot satisfy the current-User-child check below.
+        if verify_control(signed, &self.peers).is_err() {
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+        // The origin must be a current `User` child of this parent.
+        let incumbent = match self
+            .record
+            .record()
+            .children
+            .iter()
+            .find(|child| child.child_id == signed.origin.as_str())
+        {
+            Some(child) if child.kind == ChildKind::User => child.eth_address,
+            Some(_) => return ControlReply::Rejected(RejectCode::Unauthorized),
+            None => return ControlReply::Rejected(RejectCode::NotFound),
+        };
+        let node_id = signed.origin.as_str();
+        let new_address = register.address;
+
+        // Anchor is write-once; only an ETH-authorized proof may set or change
+        // it. Registration is verified against the new address; rotation against
+        // the incumbent.
+        let verified = match incumbent {
+            None => register.proof.verify_registration(node_id, &new_address),
+            Some(old) => register.proof.verify_rotation(node_id, &old, &new_address),
+        };
+        if verified.is_err() {
+            self.audit(serde_json::json!({
+                "ts": now,
+                "event": "register-eth-address",
+                "child": signed.origin.to_string(),
+                "outcome": "rejected",
+                "reason": "eth-proof",
+                "was_rotation": incumbent.is_some(),
+            }));
+            return ControlReply::Rejected(RejectCode::Unauthorized);
+        }
+
+        if let Err(err) = self
+            .record
+            .set_child_eth_address(signed.origin.as_str(), new_address)
+        {
+            return ControlReply::Rejected(map_record_error(&err));
+        }
+        if self.record.save().is_err() {
+            return ControlReply::Rejected(RejectCode::Internal);
+        }
+        self.audit(serde_json::json!({
+            "ts": now,
+            "event": "register-eth-address",
+            "child": signed.origin.to_string(),
+            "outcome": "accepted",
+            "action": if incumbent.is_some() { "rotation" } else { "registration" },
+            "address": cawala_eth::bytes_to_hex_lower(&new_address),
         }));
         ControlReply::Accepted
     }
@@ -7277,5 +7375,278 @@ mod tests {
         );
         assert_eq!(engine.record().parent.as_ref().unwrap().parent_id, "parent");
         assert_eq!(engine.record().address, Some(approval.address));
+    }
+
+    // -----------------------------------------------------------------------
+    // P2c-B: ETH anchor registration (variant 24) + R1b capabilities (23)
+    // -----------------------------------------------------------------------
+
+    /// A fixed-seed secp256k1 key for the ETH anchor tests.
+    fn eth_key(seed: u8) -> cawala_eth::SigningKey {
+        cawala_eth::signing_key_from_bytes(&[seed; 32]).expect("valid eth scalar")
+    }
+
+    fn eth_address(key: &cawala_eth::SigningKey) -> [u8; 20] {
+        cawala_eth::address_from_signing_key(key)
+    }
+
+    /// A fresh registration request proving control of `key`'s address.
+    fn registration_request(node_id: &str, key: &cawala_eth::SigningKey) -> RegisterEthAddress {
+        let address = eth_address(key);
+        let digest = cawala_eth::eth_registration_digest(node_id, &address);
+        RegisterEthAddress {
+            address,
+            proof: cawala_eth::EthProof {
+                signature: cawala_eth::sign_digest(key, &digest).expect("sign"),
+                old_address: None,
+            },
+        }
+    }
+
+    /// A rotation request authorized by `old_key`, moving to `new_key`'s address.
+    fn rotation_request(
+        node_id: &str,
+        old_key: &cawala_eth::SigningKey,
+        new_key: &cawala_eth::SigningKey,
+    ) -> RegisterEthAddress {
+        let old_address = eth_address(old_key);
+        let new_address = eth_address(new_key);
+        let digest = cawala_eth::eth_rotation_digest(node_id, &old_address, &new_address);
+        RegisterEthAddress {
+            address: new_address,
+            proof: cawala_eth::EthProof {
+                signature: cawala_eth::sign_digest(old_key, &digest).expect("sign"),
+                old_address: Some(old_address),
+            },
+        }
+    }
+
+    /// A parent engine with a single `User` child `"browser"` in slot 5.
+    fn eth_engine(dir: &std::path::Path) -> (ControlNode, OperatorSecretKey) {
+        let parent_op = secret(1);
+        let user_op = secret(2);
+        let record = record_store(
+            dir,
+            "parent",
+            Some("0"),
+            None,
+            &[("browser", ChildKind::User, 5, 7)],
+        );
+        let peers = [user_peer("browser", &user_op)];
+        (
+            engine_with(dir, "parent", parent_op, record, &peers),
+            user_op,
+        )
+    }
+
+    #[tokio::test]
+    async fn register_eth_address_registers_once_and_rejects_replay_and_bad_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, user_op) = eth_engine(dir.path());
+        let key = eth_key(0x11);
+        let addr = eth_address(&key);
+
+        // A wrong registration proof (signed over a different node id) is
+        // refused and writes nothing.
+        let mut wrong = registration_request("browser", &key);
+        wrong.proof.signature = cawala_eth::sign_digest(
+            &key,
+            &cawala_eth::eth_registration_digest("other-node", &addr),
+        )
+        .unwrap();
+        let signed = authorize_at(
+            "browser",
+            &user_op,
+            1,
+            ControlRequest::RegisterEthAddress(wrong),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+        assert_eq!(engine.record().children[0].eth_address, None);
+
+        // A correct registration is accepted and persisted.
+        let signed = authorize_at(
+            "browser",
+            &user_op,
+            2,
+            ControlRequest::RegisterEthAddress(registration_request("browser", &key)),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed.clone(), 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(
+            RecordStore::open(dir.path(), "parent")
+                .unwrap()
+                .child_eth_address("browser"),
+            Some(addr),
+            "the anchor must be persisted to node.json"
+        );
+
+        // Replaying the exact same frame is refused by the nonce guard.
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Rejected(RejectCode::Replay)
+        );
+    }
+
+    #[tokio::test]
+    async fn register_eth_address_rotation_is_authorized_only_by_the_incumbent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, user_op) = eth_engine(dir.path());
+        let old_key = eth_key(0x11);
+        let new_key = eth_key(0x22);
+        let old_addr = eth_address(&old_key);
+        let new_addr = eth_address(&new_key);
+
+        // Register the incumbent.
+        let signed = authorize_at(
+            "browser",
+            &user_op,
+            1,
+            ControlRequest::RegisterEthAddress(registration_request("browser", &old_key)),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+
+        // The anchor-swap bypass: a rotation proof signed by the NEW
+        // (non-incumbent) key must be refused; the anchor is unchanged.
+        let digest = cawala_eth::eth_rotation_digest("browser", &old_addr, &new_addr);
+        let swap = RegisterEthAddress {
+            address: new_addr,
+            proof: cawala_eth::EthProof {
+                signature: cawala_eth::sign_digest(&new_key, &digest).unwrap(),
+                old_address: Some(old_addr),
+            },
+        };
+        let signed = authorize_at(
+            "browser",
+            &user_op,
+            2,
+            ControlRequest::RegisterEthAddress(swap),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+        assert_eq!(engine.record().children[0].eth_address, Some(old_addr));
+
+        // Write-once: a registration-form proof (no `old_address`) while an
+        // incumbent exists is refused.
+        let signed = authorize_at(
+            "browser",
+            &user_op,
+            3,
+            ControlRequest::RegisterEthAddress(registration_request("browser", &new_key)),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+
+        // The incumbent authorizes the rotation.
+        let signed = authorize_at(
+            "browser",
+            &user_op,
+            4,
+            ControlRequest::RegisterEthAddress(rotation_request("browser", &old_key, &new_key)),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Accepted
+        );
+        assert_eq!(
+            RecordStore::open(dir.path(), "parent")
+                .unwrap()
+                .child_eth_address("browser"),
+            Some(new_addr)
+        );
+    }
+
+    #[tokio::test]
+    async fn register_eth_address_requires_a_user_child_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_op = secret(1);
+        let node_op = secret(3);
+        let user_op = secret(2);
+        let record = record_store(
+            dir.path(),
+            "parent",
+            Some("0"),
+            None,
+            &[("nodekid", ChildKind::Node, 3, 1)],
+        );
+        // `nodekid` is a Node child; `browser` is a registered user peer that is
+        // *not* a child of this parent.
+        let peers = [
+            node_peer("nodekid", &node_op, 9),
+            user_peer("browser", &user_op),
+        ];
+        let mut engine = engine_with(dir.path(), "parent", parent_op, record, &peers);
+        let key = eth_key(0x11);
+
+        // A non-`User` child origin is refused.
+        let signed = authorize_at(
+            "nodekid",
+            &node_op,
+            1,
+            ControlRequest::RegisterEthAddress(registration_request("nodekid", &key)),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+
+        // A registered peer that is not a child is `NotFound`.
+        let signed = authorize_at(
+            "browser",
+            &user_op,
+            2,
+            ControlRequest::RegisterEthAddress(registration_request("browser", &key)),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Rejected(RejectCode::NotFound)
+        );
+
+        // An unknown origin cannot even authenticate.
+        let ghost_op = secret(8);
+        let signed = authorize_at(
+            "ghost",
+            &ghost_op,
+            3,
+            ControlRequest::RegisterEthAddress(registration_request("ghost", &key)),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Rejected(RejectCode::Unauthorized)
+        );
+    }
+
+    #[tokio::test]
+    async fn capabilities_reply_advertises_the_node_client_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = record_store(dir.path(), "parent", Some("0"), None, &[]);
+        let mut engine = engine_with(dir.path(), "parent", secret(1), record, &[]);
+        let op = secret(9);
+        let signed = authorize_at(
+            "some-client",
+            &op,
+            1,
+            ControlRequest::Capabilities(cawala_control::Capabilities {
+                client_api_version: 1,
+            }),
+        );
+        assert_eq!(
+            engine.receive_at(any_remote(), signed, 0).await,
+            ControlReply::Capabilities(NodeCapabilities {
+                client_api_version: NODE_CLIENT_API_VERSION,
+                features: NODE_FEATURE_ETH_IDENTITY,
+            })
+        );
     }
 }

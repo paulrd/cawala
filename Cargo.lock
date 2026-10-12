@@ -412,6 +412,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "cawala-control",
+ "cawala-eth",
  "cawala-ledger",
  "cawala-msg",
  "cawala-proto",

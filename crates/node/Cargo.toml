@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.86"
 blake3 = "1.8"
 cawala-control = { path = "../control" }
+cawala-eth = { path = "../eth", default-features = false }
 cawala-ledger = { path = "../ledger" }
 cawala-msg = { path = "../msg" }
 cawala-topology = { path = "../topology" }

@@ -26,9 +26,13 @@
 
 use std::fmt;
 
-use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
+use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
+
+/// Re-export of the secp256k1 signing key so consumers of this crate's public
+/// signing functions can name the type without a direct `k256` dependency.
+pub use k256::ecdsa::SigningKey;
 
 #[cfg(feature = "bip39")]
 use coins_bip32::path::DerivationPath;
@@ -41,6 +45,7 @@ use cawala_ledger::PaymentOrder;
 use proto::OctAddr;
 
 /// BIP-44 coin type for Ethereum (`60'`).
+#[cfg(feature = "bip39")]
 const ETH_COIN_TYPE: u32 = 60;
 /// BIP-32 hardened-offset bit (`2^31`).
 pub const HARDENED: u32 = 0x8000_0000;
@@ -68,6 +73,21 @@ pub const EIP712_DOMAIN_TYPE: &str = "EIP712Domain(string name,string version,ui
 /// (`from ‖ to ‖ amount ‖ nonce ‖ expiry`) plus the payee's [`OctAddr`], and
 /// nothing else (`msg_id`/`ttl` are never authorization inputs).
 pub const ORDER_EIP712_TYPE: &str = "CawalaOrder(bytes32 orderHash,string payeeAddr)";
+
+/// EIP-712 type string for the **registration** challenge.
+///
+/// Binds the registering node id to the new address; the proof is verified
+/// against that new address (proof of control).
+pub const ETH_REGISTRATION_EIP712_TYPE: &str =
+    "CawalaEthRegistration(string nodeId,address newAddress)";
+
+/// EIP-712 type string for the **rotation** challenge.
+///
+/// Binds the node id, the incumbent address, and the new address. The proof is
+/// verified against the **incumbent** address (the old key authorizes the
+/// change); the new key may optionally co-sign.
+pub const ETH_ROTATION_EIP712_TYPE: &str =
+    "CawalaEthRotation(string nodeId,address oldAddress,address newAddress)";
 
 /// `n/2` for secp256k1: the boundary above which an ECDSA `s` is "high".
 ///
@@ -114,6 +134,13 @@ pub enum EthError {
         /// The address actually recovered from the signature.
         recovered: [u8; 20],
     },
+    /// A fresh **registration** proof carried an `old_address`; only a rotation
+    /// may name an incumbent. A registration must be verified against the new
+    /// address alone.
+    RegistrationCarriesOldAddress,
+    /// A **rotation** proof's `old_address` does not name the incumbent anchor;
+    /// the old key must authorize the change.
+    RotationIncumbentMismatch,
 }
 
 impl fmt::Display for EthError {
@@ -133,6 +160,12 @@ impl fmt::Display for EthError {
             } => write!(f, "{what} must be {expected} bytes, got {got}"),
             EthError::AddressMismatch { .. } => {
                 write!(f, "recovered address does not match the claimed address")
+            }
+            EthError::RegistrationCarriesOldAddress => {
+                write!(f, "a registration proof must not carry an old address")
+            }
+            EthError::RotationIncumbentMismatch => {
+                write!(f, "rotation proof does not name the incumbent anchor")
             }
         }
     }
@@ -344,6 +377,56 @@ fn chain_id_to_u256_be(chain_id: u64) -> [u8; 32] {
     out
 }
 
+/// ABI-encode a `string` EIP-712 field: `keccak256(utf8 bytes)`.
+fn abi_encode_string(value: &str) -> [u8; 32] {
+    keccak256(value.as_bytes())
+}
+
+/// ABI-encode an `address` EIP-712 field: left-padded to 32 bytes.
+fn abi_encode_address(address: &[u8; 20]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[12..].copy_from_slice(address);
+    out
+}
+
+/// The canonical EIP-712 digest a user signs (and the node recovers) to
+/// **register** a fresh Ethereum anchor.
+///
+/// Binds the node id and the new address under the Cawala domain separator.
+/// The proof is verified against `new_address` (proof of control): the browser
+/// signs this digest and the node requires `ecrecover == new_address`.
+#[must_use]
+pub fn eth_registration_digest(node_id: &str, new_address: &[u8; 20]) -> [u8; 32] {
+    let type_hash = keccak256(ETH_REGISTRATION_EIP712_TYPE.as_bytes());
+    let mut fields = Vec::with_capacity(64);
+    fields.extend_from_slice(&abi_encode_string(node_id));
+    fields.extend_from_slice(&abi_encode_address(new_address));
+    let struct_hash = eip712_hash_struct(&type_hash, &fields);
+    eip712_digest(&cawala_domain_separator(), &struct_hash)
+}
+
+/// The canonical EIP-712 digest a user signs (and the node recovers) to
+/// **rotate** an existing Ethereum anchor.
+///
+/// Binds the node id, the incumbent address, and the new address. The proof is
+/// verified against `old_address` (the **incumbent**): an operator key thief
+/// holding only the transport seed cannot rotate the anchor, because it lacks
+/// the old key. The new key may optionally co-sign over the same digest.
+#[must_use]
+pub fn eth_rotation_digest(
+    node_id: &str,
+    old_address: &[u8; 20],
+    new_address: &[u8; 20],
+) -> [u8; 32] {
+    let type_hash = keccak256(ETH_ROTATION_EIP712_TYPE.as_bytes());
+    let mut fields = Vec::with_capacity(96);
+    fields.extend_from_slice(&abi_encode_string(node_id));
+    fields.extend_from_slice(&abi_encode_address(old_address));
+    fields.extend_from_slice(&abi_encode_address(new_address));
+    let struct_hash = eip712_hash_struct(&type_hash, &fields);
+    eip712_digest(&cawala_domain_separator(), &struct_hash)
+}
+
 /// Sign a 32-byte prehash, returning a canonical 65-byte `r || s || v`.
 ///
 /// `v` is the Ethereum-style recovery byte (`27` or `28`). The signature is
@@ -529,6 +612,59 @@ pub struct EthProof {
     pub signature: [u8; 65],
     /// The incumbent address for a rotation; `None` for a fresh registration.
     pub old_address: Option<[u8; 20]>,
+}
+
+impl EthProof {
+    /// Verify a **fresh registration** proof for `node_id` against the new
+    /// address.
+    ///
+    /// Rejects a proof that names an `old_address` (only a rotation may) and a
+    /// signature that recovers to anything other than `new_address`.
+    pub fn verify_registration(
+        &self,
+        node_id: &str,
+        new_address: &[u8; 20],
+    ) -> Result<(), EthError> {
+        if self.old_address.is_some() {
+            return Err(EthError::RegistrationCarriesOldAddress);
+        }
+        let digest = eth_registration_digest(node_id, new_address);
+        let recovered = recover_address(&digest, &self.signature)?;
+        if recovered == *new_address {
+            Ok(())
+        } else {
+            Err(EthError::AddressMismatch {
+                expected: *new_address,
+                recovered,
+            })
+        }
+    }
+
+    /// Verify a **rotation** proof for `node_id` against the incumbent anchor.
+    ///
+    /// The proof's `old_address` must equal `incumbent` and the signature must
+    /// recover to `incumbent` over the rotation challenge; this is what stops an
+    /// operator-key-only assertion from swapping the anchor.
+    pub fn verify_rotation(
+        &self,
+        node_id: &str,
+        incumbent: &[u8; 20],
+        new_address: &[u8; 20],
+    ) -> Result<(), EthError> {
+        if self.old_address != Some(*incumbent) {
+            return Err(EthError::RotationIncumbentMismatch);
+        }
+        let digest = eth_rotation_digest(node_id, incumbent, new_address);
+        let recovered = recover_address(&digest, &self.signature)?;
+        if recovered == *incumbent {
+            Ok(())
+        } else {
+            Err(EthError::AddressMismatch {
+                expected: *incumbent,
+                recovered,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -794,6 +930,89 @@ mod tests {
             signature: sign_digest(&key, &digest).expect("sign"),
         };
         assert_eq!(identity.verify_for(&digest), Ok(()));
+    }
+
+    #[test]
+    fn registration_digest_binds_node_and_new_address() {
+        let key = signing_key_from_bytes(&[0x11; 32]).expect("valid scalar");
+        let address = address_from_signing_key(&key);
+        let node_id = "node-alpha";
+
+        let digest = eth_registration_digest(node_id, &address);
+        assert_eq!(digest, eth_registration_digest(node_id, &address));
+        // The node id and the new address are both bound.
+        assert_ne!(digest, eth_registration_digest("node-beta", &address));
+        assert_ne!(digest, eth_registration_digest(node_id, &[0xff; 20]));
+
+        let proof = EthProof {
+            signature: sign_digest(&key, &digest).expect("sign"),
+            old_address: None,
+        };
+        assert_eq!(proof.verify_registration(node_id, &address), Ok(()));
+
+        // Wrong node id / wrong claimed address are rejected.
+        assert!(proof.verify_registration("node-beta", &address).is_err());
+        assert!(matches!(
+            proof.verify_registration(node_id, &[0xff; 20]),
+            Err(EthError::AddressMismatch { .. })
+        ));
+        // A registration proof must not carry an old address.
+        let carries_old = EthProof {
+            old_address: Some(address),
+            ..proof.clone()
+        };
+        assert_eq!(
+            carries_old.verify_registration(node_id, &address),
+            Err(EthError::RegistrationCarriesOldAddress)
+        );
+    }
+
+    #[test]
+    fn rotation_digest_is_authorized_by_the_incumbent() {
+        // The incumbent key authorizes a rotation to a new address.
+        let old_key = signing_key_from_bytes(&[0x11; 32]).expect("valid scalar");
+        let new_key = signing_key_from_bytes(&[0x22; 32]).expect("valid scalar");
+        let old_address = address_from_signing_key(&old_key);
+        let new_address = address_from_signing_key(&new_key);
+        let node_id = "node-alpha";
+
+        let digest = eth_rotation_digest(node_id, &old_address, &new_address);
+        assert_eq!(
+            digest,
+            eth_rotation_digest(node_id, &old_address, &new_address)
+        );
+        assert_ne!(digest, eth_registration_digest(node_id, &new_address));
+
+        let proof = EthProof {
+            signature: sign_digest(&old_key, &digest).expect("sign"),
+            old_address: Some(old_address),
+        };
+        assert_eq!(
+            proof.verify_rotation(node_id, &old_address, &new_address),
+            Ok(())
+        );
+
+        // The anchor-swap bypass: a proof signed by the NEW (non-incumbent) key
+        // over the rotation challenge must be rejected as non-incumbent.
+        let swap = EthProof {
+            signature: sign_digest(&new_key, &digest).expect("sign"),
+            old_address: Some(old_address),
+        };
+        assert!(matches!(
+            swap.verify_rotation(node_id, &old_address, &new_address),
+            Err(EthError::AddressMismatch { .. })
+        ));
+
+        // A proof whose `old_address` does not name the incumbent is rejected
+        // before any recovery.
+        let wrong_incumbent = EthProof {
+            old_address: Some(new_address),
+            ..proof
+        };
+        assert_eq!(
+            wrong_incumbent.verify_rotation(node_id, &old_address, &new_address),
+            Err(EthError::RotationIncumbentMismatch)
+        );
     }
 
     #[test]
