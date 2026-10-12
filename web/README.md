@@ -55,6 +55,11 @@ after any `crates/client-wasm` change**, or the JS/wasm arity can desync.
 `npm run build` and `npm run build:singlefile` use the **release** profile
 (`build:wasm:release`; ~6 MB vs ~24 MB debug).
 
+`npm test` covers the R1b capabilities handshake, the identity bundle **v2**
+export/import, the ETH-anchor rotation flow, and the leaf-key pin-trust state.
+The optional **passkey lock** (F5) is browser-only and verified manually - it
+needs a real platform authenticator.
+
 `npm run build:singlefile` writes **one** `dist-single/index.html` with all
 JS/CSS inlined and the wasm embedded as base64, initialized from **bytes** (no
 `file://` fetch). It then runs `scripts/check-singlefile.mjs` to assert
@@ -129,27 +134,48 @@ BIP-39 recovery phrase (`m/44'/60'/0'/0/0`; EIP-55 address). Derivation runs the
 wasm init; the UI under `components/identity/` never imports wasm itself.
 
 **Settings -> Your Account Identity** lets you **create** a new phrase (back it
-up + confirm) or **restore** an existing one (with an address preview). Because
-the same phrase also derives the browser's Ed25519 transport key (its iroh
-NodeId), **one phrase restores both the account and the transport identity on any
-host**. The derived secrets are persisted on-device - the transport seed in
-`cawala.identity.v1`, the ETH secret in `cawala.user-identity.v1` (both
-authoritative-local) - so a reload needs no unlock; the **phrase itself is never
-stored**.
+up + confirm), **restore** an existing one (with an address preview), or
+**rotate** the account to a new phrase. Rotation is authorized by the
+**incumbent** key (the current phrase signs the node's rotation challenge), so a
+holder of only the device's transport seed cannot move the anchor; the web
+enters or generates the new phrase and confirms the **address change**
+(before → after) before sending. The commit is **idempotent** (the signed frame
+is resent unchanged on a timeout and a `Replay` reply is reconciled as applied),
+so a lost reply cannot leave the local key and the node's anchor out of sync; the
+new derived secret is persisted only on success. Because the same phrase also
+derives the browser's Ed25519 transport key (its iroh NodeId), **one phrase
+restores both the account and the transport identity on any host**. The derived
+secrets are persisted on-device - the transport seed in `cawala.identity.v1`, the
+ETH secret in `cawala.user-identity.v1` (both authoritative-local) - so a reload
+needs no unlock; the **phrase itself is never stored**.
 
-The **passkey panel** (WebAuthn unlock) is shown only on a **secure origin**
-(`https`/`localhost`). On `file://` it is **hidden**, because `file://` has no
-WebAuthn origin, and the phrase is the only unlock path. The WebAuthn PRF
-key-wrap backend is still deferred (`PASSKEY_BACKEND_READY = false`), so passkey
-actions report honestly as unavailable; a passkey is an **unlock factor, never a
-signer** (P-256 ≠ secp256k1).
+The **passkey panel** (optional WebAuthn unlock lock) is shown only on a
+**secure origin** (`https`/`localhost`); on `file://` it is **hidden** because
+`file://` has no WebAuthn origin, and the phrase is the only unlock path. Setup
+creates a passkey with the **PRF extension**, runs the PRF result through
+HKDF-SHA256 into an AES-256-GCM key that wraps the stored secp256k1 secret, and
+removes the plaintext secret from `cawala.user-identity.v1` (record **v3**). A
+locked device installs nothing at boot until a passkey unlock or a phrase restore;
+support is feature-detected (no weaker gate-only fallback) and the panel renders
+`checking` / `unsupported` / `setup` / `locked` / `unlocked`. A passkey is an
+**unlock factor, never a signer** (P-256 ≠ secp256k1); the recovery phrase is
+always the recovery path.
 
-**Settings -> Identity Portability** separately exports/imports the legacy
-passphrase-encrypted `IdentityBundleV1` (PBKDF2-SHA-256 600k + AES-256-GCM)
-carrying the 32-byte transport seed plus the secret-free join/ledger state - use
-it to move an existing install's transport seed. The mnemonic remains the
+**Settings -> Identity Portability** separately exports/imports the
+passphrase-encrypted **identity bundle v2** (PBKDF2-SHA-256 600k + AES-256-GCM,
+`nodeId` bound as AAD). It carries the 32-byte transport seed, the derived
+secp256k1 secret + EIP-55 address (so importing on a new device restores the same
+account), and the secret-free join/ledger state. A legacy **v1** bundle still
+imports (transport seed + blobs, no ETH identity). The mnemonic remains the
 portable account credential. Concurrent use of one identity on two devices is
 **not** prevented; run one device at a time.
+
+The **Leaf Ledger Trust** card (Settings) shows the routing leaf's pinned ledger
+key and its trust state. Pinning is **fail-closed**: a key pinned on first use is
+`unconfirmed` and does not count as established trust until you press **Confirm
+this leaf key**; a *different* key presented for an already-pinned leaf is shown
+as a pin-change warning and is never adopted (the existing pin stays in force).
+Confirmation is written back to the persisted ledger state and survives a reload.
 
 ## Node client API (R1b)
 

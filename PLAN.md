@@ -208,26 +208,42 @@
     carries `admins`; `ControlReply::Capabilities` is discriminant 9); ledger
     entry format 4; node on-disk ledger meta format 3; settlement payload 3;
     browser ledger payload 3 + **v4** (the browser sends V4 `OrderV4` with an
-    `EthIdentity`; it still receives V3 `OrderResult`); browser ledger state 4;
-    browser local state 1.
+    `EthIdentity`; it still receives V3 `OrderResult`); browser ledger state
+    **5**; browser local state 1; user-identity record **3**; portable identity
+    bundle **2**.
   - Browser storage keys. **Authoritative-local** (never discard):
     `cawala.identity.v1` (the Ed25519 transport seed; mnemonic-derived on new
     installs, a legacy random seed is preserved) and `cawala.user-identity.v1`
     (the R3 record: EIP-55 address + the derived secp256k1 secret used to sign
-    V4 orders; the **mnemonic is never stored**), plus the TOFU anchor fields
-    `pinned_ledger`/`pinned_leaf_keys` carried inside `cawala.ledger.v1`.
+    V4 orders; the **mnemonic is never stored**; **v3** adds the optional
+    passkey wrap `{credentialId, salt, iv, ct}` and allows the plaintext secret
+    to be absent while the passkey lock is engaged - v2 records still import),
+    plus the TOFU anchor fields `pinned_ledger`/`pinned_leaf_keys` carried inside
+    `cawala.ledger.v1`.
     **Best-effort cache** (absence tolerated): `cawala.state.v1:<nodeId>` and
     `cawala.ledger.v1:<nodeId>`. **Non-authoritative local**: `cawala.recovery.v1`,
     `cawala.admin.policy.v1`, `cawala.value.pending.v1`.
+  - Leaf-key pinning is **fail-closed** (F6). A pin is only *established* trust
+    when explicitly confirmed: the routing pin installed from the authenticated
+    `JoinApproval.parent_ledger` is `confirmed`, a first-receipt trust-on-first-use
+    pin is `unconfirmed`, and a *different* key presented for an already-pinned
+    leaf is recorded as a change and never adopted. `pin_status()` reports the
+    aggregate (`none`/`unconfirmed`/`confirmed`/`changed`); `confirm_pin()` /
+    `confirmPin()` keeps the existing key, flips it `confirmed`, and persists.
+    Bumping the ledger state to v5 discards a v4 blob on import (fail-closed reset
+    to `unconfirmed`); the web preserves an unreadable blob at boot (boot-scoped)
+    but a later persist overwrites it.
   - Hard breaks: recreate `node-data` and rebuild the wasm bundle when a format
-    changes (control 9 / routed 2 / reply 6 / ledger payload v4 are the current
-    portable-client breaks).
+    changes (control 9 / routed 2 / reply 6 / ledger payload v4 / browser ledger
+    state v5 are the current portable-client breaks).
 
 # Portable-Client Refactor (R1 / R1b / R2 / R3)
-  The web app is made host-agnostic and identity-portable. Delivered on branch
-  `refactor/portable-client` (9 commits, not yet merged to `main`). The frozen
-  design is `.slim/deepwork/portable-client-refactor-spec.md` (Addenda A/B/C);
-  the phase log is `.slim/deepwork/portable-client-refactor.md`.
+  The web app is made host-agnostic and identity-portable. The base refactor
+  (R1 / R1b types / R2 / R3) was delivered on branch `refactor/portable-client`
+  and merged to `main` as PR #2 (`8ccab19`); the follow-up work (F1-F6) is on
+  branch `refactor/portable-client-followups` (6 commits, not yet merged). The
+  frozen design is `.slim/deepwork/portable-client-refactor-spec.md`
+  (Addenda A/B/C); the phase log is `.slim/deepwork/portable-client-refactor.md`.
   - **R1 - node as source of truth over a best-effort local cache.**
     localStorage is reclassified, not removed: the node is authoritative for
     account balance, ledger height, and admin/topology views (re-validated via
@@ -238,10 +254,10 @@
     read getters (`pending_orders`, `pinned_leaf_keys`, `pending_join_outbound`,
     `client_state_info`; extended `JoinStatus`, `LedgerStatusDto`,
     `SettlementRecordDto`) expose locally-held state without a wire change.
-  - **R1b - versioned node client API.** The node-read surface ships as the R1
-    getters, and the `Capabilities` handshake ships as control variant 23 +
-    `ControlReply::Capabilities` (discriminant 9, reply 6). The **client half**
-    (F1) sends variant 23 (`ClientNode::node_capabilities`, advertising
+  - **R1b - versioned node client API (complete).** The node-read surface ships
+    as the R1 getters, and both halves of the `Capabilities` handshake ship:
+    control variant 23 + `ControlReply::Capabilities` (discriminant 9, reply 6).
+    The **client half** (F1) sends variant 23 (`ClientNode::node_capabilities`, advertising
     `CLIENT_API_VERSION`) on boot (when joined) and after a successful join,
     mapping reply discriminant 9 to a `NodeCapabilitiesDto`
     (`available` / `clientApiVersion` / `features` / `supportsEthIdentity`). An
@@ -266,7 +282,28 @@
     **version-scoped** anchor gate: an anchored sender MUST use V4, V1/V2 orders
     are rejected (`apply_same_leaf_order`/`handle_settlement_order`, not the
     downstream forwarders). The derived secret is persisted; the **mnemonic is
-    never persisted**.
+    never persisted**. F2 adds end-to-end node integration tests
+    (`crates/node/tests/eth_identity.rs`) driving the real control transport for
+    registration + rotation (`Capabilities` reply included).
+  - **R3 follow-ups (F3/F4/F5).** The **portable identity bundle is v2**: it
+    carries the derived secp256k1 `ethSecretHex` + EIP-55 address alongside the
+    transport seed and blobs, so import re-keys the ETH identity on a new device
+    (v1 bundles still import - seed + blobs, no ETH identity; crypto unchanged:
+    PBKDF2-SHA-256 600k, AES-256-GCM, `nodeId` AAD). **Client anchor rotation**
+    is delivered: the incumbent key signs the node's rotation challenge, the new
+    key is adopted only on acceptance, and the commit is **idempotent** - the
+    signed frame is retained and resent unchanged on an ambiguous transport
+    failure, with a `Replay` reply to the unique nonce reconciled as applied, so
+    local and parent anchors cannot silently diverge. The web has a dedicated
+    rotate surface (enter or generate a phrase, address-diff confirm) and
+    persists the new secret only on success. **Optional passkey lock** is
+    delivered: a WebAuthn **PRF** result is run through HKDF-SHA256 into an
+    AES-256-GCM wrap key over the stored secp256k1 secret; enrolling moves the
+    user-identity record to **v3** (wrap present, plaintext secret removed) so a
+    locked boot installs nothing until a passkey unlock or phrase restore. The
+    passkey is an unlock factor, never a signer (P-256 ≠ secp256k1); support is
+    feature-detected with no weaker gate-only fallback; the recovery phrase
+    remains the only recovery path.
   - **R2 - dual-target packaging.** Wasm is built **release**; a single-file
     `dist-single/index.html` inlines all JS/CSS + base64 wasm and initializes
     from **bytes** (never `instantiateStreaming` on `file://`). On `file://` the
@@ -276,9 +313,12 @@
     hosts (see `DEPLOYMENT.md` for the CSP caveat).
   - **Accepted limits:** ETH authorization is not embedded in the frozen ledger
     `Entry`, so audit/replay of authorization is only verifiable at the live
-    parent (an `ENTRY_FORMAT_VERSION` break is deferred). Passkey unlock (WebAuthn
-    PRF key-wrap) is deferred - a passkey is an unlock factor, never a signer
-    (P-256 ≠ secp256k1). Client-side anchor rotation is deferred.
+    parent (an `ENTRY_FORMAT_VERSION` break is deferred). Pre-anchor squatting:
+    before a child's anchor exists, any holder of that child's transport key may
+    register their own ETH address for it (first-writer TOFU); the rotation rules
+    protect an *existing* anchor, not the initial registration. The atomicity
+    guarantee covers the rotation commit only; a definitive rejection leaves the
+    incumbent in place. See the F6 notes above for the pin-trust limits.
   - **Identity/deployment decisions:** identity is user/browser-level only (nodes
     and iroh NodeIds stay Ed25519); derived secrets are persisted on-device
     unencrypted so a reload needs no unlock, and the mnemonic (off-device
@@ -295,15 +335,20 @@
     + simplified nav, P5 docs consolidation (R2).
   - Shipped as **one lockstep release** (the format/routed changes do not
     interoperate with the old wasm/web).
-  - **Portable-client refactor (R1 / R1b / R2 / R3) is delivered on branch
-    `refactor/portable-client`** (9 commits; not yet merged). Wire: control
-    format 9, reply 6, ledger payload v4. This is the next lockstep release.
+  - **Portable-client refactor base (R1 / R1b / R2 / R3) is delivered on
+    `refactor/portable-client` and merged to `main`** (PR #2, `8ccab19`); the
+    follow-ups (F1 R1b client handshake, F2 node integration tests, F3 identity
+    bundle v2, F4 anchor rotation, F5 passkey lock, F6 fail-closed pinning) are
+    delivered on `refactor/portable-client-followups` (not yet merged). Wire:
+    control format 9, reply 6, ledger payload v4, browser ledger state v5. This
+    is the next lockstep release.
   - Deferred / settled backlog: control version negotiation (single lockstep
     codebase); no `OctAddr` depth cap; foster-parent recovery cut; moved
     pointers rejected; signed topology/registry distribution rejected; browser
-    create-child deferred (provisioning stays invite/CLI); portable-client
-    follow-ups (passkey PRF unlock, client anchor rotation, auto-pin hard
-    fail-closed needs a node change).
+    create-child deferred (provisioning stays invite/CLI); leaf-key pinning
+    follow-ups (a receive-URI re-pin replaces a leaf pin without recording a
+    change; the boot preservation of an unreadable blob is boot-scoped only;
+    only the routing-leaf pin has a confirm action in the trust card).
 
 # Administration Refactor Requirements (R1-R9 intent)
   1. **R1 - all admin is tree-routed.** Every admin exchange (`AdminQuery`,
@@ -415,13 +460,22 @@
       unencrypted (transport seed + ETH secret) so a reload needs no unlock; the
       mnemonic is the root of trust and is **never persisted**. The transport
       Ed25519 key is mnemonic-derived only when no stored seed exists; a legacy
-      seed is preserved. Passkey is an unlock factor, never a signer. (2026-10-12.)
+      seed is preserved. An **optional passkey lock** (WebAuthn PRF →
+      HKDF-SHA256 → AES-256-GCM key-wrap) can seal the ETH secret on-device;
+      passkey is an unlock factor, never a signer. The portable identity bundle
+      is **v2** and carries the derived ETH secret/address (v1 still imports).
+      (2026-10-12; passkey lock + bundle v2 added 2026-10-12 follow-ups.)
   13. **Packaging/deployment**: the served deployment stays the multi-asset
       `dist/`; `dist-single/index.html` is a distributable single file for
       `file://`/zip/email/header-less hosts. Do not serve `dist-single` under a
       host CSP that lacks `script-src 'unsafe-inline'` (header + meta CSP
       intersect and blank the inline bundle). On `file://` passkeys and service
       workers are unavailable (mnemonic unlock only). (2026-10-12.)
+  14. **Leaf-key pinning is fail-closed**: a pin is only established trust when
+      explicitly confirmed; a first-receipt TOFU pin is `unconfirmed` and a
+      different key presented for a pinned leaf is recorded (never adopted).
+      `LEDGER_STATE_VERSION` 5 resets old v4 blobs to `unconfirmed` so the user
+      re-confirms. (2026-10-12, F6.)
 
 ## Superseded (recorded for history)
   - **Seniority rule** (earliest `date_joined` = most senior, senior child

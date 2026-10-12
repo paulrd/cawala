@@ -18,18 +18,32 @@ how to verify, and conventions**. Detail lives elsewhere:
 
 ## Next session brief
 
-The **portable-client refactor (R1 / R1b / R2 / R3) is DONE and gated on branch
-`refactor/portable-client`** (9 commits, not yet merged to `main`). It makes the
+The **portable-client refactor base (R1 / R1b types / R2 / R3) is DONE, gated,
+merged to `main` (PR #2, `8ccab19`)**. It makes the
 web app host-agnostic and identity-portable: localStorage is a best-effort cache
 with the node as source of truth (R1); a user-level secp256k1/BIP-39 identity
 whose transport Ed25519 key is mnemonic-derived, with a shared EIP-712 `EthIdentity`
 carried in a new `LedgerPayloadV4`/`OrderV4` and a write-once, ETH-authorized
 `ChildEntry.eth_address` anchor enforced fail-closed at the direct parent (R3);
 and dual-target packaging - a self-contained `dist-single/index.html` for
-`file://`/zip/email alongside the served multi-asset `dist/` (R2). Next: merge
-when ready (a lockstep wire break: control 9, reply 6, ledger payload v4), then
-the follow-ups below. The frozen design is
-`.slim/deepwork/portable-client-refactor-spec.md`.
+`file://`/zip/email alongside the served multi-asset `dist/` (R2). The frozen
+design is `.slim/deepwork/portable-client-refactor-spec.md` (Addenda A/B/C).
+
+The **follow-ups (F1-F6) are DONE and gated on branch
+`refactor/portable-client-followups`** (6 commits, not yet merged to `main`,
+lockstep with the base: control 9, reply 6, ledger payload v4, browser ledger
+state 5):
+
+- `eee955c` R1b client capabilities handshake (F1)
+- `fcc9116` end-to-end ETH identity node integration tests (F2)
+- `127a8bd` identity bundle v2 carries the derived ETH secret/address (F3)
+- `2057c3b` incumbent-authorized, idempotent ETH-anchor rotation (F4)
+- `1889a3d` optional passkey (WebAuthn PRF) unlock lock (F5)
+- `f30f33b` fail-closed leaf-key pinning (F6)
+
+Next: merge when ready (a lockstep wire break: control 9, reply 6, ledger payload
+v4, browser ledger state 5), then the deferred items in "Open items" below. The
+phase log is `.slim/deepwork/portable-client-refactor.md`.
 
 The **administration refactor (P1–P5) is DONE, gated, merged to `main`, and
 pushed** (`ec31535`), plus a follow-up **value simplification** (`871e4d5`):
@@ -51,7 +65,7 @@ On `main`, next: the optional backlog in "Open items" below (notably the final
 
 ## Current state
 
-- **`refactor/portable-client` (9 commits, working tree clean; NOT merged):**
+- **`refactor/portable-client` base (merged to `main` as PR #2, `8ccab19`);**
   `1627114` wasm read getters → `f2fa30b` web best-effort cache → `848b457`
   BIP-39/secp256k1/EIP-712 primitives → `4712e33` shared `cawala-eth` crate +
   control v9 (`Capabilities` 23, `RegisterEthAddress` 24) + `LedgerPayloadV4` →
@@ -67,11 +81,31 @@ On `main`, next: the optional backlog in "Open items" below (notably the final
     derived secret persisted, mnemonic never stored.
   - **R2 delivered:** release wasm; `dist-single/index.html` (bytes-inlined wasm,
     no `file://` fetch); SW + passkey hidden on `file://`.
-  - **Deferred:** passkey PRF unlock (passkey is an unlock factor only); client
-    anchor rotation; R1b client-side `Capabilities` send; wasm auto-pin hard
-    fail-closed (needs a node-side change - today it only *surfaces*
-    not-established trust).
-- `main` is clean and pushed @ `871e4d5` (was `11d7717` before the refactor).
+- **`refactor/portable-client-followups` (6 commits, working tree clean; NOT
+  merged):** `eee955c` R1b client capabilities handshake → `fcc9116` node ETH
+  identity integration tests → `127a8bd` identity bundle v2 → `2057c3b` ETH-anchor
+  rotation (idempotent) → `1889a3d` optional passkey (PRF) lock → `f30f33b`
+  fail-closed leaf-key pinning.
+  - **F1 (R1b) delivered:** both halves of the `Capabilities` handshake; the
+    client sends variant 23 on boot (when joined) and after join, maps reply 9 to
+    `NodeCapabilitiesDto`, and the web gates ETH-anchor registration on
+    `NODE_FEATURE_ETH_IDENTITY` (graceful "unavailable" on an old node).
+  - **F2 delivered:** `crates/node/tests/eth_identity.rs` end-to-end registration
+    + rotation tests over the real control transport.
+  - **F3 delivered:** portable identity bundle **v2** carries the derived
+    secp256k1 secret + EIP-55 address (v1 still imports; crypto unchanged).
+  - **F4 delivered:** incumbent-authorized ETH-anchor rotation (client-wasm +
+    web), idempotent commit (retained frame, bounded resend, `Replay`
+    reconciled as applied); dedicated rotate surface (enter or generate a phrase,
+    address-diff confirm); new secret persisted only on success.
+  - **F5 delivered:** optional passkey lock (WebAuthn PRF → HKDF-SHA256 →
+    AES-256-GCM key-wrap; user-identity record v3; locked boot); passkey panel
+    states checking/unsupported/setup/locked/unlocked; passkey is an unlock
+    factor, never a signer.
+  - **F6 delivered:** fail-closed leaf-key pinning (`PinTrust`
+    unconfirmed/confirmed; `LEDGER_STATE_VERSION` 4→5); a different pinned key is
+    recorded (never adopted); web trust card confirm action + pin-change warning.
+- `main` is clean @ `8ccab19` (PR #2 merge; administrative refactor `871e4d5`).
 - **Administration refactor** (merged; the `refactor/topology-admin` branch was
   fast-forwarded in and deleted); P1–P5 done, gated:
   - Control wire: **control format 8** (mint 8; accept 7|8), **routed control 2**
@@ -109,15 +143,26 @@ On `main`, next: the optional backlog in "Open items" below (notably the final
 - **Control version negotiation — deferred** (single lockstep codebase).
 - **`OctAddr` depth cap** — deliberately not done.
 - **Moved pointers rejected; signed topology distribution rejected** (unchanged).
+- **Passkey lock (F5) is browser-only and manually verified** — no automated test
+  (WebAuthn PRF needs a real authenticator); the recovery phrase remains the only
+  recovery path.
+- **F6 pinning follow-ups still open:** a receive-URI re-pin (`pin_payee_leaf`)
+  replaces an existing leaf pin without recording a `LeafKeyChangeV1`; the boot
+  preservation of an unreadable ledger blob is boot-scoped (a later persist
+  overwrites it); the trust card confirms only the routing-leaf pin, while a
+  detected leaf-key change on any leaf flips the aggregate `pin_status().status`
+  to `changed`.
 
 ## Verify
 
-- `CARGO_BUILD_JOBS=1 cargo test --workspace`
+- `CARGO_BUILD_JOBS=1 cargo test --workspace` (includes F2
+  `crates/node/tests/eth_identity.rs`)
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo check -p cawala-client --target wasm32-unknown-unknown`
 - `cd web && npm run build` (now builds **release** wasm, then `vite build`)
 - `cd web && npm run build:singlefile` (-> `web/dist-single/index.html`, self-containment check)
-- `cd web && npm test`
+- `cd web && npm test` (covers F1 capabilities, F3 identity bundle v2, F4
+  rotation, F6 pin trust); F5 passkey is browser-only and manual.
 - Targeted node suites: `--test admin_authority`, `--test admin_state`,
   `--test local_admin_cli`, `--test control_admin`, `--test routed_control`,
   `--test settlement_transport`, `--test exit_rebase`, `--test edge_close`,
@@ -137,9 +182,10 @@ On `main`, next: the optional backlog in "Open items" below (notably the final
   format 3, settlement payload 3, browser ledger payload 3.
   `ROUTED_CONTROL_VERSION=2` drops the carried grant; there is no `admins.json`
   (replaced by `admin_state.json`).
-  On `refactor/portable-client` these become **control 9** (accept 7|8|9),
-  **reply 6**, and browser ledger payload **v4** — a lockstep break relative to
-  `main`.
+  On `refactor/portable-client` (now on `main`) and its follow-up branch these
+  become **control 9** (accept 7|8|9), **reply 6**, browser ledger payload
+  **v4**, and browser ledger state **v5** — a lockstep break relative to the
+  pre-refactor `main`.
 - `web/src/wasm/` is gitignored; run `npm run build:wasm` after any
   `crates/client-wasm` change or the JS/wasm arity can desync.
 - Control-plane local state under `<data-dir>`: `admin_state.json`,
