@@ -45,10 +45,14 @@ pub use envelope::{
 };
 pub use ledger_payload::{
     BalanceQueryV1, BalanceReceiptV1, LEDGER_PAYLOAD_V2_VERSION, LEDGER_PAYLOAD_V3_VERSION,
-    LEDGER_PAYLOAD_VERSION, LedgerPayloadError, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
-    MAX_RECEIPT_HISTORY, OrderRejectV1, OrderResultV1, OrderResultV2, OrderResultV3, OrderStatusV1,
-    OrderV1, OrderV2, SettlementStatusV2, ValueNoticeV1, VersionedLedgerPayload, decode_versioned,
+    LEDGER_PAYLOAD_V4_VERSION, LEDGER_PAYLOAD_VERSION, LedgerPayloadError, LedgerPayloadV1,
+    LedgerPayloadV2, LedgerPayloadV3, LedgerPayloadV4, MAX_RECEIPT_HISTORY, OrderRejectV1,
+    OrderResultV1, OrderResultV2, OrderResultV3, OrderStatusV1, OrderV1, OrderV2, OrderV4,
+    SettlementStatusV2, ValueNoticeV1, VersionedLedgerPayload, decode_versioned,
 };
+// The user's ETH identity type (address + EIP-712 signature), defined in the
+// shared crypto crate, re-exported here next to the wire type that carries it.
+pub use cawala_eth::EthIdentity;
 pub use proto::OctAddr;
 pub use replay::{Seen, SeenConfig, SeenSet};
 pub use route::{

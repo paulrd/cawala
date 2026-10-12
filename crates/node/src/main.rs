@@ -2032,6 +2032,10 @@ fn print_reply(reply: &ControlReply) {
             applied.entry_hash.to_hex(),
             applied.duplicate
         ),
+        ControlReply::Capabilities(capabilities) => println!(
+            "capabilities: client_api_version={} features={:#x}",
+            capabilities.client_api_version, capabilities.features
+        ),
     }
 }
 

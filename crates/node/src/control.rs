@@ -1020,6 +1020,12 @@ impl ControlNode {
             ControlRequest::AdminRevoke(change) => {
                 self.handle_admin_revoke(signed, change, now, route)
             }
+            // v9 wire types are added in P2c-A; the node-side handling (the
+            // `Capabilities` reply and the `RegisterEthAddress` anchor gate)
+            // lands in P2c-B. Until then, reject closed.
+            ControlRequest::Capabilities(_) | ControlRequest::RegisterEthAddress(_) => {
+                ControlReply::Rejected(RejectCode::BadRequest)
+            }
         };
         self.audit_request(signed, &reply, now);
         Handled::Reply(reply)
@@ -3648,6 +3654,7 @@ fn reply_outcome(reply: &ControlReply) -> String {
         ControlReply::AdminRejected(_) => "admin-rejected".to_string(),
         ControlReply::AdminLedgerSnapshot(_) => "admin-ledger-snapshot".to_string(),
         ControlReply::AdminValueApplied(_) => "admin-value-applied".to_string(),
+        ControlReply::Capabilities(_) => "capabilities".to_string(),
     }
 }
 
@@ -3893,6 +3900,7 @@ fn signed_kind(reply: &ControlReply) -> &'static str {
         ControlReply::AdminRejected(_) => "admin-rejected",
         ControlReply::AdminLedgerSnapshot(_) => "admin-ledger-snapshot",
         ControlReply::AdminValueApplied(_) => "admin-value-applied",
+        ControlReply::Capabilities(_) => "capabilities",
     }
 }
 
@@ -3965,6 +3973,7 @@ mod tests {
             kind: ChildKind::Node,
             slot,
             date_joined,
+            eth_address: None,
         }
     }
 

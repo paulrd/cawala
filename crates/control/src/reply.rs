@@ -36,9 +36,11 @@ pub const CONTROL_ALPN: &[u8] = b"cawala/control/0";
 /// (read-only ledger view), to 4 when
 /// [`ControlReply::AdminValueApplied`] was appended (delegated value ops), and to
 /// 5 when [`AdminSnapshot::admins`] was added (the node's designated
-/// administrator set). There is no on-wire reader pinned to this constant yet;
-/// it exists so a future reader can reject a mismatched frame up front.
-pub const CONTROL_REPLY_VERSION: u8 = 5;
+/// administrator set), and to 6 when [`ControlReply::Capabilities`] was appended
+/// (the R1b handshake; discriminant 9). There is no on-wire reader pinned to
+/// this constant yet; it exists so a future reader can reject a mismatched frame
+/// up front.
+pub const CONTROL_REPLY_VERSION: u8 = 6;
 
 /// The node's answer to one direct control request.
 ///
@@ -73,6 +75,24 @@ pub enum ControlReply {
     /// [`ControlRequest::AdminBurn`](crate::ControlRequest::AdminBurn): the
     /// applied (or duplicate) value operation (variant 8, reply version 4).
     AdminValueApplied(AdminValueApplied),
+    /// Reply to
+    /// [`ControlRequest::Capabilities`](crate::ControlRequest::Capabilities):
+    /// the node's advertised client API version and feature bits (variant 9,
+    /// reply version 6).
+    Capabilities(NodeCapabilities),
+}
+
+/// The node's advertised client capabilities, for the R1b handshake.
+///
+/// Field order is frozen: postcard encodes positionally. `client_api_version`
+/// is the node's versioned client API; `features` is a bitfield of optional
+/// capabilities. Both are advisory and never an authorization input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCapabilities {
+    /// The node's supported node-client API version.
+    pub client_api_version: u16,
+    /// Optional feature bits.
+    pub features: u64,
 }
 
 /// The outcome of a delegated issue/burn, for idempotent retries.
@@ -341,6 +361,10 @@ mod tests {
             }),
             ControlReply::AdminLedgerSnapshot(admin_ledger_snapshot()),
             ControlReply::AdminValueApplied(admin_value_applied()),
+            ControlReply::Capabilities(NodeCapabilities {
+                client_api_version: 1,
+                features: 0b11,
+            }),
         ]
     }
 
@@ -484,6 +508,31 @@ mod tests {
         let reply = ControlReply::AdminValueApplied(admin_value_applied());
         let bytes = postcard::to_allocvec(&reply).unwrap();
         assert_eq!(bytes[0], 8, "AdminValueApplied must stay discriminant 8");
+    }
+
+    #[test]
+    fn capabilities_reply_discriminant_is_frozen() {
+        let reply = ControlReply::Capabilities(NodeCapabilities {
+            client_api_version: 1,
+            features: 0b11,
+        });
+        let bytes = postcard::to_allocvec(&reply).unwrap();
+        assert_eq!(bytes[0], 9, "Capabilities must stay discriminant 9");
+    }
+
+    #[test]
+    fn capabilities_reply_golden_field_order() {
+        let capabilities = NodeCapabilities {
+            client_api_version: 7,
+            features: 0xdead_beef,
+        };
+        assert_postcard_field_order(
+            &capabilities,
+            &[
+                postcard::to_allocvec(&capabilities.client_api_version).unwrap(),
+                postcard::to_allocvec(&capabilities.features).unwrap(),
+            ],
+        );
     }
 
     #[test]

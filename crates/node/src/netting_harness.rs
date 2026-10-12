@@ -914,6 +914,7 @@ mod tests {
                 kind: ChildKind::Node,
                 slot: 1,
                 date_joined: 0,
+                eth_address: None,
             }],
             address_epoch: 0,
         };
@@ -930,6 +931,7 @@ mod tests {
                 kind: ChildKind::User,
                 slot: 3,
                 date_joined: 0,
+                eth_address: None,
             }],
             address_epoch: 0,
         };
@@ -1010,12 +1012,14 @@ mod tests {
                     kind: ChildKind::Node,
                     slot: 0,
                     date_joined: 0,
+                    eth_address: None,
                 },
                 record::ChildEntry {
                     child_id: child_b.to_string(),
                     kind: ChildKind::Node,
                     slot: 1,
                     date_joined: 0,
+                    eth_address: None,
                 },
             ];
             vec![

@@ -943,6 +943,16 @@ pub async fn dispatch_ledger_envelope(
                 "ignoring browser-directed v3 order result at a leaf node"
             );
         }
+        Ok(VersionedLedgerPayload::V4(_)) => {
+            // P2c-A adds the v4 wire type; the node-side fail-closed handling
+            // (downgrade resistance + ETH `ecrecover`/anchor gate in
+            // `apply_same_leaf_order`/`handle_settlement_order`) lands in P2c-B.
+            // Until then, do not apply an unverified v4 order.
+            tracing::warn!(
+                msg_id = %env.msg_id.to_hex(),
+                "ignoring v4 ledger payload: node-side handling not yet wired"
+            );
+        }
         Err(err) => {
             tracing::warn!(
                 msg_id = %env.msg_id.to_hex(),
@@ -3235,6 +3245,7 @@ mod tests {
                     kind,
                     slot,
                     date_joined: 0,
+                    eth_address: None,
                 })
                 .collect(),
             address_epoch: 0,

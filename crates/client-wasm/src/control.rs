@@ -914,6 +914,9 @@ fn reply_kind(reply: &ControlReply) -> &'static str {
         // P5 reply variant: the wasm DTO/mapping is P5c; this label arm only
         // keeps the match exhaustive after the control reply version bump.
         ControlReply::AdminValueApplied(_) => "admin-value-applied",
+        // R1b reply variant (v9): the wasm facade is P2b/P2-ui; this label arm
+        // only keeps the match exhaustive after the control reply version bump.
+        ControlReply::Capabilities(_) => "capabilities",
     }
 }
 

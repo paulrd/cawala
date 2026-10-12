@@ -387,6 +387,7 @@ mod tests {
             kind,
             slot,
             date_joined: 0,
+            eth_address: None,
         }
     }
 

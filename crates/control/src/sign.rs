@@ -45,37 +45,40 @@ use crate::request::ControlRequest;
 /// when [`ControlRequest::AdminDetachChild`] /
 /// [`ControlRequest::AdminMoveChild`] were appended, to 7 when
 /// [`ControlRequest::AdminIssue`] / [`ControlRequest::AdminBurn`] were
-/// appended, and to 8 when [`ControlRequest::AdminDesignate`] /
-/// [`ControlRequest::AdminRevoke`] were appended. Variants are only *additive*,
-/// so a v7 verifier parses every pre-existing variant identically;
-/// [`is_supported_control_version`] therefore accepts both 7 and 8 for rolling
-/// upgrades, and [`min_control_version`] is the per-request shape gate (a
-/// v8-only variant on a v7 declaration is `BadVersion`).
+/// appended, to 8 when [`ControlRequest::AdminDesignate`] /
+/// [`ControlRequest::AdminRevoke`] were appended, and to 9 when
+/// [`ControlRequest::Capabilities`] / [`ControlRequest::RegisterEthAddress`]
+/// were appended. Variants are only *additive*, so a v7/v8 verifier parses every
+/// pre-existing variant identically; [`is_supported_control_version`] therefore
+/// accepts 7, 8, and 9 for rolling upgrades, and [`min_control_version`] is the
+/// per-request shape gate (a v9-only variant on a v7/v8 declaration is
+/// `BadVersion`).
 ///
 /// # Dual-accept is inbound-only
 ///
-/// This build always **mints** frames at [`CONTROL_FORMAT_VERSION`] (8):
+/// This build always **mints** frames at [`CONTROL_FORMAT_VERSION`] (9):
 /// `sign_decision`/`sign_forward` in the node and
-/// [`SignedControl::authorize`] everywhere stamp v8. A v7 peer therefore cannot
-/// consume a v8 value variant (unknown postcard discriminant) or a routed
-/// forward carrying it, and a v8 node emits only v8. The upgrade is effectively
+/// [`SignedControl::authorize`] everywhere stamp v9. A v7/v8 peer therefore
+/// cannot consume a v9 value variant (unknown postcard discriminant) or a routed
+/// forward carrying it, and a v9 node emits only v9. The upgrade is effectively
 /// **lockstep for node-to-child and routed frames**; version negotiation is a
-/// v2 item. Accepting v7 here keeps a v7 peer's *pre-existing* requests readable
-/// during a rolling upgrade, nothing more.
-pub const CONTROL_FORMAT_VERSION: u8 = 8;
+/// v2 item. Accepting v7/v8 here keeps a v7/v8 peer's *pre-existing* requests
+/// readable during a rolling upgrade, nothing more.
+pub const CONTROL_FORMAT_VERSION: u8 = 9;
 
 /// Whether `version` is a [`SignedControl`] wire version this build accepts
 /// **inbound**.
 ///
-/// Accepts [`CONTROL_FORMAT_VERSION`] (8) and the immediately preceding
-/// version 7. Versions only *appended* request variants, so every pre-existing
-/// variant is byte-identical in both; [`min_control_version`] is the per-request
-/// shape gate. Anything else (including v6) is rejected up front.
+/// Accepts [`CONTROL_FORMAT_VERSION`] (9) and the two immediately preceding
+/// versions 7 and 8. Versions only *appended* request variants, so every
+/// pre-existing variant is byte-identical in all three; [`min_control_version`]
+/// is the per-request shape gate. Anything else (including v6) is rejected up
+/// front.
 ///
-/// This does **not** mean minted frames are ever v7: see the inbound-only note
-/// on [`CONTROL_FORMAT_VERSION`].
+/// This does **not** mean minted frames are ever v7/v8: see the inbound-only
+/// note on [`CONTROL_FORMAT_VERSION`].
 pub fn is_supported_control_version(version: u8) -> bool {
-    matches!(version, 7 | CONTROL_FORMAT_VERSION)
+    matches!(version, 7 | 8 | CONTROL_FORMAT_VERSION)
 }
 
 /// The minimum [`SignedControl`] wire version that can carry `request`.
@@ -117,6 +120,8 @@ pub fn min_control_version(request: &ControlRequest) -> u8 {
         ControlRequest::AdminIssue(_) | ControlRequest::AdminBurn(_) => 7,
         // Appended in control format 8.
         ControlRequest::AdminDesignate(_) | ControlRequest::AdminRevoke(_) => 8,
+        // Appended in control format 9.
+        ControlRequest::Capabilities(_) | ControlRequest::RegisterEthAddress(_) => 9,
     }
 }
 
@@ -531,7 +536,7 @@ mod tests {
 
     #[test]
     fn verify_control_rejects_v3_version() {
-        // v3 is now below the accepted window (7|8); a v3 envelope must be
+        // v3 is now below the accepted window (7|8|9); a v3 envelope must be
         // rejected up front rather than parsed with a newer shape.
         assert_ne!(CONTROL_FORMAT_VERSION, 3);
         let op = operator(1);
@@ -549,11 +554,12 @@ mod tests {
     }
 
     #[test]
-    fn is_supported_control_version_accepts_7_and_8_only() {
+    fn is_supported_control_version_accepts_7_8_9() {
         assert!(is_supported_control_version(7));
         assert!(is_supported_control_version(8));
-        assert_eq!(CONTROL_FORMAT_VERSION, 8);
-        for version in [0, 1, 2, 3, 4, 5, 6, 9, u8::MAX] {
+        assert!(is_supported_control_version(9));
+        assert_eq!(CONTROL_FORMAT_VERSION, 9);
+        for version in [0, 1, 2, 3, 4, 5, 6, 10, u8::MAX] {
             assert!(
                 !is_supported_control_version(version),
                 "version {version} must be unsupported"
@@ -563,7 +569,7 @@ mod tests {
 
     #[test]
     fn verify_control_rejects_v5_version() {
-        // v5 is below the accepted window (7|8) after the P5 bump.
+        // v5 is below the accepted window (7|8|9) after the P5 bump.
         assert_ne!(CONTROL_FORMAT_VERSION, 5);
         let op = operator(1);
         let registry = registry_with(&[("origin", &op, &ledger(11))]);
@@ -762,6 +768,24 @@ mod tests {
             }),
             8,
         );
+
+        // The capabilities/eth-registration variants were introduced in v9.
+        request(
+            ControlRequest::Capabilities(crate::request::Capabilities {
+                client_api_version: 1,
+            }),
+            9,
+        );
+        request(
+            ControlRequest::RegisterEthAddress(crate::request::RegisterEthAddress {
+                address: [0xab; 20],
+                proof: cawala_eth::EthProof {
+                    signature: [0xcd; 65],
+                    old_address: None,
+                },
+            }),
+            9,
+        );
     }
 
     #[test]
@@ -775,13 +799,14 @@ mod tests {
         // `nonce` and `expiry`, at version 4 when the exit-rights variants were
         // appended, at version 5 when `AdminLedgerQuery` was appended, at
         // version 6 when the topology-admin variants were appended, at
-        // version 7 when the value-admin variants were appended, and at version
-        // 8 when the remote designation variants were appended (the version
-        // byte is inside the preimage).
+        // version 7 when the value-admin variants were appended, at version
+        // 8 when the remote designation variants were appended, and at version
+        // 9 when the capabilities/eth-registration variants were appended (the
+        // version byte is inside the preimage).
         let signed = signed_with(&operator(7));
         assert_eq!(
             signed.signing_hash().to_hex(),
-            "d50cb082c786e84229eb377f026f215b5db0163cecf85ee8e52395f7f48f5784"
+            "58895d31d59544cf0605c955aba675ee8419493c38b8d6a1f8d7663aafcd64dc"
         );
     }
 

@@ -1,0 +1,32 @@
+[package]
+name = "cawala-eth"
+version = "0.1.0"
+edition = "2024"
+
+# Native-capable, wasm-safe Ethereum crypto primitives shared by the node and
+# the wasm client (P2c, Addendum C §1). `k256` is configured without
+# `std`/`getrandom` so it pulls no RNG: BIP-32 derivation and ECDSA signing are
+# deterministic (RFC6979). The `bip39` feature adds mnemonic/HD derivation and
+# is enabled by the browser client only; the node depends on this crate with
+# `default-features = false` and therefore gains only `k256`/`sha3`.
+[dependencies]
+cawala-ledger = { path = "../ledger" }
+proto = { package = "cawala-proto", path = "../proto" }
+# `precomputed-tables` is deliberately NOT enabled here: it maps to
+# `primeorder/basepoint-table`, which requires `std`/`critical-section` that the
+# node-only (no-bip39) build does not enable. The wasm client enables it via its
+# own `k256` declaration; feature unification restores it for browser builds.
+k256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
+sha3 = "0.12"
+serde = { version = "1.0.217", features = ["derive"] }
+zeroize = "1.8"
+coins-bip32 = { version = "0.14", optional = true }
+coins-bip39 = { version = "0.14", default-features = false, features = ["english"], optional = true }
+
+[features]
+default = ["bip39"]
+# Mnemonic (BIP-39) + HD (BIP-44) derivation. Browser-only; not needed natively.
+bip39 = ["dep:coins-bip32", "dep:coins-bip39"]
+
+[dev-dependencies]
+postcard = { version = "1.1.3", features = ["use-std"] }

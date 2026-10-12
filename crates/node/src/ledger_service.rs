@@ -1615,6 +1615,7 @@ mod tests {
                 kind: ChildKind::User,
                 slot: slot as u8,
                 date_joined: 0,
+                eth_address: None,
             });
         }
         record
@@ -2558,6 +2559,7 @@ mod tests {
                 kind,
                 slot,
                 date_joined: 0,
+                eth_address: None,
             });
         }
         record
@@ -2663,6 +2665,7 @@ mod tests {
                 kind,
                 slot,
                 date_joined: 0,
+                eth_address: None,
             });
         }
 

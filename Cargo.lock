@@ -328,12 +328,11 @@ name = "cawala-client"
 version = "0.1.0"
 dependencies = [
  "cawala-control",
+ "cawala-eth",
  "cawala-ledger",
  "cawala-msg",
  "cawala-proto",
  "cawala-topology",
- "coins-bip32",
- "coins-bip39",
  "console_error_panic_hook",
  "getrandom 0.3.4",
  "iroh",
@@ -341,7 +340,6 @@ dependencies = [
  "n0-future",
  "postcard",
  "serde",
- "sha3",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -349,7 +347,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
- "zeroize",
 ]
 
 [[package]]
@@ -357,6 +354,7 @@ name = "cawala-control"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "cawala-eth",
  "cawala-ledger",
  "cawala-msg",
  "cawala-topology",
@@ -365,6 +363,21 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "url",
+]
+
+[[package]]
+name = "cawala-eth"
+version = "0.1.0"
+dependencies = [
+ "cawala-ledger",
+ "cawala-proto",
+ "coins-bip32",
+ "coins-bip39",
+ "k256",
+ "postcard",
+ "serde",
+ "sha3",
+ "zeroize",
 ]
 
 [[package]]
@@ -384,6 +397,7 @@ dependencies = [
 name = "cawala-msg"
 version = "0.1.0"
 dependencies = [
+ "cawala-eth",
  "cawala-ledger",
  "cawala-proto",
  "postcard",
