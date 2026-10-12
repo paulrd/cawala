@@ -352,6 +352,39 @@ export function clearUserIdentity() {
   _removeRecord();
 }
 
+/**
+ * Install the R3 identity record from an already-derived secp256k1 secret and
+ * its EIP-55 address, WITHOUT the mnemonic. This is the portable identity
+ * bundle import path: the bundle carries the derived secret (never the phrase),
+ * so a new device/origin restores the same ETH identity and can sign V4
+ * orders. The transport seed is restored separately by `api.js`.
+ *
+ * The mnemonic remains the off-device recovery credential; this device never
+ * has it. `source` records that the identity arrived by import.
+ *
+ * @param {{ address: string, secretHex: string, source?: 'created'|'restored' }} input
+ * @returns {object} The `getUserIdentity()` view.
+ * @throws {Error} When the address or secret is malformed.
+ */
+export function adoptIdentity({ address, secretHex, source = 'restored' }) {
+  if (typeof address !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    throw new Error('The imported identity has an invalid address.');
+  }
+  if (typeof secretHex !== 'string' || !/^[0-9a-fA-F]{64}$/.test(secretHex)) {
+    throw new Error('The imported identity has an invalid secret.');
+  }
+  _writeRecord({
+    v: USER_IDENTITY_VERSION,
+    address,
+    secret: secretHex.toLowerCase(),
+    source,
+    passkeyEnrolled: false,
+    preview: false,
+    createdAt: Date.now(),
+  });
+  return getUserIdentity();
+}
+
 // ── Passkey unlock (convenience, never a signer) ──────────────
 
 /**

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   IDENTITY_BUNDLE_VERSION,
+  LEGACY_IDENTITY_BUNDLE_VERSION,
   PBKDF2_ITERATIONS,
   encryptIdentityBundle,
   decryptIdentityBundle,
@@ -14,6 +15,8 @@ import {
 const SEED_HEX = 'a1'.repeat(32); // 64 hex chars
 const NODE_ID = 'b2'.repeat(32); // 64 hex chars
 const PASSPHRASE = 'correct horse battery staple';
+const ETH_SECRET_HEX = 'd4'.repeat(32); // 64 hex chars
+const ETH_ADDRESS = '0xAbC1234567890aBcDef0123456789ABCDEF01234'; // EIP-55 case
 
 function makeStateB64() {
   return Buffer.from('postcard-state-bytes').toString('base64');
@@ -26,6 +29,8 @@ function makeLedgerB64() {
 async function makeBundle(overrides = {}) {
   return encryptIdentityBundle({
     seedHex: SEED_HEX,
+    ethSecretHex: ETH_SECRET_HEX,
+    ethAddress: ETH_ADDRESS,
     stateB64: makeStateB64(),
     ledgerB64: makeLedgerB64(),
     nodeId: NODE_ID,
@@ -43,6 +48,51 @@ test('round-trip returns identical seed/state/ledger and nodeId', async () => {
   assert.equal(out.seedHex, SEED_HEX);
   assert.equal(out.stateB64, makeStateB64());
   assert.equal(out.ledgerB64, makeLedgerB64());
+});
+
+test('round-trip carries the R3 ETH identity (secret + EIP-55 address)', async () => {
+  const bundle = await makeBundle();
+  const out = await decryptIdentityBundle(bundle, PASSPHRASE);
+
+  assert.equal(out.ethSecretHex, ETH_SECRET_HEX);
+  assert.equal(out.ethAddress, ETH_ADDRESS, 'address case (EIP-55 checksum) is preserved');
+});
+
+test('no R3 identity round-trips as null ETH fields', async () => {
+  const bundle = await makeBundle({ ethSecretHex: null, ethAddress: null });
+  const out = await decryptIdentityBundle(bundle, PASSPHRASE);
+  assert.equal(out.ethSecretHex, null);
+  assert.equal(out.ethAddress, null);
+});
+
+test('a legacy v1 bundle imports without an ETH identity', async () => {
+  // A v1 bundle is the v2 payload minus the ETH fields. With no identity the
+  // payload is byte-identical, so relabelling the cleartext version yields a
+  // faithful legacy bundle under the same KDF/AEAD/AAD.
+  const v2 = await makeBundle({ ethSecretHex: null, ethAddress: null });
+  const legacy = { ...v2, v: LEGACY_IDENTITY_BUNDLE_VERSION };
+
+  const meta = inspectIdentityBundle(legacy);
+  assert.equal(meta.version, LEGACY_IDENTITY_BUNDLE_VERSION);
+
+  const out = await decryptIdentityBundle(legacy, PASSPHRASE);
+  assert.equal(out.version, LEGACY_IDENTITY_BUNDLE_VERSION);
+  assert.equal(out.seedHex, SEED_HEX);
+  assert.equal(out.ethSecretHex, null);
+  assert.equal(out.ethAddress, null);
+  assert.equal(out.stateB64, makeStateB64());
+  assert.equal(out.ledgerB64, makeLedgerB64());
+});
+
+test('half an ETH identity is rejected at encrypt and decrypt', async () => {
+  await assert.rejects(
+    () => makeBundle({ ethAddress: null }),
+    /Malformed identity bundle/,
+  );
+  await assert.rejects(
+    () => makeBundle({ ethSecretHex: null }),
+    /Malformed identity bundle/,
+  );
 });
 
 test('round-trip supports null state/ledger', async () => {
@@ -100,7 +150,7 @@ test('inspectIdentityBundle returns metadata without a passphrase', async () => 
 test('inspectIdentityBundle rejects unsupported version', async () => {
   const bundle = await makeBundle();
   assert.throws(
-    () => inspectIdentityBundle({ ...bundle, v: 2 }),
+    () => inspectIdentityBundle({ ...bundle, v: 3 }),
     /Unsupported identity bundle version/,
   );
 });
@@ -123,13 +173,15 @@ test('empty passphrase is rejected', async () => {
   );
 });
 
-test('leak guard: serialized bundle never contains the seed', async () => {
+test('leak guard: serialized bundle never contains the seed or ETH secret', async () => {
   const bundle = await makeBundle();
   const serialized = serializeIdentityBundle(bundle);
 
   assert.equal(serialized.includes(SEED_HEX), false);
   assert.equal(serialized.toLowerCase().includes(SEED_HEX), false);
   assert.equal(serialized.includes('seedHex'), false);
+  assert.equal(serialized.toLowerCase().includes(ETH_SECRET_HEX), false);
+  assert.equal(serialized.includes('ethSecretHex'), false);
   // The public metadata is still present.
   assert.equal(serialized.includes(NODE_ID), true);
 });
@@ -147,10 +199,11 @@ test('parseIdentityBundle rejects malformed JSON with a friendly error', () => {
   assert.throws(() => parseIdentityBundle(''), /Malformed identity bundle/);
 });
 
-test('frozen constants: PBKDF2_ITERATIONS >= 600000 and version 1', async () => {
-  assert.equal(IDENTITY_BUNDLE_VERSION, 1);
+test('frozen constants: PBKDF2_ITERATIONS >= 600000 and version 2', async () => {
+  assert.equal(IDENTITY_BUNDLE_VERSION, 2);
+  assert.equal(LEGACY_IDENTITY_BUNDLE_VERSION, 1);
   assert.ok(PBKDF2_ITERATIONS >= 600000);
   const bundle = await makeBundle();
-  assert.equal(bundle.v, 1);
+  assert.equal(bundle.v, 2);
   assert.ok(bundle.kdf.iterations >= 600000);
 });

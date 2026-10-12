@@ -2703,8 +2703,10 @@ function _removeLegacyBlobs() {
 }
 
 /**
- * Encrypt and serialize the current identity (seed + opaque state/ledger blobs)
- * into a passphrase-protected, portable bundle string.
+ * Encrypt and serialize the current identity into a passphrase-protected,
+ * portable bundle string. The bundle carries the transport seed, the R3 user
+ * identity's derived secp256k1 secret + EIP-55 address (when one exists), and
+ * the opaque state/ledger blobs.
  *
  * Requires a live client and a stored seed. Does not mutate any state.
  *
@@ -2718,6 +2720,25 @@ export async function exportIdentityBundle(passphrase) {
     throw new Error('No identity to export. This device has no stored account key.');
   }
   const nodeId = node.endpoint_id();
+
+  // Carry the R3 ETH identity so the same address/secret is restored on import.
+  // Absent on a transport-only install: the bundle then restores seed + blobs.
+  let ethSecretHex = null;
+  let ethAddress = null;
+  try {
+    const secret = userIdentity.getIdentitySecretBytes();
+    const address = userIdentity.getEthAddress();
+    if (secret && address) {
+      ethSecretHex = _bytesToHex(secret);
+      ethAddress = address;
+    }
+  } catch (err) {
+    _warnOnce(
+      'export-user-identity',
+      '[api] could not read the user identity; exporting the transport identity only',
+      err,
+    );
+  }
 
   let stateB64 = null;
   let ledgerB64 = null;
@@ -2736,6 +2757,8 @@ export async function exportIdentityBundle(passphrase) {
 
   const bundle = await idb.encryptIdentityBundle({
     seedHex,
+    ethSecretHex,
+    ethAddress,
     stateB64,
     ledgerB64,
     nodeId,
@@ -2760,7 +2783,11 @@ export function inspectIdentityBundle(text) {
  * Decrypt and install an identity bundle, replacing any current identity.
  *
  * Tears the live client down, writes the recovered seed to `cawala.identity.v1`
- * and the recovered state/ledger blobs under the bundle's `nodeId` keys. Does
+ * and the recovered state/ledger blobs under the bundle's `nodeId` keys. When
+ * the bundle carries an R3 ETH identity (v2 with a user identity), the derived
+ * secp256k1 secret + address are written to `cawala.user-identity.v1` so the
+ * reloaded node re-keys and can sign V4 orders. A legacy v1 bundle restores
+ * the transport seed + blobs and clears any ETH identity on this device. Does
  * NOT reload; the caller reloads so `initApi()` restores the new identity.
  *
  * JS cannot derive the endpoint id from an Ed25519 seed without the wasm
@@ -2769,7 +2796,7 @@ export function inspectIdentityBundle(text) {
  *
  * @param {string} text
  * @param {string} passphrase
- * @returns {Promise<{ nodeId: string }>}
+ * @returns {Promise<{ nodeId: string, ethAddress: string|null }>}
  */
 export async function importIdentityBundle(text, passphrase) {
   const bundle = idb.parseIdentityBundle(text);
@@ -2796,7 +2823,29 @@ export async function importIdentityBundle(text, passphrase) {
   _writeScopedB64(LEDGER_KEY, nodeId, decrypted.ledgerB64);
   _removeLegacyBlobs();
 
-  return { nodeId };
+  // Restore (or clear) the R3 ETH identity so the reloaded node signs as the
+  // imported user. A v1 bundle carries neither field — adopt nothing and drop
+  // any stale ETH identity rather than pairing it with the imported transport.
+  const hasEth = decrypted.ethSecretHex != null && decrypted.ethAddress != null;
+  if (hasEth) {
+    try {
+      userIdentity.adoptIdentity({
+        address: decrypted.ethAddress,
+        secretHex: decrypted.ethSecretHex,
+      });
+    } catch (err) {
+      _warnOnce(
+        'identity-import-user-identity',
+        '[api] could not restore the imported user identity',
+        err,
+      );
+    }
+  } else {
+    userIdentity.clearUserIdentity();
+  }
+  refreshUserIdentity();
+
+  return { nodeId, ethAddress: hasEth ? decrypted.ethAddress : null };
 }
 
 /**
