@@ -300,6 +300,7 @@ async function _reactivateTransportIdentity() {
   }
   _ethRegisteredFor = null;
   _ethRegistration = null;
+  _resetNodeCapabilities();
   _lastControlEvent = null;
   _trustEstablished = false;
   try {
@@ -472,6 +473,13 @@ let _ethRegisteredFor = null;
 /** @type {{ status: string, address: string|null, trigger: string, at: number, error: string|null }|null} */
 let _ethRegistration = null;
 
+// R1b node-client API capabilities handshake. `_nodeCapabilities` is the last
+// successful result (`null` until the handshake completes and whenever it is
+// unavailable), mirrored into `apiCapabilities` for the UI. Reset on teardown /
+// re-spawn so a stale parent's capabilities never gate the next session.
+/** @type {{ available: boolean, clientApiVersion: number|null, features: number, supportsEthIdentity: boolean }|null} */
+let _nodeCapabilities = null;
+
 // JS-side in-flight payment map keyed by order hash hex, for UI status.
 const _pendingSends = new Map();
 // Throttle duplicate balance requests fired from init + spawnClient.
@@ -564,6 +572,7 @@ export async function __bootRealNodeForTest(wasm) {
       _trustEstablished = false;
       _ethRegisteredFor = null;
       _ethRegistration = null;
+      _resetNodeCapabilities();
       _identitySource = 'memory';
       _memorySeed = null;
       _spawnedSeedHex = null;
@@ -871,6 +880,9 @@ async function _spawnRealNode() {
   _syncAdministeredNode();
   // (Re)verify the persisted balance as soon as an address is known.
   _requestBalanceIfJoined();
+  // R1b: learn the parent's node-client API capabilities before any optional
+  // ETH-identity action, so registration is gated on the advertised feature.
+  await _fetchNodeCapabilities();
   // Already joined on load + an identity exists → register the ETH anchor
   // (quietly; `getEthRegistrationStatus()` carries the outcome).
   void _maybeRegisterEthAddress('boot');
@@ -1658,6 +1670,7 @@ function _drainControlEvents() {
         parentChanged = true;
         // A later re-join must register the ETH anchor again.
         _ethRegisteredFor = null;
+        _resetNodeCapabilities();
       }
       ev.free?.();
       drained = true;
@@ -1678,8 +1691,9 @@ function _drainControlEvents() {
   // A fresh approval means an address now exists: verify its balance.
   if (accepted) {
     _requestBalanceIfJoined();
-    // Now joined: register the user's ETH anchor with the parent (once).
-    void _maybeRegisterEthAddress('join');
+    // Now joined: handshake for capabilities, then register the user's ETH
+    // anchor with the parent (once), gated on the advertised feature.
+    void _handshakeAndMaybeRegisterEth('join');
   }
 }
 
@@ -1688,6 +1702,97 @@ function _drainControlEvents() {
  */
 export function getLastControlEvent() {
   return _lastControlEvent ? { ..._lastControlEvent } : null;
+}
+
+// ── R1b node capabilities handshake (control variant 23) ──────
+
+/**
+ * The last successful node-capabilities handshake, as a plain object, or null
+ * when it has not completed (an old node, a transport failure, or a client that
+ * is not joined). `supportsEthIdentity` is the gate for ETH-identity actions.
+ *
+ * @returns {{ available: boolean, clientApiVersion: number|null, features: number, supportsEthIdentity: boolean }|null}
+ */
+export function getNodeCapabilities() {
+  return _nodeCapabilities ? { ..._nodeCapabilities } : null;
+}
+
+/**
+ * Clear the cached capabilities and mirror "unavailable" into the store.
+ */
+function _resetNodeCapabilities() {
+  _nodeCapabilities = null;
+  _applyNodeCapabilities(null);
+}
+
+/**
+ * Mirror a capabilities result (or null) into `apiCapabilities`.
+ * @param {{ available: boolean, clientApiVersion: number|null, features: number, supportsEthIdentity: boolean }|null} caps
+ */
+function _applyNodeCapabilities(caps) {
+  apiCapabilities.nodeCapabilitiesAvailable = !!(caps && caps.available);
+  apiCapabilities.nodeClientApiVersion = caps && caps.available ? caps.clientApiVersion : null;
+  apiCapabilities.nodeSupportsEthIdentity = !!(caps && caps.supportsEthIdentity);
+}
+
+/**
+ * Ask the direct parent for its node-client API capabilities (R1b handshake).
+ *
+ * Graceful by construction: the wasm `node_capabilities()` never rejects on an
+ * old node / decode failure / transport error, and this wrapper also tolerates
+ * a wasm build without the method. On any failure the store is set to
+ * "unavailable" and no error surfaces. Returns the mapped result, or null when
+ * unavailable.
+ *
+ * @returns {Promise<{ available: boolean, clientApiVersion: number|null, features: number, supportsEthIdentity: boolean }|null>}
+ */
+async function _fetchNodeCapabilities() {
+  const node = _clientNode;
+  if (_useMock || !node) return null;
+  // A stale NodeId would ask the parent on behalf of the pre-identity leaf;
+  // skip until the live node is re-activated.
+  if (_transportIdentityIsStale()) return null;
+  if (typeof node.node_capabilities !== 'function') {
+    _resetNodeCapabilities();
+    return null;
+  }
+  let dto = null;
+  try {
+    dto = await node.node_capabilities();
+  } catch (err) {
+    _warnOnce('node-capabilities', '[api] node capabilities handshake failed', err);
+    _resetNodeCapabilities();
+    return null;
+  }
+  try {
+    if (!dto.available) {
+      // An old node / decode failure: treat as unavailable so the legacy
+      // best-effort ETH path still runs (no feature gate).
+      _resetNodeCapabilities();
+      return null;
+    }
+    const mapped = {
+      available: true,
+      clientApiVersion: Number(dto.client_api_version),
+      features: Number(dto.features ?? 0),
+      supportsEthIdentity: !!dto.supports_eth_identity,
+    };
+    _nodeCapabilities = mapped;
+    _applyNodeCapabilities(mapped);
+    return mapped;
+  } finally {
+    dto.free?.();
+  }
+}
+
+/**
+ * Handshake then (conditionally) register the ETH anchor. Used on the join path
+ * where the approval is drained synchronously by the poller.
+ * @param {'boot'|'join'} trigger
+ */
+async function _handshakeAndMaybeRegisterEth(trigger) {
+  await _fetchNodeCapabilities();
+  await _maybeRegisterEthAddress(trigger);
 }
 
 // ── ETH anchor registration (control variant 24) ──────────────
@@ -1749,6 +1854,22 @@ async function _maybeRegisterEthAddress(trigger) {
   if (_ethRegisteredFor === key) return;
   _ethRegisteredFor = key;
 
+  // R1b gating: when the capabilities handshake completed and the node does
+  // NOT advertise `NODE_FEATURE_ETH_IDENTITY`, skip registration rather than
+  // send control variant 24 the node would reject. When capabilities are
+  // unavailable (`_nodeCapabilities == null` — an old node/wasm build or a
+  // transient failure) keep the legacy best-effort attempt so nothing regresses.
+  if (_nodeCapabilities && !_nodeCapabilities.supportsEthIdentity) {
+    _ethRegistration = {
+      status: 'unsupported',
+      address: ethAddress,
+      trigger,
+      at: Date.now(),
+      error: null,
+    };
+    return;
+  }
+
   try {
     const bucket = await node.register_eth_address();
     _ethRegistration = {
@@ -1782,6 +1903,9 @@ async function _maybeRegisterEthAddress(trigger) {
 function _surfaceEthRegistration(outcome) {
   if (outcome.trigger !== 'join') return;
   const status = outcome.status;
+  // The node advertised no ETH-identity feature: degrading is expected, not an
+  // error, so stay silent (the outcome is recorded for `getEthRegistrationStatus`).
+  if (status === 'unsupported') return;
   if (status === 'accepted') {
     showToast('Account address registered with the network.', 'ok');
   } else if (status.startsWith('rejected')) {
@@ -2479,6 +2603,7 @@ export function destroyClient() {
   }
   _pendingSends.clear();
   _ethRegisteredFor = null;
+  _resetNodeCapabilities();
   _spawnedSeedHex = null;
   _releaseIdentityLock();
 }
@@ -2508,6 +2633,7 @@ function _teardownClient() {
     _clientNode = null;
   }
   _ethRegisteredFor = null;
+  _resetNodeCapabilities();
   _releaseIdentityLock();
   _memorySeed = null;
   _identitySource = 'memory';

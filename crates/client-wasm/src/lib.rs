@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 
 use cawala_control::{
     AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminMoveChild, AdminRedeliverJoin,
-    AdminValueRequest, CONTROL_ALPN, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply,
-    ControlRequest, DesignationChange, ExitRequest, Invite, JoinRequest, NodeId,
+    AdminValueRequest, CONTROL_ALPN, CONTROL_REQUEST_TTL_SECS, Capabilities, ChildKind,
+    ControlReply, ControlRequest, DesignationChange, ExitRequest, Invite, JoinRequest, NodeId,
     OperatorSecretKey, RegisterEthAddress, RejectCode, SignedControl,
 };
 use cawala_msg::{
@@ -51,7 +51,7 @@ pub mod state;
 use crate::control::{
     AncestorCache, AncestorEntry, ControlHandler, JOIN_TTL_SECONDS, ROUTED_REPLY_TIMEOUT_SECS,
     SharedControl, ancestor_walk_step, build_routed_control, exchange_control, invite_endpoint_addr,
-    prepare_admin_exchange, routed_request_envelope, verify_routed_reply_bytes,
+    prepare_admin_exchange, routed_request_envelope, sign_own_control, verify_routed_reply_bytes,
 };
 use crate::dto::{
     AdminActionDto, AdminLedgerSnapshotDto, AdminSnapshotDto, AdminTargetDto, AdminValueAppliedDto,
@@ -1845,6 +1845,40 @@ impl ClientNode {
         })
     }
 
+    /// Perform the R1b node-client API `Capabilities` handshake with the direct
+    /// parent.
+    ///
+    /// Sends control variant 23
+    /// `Capabilities { client_api_version: CLIENT_API_VERSION }` directly to the
+    /// parent (the same direct exchange as [`ClientNode::register_eth_address`])
+    /// and maps reply discriminant 9 to a [`dto::NodeCapabilitiesDto`].
+    ///
+    /// This **never errors**: an **old node** that cannot decode variant 23, an
+    /// unexpected reply, a transport failure/timeout, a client with no control
+    /// identity, or a not-yet-joined client all yield the graceful "capabilities
+    /// unavailable" DTO (`available === false`), never a hang or a panic.
+    /// Callers gate ETH-identity actions on
+    /// [`dto::NodeCapabilitiesDto::supports_eth_identity`].
+    pub async fn node_capabilities(&self) -> dto::NodeCapabilitiesDto {
+        let Some(operator) = self.control.operator.clone() else {
+            return dto::NodeCapabilitiesDto::unavailable();
+        };
+        let Ok((_self_addr, parent)) = self.joined_context() else {
+            return dto::NodeCapabilitiesDto::unavailable();
+        };
+        let node_id = self.control.node_id().to_string();
+        let Ok(signed) = sign_own_control(&node_id, &operator, capabilities_request()) else {
+            return dto::NodeCapabilitiesDto::unavailable();
+        };
+        let Ok(target) = parent.node_id.as_str().parse::<EndpointId>() else {
+            return dto::NodeCapabilitiesDto::unavailable();
+        };
+        let reply = exchange_control(self.router.endpoint(), EndpointAddr::from(target), &signed)
+            .await
+            .map_err(|_| ());
+        dto::NodeCapabilitiesDto::from_exchange(reply)
+    }
+
     /// This client's payment receive URI:
     /// `cawala://pay?to=<EndpointId>&addr=<OctAddr>`.
     ///
@@ -2344,6 +2378,18 @@ pub(crate) fn designation_request(child: &str, designate: bool) -> Result<Contro
     })
 }
 
+/// Build the R1b `Capabilities` handshake request advertising this client's
+/// node-client API version.
+///
+/// Separated from the wasm method so the variant mapping is native-testable: a
+/// frontend must advertise [`dto::CLIENT_API_VERSION`] (never an unversioned
+/// zero), and the request must encode as control variant 23.
+pub(crate) fn capabilities_request() -> ControlRequest {
+    ControlRequest::Capabilities(Capabilities {
+        client_api_version: dto::CLIENT_API_VERSION,
+    })
+}
+
 /// Map an admin reply rejection to a JS error carrying the stable code string.
 fn admin_rejected(code: RejectCode) -> JsError {
     JsError::new(&format!(
@@ -2530,5 +2576,32 @@ mod tests {
 
         // A non-endpoint child id is refused before any request is built.
         assert!(designation_request("not-a-node", true).is_err());
+    }
+
+    /// The R1b handshake builds control variant 23 and advertises this client's
+    /// API version — the append-only discriminant older nodes reject.
+    #[test]
+    fn capabilities_request_builds_variant_23() {
+        let request = capabilities_request();
+        assert_eq!(
+            request,
+            ControlRequest::Capabilities(Capabilities {
+                client_api_version: dto::CLIENT_API_VERSION,
+            })
+        );
+        // Postcard encodes the enum discriminant positionally: variant 23.
+        let bytes = postcard::to_allocvec(&request).expect("capabilities encodes");
+        assert_eq!(bytes[0], 23, "capabilities must be control variant 23");
+    }
+
+    /// The handshake is signed by this browser's own operator key (the same
+    /// path `register_eth_address` uses), so the parent can authenticate it.
+    #[test]
+    fn capabilities_handshake_is_self_signed() {
+        let operator = OperatorSecretKey::from_bytes([7u8; 32]);
+        let signed =
+            sign_own_control("node-abc", &operator, capabilities_request()).expect("signs");
+        assert_eq!(signed.request, capabilities_request());
+        assert_eq!(signed.origin.as_str(), "node-abc");
     }
 }

@@ -238,12 +238,19 @@
     read getters (`pending_orders`, `pinned_leaf_keys`, `pending_join_outbound`,
     `client_state_info`; extended `JoinStatus`, `LedgerStatusDto`,
     `SettlementRecordDto`) expose locally-held state without a wire change.
-  - **R1b - versioned node client API (partial).** The node-read surface ships
-    as the R1 getters, and the `Capabilities` handshake **types** ship as control
-    variant 23 + `ControlReply::Capabilities` (discriminant 9, reply 6). The
-    **client-side `Capabilities` send is deferred**; `CONTROL_REPLY_VERSION` is
-    inert (the version rides in the payload), and an old node's decode failure is
-    treated as "unsupported".
+  - **R1b - versioned node client API.** The node-read surface ships as the R1
+    getters, and the `Capabilities` handshake ships as control variant 23 +
+    `ControlReply::Capabilities` (discriminant 9, reply 6). The **client half**
+    (F1) sends variant 23 (`ClientNode::node_capabilities`, advertising
+    `CLIENT_API_VERSION`) on boot (when joined) and after a successful join,
+    mapping reply discriminant 9 to a `NodeCapabilitiesDto`
+    (`available` / `clientApiVersion` / `features` / `supportsEthIdentity`). An
+    old node's decode failure, an unexpected reply, or a timeout is a graceful
+    "capabilities unavailable" (`available === false`), never a hang.
+    `CONTROL_REPLY_VERSION` stays inert (the version rides in the payload). The
+    web facade (`getNodeCapabilities()`, `apiCapabilities.nodeSupportsEthIdentity`)
+    gates ETH-identity registration on `NODE_FEATURE_ETH_IDENTITY`, degrading to
+    the legacy best-effort path when capabilities are unavailable.
   - **R3 - user-level secp256k1 identity.** A secp256k1 key from a BIP-39
     mnemonic (`m/44'/60'/0'/0/0`; EIP-55 address) is the user's identity, done
     in Rust wasm (`k256`/`sha3`/`coins-bip39`) so key material never reaches JS
@@ -295,8 +302,8 @@
     codebase); no `OctAddr` depth cap; foster-parent recovery cut; moved
     pointers rejected; signed topology/registry distribution rejected; browser
     create-child deferred (provisioning stays invite/CLI); portable-client
-    follow-ups (passkey PRF unlock, client anchor rotation, client `Capabilities`
-    send, auto-pin hard fail-closed needs a node change).
+    follow-ups (passkey PRF unlock, client anchor rotation, auto-pin hard
+    fail-closed needs a node change).
 
 # Administration Refactor Requirements (R1-R9 intent)
   1. **R1 - all admin is tree-routed.** Every admin exchange (`AdminQuery`,

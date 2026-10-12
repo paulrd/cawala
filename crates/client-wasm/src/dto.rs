@@ -8,8 +8,8 @@
 
 use cawala_control::{
     AdminApproved, AdminLedgerAccount, AdminLedgerSnapshot, AdminPendingJoin, AdminRejected,
-    AdminSnapshot, AdminValueApplied, AdminValueDirection, ChildKind, DeliveryStatus, Invite,
-    NodeId, NodeSnapshot, OperatorPubKey, RejectCode, ValueRequestId,
+    AdminSnapshot, AdminValueApplied, AdminValueDirection, ChildKind, ControlReply, DeliveryStatus,
+    Invite, NodeId, NodeSnapshot, OperatorPubKey, RejectCode, ValueRequestId,
 };
 use cawala_ledger::{Hash, LedgerPubKey};
 use cawala_msg::OctAddr;
@@ -1197,6 +1197,105 @@ impl ClientStateInfo {
     #[wasm_bindgen(getter)]
     pub fn ledger_version(&self) -> u8 {
         self.ledger_version
+    }
+}
+
+/// The node-client API version this browser client advertises in the R1b
+/// `Capabilities` handshake (control variant 23).
+///
+/// Mirrors the node's `NODE_CLIENT_API_VERSION`. A frontend targeting this
+/// client must treat the node's reply version as advisory, not an authorization
+/// input.
+pub const CLIENT_API_VERSION: u16 = 1;
+
+/// Node capability bit: the node supports the R3 ETH-identity anchor
+/// (`RegisterEthAddress` / `LedgerPayloadV4`).
+///
+/// Mirrors the node's `NODE_FEATURE_ETH_IDENTITY`. The web gates its
+/// ETH-identity actions on [`NodeCapabilitiesDto::supports_eth_identity`].
+pub const NODE_FEATURE_ETH_IDENTITY: u64 = 1 << 0;
+
+/// The node's advertised capabilities, from the R1b handshake.
+///
+/// `available` is `false` when the handshake did not complete — an old node that
+/// cannot decode control variant 23, an unexpected reply, a transport failure,
+/// or a client that is not joined. In that case the version/features are zeroed
+/// and every `supports_*` getter is `false`, so a caller degrades gracefully
+/// rather than hanging or panicking.
+///
+/// Published by [`crate::ClientNode::node_capabilities`] and consumed by the web
+/// facade (`getNodeCapabilities()` / `apiCapabilities.nodeSupportsEthIdentity`).
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct NodeCapabilitiesDto {
+    available: bool,
+    client_api_version: u16,
+    features: u64,
+}
+
+impl NodeCapabilitiesDto {
+    /// The graceful "capabilities unavailable" result.
+    pub(crate) fn unavailable() -> Self {
+        NodeCapabilitiesDto {
+            available: false,
+            client_api_version: 0,
+            features: 0,
+        }
+    }
+
+    /// A completed handshake with the node's advertised version and features.
+    pub(crate) fn from_capabilities(client_api_version: u16, features: u64) -> Self {
+        NodeCapabilitiesDto {
+            available: true,
+            client_api_version,
+            features,
+        }
+    }
+
+    /// Map one control exchange outcome.
+    ///
+    /// A `Capabilities` reply is `available`; **any** other outcome — an old
+    /// node's unknown-variant decode error (surfaced as `Err`), an unexpected
+    /// reply shape, or a transport failure/timeout — is the graceful
+    /// `unavailable` result. Never an error, never a hang.
+    pub(crate) fn from_exchange(reply: Result<ControlReply, ()>) -> Self {
+        match reply {
+            Ok(ControlReply::Capabilities(caps)) => {
+                NodeCapabilitiesDto::from_capabilities(caps.client_api_version, caps.features)
+            }
+            _ => NodeCapabilitiesDto::unavailable(),
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl NodeCapabilitiesDto {
+    /// Whether the handshake completed. `false` means "capabilities
+    /// unavailable"; the getters below are then all zero/false and the caller
+    /// must degrade rather than act on them.
+    #[wasm_bindgen(getter)]
+    pub fn available(&self) -> bool {
+        self.available
+    }
+
+    /// The node's advertised node-client API version, or `0` when unavailable.
+    #[wasm_bindgen(getter)]
+    pub fn client_api_version(&self) -> u16 {
+        self.client_api_version
+    }
+
+    /// The node's feature bitfield as an `f64` (never a raw `u64`/BigInt), or
+    /// `0` when unavailable.
+    #[wasm_bindgen(getter)]
+    pub fn features(&self) -> f64 {
+        self.features as f64
+    }
+
+    /// Whether the node advertises the R3 ETH-identity feature. Always `false`
+    /// when the handshake is unavailable (fail closed).
+    #[wasm_bindgen(getter)]
+    pub fn supports_eth_identity(&self) -> bool {
+        self.available && self.features & NODE_FEATURE_ETH_IDENTITY != 0
     }
 }
 
@@ -2808,5 +2907,47 @@ mod tests {
         let info = ClientStateInfo::new(LOCAL_STATE_VERSION, LEDGER_STATE_VERSION);
         assert_eq!(info.state_version, LOCAL_STATE_VERSION);
         assert_eq!(info.ledger_version, LEDGER_STATE_VERSION);
+    }
+
+    #[test]
+    fn node_capabilities_dto_maps_reply_and_gates_eth_feature() {
+        let caps = NodeCapabilitiesDto::from_exchange(Ok(ControlReply::Capabilities(
+            cawala_control::NodeCapabilities {
+                client_api_version: 3,
+                features: NODE_FEATURE_ETH_IDENTITY,
+            },
+        )));
+        assert!(caps.available);
+        assert_eq!(caps.client_api_version, 3);
+        assert_eq!(caps.features, NODE_FEATURE_ETH_IDENTITY);
+        assert!(caps.supports_eth_identity());
+
+        // An available node whose feature bitfield lacks the ETH bit is
+        // available but not ETH-capable.
+        let no_eth = NodeCapabilitiesDto::from_exchange(Ok(ControlReply::Capabilities(
+            cawala_control::NodeCapabilities {
+                client_api_version: 1,
+                features: 0,
+            },
+        )));
+        assert!(no_eth.available);
+        assert!(!no_eth.supports_eth_identity());
+    }
+
+    #[test]
+    fn node_capabilities_dto_is_graceful_on_old_node_or_unexpected_reply() {
+        // An old node cannot decode control variant 23: the exchange surfaces a
+        // decode/transport error, which must map to "unavailable", not an error.
+        let failed = NodeCapabilitiesDto::from_exchange(Err(()));
+        assert!(!failed.available);
+        assert_eq!(failed.client_api_version, 0);
+        assert_eq!(failed.features, 0);
+        assert!(!failed.supports_eth_identity());
+
+        // A decodable but structurally unexpected reply is likewise unavailable.
+        let other =
+            NodeCapabilitiesDto::from_exchange(Ok(ControlReply::Rejected(RejectCode::BadVersion)));
+        assert!(!other.available);
+        assert!(!other.supports_eth_identity());
     }
 }

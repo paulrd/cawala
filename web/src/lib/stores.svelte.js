@@ -52,7 +52,7 @@ export function applyUserIdentity(next) {
 
 // ── Live-mode capabilities & control events ──────────────────
 
-/** @type {{ mock: boolean, canAdmin: boolean, canQueryPeers: boolean, canQueryNode: boolean, identityPersistent: boolean, multiTabLeader: boolean, multiTabWarning: string|null }} */
+/** @type {{ mock: boolean, canAdmin: boolean, canQueryPeers: boolean, canQueryNode: boolean, identityPersistent: boolean, multiTabLeader: boolean, multiTabWarning: string|null, nodeCapabilitiesAvailable: boolean, nodeClientApiVersion: number|null, nodeSupportsEthIdentity: boolean }} */
 export const apiCapabilities = $state({
   mock: true,
   canAdmin: false,
@@ -61,6 +61,14 @@ export const apiCapabilities = $state({
   identityPersistent: false,
   multiTabLeader: false,
   multiTabWarning: null,
+  // R1b node-client API capabilities handshake: whether the parent answered,
+  // the node's advertised client-API version (`null` when unavailable), and
+  // whether it advertises the R3 ETH-identity feature. The web gates its
+  // ETH-identity actions on `nodeSupportsEthIdentity`; when the handshake is
+  // unavailable the flag is false but existing best-effort behavior is kept.
+  nodeCapabilitiesAvailable: false,
+  nodeClientApiVersion: null,
+  nodeSupportsEthIdentity: false,
 });
 
 /** Last control event drained from the wasm poller. */

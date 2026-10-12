@@ -151,6 +151,25 @@ it to move an existing install's transport seed. The mnemonic remains the
 portable account credential. Concurrent use of one identity on two devices is
 **not** prevented; run one device at a time.
 
+## Node client API (R1b)
+
+On boot (once joined) and after every successful join the client performs a
+versioned **capabilities handshake** with its direct parent: it sends control
+variant 23 (`ClientNode::node_capabilities`, advertising `CLIENT_API_VERSION`)
+and maps reply discriminant 9 to a `NodeCapabilitiesDto`. The facade exposes the
+result as `getNodeCapabilities()` (`{ available, clientApiVersion, features,
+supportsEthIdentity }`) and mirrors it into the reactive
+`apiCapabilities` store (`nodeCapabilitiesAvailable`,
+`nodeClientApiVersion`, `nodeSupportsEthIdentity`).
+
+An **old node** that cannot decode variant 23, an unexpected reply, or a
+transport failure is a graceful "capabilities unavailable" (`available ===
+false`) - never a hang. When the node advertises
+`NODE_FEATURE_ETH_IDENTITY`, the web registers the user's ETH anchor (control
+variant 24); when the handshake completes without that feature it skips
+registration, and when capabilities are unavailable it keeps the legacy
+best-effort path (nothing regresses).
+
 ## Smoke scripts (network-dependent)
 
 `web/scripts/` drives the wasm module (or a browser-equivalent client) against
