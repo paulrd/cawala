@@ -2299,8 +2299,57 @@ impl ClientNode {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pinned_leaf_keys
             .iter()
-            .map(|(node, ledger)| dto::PinnedLeafKeyDto::new(node, *ledger))
+            .map(|entry| dto::PinnedLeafKeyDto::new(&entry.node_id, entry.ledger))
             .collect()
+    }
+
+    /// The explicit trust status of every pinned leaf key: whether each pin is
+    /// `unconfirmed` (TOFU) or `confirmed`, plus any recorded pin change.
+    ///
+    /// A pin is never *established* trust by itself: the web derives
+    /// `trustEstablished` from [`dto::PinStatusDto`] (a `confirmed` routing pin
+    /// with no pending change), never from a mere pin's presence.
+    pub fn pin_status(&self) -> dto::PinStatusDto {
+        let ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        dto::PinStatusDto::from_state(&ledger)
+    }
+
+    /// Explicitly confirm the pin for `node_id` (a leaf node id or the current
+    /// parent's leaf node id for the routing ledger pin).
+    ///
+    /// Confirmation keeps the existing pinned key — it never adopts a presented
+    /// change — flips its trust to `confirmed`, and clears any recorded change
+    /// for that node. The updated state is persisted by the caller through
+    /// [`ClientNode::export_ledger_state`], so the confirmation survives a
+    /// reload. Returns an error when no pin exists for `node_id`.
+    pub fn confirm_pin(&self, node_id: String) -> Result<(), JsError> {
+        let target = cawala_ledger::NodeId::from(node_id);
+        // The routing ledger pin has no node id of its own; it belongs to the
+        // current parent leaf.
+        let parent = {
+            let state = self.control.lock_state();
+            state
+                .record
+                .parent
+                .as_ref()
+                .map(|link| cawala_ledger::NodeId::from(link.node_id.as_str().to_string()))
+        };
+        let mut ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut confirmed = false;
+        if parent.as_ref() == Some(&target) {
+            confirmed |= ledger.confirm_pinned_ledger(&target);
+        }
+        confirmed |= ledger.confirm_leaf_pin(&target);
+        if !confirmed {
+            return Err(JsError::new("no pin to confirm for that node"));
+        }
+        Ok(())
     }
 
     /// Export the ledger state as postcard bytes.

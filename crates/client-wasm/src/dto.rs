@@ -17,9 +17,9 @@ use wasm_bindgen::{JsError, prelude::wasm_bindgen};
 
 use crate::control::AncestorEntry;
 use crate::ledger_state::{
-    ActivityEntryV1, LedgerStateV1, OrderResultApplication, PendingOrderV1, SettlementApplication,
-    SettlementRecordV1, VerifiedBalanceV1, hop_role_str, settlement_state_failed_at,
-    settlement_state_reason, settlement_state_str,
+    ActivityEntryV1, LedgerStateV1, OrderResultApplication, PendingOrderV1, PinTrust,
+    SettlementApplication, SettlementRecordV1, VerifiedBalanceV1, hop_role_str, pin_trust_str,
+    settlement_state_failed_at, settlement_state_reason, settlement_state_str,
 };
 use crate::state::LocalStateV1;
 use crate::to_js_err;
@@ -796,6 +796,175 @@ impl ActivityEntryDto {
     #[wasm_bindgen(getter)]
     pub fn issued_at(&self) -> f64 {
         self.issued_at
+    }
+}
+
+/// One payee leaf pin with its explicit trust status, as surfaced by
+/// [`crate::ClientNode::pin_status`].
+///
+/// `trust` is `"unconfirmed"` for a trust-on-first-use pin that has not been
+/// explicitly confirmed, or `"confirmed"` once the caller confirms it.
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct LeafPinDto {
+    node_id: String,
+    ledger: String,
+    trust: String,
+}
+
+#[wasm_bindgen]
+impl LeafPinDto {
+    /// The leaf node id.
+    #[wasm_bindgen(getter)]
+    pub fn node_id(&self) -> String {
+        self.node_id.clone()
+    }
+
+    /// The pinned ledger key as 64 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn ledger(&self) -> String {
+        self.ledger.clone()
+    }
+
+    /// `"unconfirmed"` or `"confirmed"`.
+    #[wasm_bindgen(getter)]
+    pub fn trust(&self) -> String {
+        self.trust.clone()
+    }
+}
+
+/// A *different* ledger key presented for an already-pinned leaf.
+///
+/// `pinned` is the key still in force; `presented` is the rejected different
+/// key. A change is surfaced here and never silently adopted.
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct PinChangeDto {
+    node_id: String,
+    pinned: String,
+    presented: String,
+}
+
+#[wasm_bindgen]
+impl PinChangeDto {
+    /// The leaf node id whose pinned key differs.
+    #[wasm_bindgen(getter)]
+    pub fn node_id(&self) -> String {
+        self.node_id.clone()
+    }
+
+    /// The key currently pinned (still in force), as 64 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn pinned(&self) -> String {
+        self.pinned.clone()
+    }
+
+    /// The different key that was presented and rejected.
+    #[wasm_bindgen(getter)]
+    pub fn presented(&self) -> String {
+        self.presented.clone()
+    }
+}
+
+/// The explicit trust status of the client's pins, as returned by
+/// [`crate::ClientNode::pin_status`].
+///
+/// `status` is the aggregate: `"changed"` when a pin change was detected,
+/// `"unconfirmed"` when a pin is still a TOFU fallback, `"confirmed"` when a
+/// pin is explicitly confirmed, and `"none"` when nothing is pinned. The web
+/// treats `trustEstablished` as "the routing ledger pin is `confirmed` and no
+/// change is pending", never as a mere pin's presence.
+#[wasm_bindgen]
+pub struct PinStatusDto {
+    status: String,
+    ledger_pin: Option<String>,
+    ledger_trust: Option<String>,
+    leaf_pins: Vec<LeafPinDto>,
+    changes: Vec<PinChangeDto>,
+}
+
+impl PinStatusDto {
+    /// Build the trust view from the persisted ledger state.
+    pub(crate) fn from_state(state: &LedgerStateV1) -> Self {
+        let ledger_pin = state.pinned_ledger.map(|key| key.to_string());
+        let ledger_trust = ledger_pin
+            .as_ref()
+            .map(|_| pin_trust_str(state.pinned_ledger_trust).to_string());
+        let leaf_pins: Vec<LeafPinDto> = state
+            .pinned_leaf_keys
+            .iter()
+            .map(|entry| LeafPinDto {
+                node_id: entry.node_id.as_str().to_string(),
+                ledger: entry.ledger.to_string(),
+                trust: pin_trust_str(entry.trust).to_string(),
+            })
+            .collect();
+        let changes: Vec<PinChangeDto> = state
+            .leaf_key_changes
+            .iter()
+            .map(|change| PinChangeDto {
+                node_id: change.node_id.as_str().to_string(),
+                pinned: change.pinned.to_string(),
+                presented: change.presented.to_string(),
+            })
+            .collect();
+        let has_unconfirmed = (state.pinned_ledger.is_some()
+            && state.pinned_ledger_trust == PinTrust::Unconfirmed)
+            || state
+                .pinned_leaf_keys
+                .iter()
+                .any(|entry| entry.trust == PinTrust::Unconfirmed);
+        let any_pin = state.pinned_ledger.is_some() || !state.pinned_leaf_keys.is_empty();
+        let status = if !state.leaf_key_changes.is_empty() {
+            "changed"
+        } else if has_unconfirmed {
+            "unconfirmed"
+        } else if any_pin {
+            "confirmed"
+        } else {
+            "none"
+        };
+        PinStatusDto {
+            status: status.to_string(),
+            ledger_pin,
+            ledger_trust,
+            leaf_pins,
+            changes,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl PinStatusDto {
+    /// The aggregate status: `"none"`, `"unconfirmed"`, `"confirmed"`, or
+    /// `"changed"`.
+    #[wasm_bindgen(getter)]
+    pub fn status(&self) -> String {
+        self.status.clone()
+    }
+
+    /// The routing leaf's pinned ledger key, as 64 lowercase hex characters.
+    #[wasm_bindgen(getter)]
+    pub fn ledger_pin(&self) -> Option<String> {
+        self.ledger_pin.clone()
+    }
+
+    /// The routing pin's trust: `"unconfirmed"`, `"confirmed"`, or `None`.
+    #[wasm_bindgen(getter)]
+    pub fn ledger_trust(&self) -> Option<String> {
+        self.ledger_trust.clone()
+    }
+
+    /// The payee leaf pins with their trust status.
+    #[wasm_bindgen(getter)]
+    pub fn leaf_pins(&self) -> Vec<LeafPinDto> {
+        self.leaf_pins.clone()
+    }
+
+    /// The detected pin changes (never adopted).
+    #[wasm_bindgen(getter)]
+    pub fn changes(&self) -> Vec<PinChangeDto> {
+        self.changes.clone()
     }
 }
 

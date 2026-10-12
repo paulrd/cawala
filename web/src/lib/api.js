@@ -874,12 +874,14 @@ async function _spawnRealNode() {
   });
 
   // Trust anchors (pinned_ledger / pinned_leaf_keys) live inside the ledger
-  // blob. Trust is established ONLY when that blob actually imported AND at
-  // least one anchor was restored from it. A corrupt or version-bumped blob
-  // leaves `ledgerImported === false` (its `import_ledger_state` threw), so a
-  // later receipt must never be silently treated as TOFU-established even
-  // though the bytes were present. Fail-closed; see `getTrustState()`.
-  _trustEstablished = restoreResult.ledgerImported && _hasRestoredAnchors(node);
+  // blob. Trust is established ONLY when that blob actually imported AND the
+  // restored routing pin is *confirmed* (a TOFU fallback pin is `unconfirmed`
+  // and does not count). A corrupt or version-bumped blob leaves
+  // `ledgerImported === false` (its `import_ledger_state` threw), so a later
+  // receipt must never be silently treated as TOFU-established even though the
+  // bytes were present. Fail-closed; see `getTrustState()`. An older client
+  // build without `pin_status()` falls back to the restored-anchor heuristic.
+  _trustEstablished = restoreResult.ledgerImported && _pinTrustConfirmed(node);
 
   // Rebuild the UI activity list from the restored state (persisted value
   // notices + terminal settlement records) so past activity survives a reload.
@@ -2510,6 +2512,70 @@ function _readPinnedLeafKeys(node = _clientNode) {
 }
 
 /**
+ * The explicit pin-trust status (`pin_status()`), or `null` when this client
+ * build has no such getter (an older wasm). Frees every wasm handle it creates.
+ *
+ * @param {object|null} [node]
+ * @returns {{ status: string, ledgerPin: string|null, ledgerTrust: string|null, leafPins: Array<{nodeId:string,ledger:string,trust:string}>, changes: Array<{nodeId:string,pinned:string,presented:string}> }|null}
+ */
+function _readPinStatus(node = _clientNode) {
+  if (!node || typeof node.pin_status !== 'function') return null;
+  let dto;
+  try {
+    dto = node.pin_status();
+  } catch (err) {
+    _warnOnce('pin-status', '[api] pin_status read failed', err);
+    return null;
+  }
+  if (!dto) return null;
+  try {
+    const leafPins = dto.leaf_pins ?? [];
+    const changes = dto.changes ?? [];
+    return {
+      status: dto.status,
+      ledgerPin: dto.ledger_pin ?? null,
+      ledgerTrust: dto.ledger_trust ?? null,
+      leafPins: leafPins.map((entry) => {
+        try {
+          return { nodeId: entry.node_id, ledger: entry.ledger, trust: entry.trust };
+        } finally {
+          entry.free?.();
+        }
+      }),
+      changes: changes.map((change) => {
+        try {
+          return {
+            nodeId: change.node_id,
+            pinned: change.pinned,
+            presented: change.presented,
+          };
+        } finally {
+          change.free?.();
+        }
+      }),
+    };
+  } finally {
+    dto.free?.();
+  }
+}
+
+/**
+ * Whether the live node reports a *confirmed* routing-leaf pin with no pending
+ * pin change (the fail-closed meaning of "trust established"). This mirrors the
+ * `established` rule in {@link getTrustState} exactly: a confirmed pin that
+ * still has a recorded change is NOT established. Falls back to the legacy
+ * `/restored-anchors/` heuristic when the client build has no `pin_status()`.
+ *
+ * @param {object} node
+ * @returns {boolean}
+ */
+function _pinTrustConfirmed(node) {
+  const pin = _readPinStatus(node);
+  if (pin) return pin.ledgerTrust === 'confirmed' && pin.changes.length === 0;
+  return _hasRestoredAnchors(node);
+}
+
+/**
  * The in-flight outbound join request, as a plain object, or null.
  * @param {object|null} [node]
  * @returns {object|null}
@@ -2607,47 +2673,110 @@ export function getClientStateInfo() {
 }
 
 /**
- * Whether TOFU trust anchors were restored from the persisted ledger cache at
- * boot. False on a fresh origin (no cache): trust is not established.
+ * Whether the routing-leaf pin is *confirmed* (the fail-closed meaning of trust
+ * established). False on a fresh origin and for a TOFU-unconfirmed pin.
  * @returns {boolean}
  */
 export function isTrustEstablished() {
-  return _trustEstablished;
+  return getTrustState().established;
 }
 
 /**
- * The trust-anchor surface. `established` is whether pins were restored from
- * the persisted cache; `needsReestablish` is the complement in live mode.
+ * The trust-anchor surface.
+ *
+ * `established` is true ONLY when the routing leaf's pin is explicitly
+ * `confirmed` and no pin change is pending — a trust-on-first-use pin is
+ * `unconfirmed` and never counts. `status` is the aggregate pin status
+ * (`none`/`unconfirmed`/`confirmed`/`changed`); `changes` lists detected pin
+ * changes (a different key presented for a pinned leaf, never adopted);
+ * `ledgerPinNode` is the node id to pass to {@link confirmPin} to confirm the
+ * routing pin.
  *
  * Fail-closed: when `needsReestablish` is true the UI must not present a pin as
- * TOFU-established, even if one appears in-session. Preventing the wasm layer
- * from auto-pinning in the first place needs a node change (follow-up).
+ * established. An older client build without `pin_status()` degrades to the
+ * restored-anchor heuristic.
  *
- * @returns {{ established: boolean, needsReestablish: boolean, pinnedLedger: string|null, pinnedLeafKeys: Array<{ nodeId: string, ledger: string }>, mock: boolean }}
+ * @returns {{ established: boolean, needsReestablish: boolean, status: string, ledgerTrust: 'unconfirmed'|'confirmed'|null, ledgerPinNode: string|null, pinnedLedger: string|null, pinnedLeafKeys: Array<{ nodeId: string, ledger: string }>, changes: Array<{ nodeId: string, pinned: string, presented: string }>, mock: boolean }}
  */
 export function getTrustState() {
   if (_useMock || !_clientNode) {
     return {
       established: false,
       needsReestablish: false,
+      status: 'none',
+      ledgerTrust: null,
+      ledgerPinNode: null,
       pinnedLedger: null,
       pinnedLeafKeys: [],
+      changes: [],
       mock: true,
     };
   }
   let pinnedLedger = null;
+  let parent = null;
   try {
-    pinnedLedger = _readLedgerStatus(_clientNode).pinnedLedger;
+    const status = _readLedgerStatus(_clientNode);
+    pinnedLedger = status.pinnedLedger;
+    parent = status.parent;
   } catch (err) {
     _warnOnce('trust-ledger', '[api] trust state ledger read failed', err);
   }
+  const pin = _readPinStatus(_clientNode);
+  if (pin) {
+    const ledgerTrust = pin.ledgerTrust ?? null;
+    const established = ledgerTrust === 'confirmed' && pin.changes.length === 0;
+    return {
+      established,
+      needsReestablish: !established,
+      status: pin.status,
+      ledgerTrust,
+      ledgerPinNode: parent,
+      pinnedLedger: pin.ledgerPin ?? pinnedLedger,
+      pinnedLeafKeys: pin.leafPins.map((entry) => ({ nodeId: entry.nodeId, ledger: entry.ledger })),
+      changes: pin.changes,
+      mock: false,
+    };
+  }
+  // Legacy fallback (a client build without `pin_status()`): a restored anchor
+  // is the best available signal, and an in-session pin reads as unconfirmed.
   return {
     established: _trustEstablished,
     needsReestablish: !_trustEstablished,
+    status: _trustEstablished ? 'confirmed' : pinnedLedger ? 'unconfirmed' : 'none',
+    ledgerTrust: _trustEstablished ? 'confirmed' : pinnedLedger ? 'unconfirmed' : null,
+    ledgerPinNode: parent,
     pinnedLedger,
     pinnedLeafKeys: _readPinnedLeafKeys(_clientNode),
+    changes: [],
     mock: false,
   };
+}
+
+/**
+ * Explicitly confirm the pin for `nodeId` (a payee leaf node id, or the current
+ * parent's node id for the routing leaf pin — see `getTrustState().ledgerPinNode`).
+ *
+ * Confirmation keeps the existing pinned key (it never adopts a presented pin
+ * change), marks it `confirmed`, and clears any recorded change for that node.
+ * The updated ledger state is re-exported, so the confirmation survives a
+ * reload. Returns the refreshed trust state.
+ *
+ * @param {string} nodeId
+ * @returns {object}
+ */
+export function confirmPin(nodeId) {
+  const node = _requireNode();
+  if (typeof node.confirm_pin !== 'function') {
+    throw new Error('This client build cannot confirm pins.');
+  }
+  if (nodeId == null || String(nodeId).length === 0) {
+    throw new Error('A pin subject node id is required.');
+  }
+  node.confirm_pin(String(nodeId));
+  _trustEstablished = _pinTrustConfirmed(node);
+  _persistLedgerState();
+  _syncLedgerStoreFromStatus();
+  return getTrustState();
 }
 
 /**
