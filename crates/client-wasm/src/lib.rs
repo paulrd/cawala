@@ -1677,7 +1677,7 @@ impl ClientNode {
         let order_hash = order.hash();
         let auth = order.authorize(&operator).map_err(to_js_err)?;
 
-        // The leaf decides same-leaf `Direct` vs a cross-leaf depth-1 `Descend`
+        // The leaf decides same-leaf `Direct` vs a cross-subtree `Descend`
         // settlement; record the payer role now so a later terminal proof can be
         // verified against it. The out-of-band leaf pin (when the payer pinned
         // one from the receive URI) is already in the pinned-leaf registry.

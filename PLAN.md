@@ -170,6 +170,16 @@
 ## Settlement
   - Cross-subtree payments settle at the least common ancestor (LCA) between
     prefunded settlement accounts - prefunded only, no overdraw (decision 5).
+  - A settlement cascade is the full tree path
+    `[payer_leaf, ...ascend..., LCA, ...descend..., payee_leaf]`, for **any**
+    depth (no depth-1 restriction); the signer list is capped at `MAX_HOPS` (32).
+    The settle payload format is unchanged (**settle payload 3**), so this is not
+    a wire-format break - but a pre-change peer refuses deep routes (silent drop),
+    making it a lockstep change.
+  - The origin's per-payment intermediate audit is **best-effort**: it fully
+    resolves only its own persisted parent hop and records a deep route `degraded`
+    (`unresolvable_signer`); the verified terminal proof is the funds gate and
+    netting remains the deep-path detection backstop.
   - Periodic netting reconciles balances.
   - Value creation/destruction = signed issue/burn entries propagated with
     ledger commitments.

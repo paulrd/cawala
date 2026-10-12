@@ -821,21 +821,31 @@ async fn stalled_terminal_times_out_then_retry_is_idempotent() {
     assert_eq!(ledger_len(&h.p).await, p_len);
 }
 
+/// Settlement is no longer depth-1: a route deeper than depth-1 is derived and
+/// reserved by the origin, then fails downstream because the payee leaf is not
+/// in the known topology (the LCA cannot resolve its child toward the payee).
+/// The origin's own hop already committed, so the downstream `Malformed` is
+/// surfaced as `Indeterminate`.
 #[tokio::test]
-async fn too_deep_route_rejects_without_appending() {
+async fn deep_route_reserves_then_fails_downstream() {
     let mut h = setup(Mode::Full).await;
     let now = unix_now();
     let order = order(&h.ua, "uZ", 100, 1, now + 3600);
-    // Payee address shares no grandparent with the payer leaf.
+    // Payee address shares no grandparent with the payer leaf: a deep route
+    // (`[0.1, 0, 0.3, 0.3.5]`, within the signer cap).
     let env = order_env(&h.ua, "0.1", &order, "0.3.5.7");
     send_from_user(&h.ua, &env, h.config.hop_timeout).await;
 
     let result = recv_order_result(&mut h.ua.sink).await;
     match &result.status {
-        SettlementStatusV2::Rejected { reason } => assert_eq!(*reason, OrderRejectV1::BadRequest),
-        other => panic!("expected Rejected, got {other:?}"),
+        SettlementStatusV2::Indeterminate { reason } => {
+            assert_eq!(*reason, OrderRejectV1::BadRequest)
+        }
+        other => panic!("expected Indeterminate, got {other:?}"),
     }
-    assert_eq!(ledger_len(&h.a).await, 2, "origin guard must not append");
+    // The origin reserved its (Ascend) hop before forwarding; the LCA did not
+    // append (it could not derive its hop).
+    assert_eq!(ledger_len(&h.a).await, 3, "origin reserves a deep route");
     assert_eq!(ledger_len(&h.p).await, 4);
 }
 

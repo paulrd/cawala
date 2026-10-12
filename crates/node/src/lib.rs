@@ -59,7 +59,7 @@ pub use msg::{
 };
 pub use settlement::{
     DerivedHop, MAX_PENDING, MAX_TERMINAL, PendingSettlement, SettlementManager, TerminalRecord,
-    derive_hop, expected_signers, route_is_depth_one,
+    derive_hop, route_signers,
 };
 
 /// Bind an endpoint with the given persisted [`iroh::SecretKey`] and start the

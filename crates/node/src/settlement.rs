@@ -5,10 +5,10 @@
 //! `role = classify_hop(payer, payee, this)` and the two accounts follow the
 //! canonical `hop_postings` shape resolved from the record's child slots.
 //!
-//! v1 scope is depth-1: the three signers are
-//! `[payer_leaf, lca, payee_leaf]`. Anything else is rejected
-//! ([`SettleRejectV1::RouteTooDeep`]). This module is pure and synchronous; no
-//! transport.
+//! The signer path is `[payer_leaf, ...ascend..., lca, ...descend..., payee_leaf]`
+//! for any depth (see [`route_signers`]); the cap on that list is enforced by
+//! callers via [`cawala_msg::MAX_SETTLE_HOPS`]. This module is pure and
+//! synchronous; no transport.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -39,44 +39,63 @@ pub struct DerivedHop {
     pub second: AccountRef,
 }
 
-/// Whether the payment is within the v1 depth-1 settlement scope.
+/// The ordered signer addresses of a settlement cascade:
 ///
-/// Both endpoints must be at least depth 2 (a leaf's user). Same-leaf payments
-/// (`src.parent() == dst.parent()`) are the trivial `Direct` case; otherwise the
-/// two leaf addresses must be siblings (`src.parent()!.parent() ==
-/// dst.parent()!.parent()`), so the LCA is one level above the leaves.
-pub fn route_is_depth_one(src: &OctAddr, dst: &OctAddr) -> bool {
+/// `[payer_leaf, ...ascend..., lca, ...descend..., payee_leaf]`.
+///
+/// Both endpoints must be at least depth 2 (a leaf's user). A same-leaf payment
+/// (`src.parent() == dst.parent()`) is the trivial `Direct` case, handled as a
+/// single hop rather than a cascade, and yields `None`. Otherwise the path is
+/// the strictly-ascending chain from the payer's leaf to the least common
+/// ancestor, followed by the strictly-descending chain to the payee's leaf (the
+/// LCA appears exactly once).
+///
+/// The result always has length at least 3 (both leaves are distinct and the
+/// LCA lies strictly above them), but callers must still bound it against
+/// [`cawala_msg::MAX_SETTLE_HOPS`] before use.
+pub fn route_signers(src: &OctAddr, dst: &OctAddr) -> Option<Vec<OctAddr>> {
     if src.depth() < 2 || dst.depth() < 2 {
-        return false;
-    }
-    let (Some(src_leaf), Some(dst_leaf)) = (src.parent(), dst.parent()) else {
-        return false;
-    };
-    if src_leaf == dst_leaf {
-        return true;
-    }
-    matches!(
-        (src_leaf.parent(), dst_leaf.parent()),
-        (Some(src_lca), Some(dst_lca)) if src_lca == dst_lca
-    )
-}
-
-/// The three signer addresses of a depth-1 settlement cascade, in order:
-/// `[payer_leaf, lca, payee_leaf]`.
-///
-/// Returns `None` for a same-leaf payment (handled as a single `Direct` hop, not
-/// a 3-hop settlement) and for any route outside the depth-1 scope.
-pub fn expected_signers(src: &OctAddr, dst: &OctAddr) -> Option<[OctAddr; 3]> {
-    if !route_is_depth_one(src, dst) {
         return None;
     }
     let src_leaf = src.parent()?;
     let dst_leaf = dst.parent()?;
-    // Same-leaf is a `Direct` move, not a 3-hop cascade.
+    // Same-leaf is a `Direct` move, not a cascade.
     if src_leaf == dst_leaf {
         return None;
     }
-    Some([src_leaf, src.lca(dst), dst_leaf])
+    let lca = src_leaf.lca(&dst_leaf);
+    // The LCA must lie strictly above both leaves. If it equals either leaf, one
+    // endpoint "leaf" is an ancestor of the other — not a valid cascade (a leaf
+    // node has no node descendants) — and would otherwise yield a degenerate
+    // signer path.
+    if lca == src_leaf || lca == dst_leaf {
+        return None;
+    }
+
+    let mut signers = Vec::new();
+    // Ascending: payer leaf up to and including the LCA.
+    let mut cur = src_leaf;
+    loop {
+        signers.push(cur.clone());
+        if cur == lca {
+            break;
+        }
+        cur = cur.parent()?;
+    }
+    // Descending: payee leaf up to (but excluding) the LCA, reversed onto the
+    // end so the payee leaf comes last.
+    let mut descend = Vec::new();
+    let mut cur = dst_leaf;
+    while cur != lca {
+        descend.push(cur.clone());
+        cur = cur.parent()?;
+    }
+    descend.reverse();
+    signers.extend(descend);
+    // The LCA is strictly above both leaves (guarded above), so the path is at
+    // least `[payer_leaf, lca, payee_leaf]`.
+    debug_assert!(signers.len() >= 3);
+    Some(signers)
 }
 
 /// Derive this signer's hop from the route and the node record.
@@ -533,25 +552,30 @@ mod tests {
     }
 
     #[test]
-    fn route_scope_and_signers() {
+    fn route_signers_covers_any_depth() {
         let same_leaf = (addr("0.1.3"), addr("0.1.4"));
         let depth_one = (addr("0.1.3"), addr("0.2.4"));
         let deeper = (addr("0.1.3"), addr("0.3.5.7"));
         let too_shallow = (addr("0"), addr("0.2"));
 
-        assert!(route_is_depth_one(&same_leaf.0, &same_leaf.1));
-        assert!(route_is_depth_one(&depth_one.0, &depth_one.1));
-        assert!(!route_is_depth_one(&deeper.0, &deeper.1));
-        assert!(!route_is_depth_one(&too_shallow.0, &too_shallow.1));
-
-        // A same-leaf payment is `Direct`, not a 3-hop settlement.
-        assert_eq!(expected_signers(&same_leaf.0, &same_leaf.1), None);
+        // A same-leaf payment is `Direct`, not a cascade.
+        assert_eq!(route_signers(&same_leaf.0, &same_leaf.1), None);
+        assert_eq!(route_signers(&too_shallow.0, &too_shallow.1), None);
+        // A crafted route whose payee "leaf" is an ancestor of the payer leaf is
+        // not a valid cascade (it would otherwise yield a two-signer path).
         assert_eq!(
-            expected_signers(&depth_one.0, &depth_one.1),
-            Some([addr("0.1"), addr("0"), addr("0.2")])
+            route_signers(&addr("0.1.2.3"), &addr("0.1.5")),
+            None
         );
-        assert_eq!(expected_signers(&deeper.0, &deeper.1), None);
-        assert_eq!(expected_signers(&too_shallow.0, &too_shallow.1), None);
+
+        assert_eq!(
+            route_signers(&depth_one.0, &depth_one.1),
+            Some(vec![addr("0.1"), addr("0"), addr("0.2")])
+        );
+        assert_eq!(
+            route_signers(&deeper.0, &deeper.1),
+            Some(vec![addr("0.1"), addr("0"), addr("0.3"), addr("0.3.5")])
+        );
     }
 
     fn pending(nonce: u64, deadline_secs: u64) -> PendingSettlement {

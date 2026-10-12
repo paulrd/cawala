@@ -58,10 +58,11 @@ use crate::ledger_payload::OrderRejectV1;
 /// [`SettlePayloadError::UnsupportedVersion`].
 pub const SETTLE_PAYLOAD_VERSION: u8 = 3;
 
-/// Maximum number of carried settlement hops a caller should accept. This is a
-/// use-site bound (the v1 route is depth-1: `Ascend`/`Lca`/`Descend`); decoding
+/// Maximum number of signers in a settlement cascade. This is a use-site bound:
+/// the signer list spans the payer leaf, the intermediates, and the payee leaf,
+/// so it is bounded by the envelope hop chain ([`crate::MAX_HOPS`]). Decoding
 /// never truncates.
-pub const MAX_SETTLE_HOPS: usize = 3;
+pub const MAX_SETTLE_HOPS: usize = crate::MAX_HOPS;
 
 /// A versioned settlement payload.
 ///
@@ -177,13 +178,14 @@ pub struct SettleResultV3 {
 }
 
 impl SettleResultV3 {
-    /// Whether the echoed `intermediates` fit the depth-1 bound.
+    /// Whether the echoed `intermediates` fit the signer bound.
     ///
-    /// A depth-1 route has exactly three signers, leaving at most one hop
-    /// strictly between origin and terminal
-    /// ([`MAX_SETTLE_HOPS`].saturating_sub(2)). Decoding never truncates; the
-    /// origin decides what to do on overflow (a `Rejected` outcome carries no
-    /// intermediates, so it is always within bound).
+    /// A cascade carries at most [`MAX_SETTLE_HOPS`] signers, of which the payer
+    /// leaf and the terminal leaf are not intermediates, leaving at most
+    /// `MAX_SETTLE_HOPS - 2` (= 30) hops strictly between origin and terminal.
+    /// Decoding never truncates; the origin decides what to do on overflow (a
+    /// `Rejected` outcome carries no intermediates, so it is always within
+    /// bound).
     pub fn intermediates_within_bound(&self) -> bool {
         match &self.outcome {
             SettleOutcomeV3::Applied { intermediates, .. } => {
@@ -309,7 +311,8 @@ pub enum SettleRejectV1 {
         /// The per-hop refusal reason.
         reason: OrderRejectV1,
     },
-    /// The route is deeper than the v1 depth-1 scope.
+    /// The route is not derivable, or exceeds the signer cap
+    /// ([`MAX_SETTLE_HOPS`]).
     RouteTooDeep,
     /// The message was structurally malformed (bad route, missing child, ...).
     Malformed,
@@ -402,8 +405,10 @@ mod tests {
     }
 
     fn hop(i: usize) -> SettleHopV3 {
+        // Two octal levels, so the helper stays valid past 8 hops (a signer cap
+        // of `MAX_SETTLE_HOPS` needs up to 33 distinct addresses).
         SettleHopV3 {
-            signer_addr: addr(&format!("0.{}", i + 1)),
+            signer_addr: addr(&format!("0.{}.{}", i / 8, i % 8)),
             entry: signed_entry(),
             proof: None,
         }
@@ -508,6 +513,21 @@ mod tests {
                 SettleOutcomeV3::Rejected { reason },
             )));
         }
+    }
+
+    /// A deep cascade (more than the depth-1 three signers) round-trips
+    /// unchanged, locking the generalization.
+    #[test]
+    fn deep_forward_and_result_round_trip() {
+        // Six carried hops, well beyond the old depth-1 three-signer route.
+        round_trip(&SettlePayloadV3::Forward(full_forward(6)));
+
+        // An applied outcome echoing several proven intermediates round-trips.
+        let mut hops: Vec<SettleHopV3> = (0..4).map(hop).collect();
+        for hop in &mut hops {
+            hop.proof = Some(sample_entry_proof());
+        }
+        round_trip(&SettlePayloadV3::Result(result(applied(hops))));
     }
 
     #[test]

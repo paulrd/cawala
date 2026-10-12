@@ -37,11 +37,12 @@ use cawala_ledger::{
 use cawala_control::{ControlReply, RejectCode, RoutedControlV1, SignedRoutedReply};
 use cawala_msg::{
     Ack, AckStatus, EntryProofV1, Envelope, Hop, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
-    LedgerPayloadV4, MSG_CONTROL_V1, MSG_LEDGER_V1, MSG_SETTLE_V1, MessageType, MsgError, MsgId,
-    Neighbor, NeighborKind, OrderRejectV1, OrderResultV1, OrderResultV2, OrderResultV3,
-    OrderStatusV1, PeerRef, RejectReason, Routable, RouteDecision, RouteError, Seen, SeenConfig,
-    SeenSet, SettleForwardV3, SettleHopV3, SettleOutcomeV3, SettlePayloadV3, SettleRejectV1,
-    SettleResultV3, SettlementStatusV2, ValueNoticeV1, VersionedLedgerPayload, decode_versioned,
+    LedgerPayloadV4, MAX_SETTLE_HOPS, MSG_CONTROL_V1, MSG_LEDGER_V1, MSG_SETTLE_V1, MessageType,
+    MsgError, MsgId, Neighbor, NeighborKind, OrderRejectV1, OrderResultV1, OrderResultV2,
+    OrderResultV3, OrderStatusV1, PeerRef, RejectReason, Routable, RouteDecision, RouteError, Seen,
+    SeenConfig, SeenSet, SettleForwardV3, SettleHopV3, SettleOutcomeV3, SettlePayloadV3,
+    SettleRejectV1, SettleResultV3, SettlementStatusV2, ValueNoticeV1, VersionedLedgerPayload,
+    decode_versioned,
 };
 use cawala_topology::ChildKind;
 
@@ -54,8 +55,7 @@ use crate::ledger_service::{ApplyOutcome, HopOutcome, LedgerService};
 use crate::orders;
 use crate::record::{NodeRecord, RecordStore};
 use crate::settlement::{
-    DerivedHop, PendingSettlement, SettlementManager, TerminalRecord, derive_hop, expected_signers,
-    route_is_depth_one,
+    DerivedHop, PendingSettlement, SettlementManager, TerminalRecord, derive_hop, route_signers,
 };
 
 /// ALPN negotiated on every `cawala/msg/0` connection.
@@ -1435,8 +1435,13 @@ async fn handle_settlement_order(
         return;
     };
 
-    // v1 depth-1 guard: reject anything deeper without touching the ledger.
-    if !route_is_depth_one(&payer_addr, payee_addr) {
+    // Derive the full signer path and reject anything outside the enforced
+    // signer cap without touching the ledger.
+    let Some(signers) = route_signers(&payer_addr, payee_addr) else {
+        send_settlement_reject(endpoint, source, config, env, order.hash(), OrderRejectV1::BadRequest).await;
+        return;
+    };
+    if signers.len() > MAX_SETTLE_HOPS {
         send_settlement_reject(endpoint, source, config, env, order.hash(), OrderRejectV1::BadRequest).await;
         return;
     }
@@ -1536,8 +1541,6 @@ async fn handle_settlement_order(
             if let Some(evicted) = manager.lock().await.reserve(pending) {
                 send_timeout_result(endpoint, source, config, ledger, Some(record), &evicted).await;
             }
-            let signers = expected_signers(&payer_addr, payee_addr)
-                .expect("depth-1 route has three signers");
             send_settle_payload_to(
                 endpoint,
                 source,
@@ -2035,7 +2038,7 @@ async fn handle_settle_result(
                 }
             }
             SettleOutcomeV3::Rejected { .. } => {
-                let expected = expected_signers(&pending.payer_addr, &pending.payee_addr)
+                let expected = route_signers(&pending.payer_addr, &pending.payee_addr)
                     .map(|signers| signers.iter().any(|addr| addr == &env.src.addr))
                     .unwrap_or(false);
                 if !expected {
@@ -2087,6 +2090,7 @@ async fn handle_settle_result(
                                 data_dir,
                                 &payment_id,
                                 intermediates.first(),
+                                1,
                                 None,
                                 "registry",
                             );
@@ -2209,16 +2213,19 @@ async fn handle_settle_result(
 struct IntermediateCheck {
     /// A short, machine-readable name for the failed check.
     which_check: &'static str,
-    /// The expected LCA node id, once it has been resolved.
+    /// The expected node id, once it has been resolved.
     expected_node_id: Option<NodeId>,
+    /// 1-based index of the offending hop in the cascade (`1` is the first
+    /// intermediate, the origin's parent).
+    hop_index: usize,
 }
 
 /// Audit the `intermediates` echoed in a verified `Applied` result.
 ///
-/// Returns `true` when the single, positionally-checked intermediate is
-/// accountable to the origin's own persisted parent row. On failure it appends
-/// one best-effort audit line and returns `false`; the caller still treats the
-/// funds outcome as `Applied` (M2).
+/// Returns `true` when every positionally-checked intermediate is accountable to
+/// the origin's own persisted parent row. On failure it appends one best-effort
+/// audit line and returns `false`; the caller still treats the funds outcome as
+/// `Applied` (M2).
 fn intermediates_accountable(
     pending: &PendingSettlement,
     terminal_proof: &EntryProofV1,
@@ -2230,10 +2237,16 @@ fn intermediates_accountable(
     match intermediates_check(pending, terminal_proof, intermediates, data_dir, node_id, registry) {
         Ok(()) => true,
         Err(check) => {
+            // `hop_index` is 1-based; `intermediates[0]` is the origin's parent.
+            let hop = check
+                .hop_index
+                .checked_sub(1)
+                .and_then(|index| intermediates.get(index));
             audit_intermediate_degraded(
                 data_dir,
                 &pending.order.hash(),
-                intermediates.first(),
+                hop,
+                check.hop_index,
                 check.expected_node_id.as_ref(),
                 check.which_check,
             );
@@ -2244,11 +2257,16 @@ fn intermediates_accountable(
 
 /// The accountability checks themselves; see [`intermediates_accountable`].
 ///
-/// In the depth-1 route there is exactly one intermediate: the LCA
-/// (`expected_signers[1]`). It must match the origin's own parent, carry a
-/// canonical `Lca` transfer of this order whose **accounts** bind the origin's
-/// own node id to the verified terminal signer's node id (M1), and carry a
-/// valid inclusion proof under the persisted parent's ledger key (M5).
+/// The origin can fully resolve exactly one intermediate: its own persisted
+/// parent (`signers[1]`). It must match the origin's parent address, carry a
+/// canonical transfer of this order whose **accounts** bind the origin's own
+/// node id (M1), and carry a valid inclusion proof under the persisted parent's
+/// ledger key (M5). Hops above the parent (a deep route) are only structurally
+/// checked here — the origin cannot bind them to a registered key — so a deep
+/// route always ends as an `unresolvable_signer` degradation.
+///
+/// The check order and `which_check` names are chosen so the depth-1 case (a
+/// single intermediate, the LCA) is byte-for-byte the historical behaviour.
 #[allow(clippy::too_many_arguments)]
 fn intermediates_check(
     pending: &PendingSettlement,
@@ -2259,18 +2277,20 @@ fn intermediates_check(
     registry: &PeerRegistry,
 ) -> Result<(), IntermediateCheck> {
     macro_rules! fail {
-        ($which:expr, $node:expr) => {
+        ($which:expr, $node:expr, $hop_index:expr) => {
             return Err(IntermediateCheck {
                 which_check: $which,
                 expected_node_id: $node,
+                hop_index: $hop_index,
             })
         };
     }
 
-    let Some(signers) = expected_signers(&pending.payer_addr, &pending.payee_addr) else {
+    let Some(signers) = route_signers(&pending.payer_addr, &pending.payee_addr) else {
         return Err(IntermediateCheck {
             which_check: "route",
             expected_node_id: None,
+            hop_index: 1,
         });
     };
     // (a) exactly the expected intermediate set, positionally.
@@ -2278,33 +2298,40 @@ fn intermediates_check(
         return Err(IntermediateCheck {
             which_check: "intermediates_len",
             expected_node_id: None,
+            hop_index: 1,
         });
     }
-    let hop = &intermediates[0];
-    if hop.signer_addr != signers[1] {
-        return Err(IntermediateCheck {
-            which_check: "intermediate_signer",
-            expected_node_id: None,
-        });
+    for (k, hop) in intermediates.iter().enumerate() {
+        if hop.signer_addr != signers[k + 1] {
+            return Err(IntermediateCheck {
+                which_check: "intermediate_signer",
+                expected_node_id: None,
+                hop_index: k + 1,
+            });
+        }
     }
 
-    // (b) the origin's persisted parent must be the expected LCA.
+    // (b) the origin's persisted parent must be the expected first intermediate
+    // (`signers[1]`).
     let record = RecordStore::open(data_dir, node_id)
         .map(|store| store.record().clone())
         .map_err(|_| IntermediateCheck {
             which_check: "record",
             expected_node_id: None,
+            hop_index: 1,
         })?;
     if record.address.as_ref().and_then(|addr| addr.parent()) != Some(signers[1].clone()) {
         return Err(IntermediateCheck {
             which_check: "origin_parent_addr",
             expected_node_id: None,
+            hop_index: 1,
         });
     }
     let Some(parent_link) = record.parent.as_ref() else {
         return Err(IntermediateCheck {
             which_check: "origin_parent_link",
             expected_node_id: None,
+            hop_index: 1,
         });
     };
     let parent_node_id = NodeId::from(parent_link.parent_id.clone());
@@ -2313,84 +2340,194 @@ fn intermediates_check(
     // (c) the persisted parent row must resolve to a ledger-bearing node; if it
     // cannot (e.g. a ledger rotation left it stale), degrade rather than fail.
     let Some(parent_row) = registry.get(&parent_node_id) else {
-        fail!("parent_row", expected_node_id.clone());
+        fail!("parent_row", expected_node_id.clone(), 1);
     };
     if parent_row.role != PeerRole::Node {
-        fail!("parent_role", expected_node_id.clone());
+        fail!("parent_role", expected_node_id.clone(), 1);
     }
     let Some(parent_ledger) = parent_row.ledger else {
-        fail!("parent_ledger", expected_node_id.clone());
+        fail!("parent_ledger", expected_node_id.clone(), 1);
     };
 
-    // (d) the hop must be a canonical `Lca` transfer of this order.
-    let entry = &hop.entry.entry;
+    // (d) the parent hop must be a canonical transfer of this order, with the
+    // role the classifier derives for `signers[1]`.
+    let parent_hop = &intermediates[0];
+    let parent_role = classify_hop(&pending.payer_addr, &pending.payee_addr, &signers[1]);
+    let entry = &parent_hop.entry.entry;
     let cawala_ledger::EntryBody::Transfer {
         payment_id,
         amount,
         role,
     } = &entry.body
     else {
-        fail!("intermediate_body", expected_node_id.clone());
+        fail!("intermediate_body", expected_node_id.clone(), 1);
     };
-    if *payment_id != pending.order.hash()
+    if Some(*role) != parent_role
+        || *payment_id != pending.order.hash()
         || *amount != pending.order.amount
-        || *role != HopRole::Lca
     {
-        fail!("intermediate_body", expected_node_id.clone());
+        fail!("intermediate_body", expected_node_id.clone(), 1);
     }
     if entry.check_conservation().is_err() {
-        fail!("intermediate_conservation", expected_node_id.clone());
+        fail!("intermediate_conservation", expected_node_id.clone(), 1);
     }
     if entry.ledger_id != parent_ledger {
-        fail!("intermediate_ledger_id", expected_node_id.clone());
+        fail!("intermediate_ledger_id", expected_node_id.clone(), 1);
     }
-    if hop.entry.verify(&parent_ledger).is_err() {
-        fail!("intermediate_signature", expected_node_id.clone());
+    if parent_hop.entry.verify(&parent_ledger).is_err() {
+        fail!("intermediate_signature", expected_node_id.clone(), 1);
     }
 
-    // (e) M1: bind the posting accounts, not just the shape. For `Lca` the
-    // tuple is `(debited_child, credited_child)`; the debit must name the
-    // origin's own node and the credit the verified terminal signer's node.
-    let Ok(accounts) = cawala_ledger::entry_hop_accounts(entry, HopRole::Lca) else {
-        fail!("intermediate_accounts", expected_node_id.clone());
+    // (e) M1: bind the posting accounts, not just the shape. The binding depends
+    // on the parent's role on the route:
+    //  - `Ascend` (a deeper payer side): `(Parent, Child(toward_src))`; the
+    //    parent's child toward the payer is the origin itself.
+    //  - `Lca`: `(debited_child, credited_child)`. At depth-1 the parent *is* the
+    //    least common ancestor and credits the terminal (payee) leaf. On a deeper
+    //    route the parent is the LCA only when the payer side is exactly one
+    //    level; it then credits the first payee-side signer (`signers[2]`), whose
+    //    node id the origin cannot resolve, so only the debit (the origin) is
+    //    bound here and the route degrades as `unresolvable_signer` below.
+    let Ok(accounts) = cawala_ledger::entry_hop_accounts(entry, *role) else {
+        fail!("intermediate_accounts", expected_node_id.clone(), 1);
     };
-    let expected_from = cawala_ledger::AccountRef::Child(NodeId::from(node_id.to_string()));
-    let expected_to = cawala_ledger::AccountRef::Child(terminal_proof.signer.node_id.clone());
-    if accounts != (expected_from, expected_to) {
-        fail!("intermediate_accounts", expected_node_id.clone());
+    let origin_child = cawala_ledger::AccountRef::Child(NodeId::from(node_id.to_string()));
+    match parent_role {
+        Some(HopRole::Ascend) => {
+            if accounts != (cawala_ledger::AccountRef::Parent, origin_child) {
+                fail!("intermediate_accounts", expected_node_id.clone(), 1);
+            }
+        }
+        Some(HopRole::Lca) if intermediates.len() == 1 => {
+            let expected = (
+                origin_child,
+                cawala_ledger::AccountRef::Child(terminal_proof.signer.node_id.clone()),
+            );
+            if accounts != expected {
+                fail!("intermediate_accounts", expected_node_id.clone(), 1);
+            }
+        }
+        Some(HopRole::Lca) => {
+            // Deep route with a shallow payer side: the credited child is the
+            // first payee-side signer, unresolvable from the origin. Bind the
+            // debit (the origin) only; (h) below degrades as `unresolvable_signer`.
+            if accounts.0 != origin_child {
+                fail!("intermediate_accounts", expected_node_id.clone(), 1);
+            }
+        }
+        // `classify_hop` only yields `Lca`/`Ascend` for an interior ancestor of
+        // the payer leaf; anything else is not accountably bound.
+        _ => fail!("intermediate_accounts", expected_node_id.clone(), 1),
     }
 
     // (f) the hop's own inclusion proof, mirroring the terminal proof checks.
-    let Some(proof) = &hop.proof else {
-        fail!("intermediate_proof_missing", expected_node_id.clone());
+    let Some(proof) = &parent_hop.proof else {
+        fail!("intermediate_proof_missing", expected_node_id.clone(), 1);
     };
-    if proof.leaf_addr != hop.signer_addr || proof.leaf_addr != signers[1] {
-        fail!("intermediate_proof_leaf", expected_node_id.clone());
+    if proof.leaf_addr != parent_hop.signer_addr || proof.leaf_addr != signers[1] {
+        fail!("intermediate_proof_leaf", expected_node_id.clone(), 1);
     }
-    if proof.entry != hop.entry {
-        fail!("intermediate_proof_entry", expected_node_id.clone());
+    if proof.entry != parent_hop.entry {
+        fail!("intermediate_proof_entry", expected_node_id.clone(), 1);
     }
     if proof.signer.role != PeerRole::Node {
-        fail!("intermediate_proof_signer_role", expected_node_id.clone());
+        fail!("intermediate_proof_signer_role", expected_node_id.clone(), 1);
     }
     if proof.signer.node_id != parent_node_id {
-        fail!("intermediate_proof_signer_node", expected_node_id.clone());
+        fail!("intermediate_proof_signer_node", expected_node_id.clone(), 1);
     }
     if proof.signer.ledger != Some(parent_ledger) {
-        fail!("intermediate_proof_signer_ledger", expected_node_id.clone());
+        fail!("intermediate_proof_signer_ledger", expected_node_id.clone(), 1);
     }
     if proof.commitment.commitment.ledger_pubkey != parent_ledger {
-        fail!("intermediate_proof_commitment", expected_node_id.clone());
+        fail!("intermediate_proof_commitment", expected_node_id.clone(), 1);
     }
     if proof.validate().is_err() {
-        fail!("intermediate_proof_validate", expected_node_id.clone());
+        fail!("intermediate_proof_validate", expected_node_id.clone(), 1);
     }
     if !cawala_ledger::verify_entry_inclusion(
         &proof.entry,
         &proof.inclusion,
         &proof.commitment.commitment.entry_root,
     ) {
-        fail!("intermediate_proof_inclusion", expected_node_id.clone());
+        fail!("intermediate_proof_inclusion", expected_node_id.clone(), 1);
+    }
+
+    // (g) extra intermediates (a deep route): structural and inclusion checks
+    // only. The origin holds no registered key for these signers, so it cannot
+    // bind a name to a key; it still rejects a malformed or unsigned hop.
+    for (k, hop) in intermediates.iter().enumerate().skip(1) {
+        let hop_index = k + 1;
+        let Some(expected_role) =
+            classify_hop(&pending.payer_addr, &pending.payee_addr, &signers[k + 1])
+        else {
+            fail!("intermediate_signer", None, hop_index);
+        };
+        let entry = &hop.entry.entry;
+        let cawala_ledger::EntryBody::Transfer {
+            payment_id,
+            amount,
+            role,
+        } = &entry.body
+        else {
+            fail!("intermediate_body", None, hop_index);
+        };
+        if Some(*role) != Some(expected_role)
+            || *payment_id != pending.order.hash()
+            || *amount != pending.order.amount
+        {
+            fail!("intermediate_body", None, hop_index);
+        }
+        if entry.check_conservation().is_err() {
+            fail!("intermediate_conservation", None, hop_index);
+        }
+        if hop.entry.verify(&entry.ledger_id).is_err() {
+            fail!("intermediate_signature", None, hop_index);
+        }
+        if cawala_ledger::entry_hop_accounts(entry, *role).is_err() {
+            fail!("intermediate_accounts", None, hop_index);
+        }
+        let Some(proof) = &hop.proof else {
+            fail!("intermediate_proof_missing", None, hop_index);
+        };
+        if proof.leaf_addr != hop.signer_addr {
+            fail!("intermediate_proof_leaf", None, hop_index);
+        }
+        if proof.entry != hop.entry {
+            fail!("intermediate_proof_entry", None, hop_index);
+        }
+        if proof.signer.role != PeerRole::Node {
+            fail!("intermediate_proof_signer_role", None, hop_index);
+        }
+        // The proof must be bound to the entry's own declared ledger key (the
+        // signer's node id is unresolvable here, but the key it names is not).
+        if proof.signer.ledger != Some(entry.ledger_id) {
+            fail!("intermediate_proof_signer_ledger", None, hop_index);
+        }
+        if proof.commitment.commitment.ledger_pubkey != entry.ledger_id {
+            fail!("intermediate_proof_commitment", None, hop_index);
+        }
+        if proof.validate().is_err() {
+            fail!("intermediate_proof_validate", None, hop_index);
+        }
+        if !cawala_ledger::verify_entry_inclusion(
+            &proof.entry,
+            &proof.inclusion,
+            &proof.commitment.commitment.entry_root,
+        ) {
+            fail!("intermediate_proof_inclusion", None, hop_index);
+        }
+    }
+
+    // (h) the hops above the origin's parent are not resolvable from the origin,
+    // so a deep route is always degraded even when structurally sound. Depth-1
+    // (a single intermediate) stays non-degraded.
+    if intermediates.len() > 1 {
+        return Err(IntermediateCheck {
+            which_check: "unresolvable_signer",
+            expected_node_id: None,
+            hop_index: 2,
+        });
     }
     Ok(())
 }
@@ -2403,6 +2540,7 @@ fn audit_intermediate_degraded(
     data_dir: &Path,
     payment_id: &Hash,
     hop: Option<&SettleHopV3>,
+    hop_index: usize,
     expected_node_id: Option<&NodeId>,
     which_check: &str,
 ) {
@@ -2414,7 +2552,7 @@ fn audit_intermediate_degraded(
     // may be lost on I/O failure (which never changes the funds outcome).
     tracing::warn!(
         payment_id = %payment_id.to_hex(),
-        hop_index = 1,
+        hop_index,
         signer_addr = %hop.map(|hop| hop.signer_addr.to_string()).unwrap_or_default(),
         expected_node_id = %expected_node_id.map(NodeId::to_string).unwrap_or_default(),
         which_check,
@@ -2425,7 +2563,7 @@ fn audit_intermediate_degraded(
         serde_json::json!({
             "event": "settle-intermediate-degraded",
             "payment_id": payment_id.to_hex(),
-            "hop_index": 1,
+            "hop_index": hop_index,
             "signer_addr": hop.map(|hop| hop.signer_addr.to_string()).unwrap_or_default(),
             "expected_node_id": expected_node_id.map(NodeId::to_string).unwrap_or_default(),
             "entry_hash": entry_hash,
@@ -2461,9 +2599,14 @@ async fn handle_settle_forward(
         .map(|neighbor| (neighbor.addr.clone(), NodeId::from(neighbor.node.clone())))
         .collect();
 
-    let Some(signers) = expected_signers(&forward.payer_addr, &forward.payee_addr) else {
+    let Some(signers) = route_signers(&forward.payer_addr, &forward.payee_addr) else {
         return;
     };
+    // Mirror the origin's signer cap: a cascade longer than `MAX_SETTLE_HOPS`
+    // signers is refused at every hop, not just where it started.
+    if signers.len() > MAX_SETTLE_HOPS {
+        return;
+    }
     // The hop index is derived from how many hops are already carried; the wire
     // never chooses it. This node must be the next expected signer.
     let index = forward.hops.len();
@@ -2747,10 +2890,11 @@ const MAX_UNRESOLVABLE_SIGNER_NOTES: usize = 4096;
 /// Process-wide set of unresolvable carried-signer addresses already logged.
 ///
 /// The terminal logs each distinct unresolvable signer address **at most once**:
-/// in the depth-1 route the payer leaf's carried hop is always unresolvable at
-/// the terminal, so a per-hop `warn!` on every honest cross-leaf settlement
-/// would be alert noise. Bounded so a hostile flood of distinct addresses cannot
-/// grow it without limit.
+/// on any route the payer leaf's carried hop is unresolvable at the terminal
+/// (the payer leaf is never a direct neighbor of the payee leaf), and on deep
+/// routes the deeper spine hops are unresolvable too, so a per-hop `warn!` on
+/// every honest cross-leaf settlement would be alert noise. Bounded so a hostile
+/// flood of distinct addresses cannot grow it without limit.
 static UNRESOLVABLE_SIGNERS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 
 /// Record `addr` and return whether this call is the first sighting that fits
@@ -2779,9 +2923,10 @@ fn note_unresolvable_signer(addr: &cawala_msg::OctAddr) -> bool {
 /// registry row (with a ledger key) is known — the entry signature is verified
 /// under exactly that signer's key; a mismatch rejects.
 ///
-/// In the depth-1 route the immediately-preceding hop (`signers[index-1]`,
-/// already authenticated as the transport sender) is a direct neighbor of this
-/// node, so its signature is required at the terminal leaf and at the LCA.
+/// In any route the immediately-preceding hop (`signers[index-1]`, already
+/// authenticated as the transport sender) is a direct neighbor of this node, so
+/// its signature is required at every intermediate signer and at the terminal
+/// leaf.
 ///
 /// Residual: a carried hop naming a node that is neither us nor a known direct
 /// neighbor cannot be bound to that node's registered key here; it is logged and
@@ -2790,16 +2935,17 @@ fn note_unresolvable_signer(addr: &cawala_msg::OctAddr) -> bool {
 ///
 /// Phase 2 closes the *origin's* gap separately: the terminal echoes the
 /// intermediate hops in `SettleOutcomeV3::Applied::intermediates` and the origin
-/// audits them in `intermediates_accountable` — binding the LCA hop's posting
-/// **accounts** (debited child == the origin's own node id, credited child == the
-/// verified terminal signer's node id) and verifying the hop entry/signature and
-/// its inclusion proof against the origin's own persisted parent row. A failure
-/// is forensic only: the verified terminal `Applied` is still accepted and
-/// recorded `degraded`, with a `settle-intermediate-degraded` audit line (M2).
+/// audits them in `intermediates_accountable` — binding the origin's own parent
+/// hop's posting **accounts** and verifying that hop's entry/signature and its
+/// inclusion proof against the origin's own persisted parent row (deep routes
+/// are best-effort: hops above the parent are not resolvable to the origin and
+/// degrade as `unresolvable_signer`). A failure is forensic only: the verified
+/// terminal `Applied` is still accepted and recorded `degraded`, with a
+/// `settle-intermediate-degraded` audit line (M2).
 #[allow(clippy::too_many_arguments)]
 fn carried_hops_match(
     hops: &[SettleHopV3],
-    signers: &[cawala_msg::OctAddr; 3],
+    signers: &[cawala_msg::OctAddr],
     payer_addr: &cawala_msg::OctAddr,
     payee_addr: &cawala_msg::OctAddr,
     this_addr: &cawala_msg::OctAddr,
@@ -4091,8 +4237,8 @@ mod tests {
         }
     }
 
-    fn signer_addrs() -> [cawala_msg::OctAddr; 3] {
-        expected_signers(&"0.1.3".parse().unwrap(), &"0.2.4".parse().unwrap())
+    fn signer_addrs() -> Vec<cawala_msg::OctAddr> {
+        route_signers(&"0.1.3".parse().unwrap(), &"0.2.4".parse().unwrap())
             .expect("depth-1 route has three signers")
     }
 
@@ -4475,7 +4621,7 @@ mod tests {
     // ---------------------------------------------------------------------
 
     /// Origin `A` at `0.1`, parent/LCA `P` at `0`, payee leaf `B` at `0.2`, so
-    /// `expected_signers(0.1.3, 0.2.4) == [0.1, 0, 0.2]`.
+    /// `route_signers(0.1.3, 0.2.4) == [0.1, 0, 0.2]`.
     const ORIGIN_ID: &str = "A";
     const PARENT_ID: &str = "P";
     const PARENT_ADDR: &str = "0";
@@ -4948,6 +5094,399 @@ mod tests {
         );
         hop.proof.as_mut().unwrap().commitment.commitment.ledger_pubkey = decoy.public();
         assert_degraded(&fx, &[hop], "intermediate_proof_commitment");
+    }
+
+    // -----------------------------------------------------------------------
+    // P2d: deep-route origin audit (best-effort, degraded)
+    // -----------------------------------------------------------------------
+
+    /// Deep fixture: origin leaf `A` at `0.1.2` (payer user `0.1.2.3`), parent
+    /// `P` at `0.1`, LCA `R` at `0`, payee leaf `B` at `0.5` (user `0.5.4`), so
+    /// `route_signers(0.1.2.3, 0.5.4) == [0.1.2, 0.1, 0, 0.5]`. The parent's hop
+    /// (`0.1`, role `Ascend`) is the only intermediate the origin can resolve;
+    /// the LCA hop (`0`, role `Lca`) is not.
+    const DEEP_ORIGIN_ID: &str = "A";
+    const DEEP_PARENT_ID: &str = "P";
+    const DEEP_LCA_ID: &str = "R";
+    const DEEP_PAYEE_ID: &str = "B";
+
+    fn deep_order() -> PaymentOrder {
+        PaymentOrder {
+            from: NodeId::from("uA"),
+            to: NodeId::from("uB"),
+            amount: cawala_ledger::Amount::new(100),
+            nonce: 11,
+            expiry: u64::MAX,
+        }
+    }
+
+    fn deep_pending(order: &PaymentOrder) -> PendingSettlement {
+        let op = OperatorSecretKey::from_bytes([9u8; 32]);
+        PendingSettlement {
+            browser: PeerRef {
+                addr: "0.1.2.3".parse().unwrap(),
+                node: "uA".to_string(),
+            },
+            browser_msg_id: MsgId([11u8; 16]),
+            order: order.clone(),
+            auth: AuthRef {
+                operator: op.public(),
+                nonce: 11,
+                order_hash: order.hash(),
+                signature: op.sign(b"x"),
+            },
+            payer_addr: "0.1.2.3".parse().unwrap(),
+            payee_addr: "0.5.4".parse().unwrap(),
+            payee_leaf_addr: "0.5".parse().unwrap(),
+            local_seq: 0,
+            local_hash: Hash::ZERO,
+            deadline_secs: u64::MAX,
+            reply_v2: true,
+        }
+    }
+
+    /// Write the deep origin's record (`A`, address `0.1.2`, parent `P` slot 2).
+    fn write_deep_origin_record(dir: &Path) {
+        let mut store = RecordStore::open(dir, DEEP_ORIGIN_ID).unwrap();
+        store.set_parent(DEEP_PARENT_ID, 2).unwrap();
+        store.set_address("0.1.2".parse().unwrap()).unwrap();
+        store.save().unwrap();
+    }
+
+    /// Build a fully-proven hop for any role/signer (whereas [`build_lca_hop`]
+    /// hardcodes the depth-1 LCA). Funds whatever the role-canonical `postings`
+    /// debit so the entry appends cleanly, then builds an inclusion proof.
+    fn build_proven_hop(
+        signer_addr: &str,
+        signer_node_id: &str,
+        order: &PaymentOrder,
+        hop_key: &cawala_ledger::LedgerSecretKey,
+        role: HopRole,
+        postings: Vec<cawala_ledger::Posting>,
+        with_proof: bool,
+    ) -> SettleHopV3 {
+        let mut ledger = cawala_ledger::Ledger::new_root(hop_key.public());
+        let mut prev = Hash::ZERO;
+        let op = OperatorSecretKey::from_bytes([1u8; 32]);
+        let auth = order.authorize(&op).unwrap();
+
+        let mut children: Vec<NodeId> = Vec::new();
+        for posting in &postings {
+            if let cawala_ledger::AccountRef::Child(id) = &posting.account
+                && !children.contains(id)
+            {
+                children.push(id.clone());
+            }
+        }
+        for child in &children {
+            append_entry(
+                &mut ledger,
+                hop_key,
+                &mut prev,
+                cawala_ledger::EntryBody::OpenAccount {
+                    child: child.clone(),
+                    kind: ChildKind::Node,
+                },
+                vec![],
+                None,
+            );
+        }
+
+        // Fund every net-debited account so the transfer keeps non-negative
+        // balances: a child with an `Issue`, the universal parent with a balanced
+        // `Descend` (which credits `Parent` and one child).
+        let mut net: std::collections::BTreeMap<cawala_ledger::AccountRef, i64> =
+            std::collections::BTreeMap::new();
+        for posting in &postings {
+            *net.entry(posting.account.clone()).or_default() += posting.delta.get();
+        }
+        for (account, delta) in &net {
+            if *delta >= 0 {
+                continue;
+            }
+            let amount = u64::try_from(-*delta).unwrap();
+            match account {
+                cawala_ledger::AccountRef::Child(child) => {
+                    append_entry(
+                        &mut ledger,
+                        hop_key,
+                        &mut prev,
+                        cawala_ledger::EntryBody::Issue {
+                            child: child.clone(),
+                            amount: cawala_ledger::Amount::new(amount),
+                        },
+                        vec![posting(
+                            cawala_ledger::AccountRef::Child(child.clone()),
+                            amount as i64,
+                        )],
+                        Some(auth.clone()),
+                    );
+                }
+                cawala_ledger::AccountRef::Parent => {
+                    let child = children
+                        .first()
+                        .expect("a parent debit needs an opened child")
+                        .clone();
+                    append_entry(
+                        &mut ledger,
+                        hop_key,
+                        &mut prev,
+                        cawala_ledger::EntryBody::Transfer {
+                            payment_id: order.hash(),
+                            amount: cawala_ledger::Amount::new(amount),
+                            role: HopRole::Descend,
+                        },
+                        vec![
+                            posting(cawala_ledger::AccountRef::Parent, amount as i64),
+                            posting(cawala_ledger::AccountRef::Child(child), amount as i64),
+                        ],
+                        Some(auth.clone()),
+                    );
+                }
+            }
+        }
+
+        let seq = ledger.len() as u64;
+        let signed = SignedEntry::sign(
+            cawala_ledger::Entry {
+                ledger_id: hop_key.public(),
+                seq,
+                height: seq,
+                prev_hash: prev,
+                issued_at: 0,
+                body: cawala_ledger::EntryBody::Transfer {
+                    payment_id: order.hash(),
+                    amount: order.amount,
+                    role,
+                },
+                postings,
+                auth: Some(auth),
+            },
+            hop_key,
+        )
+        .unwrap();
+        ledger.append(signed.clone()).unwrap();
+
+        let proof = with_proof.then(|| {
+            let inclusion = cawala_ledger::entry_inclusion_proof(&ledger, seq).unwrap();
+            let commitment = cawala_ledger::build_commitment(&ledger, Hash::ZERO, 0).unwrap();
+            let commitment = cawala_ledger::SignedCommitment::sign(commitment, hop_key).unwrap();
+            EntryProofV1 {
+                entry: signed.clone(),
+                signer: PeerKeys {
+                    node_id: NodeId::from(signer_node_id),
+                    operator: op.public(),
+                    ledger: Some(hop_key.public()),
+                    role: PeerRole::Node,
+                },
+                leaf_addr: signer_addr.parse().unwrap(),
+                commitment,
+                inclusion,
+            }
+        });
+        SettleHopV3 {
+            signer_addr: signer_addr.parse().unwrap(),
+            entry: signed,
+            proof,
+        }
+    }
+
+    /// A deep route passes the parent-hop checks but is recorded degraded as
+    /// `unresolvable_signer` at `hop_index` 2: the hops above the origin's
+    /// parent are not resolvable from the origin.
+    #[test]
+    fn deep_route_origin_audit_is_degraded_unresolvable() {
+        let dir = tempfile::tempdir().unwrap();
+        write_deep_origin_record(dir.path());
+        let order = deep_order();
+        let pending = deep_pending(&order);
+        let m = i64::try_from(order.amount.get()).unwrap();
+
+        let parent_key = cawala_ledger::LedgerSecretKey::from_bytes([0x22; 32]);
+        let lca_key = cawala_ledger::LedgerSecretKey::from_bytes([0x33; 32]);
+        let mut registry = PeerRegistry::new();
+        registry
+            .insert(node_row(
+                DEEP_PARENT_ID,
+                &OperatorSecretKey::from_bytes([2u8; 32]),
+                &parent_key,
+            ))
+            .unwrap();
+
+        // Parent hop (`0.1`, `Ascend`): debit child is the origin leaf `A`.
+        let parent_hop = build_proven_hop(
+            "0.1",
+            DEEP_PARENT_ID,
+            &order,
+            &parent_key,
+            HopRole::Ascend,
+            vec![
+                posting(cawala_ledger::AccountRef::Parent, -m),
+                posting(
+                    cawala_ledger::AccountRef::Child(NodeId::from(DEEP_ORIGIN_ID)),
+                    -m,
+                ),
+            ],
+            true,
+        );
+        // LCA hop (`0`, `Lca`): structurally checked only.
+        let lca_hop = build_proven_hop(
+            "0",
+            DEEP_LCA_ID,
+            &order,
+            &lca_key,
+            HopRole::Lca,
+            vec![
+                posting(
+                    cawala_ledger::AccountRef::Child(NodeId::from(DEEP_PARENT_ID)),
+                    -m,
+                ),
+                posting(
+                    cawala_ledger::AccountRef::Child(NodeId::from(DEEP_PAYEE_ID)),
+                    m,
+                ),
+            ],
+            true,
+        );
+
+        assert!(!intermediates_accountable(
+            &pending,
+            &terminal_proof_for(DEEP_PAYEE_ID),
+            &[parent_hop, lca_hop],
+            dir.path(),
+            DEEP_ORIGIN_ID,
+            &registry,
+        ));
+        let audits = degraded_audits(dir.path());
+        assert_eq!(audits.len(), 1, "exactly one degraded audit line");
+        assert_eq!(
+            audits[0].get("which_check").and_then(|value| value.as_str()),
+            Some("unresolvable_signer")
+        );
+        assert_eq!(
+            audits[0].get("hop_index").and_then(|value| value.as_u64()),
+            Some(2)
+        );
+    }
+
+    /// A signer path deeper than depth-1 derives locally and fits the signer cap
+    /// the origin enforces before accepting an order.
+    #[test]
+    fn deep_route_signers_are_derived_and_within_cap() {
+        let signers = route_signers(&"0.1.2.3".parse().unwrap(), &"0.5.6.7".parse().unwrap())
+            .expect("a cross-subtree route has a signer path");
+        assert_eq!(
+            signers,
+            vec![
+                "0.1.2".parse::<cawala_msg::OctAddr>().unwrap(),
+                "0.1".parse().unwrap(),
+                "0".parse().unwrap(),
+                "0.5".parse().unwrap(),
+                "0.5.6".parse().unwrap(),
+            ]
+        );
+        assert!(signers.len() <= MAX_SETTLE_HOPS);
+    }
+
+    /// A deep route whose *payer* side is depth-1 and whose *payee* side is
+    /// deeper: `route_signers(0.1.3, 0.5.6.7) == [0.1, 0, 0.5, 0.5.6]`. The
+    /// origin's parent (`0`) is the LCA even though the route is deep, so the
+    /// parent hop is `Lca` and its credited child is the first payee-side signer
+    /// (`0.5`), whose node id the origin cannot resolve. The audit must degrade as
+    /// `unresolvable_signer` at hop 2, not mislabel an honest hop as
+    /// `intermediate_accounts` (regression).
+    #[test]
+    fn deep_shallow_payer_origin_audit_is_degraded_unresolvable() {
+        let dir = tempfile::tempdir().unwrap();
+        write_origin_record(dir.path()); // `A` at `0.1`, parent `P` at `0` slot 1.
+
+        let op = OperatorSecretKey::from_bytes([9u8; 32]);
+        let order = PaymentOrder {
+            from: NodeId::from("uA"),
+            to: NodeId::from("uB"),
+            amount: cawala_ledger::Amount::new(100),
+            nonce: 12,
+            expiry: u64::MAX,
+        };
+        let pending = PendingSettlement {
+            browser: PeerRef {
+                addr: "0.1.3".parse().unwrap(),
+                node: "uA".to_string(),
+            },
+            browser_msg_id: MsgId([12u8; 16]),
+            order: order.clone(),
+            auth: AuthRef {
+                operator: op.public(),
+                nonce: 12,
+                order_hash: order.hash(),
+                signature: op.sign(b"x"),
+            },
+            payer_addr: "0.1.3".parse().unwrap(),
+            payee_addr: "0.5.6.7".parse().unwrap(),
+            payee_leaf_addr: "0.5.6".parse().unwrap(),
+            local_seq: 0,
+            local_hash: Hash::ZERO,
+            deadline_secs: u64::MAX,
+            reply_v2: true,
+        };
+        let m = i64::try_from(order.amount.get()).unwrap();
+
+        let parent_key = cawala_ledger::LedgerSecretKey::from_bytes([0x22; 32]);
+        let registry = audit_registry(&parent_key); // parent `P` -> `parent_key`.
+
+        // Parent hop at `0` (`Lca`): debit the origin leaf `A`, credit the first
+        // payee-side signer (an unresolvable node id here).
+        let parent_hop = build_proven_hop(
+            "0",
+            PARENT_ID,
+            &order,
+            &parent_key,
+            HopRole::Lca,
+            vec![
+                posting(cawala_ledger::AccountRef::Child(NodeId::from(ORIGIN_ID)), -m),
+                posting(
+                    cawala_ledger::AccountRef::Child(NodeId::from("payee-branch")),
+                    m,
+                ),
+            ],
+            true,
+        );
+        // Descend hop at `0.5` (extra intermediate): structurally checked only.
+        let descend_key = cawala_ledger::LedgerSecretKey::from_bytes([0x44; 32]);
+        let descend_hop = build_proven_hop(
+            "0.5",
+            "Q",
+            &order,
+            &descend_key,
+            HopRole::Descend,
+            vec![
+                posting(cawala_ledger::AccountRef::Parent, m),
+                posting(
+                    cawala_ledger::AccountRef::Child(NodeId::from("payee-user")),
+                    m,
+                ),
+            ],
+            true,
+        );
+
+        assert!(!intermediates_accountable(
+            &pending,
+            &terminal_proof_for("B"),
+            &[parent_hop, descend_hop],
+            dir.path(),
+            ORIGIN_ID,
+            &registry,
+        ));
+        let audits = degraded_audits(dir.path());
+        assert_eq!(audits.len(), 1, "exactly one degraded audit line");
+        assert_eq!(
+            audits[0].get("which_check").and_then(|value| value.as_str()),
+            Some("unresolvable_signer")
+        );
+        assert_eq!(
+            audits[0].get("hop_index").and_then(|value| value.as_u64()),
+            Some(2)
+        );
     }
 
     // -----------------------------------------------------------------------
