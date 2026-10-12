@@ -589,10 +589,13 @@ pub struct ClientNode {
     ledger: Arc<Mutex<LedgerStateV1>>,
     /// The optional user ETH identity (R3).
     ///
-    /// Set by [`ClientNode::set_user_identity`] and cleared by
-    /// [`ClientNode::clear_user_identity`]. The secp256k1 key never leaves wasm.
-    /// When set, [`ClientNode::send_payment`] emits a `LedgerPayloadV4` carrying
-    /// the user's EIP-712 signature; when unset, the legacy V2 path is used.
+    /// Set by [`ClientNode::set_user_identity`] (from a mnemonic) or
+    /// [`ClientNode::set_user_identity_from_secret`] (from a persisted secret),
+    /// and cleared by [`ClientNode::clear_user_identity`]. The secp256k1 key
+    /// never leaves wasm except through the explicit on-device persistence
+    /// export [`UserIdentity::secret_bytes`]. When set,
+    /// [`ClientNode::send_payment`] emits a `LedgerPayloadV4` carrying the
+    /// user's EIP-712 signature; when unset, the legacy V2 path is used.
     user_identity: UserIdentitySlot,
 }
 
@@ -1754,6 +1757,25 @@ impl ClientNode {
         self.user_identity
             .set_from_mnemonic(mnemonic, passphrase.as_deref())
             .map_err(to_js_err)
+    }
+
+    /// Restore the user's Ethereum identity from a raw 32-byte secp256k1
+    /// secret.
+    ///
+    /// This is the on-device persistence counterpart to
+    /// [`ClientNode::set_user_identity`]: the web derives the secret once (via
+    /// [`UserIdentity::secret_bytes`]) and stores it under the
+    /// authoritative-local user identity key, so a reload restores the identity
+    /// without the mnemonic (which is never persisted). The secret must be
+    /// exactly 32 bytes and a valid secp256k1 scalar; anything else is a JS
+    /// error and the previously stored identity (if any) is left untouched.
+    ///
+    /// The resulting identity is identical to `set_user_identity` at index `0`
+    /// (same scalar → same EIP-55 address), so [`ClientNode::send_payment`]
+    /// resumes emitting `LedgerPayloadV4` and [`ClientNode::register_eth_address`]
+    /// resumes working.
+    pub fn set_user_identity_from_secret(&self, secret: &[u8]) -> Result<(), JsError> {
+        self.user_identity.set_from_secret(secret).map_err(to_js_err)
     }
 
     /// The stored user ETH address (EIP-55 checksummed), or `None` when no

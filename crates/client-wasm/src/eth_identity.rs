@@ -19,10 +19,13 @@
 //!   (EIP-2)** normalization and a validated recovery id, serialized as a
 //!   65-byte `r || s || v` (`v ∈ {27, 28}`).
 //!
-//! The raw secret never crosses the wasm boundary. [`UserIdentity`] is a
-//! `wasm-bindgen` handle that owns a [`SigningKey`] internally and exposes only
-//! the address, public key, signatures and digests. `k256`'s `SigningKey`
-//! implements `ZeroizeOnDrop`, so the scalar is wiped when the handle is freed.
+//! [`UserIdentity`] is a `wasm-bindgen` handle that owns a [`SigningKey`]
+//! internally and exposes the address, public key, signatures and digests.
+//! `k256`'s `SigningKey` implements `ZeroizeOnDrop`, so the scalar is wiped when
+//! the handle is freed. The raw secret never crosses the wasm boundary **except**
+//! through one explicit, documented on-device persistence export
+//! ([`UserIdentity::secret_bytes`]) — there is no signing API that consumes
+//! JS-owned bytes.
 
 // Re-export the shared implementation so `cawala_client::eth_identity::*`
 // resolves exactly as before (behavior and API unchanged).
@@ -107,6 +110,18 @@ impl UserIdentity {
             old_address: None,
         })
     }
+
+    /// The raw 32-byte secp256k1 secret, as a fixed array so the caller can own
+    /// and zeroize its copy.
+    ///
+    /// **Secret material**: only the explicit persistence export
+    /// ([`UserIdentity::secret_bytes`]) uses this. Never a signing input.
+    pub(crate) fn secret_array(&self) -> [u8; 32] {
+        let bytes = self.key.to_bytes();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(bytes.as_slice());
+        out
+    }
 }
 
 /// A slot holding an optional user ETH identity, owned by
@@ -133,6 +148,20 @@ impl UserIdentitySlot {
     ) -> Result<(), EthError> {
         let identity = UserIdentity::from_mnemonic_inner(mnemonic, passphrase, DEFAULT_ACCOUNT_INDEX)?;
         *self.lock() = Some(identity);
+        Ok(())
+    }
+
+    /// Store the user identity from a raw 32-byte secp256k1 secret.
+    ///
+    /// This is the on-device persistence counterpart to
+    /// [`UserIdentitySlot::set_from_mnemonic`]: a secret previously exported by
+    /// [`UserIdentity::secret_bytes`] restores the identical scalar (and thus
+    /// the identical EIP-55 address). A wrong length or a value that is not a
+    /// valid secp256k1 scalar is rejected via [`EthError`]; the slot is left
+    /// untouched on error.
+    pub(crate) fn set_from_secret(&self, secret: &[u8]) -> Result<(), EthError> {
+        let key = signing_key_from_bytes(secret)?;
+        *self.lock() = Some(UserIdentity::from_signing_key(key));
         Ok(())
     }
 
@@ -225,6 +254,29 @@ impl UserIdentity {
     #[must_use]
     pub fn public_key_uncompressed(&self) -> Vec<u8> {
         uncompressed_public_key(&self.key).to_vec()
+    }
+
+    /// Export the raw 32-byte secp256k1 secret **for on-device persistence
+    /// only**.
+    ///
+    /// Reload restoration must not require the mnemonic (the mnemonic itself is
+    /// never persisted — it stays the off-device recovery credential), so the
+    /// web stores this derived secret under the authoritative-local user
+    /// identity key and restores it on boot via
+    /// [`ClientNode::set_user_identity_from_secret`] (or the equivalent
+    /// [`UserIdentity::from_secret_key`]). The secret is deterministic, so this
+    /// is exactly the scalar `fromMnemonic` derives at index `0` and it yields
+    /// the same EIP-55 address.
+    ///
+    /// This is a deliberate, narrow exception to "the key never leaves wasm":
+    /// no signing API consumes JS-owned bytes, so exporting is the only way the
+    /// value crosses the boundary. JS owns the returned array and must treat it
+    /// as secret (zeroize where possible); prefer passkey/key-wrap encryption
+    /// for at-rest protection.
+    #[wasm_bindgen(js_name = secretBytes)]
+    #[must_use]
+    pub fn secret_bytes(&self) -> Vec<u8> {
+        self.secret_array().to_vec()
     }
 
     /// Sign a 32-byte digest, returning canonical 65-byte `r || s || v`.
@@ -379,6 +431,60 @@ mod tests {
             signing_key_from_bytes(&[0u8; 32]),
             Err(EthError::InvalidSecretKey)
         );
+    }
+
+    #[test]
+    fn secret_bytes_round_trips_through_slot() {
+        use cawala_ledger::{Amount, NodeId};
+
+        // `fromMnemonic` (index 0) → export → restore must be identity-preserving.
+        let identity =
+            UserIdentity::from_mnemonic_inner(ETH_TEST_MNEMONIC, None, DEFAULT_ACCOUNT_INDEX)
+                .expect("derive");
+        let expected = checksum_address(&identity.address_array());
+        assert_eq!(expected, "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+
+        let secret = identity.secret_bytes();
+        assert_eq!(secret.len(), 32);
+        assert_eq!(secret, identity.secret_array().to_vec());
+
+        let slot = UserIdentitySlot::default();
+        slot.set_from_secret(&secret).expect("restore from secret");
+        assert_eq!(slot.address().as_deref(), Some(expected.as_str()));
+
+        // A restored identity produces a signature that recovers to the address,
+        // mirroring the V4 order path.
+        let order = PaymentOrder {
+            from: NodeId::from("alice"),
+            to: NodeId::from("bob"),
+            amount: Amount::new(7),
+            nonce: 5,
+            expiry: 100,
+        };
+        let payee: OctAddr = "0.2.4".parse().expect("valid octal address");
+        let eth = slot
+            .sign_order(&order, &payee)
+            .expect("sign")
+            .expect("identity set");
+        let digest = order_digest(&order, &payee);
+        assert_eq!(eth.recovered_address(&digest), Ok(eth.address));
+        assert_eq!(checksum_address(&eth.address), expected);
+    }
+
+    #[test]
+    fn set_from_secret_rejects_malformed() {
+        let slot = UserIdentitySlot::default();
+        assert!(matches!(
+            slot.set_from_secret(&[0x11; 31]),
+            Err(EthError::InvalidLength { .. })
+        ));
+        // Zero (and any out-of-range scalar) is rejected.
+        assert_eq!(
+            slot.set_from_secret(&[0u8; 32]),
+            Err(EthError::InvalidSecretKey)
+        );
+        // Nothing was stored by the failed attempts.
+        assert!(slot.address().is_none());
     }
 
     #[test]
