@@ -13,6 +13,7 @@
     restoreIdentity,
     rotateUserEthIdentity,
     isPasskeyAvailable,
+    getPasskeyStatus,
     InvalidMnemonicError,
   } from '../../lib/api.js';
   import { userIdentityState, showToast } from '../../lib/stores.svelte.js';
@@ -76,6 +77,17 @@
   let rotateDone = $state(false); // success note shown on the manage step
 
   let passkeyAvailable = $derived(isPasskeyAvailable());
+  // A passkey lock that is engaged (enrolled, secret not installed) gates first
+  // use on this device, so the identity surface says so where the address shows
+  // — the panel is promoted above the address while locked. `passkeyEpoch` is
+  // bumped after a passkey mutation so the promotion clears on unlock/remove.
+  let passkeyEpoch = $state(0);
+  let passkeyLocked = $derived.by(() => {
+    void userIdentityState.established;
+    void userIdentityState.passkeyEnrolled;
+    void passkeyEpoch;
+    return passkeyAvailable && getPasskeyStatus().locked;
+  });
   let phraseWords = $derived(phrase ? phrase.split(' ') : []);
   let restoreWordCount = $derived(
     restoreText.trim() === '' ? 0 : restoreText.trim().split(/\s+/).length,
@@ -597,7 +609,7 @@
             />
 
             {#if passkeyAvailable}
-              <PasskeyPanel />
+              <PasskeyPanel onChanged={() => passkeyEpoch++} />
             {/if}
 
             <div class="warn-box">
@@ -924,6 +936,15 @@
           <div class="stack">
             <h3 class="step-heading">Your account identity</h3>
 
+            <!-- Locked on boot: the passkey gate is what the user meets first,
+                 so it sits above the address instead of below the fold. -->
+            {#if passkeyLocked}
+              <PasskeyPanel
+                onChanged={() => passkeyEpoch++}
+                onUseRecoveryPhrase={() => startRestore('manage')}
+              />
+            {/if}
+
             <EthAddressBlock
               address={userIdentityState.address}
               explanation="This address comes from your recovery phrase. Share it like an account number — knowing it lets people send you things, not take them."
@@ -973,8 +994,11 @@
               </button>
             </div>
 
-            {#if passkeyAvailable}
-              <PasskeyPanel />
+            {#if passkeyAvailable && !passkeyLocked}
+              <PasskeyPanel
+                onChanged={() => passkeyEpoch++}
+                onUseRecoveryPhrase={() => startRestore('manage')}
+              />
             {/if}
 
             <div class="warn-box">

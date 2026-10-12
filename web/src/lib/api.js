@@ -73,8 +73,12 @@ import * as userIdentity from './userIdentity.js';
 // `userIdentityState` store in sync after every mutation, so components read
 // the store and only call these on user actions. Address derivation and the
 // derived secret now run the REAL wasm secp256k1 engine, injected into the
-// facade after `initApi` loads wasm (`_wasmIdentityBackend` below). The
-// passkey wrap stays deferred (`PASSKEY_BACKEND_READY === false`).
+// facade after `initApi` loads wasm (`_wasmIdentityBackend` below).
+//
+// Passkey unlock is an OPTIONAL lock (WebAuthn PRF key-wrap,
+// `PASSKEY_BACKEND_READY === true`): enrolling removes the plaintext secret
+// from storage and from the live node; a passkey unlock installs it for the
+// session and re-applies it to the node. See `getPasskeyStatus()`.
 //
 // CREATE/RESTORE also do two wasm-side things here (this module owns the
 // ClientNode lifecycle and `cawala.identity.v1`):
@@ -91,6 +95,7 @@ import * as userIdentity from './userIdentity.js';
 export const {
   InvalidMnemonicError,
   PasskeyUnavailableError,
+  PasskeyUnsupportedError,
   IdentityBackendUnavailableError,
   MNEMONIC_ERRORS,
 } = userIdentity;
@@ -106,6 +111,19 @@ export function refreshUserIdentity() {
 /** Whether passkey unlock could work in this context (secure context + WebAuthn). */
 export function isPasskeyAvailable() {
   return userIdentity.isPasskeyAvailable();
+}
+
+/**
+ * The passkey-lock status:
+ * `{ available, prfSupported, enrolled, locked }`.
+ * `prfSupported` is `null` until determined; `locked` is `enrolled` while the
+ * secret is not currently installed (a passkey unlock or mnemonic restore is
+ * needed).
+ *
+ * @returns {{ available: boolean, prfSupported: boolean|null, enrolled: boolean, locked: boolean }}
+ */
+export function getPasskeyStatus() {
+  return userIdentity.getPasskeyStatus();
 }
 
 /**
@@ -186,35 +204,43 @@ export function hasPasskey() {
 }
 
 /**
- * Set up biometric unlock (WebAuthn PRF key-wrap of the mnemonic).
- * Throws `PasskeyUnavailableError` outside a secure context and
- * `IdentityBackendUnavailableError` until the crypto engine lands.
+ * Set up biometric unlock (WebAuthn PRF key-wrap of the derived secp256k1
+ * secret). Enrolling removes the plaintext secret from storage and clears it
+ * from the live node (the lock engages immediately — a passkey unlock is then
+ * required). Throws `PasskeyUnavailableError` outside a secure context and
+ * `PasskeyUnsupportedError` when PRF is unavailable.
  * @returns {Promise<object>} The status view.
  */
 export async function enrollPasskey() {
   const status = await userIdentity.enrollPasskey();
   refreshUserIdentity();
+  _syncUserIdentityToNode();
   return status;
 }
 
 /**
- * Unlock with the enrolled passkey. Same error classes as `enrollPasskey`,
- * plus a not-enrolled message.
+ * Unlock with the enrolled passkey: unwrap the secret for this session and
+ * re-apply it to the live node. Same error classes as `enrollPasskey`, plus a
+ * not-enrolled message and a failed-assertion error. A failure changes nothing.
  * @returns {Promise<object>} The status view.
  */
 export async function unlockWithPasskey() {
   const status = await userIdentity.unlockWithPasskey();
   refreshUserIdentity();
+  _syncUserIdentityToNode();
   return status;
 }
 
 /**
- * Remove the enrolled passkey (the recovery phrase is unaffected).
+ * Remove the enrolled passkey while unlocked: the plaintext secret returns to
+ * seamless storage, the live node keeps it, and the recovery phrase is
+ * unaffected.
  * @returns {Promise<object>} The status view.
  */
 export async function removePasskey() {
   const status = await userIdentity.removePasskey();
   refreshUserIdentity();
+  _syncUserIdentityToNode();
   return status;
 }
 
@@ -383,9 +409,9 @@ async function _persistDerivedTransportSeed(mnemonic, passphrase = '') {
 }
 
 /**
- * Feed the persisted derived secp256k1 secret back into a node so it signs V4
- * orders and can register its anchor. No-op when the node or secret is absent.
- * Never throws.
+ * Feed the currently installed derived secp256k1 secret back into a node so it
+ * signs V4 orders and can register its anchor. No-op when the node or secret is
+ * absent (which is the locked case). Never throws.
  *
  * @param {object|null} node
  * @returns {boolean} Whether the identity was applied.
@@ -407,6 +433,25 @@ function _applyStoredUserIdentity(node) {
     _warnOnce('user-identity-set', '[api] could not set the user identity from the stored secret', err);
     return false;
   }
+}
+
+/**
+ * Reflect the current passkey lock state onto the live node: install the secret
+ * when it is available (seamless storage or a just-completed unlock), otherwise
+ * clear the node's in-memory identity so a locked device cannot sign. The
+ * transport key is never touched. Never throws.
+ *
+ * @returns {boolean} Whether an identity is now installed on the node.
+ */
+function _syncUserIdentityToNode() {
+  if (!_clientNode) return false;
+  if (_applyStoredUserIdentity(_clientNode)) return true;
+  try {
+    _clientNode.clear_user_identity?.();
+  } catch (err) {
+    _warnOnce('user-identity-clear', '[api] could not clear the live user identity while locked', err);
+  }
+  return false;
 }
 
 // ── Internal state ────────────────────────────────────────────
