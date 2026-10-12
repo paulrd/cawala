@@ -23,6 +23,10 @@
  *     - the TOFU anchors `pinned_ledger` / `pinned_leaf_keys` — carried *inside*
  *       the `cawala.ledger.v1` blob today (no key of their own). They are the
  *       authoritative-local trust pins a settlement proof must verify under.
+ *     - `cawala.ledger.backup.v1:<nodeId>` — a quarantine copy of a ledger blob
+ *       whose import failed. It holds the same authoritative-local TOFU anchors,
+ *       so it must not be discarded: it is the only recoverable copy once the
+ *       live `cawala.ledger.v1:<nodeId>` blob is overwritten by a fresh export.
  *
  * - **best-effort cache** — absence is tolerated. These blobs let a reload
  *   reconstruct local intent (pending orders, outbound join) without a network
@@ -60,6 +64,7 @@ export const STORAGE_KEYS = Object.freeze({
   USER_IDENTITY: 'cawala.user-identity.v1',
   STATE: 'cawala.state.v1',
   LEDGER: 'cawala.ledger.v1',
+  LEDGER_BACKUP: 'cawala.ledger.backup.v1',
   RECOVERY: 'cawala.recovery.v1',
   ADMIN_POLICY: 'cawala.admin.policy.v1',
   VALUE_PENDING: 'cawala.value.pending.v1',
@@ -119,6 +124,13 @@ export const STORAGE_CLASSIFICATION = Object.freeze([
     description: 'Secret-free ledger blob (pins, balance, activity, pending orders). Absence tolerated.',
   },
   {
+    key: STORAGE_KEYS.LEDGER_BACKUP,
+    class: STORAGE_CLASS.AUTHORITATIVE_LOCAL,
+    scope: 'identity',
+    description:
+      'Quarantine copy of a ledger blob that failed to import; retains the authoritative-local TOFU anchors so they are recoverable after the live blob is overwritten.',
+  },
+  {
     key: STORAGE_KEYS.RECOVERY,
     class: STORAGE_CLASS.NON_AUTHORITATIVE_LOCAL,
     scope: 'global',
@@ -161,6 +173,13 @@ export function classifyStorageKey(key) {
   if (key === STORAGE_KEYS.LEDGER || key.startsWith(`${STORAGE_KEYS.LEDGER}:`)) {
     return STORAGE_CLASS.BEST_EFFORT_CACHE;
   }
+  // The quarantine backup is authoritative-local (it retains the TOFU anchors).
+  if (
+    key === STORAGE_KEYS.LEDGER_BACKUP ||
+    key.startsWith(`${STORAGE_KEYS.LEDGER_BACKUP}:`)
+  ) {
+    return STORAGE_CLASS.AUTHORITATIVE_LOCAL;
+  }
 
   return null;
 }
@@ -189,6 +208,13 @@ function _base64ToBytes(b64) {
   const out = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
   return out;
+}
+
+/** Encode bytes as standard base64. */
+function _bytesToBase64(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
 }
 
 /**
@@ -227,6 +253,33 @@ export function readScopedBlob(base, nodeId, options = {}) {
   } catch (err) {
     options.onWarn?.('decode', err);
     return null;
+  }
+}
+
+/**
+ * Write an identity-scoped base64 blob. Best-effort: returns `false` (never
+ * throws) when storage is unavailable or rejects the write (private mode /
+ * quota). Used to quarantine a ledger blob that failed to import.
+ *
+ * @param {string} base The un-suffixed key, e.g. `cawala.ledger.backup.v1`.
+ * @param {string} nodeId
+ * @param {Uint8Array} bytes
+ * @param {{ store?: any, onWarn?: (kind: 'write', err: unknown) => void }} [options]
+ * @returns {boolean} Whether the blob was written.
+ */
+export function writeScopedBlob(base, nodeId, bytes, options = {}) {
+  const store = _resolveStore(options.store);
+  if (!store) {
+    options.onWarn?.('write', new Error('storage unavailable'));
+    return false;
+  }
+  if (!bytes || bytes.length === 0) return false;
+  try {
+    store.setItem(`${base}:${nodeId}`, _bytesToBase64(bytes));
+    return true;
+  } catch (err) {
+    options.onWarn?.('write', err);
+    return false;
   }
 }
 

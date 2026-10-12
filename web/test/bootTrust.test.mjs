@@ -42,6 +42,7 @@ const { __bootRealNodeForTest, isTrustEstablished, getTrustState } = await impor
 const NODE_ID = 'boot-node';
 const IDENTITY_KEY = 'cawala.identity.v1';
 const LEDGER_KEY = `cawala.ledger.v1:${NODE_ID}`;
+const LEDGER_BACKUP_KEY = `cawala.ledger.backup.v1:${NODE_ID}`;
 
 /** Pre-seed a 32-byte identity so boot never calls the wasm RNG. */
 function seedIdentity() {
@@ -109,6 +110,9 @@ function makeBootWasm(opts = {}) {
 /** Boot with the given raw ledger bytes seeded under the scoped key. */
 async function bootWithLedgerBytes(bytes, opts = {}) {
   seedIdentity();
+  // Each boot starts without a quarantine backup so a test can assert whether
+  // *this* boot wrote one.
+  memory.removeItem(LEDGER_BACKUP_KEY);
   const b64 = Buffer.from(bytes).toString('base64');
   memory.setItem(LEDGER_KEY, b64);
   const { wasm } = makeBootWasm(opts);
@@ -128,8 +132,16 @@ test('boot: a corrupt ledger blob is fail-closed and its bytes are preserved', a
     const trust = getTrustState();
     assert.equal(trust.established, false);
     assert.equal(trust.needsReestablish, true);
-    // The unreadable blob may still carry authoritative-local TOFU anchors.
-    assert.equal(memory.getItem(LEDGER_KEY), seededB64, 'corrupt blob must not be clobbered');
+    assert.equal(trust.ledgerBlobUnreadable, true, 'the unreadable blob is surfaced');
+    // The original (unreadable) bytes are quarantined under the authoritative-
+    // local backup key, so they survive the fresh export that overwrites the
+    // live blob.
+    assert.equal(memory.getItem(LEDGER_BACKUP_KEY), seededB64, 'corrupt blob is quarantined');
+    assert.equal(
+      memory.getItem(LEDGER_KEY),
+      Buffer.from(new Uint8Array([2])).toString('base64'),
+      'the live blob is a fresh export; the backup is the recovery copy',
+    );
   } finally {
     stop();
   }
@@ -149,7 +161,12 @@ test('boot: a version-bumped ledger blob is fail-closed and its bytes are preser
     const trust = getTrustState();
     assert.equal(trust.established, false);
     assert.equal(trust.needsReestablish, true);
-    assert.equal(memory.getItem(LEDGER_KEY), seededB64, 'version-bumped blob must not be clobbered');
+    assert.equal(trust.ledgerBlobUnreadable, true);
+    assert.equal(memory.getItem(LEDGER_BACKUP_KEY), seededB64, 'version-bumped blob is quarantined');
+    assert.equal(
+      memory.getItem(LEDGER_KEY),
+      Buffer.from(new Uint8Array([2])).toString('base64'),
+    );
   } finally {
     stop();
   }
@@ -164,8 +181,10 @@ test('boot: a clean import with restored anchors establishes trust and persists'
     const trust = getTrustState();
     assert.equal(trust.established, true);
     assert.equal(trust.needsReestablish, false);
+    assert.equal(trust.ledgerBlobUnreadable, false, 'a clean import has nothing to quarantine');
     // A successful import may safely re-export over the source blob.
     assert.equal(memory.getItem(LEDGER_KEY), Buffer.from(new Uint8Array([2])).toString('base64'));
+    assert.equal(memory.getItem(LEDGER_BACKUP_KEY), null, 'no backup is written on a clean import');
   } finally {
     stop();
   }

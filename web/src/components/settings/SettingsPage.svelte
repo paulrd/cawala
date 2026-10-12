@@ -19,6 +19,7 @@
     getClientStateInfo,
     getTrustState,
     confirmPin,
+    acceptPinChange,
     exportIdentityBundle,
     inspectIdentityBundle,
     importIdentityBundle,
@@ -62,6 +63,32 @@
       showToast(err?.message || 'Could not confirm the leaf ledger key.', 'danger');
     } finally {
       confirmPinBusy = false;
+    }
+  }
+
+  // Per-node pin-change actions. A detected change on ANY leaf is actionable:
+  // "Keep pinned key" re-confirms the existing pin (clearing the change), and
+  // "Adopt presented key" explicitly adopts the presented key. Only one action
+  // runs at a time; the busy node id tracks which row is in flight.
+  let changeBusyNode = $state(null);
+  let changeAction = $state(null);
+  async function handleChangeAction(nodeId, action) {
+    if (changeBusyNode != null || !nodeId) return;
+    changeBusyNode = nodeId;
+    changeAction = action;
+    try {
+      if (action === 'accept') {
+        acceptPinChange(nodeId);
+        showToast('Presented leaf ledger key adopted.', 'ok');
+      } else {
+        confirmPin(nodeId);
+        showToast('Existing leaf ledger key kept.', 'ok');
+      }
+    } catch (err) {
+      showToast(err?.message || 'Could not update the leaf ledger key pin.', 'danger');
+    } finally {
+      changeBusyNode = null;
+      changeAction = null;
     }
   }
 
@@ -242,35 +269,55 @@
     </div>
   </Card>
 
-  {#if !isMockMode() && trust.pinnedLedger}
+  {#if !isMockMode() && (trust.pinnedLedger || trust.changes.length > 0)}
     <Card title="Leaf Ledger Trust" variant={trust.established ? undefined : 'warn'}>
       <div class="settings-section">
-        <div class="setting-row">
-          <span class="setting-label">Pinned ledger</span>
-          <code class="text-sm" style="word-break: break-all; font-family: var(--mono);">
-            {trust.pinnedLedger}
-          </code>
-        </div>
+        {#if trust.pinnedLedger}
+          <div class="setting-row">
+            <span class="setting-label">Pinned ledger</span>
+            <code class="text-sm" style="word-break: break-all; font-family: var(--mono);">
+              {trust.pinnedLedger}
+            </code>
+          </div>
+        {/if}
 
-        {#if trust.changes.length > 0}
+        {#each trust.changes as change (change.nodeId)}
           <div class="warn-box">
             <span class="warn-icon">!</span>
             <span>
               Pin change detected: a different ledger key was presented for
-              {trust.changes[0].nodeId}. The existing pin is still in force and the
-              new key was <strong>not</strong> adopted. Verify the change out-of-band
-              before relying on payments to or from this leaf.
+              {change.nodeId}. The existing pin is still in force and the new key was
+              <strong>not</strong> adopted. Verify the change out-of-band before
+              relying on payments to or from this leaf.
             </span>
           </div>
           <div class="setting-row">
             <span class="setting-label">Pinned key</span>
-            <code class="text-sm" style="word-break: break-all; font-family: var(--mono);">{trust.changes[0].pinned}</code>
+            <code class="text-sm" style="word-break: break-all; font-family: var(--mono);">{change.pinned}</code>
           </div>
           <div class="setting-row">
             <span class="setting-label">Presented key</span>
-            <code class="text-sm" style="word-break: break-all; font-family: var(--mono);">{trust.changes[0].presented}</code>
+            <code class="text-sm" style="word-break: break-all; font-family: var(--mono);">{change.presented}</code>
           </div>
-        {/if}
+          <div class="admin-mode-actions">
+            <button
+              type="button"
+              class="btn btn--primary btn--sm"
+              disabled={changeBusyNode != null}
+              onclick={() => handleChangeAction(change.nodeId, 'keep')}
+            >
+              {#if changeBusyNode === change.nodeId && changeAction === 'keep'}Keeping...{:else}Keep pinned key{/if}
+            </button>
+            <button
+              type="button"
+              class="btn btn--ghost btn--sm"
+              disabled={changeBusyNode != null}
+              onclick={() => handleChangeAction(change.nodeId, 'accept')}
+            >
+              {#if changeBusyNode === change.nodeId && changeAction === 'accept'}Adopting...{:else}Adopt presented key{/if}
+            </button>
+          </div>
+        {/each}
 
         {#if trust.established}
           <p class="muted text-sm" style="margin-top: var(--sp-1);">
@@ -293,6 +340,22 @@
             {#if confirmPinBusy}Confirming...{:else}Confirm this leaf key{/if}
           </button>
         {/if}
+      </div>
+    </Card>
+  {/if}
+
+  {#if !mock && trust.ledgerBlobUnreadable}
+    <Card title="Ledger State Backup" variant="warn">
+      <div class="settings-section">
+        <div class="warn-box">
+          <span class="warn-icon">!</span>
+          <span>
+            The stored ledger state could not be read (for example, it was written by a
+            newer client version). The original bytes were quarantined so the local trust
+            pins are not lost, and local state started fresh. Re-establish trust by
+            verifying the leaf ledger key out-of-band before relying on payments.
+          </span>
+        </div>
       </div>
     </Card>
   {/if}

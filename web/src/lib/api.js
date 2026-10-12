@@ -63,6 +63,7 @@ import {
   STORAGE_KEYS,
   readScopedBlob,
   restoreBlobs,
+  writeScopedBlob,
 } from './storage.js';
 import * as userIdentity from './userIdentity.js';
 
@@ -471,6 +472,8 @@ const IDENTITY_KEY = STORAGE_KEYS.IDENTITY;
 const STATE_KEY = STORAGE_KEYS.STATE;
 // Distinct key for the secret-free ledger blob (balance/activity/pending).
 const LEDGER_KEY = STORAGE_KEYS.LEDGER;
+// Quarantine key for a ledger blob whose import failed (authoritative-local).
+const LEDGER_BACKUP_KEY = STORAGE_KEYS.LEDGER_BACKUP;
 const SEED_BYTES = 32;
 
 /**
@@ -509,6 +512,14 @@ let _lastControlEvent = null;
 // cache): trust is not established, and a later receipt must not be silently
 // treated as TOFU-established. Set once in `_spawnRealNode`.
 let _trustEstablished = false;
+
+// A present ledger blob that failed to import at boot. Its raw bytes are held
+// here so the *first* `_persistLedgerState()` can stash them under the
+// authoritative-local quarantine key before overwriting the live blob; the flag
+// is surfaced through `getTrustState().ledgerBlobUnreadable`. Cleared once the
+// bytes are stashed (bounded, non-blocking).
+let _unreadableLedgerBytes = null;
+let _ledgerBlobUnreadable = false;
 
 // ETH-anchor registration bookkeeping. `_ethRegisteredFor` keys the joined
 // session (`<parent>:<address>`) so `register_eth_address()` is attempted once
@@ -615,6 +626,8 @@ export async function __bootRealNodeForTest(wasm) {
       _clientNode = null;
       _releaseIdentityLock();
       _trustEstablished = false;
+      _unreadableLedgerBytes = null;
+      _ledgerBlobUnreadable = false;
       _ethRegisteredFor = null;
       _ethRegistration = null;
       _resetNodeCapabilities();
@@ -813,10 +826,46 @@ function _loadLedgerState(nodeId) {
 }
 
 /**
+ * Quarantine the raw bytes of a ledger blob that failed to import, under the
+ * authoritative-local backup key, before the live blob is overwritten.
+ *
+ * Best-effort and bounded: called at most once per failed import. Never throws.
+ * @param {Uint8Array} bytes The original (unreadable) ledger blob bytes.
+ * @returns {boolean} Whether the backup was written.
+ */
+function _stashUnreadableLedger(bytes) {
+  if (!_clientNode || !bytes || bytes.length === 0) return false;
+  let nodeId;
+  try {
+    nodeId = _clientNode.endpoint_id();
+  } catch (err) {
+    _warnOnce('ledger-backup-id', '[api] could not read endpoint id to quarantine the ledger blob', err);
+    return false;
+  }
+  return writeScopedBlob(LEDGER_BACKUP_KEY, nodeId, bytes, {
+    onWarn(kind, err) {
+      _warnOnce(
+        'ledger-backup-write',
+        '[api] could not quarantine the unreadable ledger blob (private mode/quota)',
+        err,
+      );
+    },
+  });
+}
+
+/**
  * Persist `node.export_ledger_state()` to localStorage. Best-effort; never throws.
+ *
+ * If a present ledger blob failed to import at boot, its original bytes are
+ * quarantined under the backup key *before* this first overwrite, so the
+ * authoritative-local TOFU anchors stay recoverable. The stash is one-shot.
  */
 function _persistLedgerState() {
   if (!_clientNode) return;
+  if (_unreadableLedgerBytes) {
+    _stashUnreadableLedger(_unreadableLedgerBytes);
+    _unreadableLedgerBytes = null;
+  }
   try {
     const bytes = _clientNode.export_ledger_state();
     _persistScopedBlob(LEDGER_KEY, bytes, 'ledger-write');
@@ -901,21 +950,27 @@ async function _spawnRealNode() {
   // transport seed was already consumed by `_loadOrCreateIdentity` above.
   _applyStoredUserIdentity(node);
   _persistState();
-  // Pin safety: never overwrite a ledger blob whose import failed. The blob
-  // carries the authoritative-local TOFU anchors (pinned_ledger /
-  // pinned_leaf_keys), which the node cannot re-supply. Re-exporting the now
-  // empty in-memory ledger state would clobber the only trusted copy with no
-  // recovery path, so preserve the original bytes when a blob was present but
-  // unreadable. A fresh origin (no blob) and a successful import both persist.
+  // Pin safety: a present ledger blob that failed to import still carries the
+  // authoritative-local TOFU anchors (pinned_ledger / pinned_leaf_keys), which
+  // the node cannot re-supply. Before the first overwrite, stash the original
+  // bytes under the quarantine key so they stay recoverable; then normal
+  // persistence resumes. The condition is surfaced through
+  // `getTrustState().ledgerBlobUnreadable`. Bounded and non-blocking: the stash
+  // is one-shot and a failed write never blocks boot.
   const hadLedgerBlob = Boolean(ledgerBytes && ledgerBytes.length > 0);
-  if (!hadLedgerBlob || restoreResult.ledgerImported) {
-    _persistLedgerState();
-  } else {
+  _ledgerBlobUnreadable = hadLedgerBlob && !restoreResult.ledgerImported;
+  // Hold the original bytes (or clear a stale pending stash on a clean boot) so
+  // the first persist quarantines exactly this boot's unreadable blob.
+  _unreadableLedgerBytes = _ledgerBlobUnreadable ? ledgerBytes : null;
+  if (_ledgerBlobUnreadable) {
     _warnOnce(
       'ledger-preserve',
-      '[api] ledger blob failed to import; preserving the original bytes so the authoritative-local TOFU anchors are not destroyed',
+      '[api] ledger blob failed to import; quarantining the original bytes so the authoritative-local TOFU anchors are not destroyed',
     );
   }
+  // `_persistLedgerState` quarantines any pending unreadable bytes before it
+  // overwrites, then re-exports the (possibly empty) in-memory ledger.
+  _persistLedgerState();
   // Reflect any restored verified balance in the reactive store immediately.
   _syncLedgerStoreFromStatus();
   _startControlPoller();
@@ -2693,10 +2748,12 @@ export function isTrustEstablished() {
  * routing pin.
  *
  * Fail-closed: when `needsReestablish` is true the UI must not present a pin as
- * established. An older client build without `pin_status()` degrades to the
+ * established. `ledgerBlobUnreadable` is true when a present ledger blob failed
+ * to import at boot and was quarantined (its TOFU anchors are recoverable under
+ * the backup key). An older client build without `pin_status()` degrades to the
  * restored-anchor heuristic.
  *
- * @returns {{ established: boolean, needsReestablish: boolean, status: string, ledgerTrust: 'unconfirmed'|'confirmed'|null, ledgerPinNode: string|null, pinnedLedger: string|null, pinnedLeafKeys: Array<{ nodeId: string, ledger: string }>, changes: Array<{ nodeId: string, pinned: string, presented: string }>, mock: boolean }}
+ * @returns {{ established: boolean, needsReestablish: boolean, status: string, ledgerTrust: 'unconfirmed'|'confirmed'|null, ledgerPinNode: string|null, pinnedLedger: string|null, pinnedLeafKeys: Array<{ nodeId: string, ledger: string }>, changes: Array<{ nodeId: string, pinned: string, presented: string }>, ledgerBlobUnreadable: boolean, mock: boolean }}
  */
 export function getTrustState() {
   if (_useMock || !_clientNode) {
@@ -2709,6 +2766,7 @@ export function getTrustState() {
       pinnedLedger: null,
       pinnedLeafKeys: [],
       changes: [],
+      ledgerBlobUnreadable: false,
       mock: true,
     };
   }
@@ -2734,6 +2792,7 @@ export function getTrustState() {
       pinnedLedger: pin.ledgerPin ?? pinnedLedger,
       pinnedLeafKeys: pin.leafPins.map((entry) => ({ nodeId: entry.nodeId, ledger: entry.ledger })),
       changes: pin.changes,
+      ledgerBlobUnreadable: _ledgerBlobUnreadable,
       mock: false,
     };
   }
@@ -2748,6 +2807,7 @@ export function getTrustState() {
     pinnedLedger,
     pinnedLeafKeys: _readPinnedLeafKeys(_clientNode),
     changes: [],
+    ledgerBlobUnreadable: _ledgerBlobUnreadable,
     mock: false,
   };
 }
@@ -2773,6 +2833,35 @@ export function confirmPin(nodeId) {
     throw new Error('A pin subject node id is required.');
   }
   node.confirm_pin(String(nodeId));
+  _trustEstablished = _pinTrustConfirmed(node);
+  _persistLedgerState();
+  _syncLedgerStoreFromStatus();
+  return getTrustState();
+}
+
+/**
+ * Explicitly adopt the *presented* key of a recorded pin change for `nodeId`.
+ *
+ * A pin change is detected when a different ledger key is presented for an
+ * already-pinned leaf; it is recorded (never silently adopted). This is the
+ * explicit user action that adopts the new key: it replaces the pin for that
+ * leaf (or the routing pin, when `nodeId` is the current parent's leaf), marks
+ * it `confirmed`, clears the recorded change, and re-exports the ledger state so
+ * the decision survives a reload. Use {@link confirmPin} instead to keep the
+ * existing pinned key. Returns the refreshed trust state.
+ *
+ * @param {string} nodeId
+ * @returns {object}
+ */
+export function acceptPinChange(nodeId) {
+  const node = _requireNode();
+  if (typeof node.accept_pin_change !== 'function') {
+    throw new Error('This client build cannot accept a pin change.');
+  }
+  if (nodeId == null || String(nodeId).length === 0) {
+    throw new Error('A pin subject node id is required.');
+  }
+  node.accept_pin_change(String(nodeId));
   _trustEstablished = _pinTrustConfirmed(node);
   _persistLedgerState();
   _syncLedgerStoreFromStatus();

@@ -30,7 +30,8 @@
 //! [`SettlementStateV1::Unverified`] and is never reported as a completed
 //! payment. A *different* key presented for an already-pinned leaf is recorded
 //! as a [`LeafKeyChangeV1`] and never silently adopted; the caller must act
-//! explicitly ([`LedgerStateV1::confirm_leaf_pin`] keeps the existing pin).
+//! explicitly ([`LedgerStateV1::confirm_leaf_pin`] keeps the existing pin,
+//! [`LedgerStateV1::accept_leaf_key_change`] adopts the presented key).
 //!
 //! # Bounds
 //!
@@ -289,6 +290,24 @@ pub struct LeafKeyChangeV1 {
     pub pinned: LedgerPubKey,
     /// The different key that was presented and rejected.
     pub presented: LedgerPubKey,
+}
+
+/// The outcome of an explicit out-of-band (receive-URI) leaf-key pin attempt.
+///
+/// The receive-URI path is fail-closed: a key that differs from an existing pin
+/// is recorded as a change and **never silently adopted**, so a receive URI
+/// cannot overwrite established trust. The caller may explicitly adopt the
+/// presented key with [`LedgerStateV1::accept_leaf_key_change`] (or keep the
+/// existing pin).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeafPinOutcome {
+    /// No pin existed: the key was installed as an out-of-band `Confirmed` pin.
+    Pinned,
+    /// The presented key matched the existing pin (whose trust was confirmed).
+    AlreadyPinned,
+    /// A *different* key was presented for an already-pinned leaf: the change
+    /// was recorded and the existing pin is retained.
+    Conflict(Box<LeafKeyChangeV1>),
 }
 
 /// Stable JS string for a [`PinTrust`].
@@ -571,8 +590,10 @@ impl LedgerStateV1 {
     /// Pin (or replace) the ledger key expected for a leaf node's terminal
     /// proofs, recorded as [`PinTrust::Confirmed`].
     ///
-    /// This is the explicit/out-of-band path (a receive-URI pin); evicts the
-    /// oldest beyond [`MAX_PINNED_LEAF_KEYS`].
+    /// This is an **unconditional** explicit setter: it replaces any existing
+    /// pin. Use [`LedgerStateV1::pin_leaf_key_from_receive`] for the
+    /// user-facing receive-URI path, which is fail-closed against an existing
+    /// different key. Evicts the oldest beyond [`MAX_PINNED_LEAF_KEYS`].
     pub fn pin_leaf_key(&mut self, node_id: NodeId, ledger: LedgerPubKey) {
         self.set_leaf_key(node_id, ledger, PinTrust::Confirmed);
     }
@@ -605,6 +626,73 @@ impl LedgerStateV1 {
         while self.pinned_leaf_keys.len() > MAX_PINNED_LEAF_KEYS {
             self.pinned_leaf_keys.remove(0);
         }
+    }
+
+    /// Pin a leaf key presented out-of-band by a receive URI, fail-closed.
+    ///
+    /// - No existing pin: installs the key as [`PinTrust::Confirmed`] (a receive
+    ///   URI is an explicit out-of-band channel).
+    /// - Matching existing pin: confirms it in place (never downgrades).
+    /// - Different existing pin: records a [`LeafKeyChangeV1`] and **does not
+    ///   adopt** the presented key; the existing pin stays in force. The caller
+    ///   must act explicitly via [`LedgerStateV1::accept_leaf_key_change`]
+    ///   (adopt) or leave the existing pin (keep).
+    ///
+    /// This is consistent with the routing ([`verify_receipt`]) and terminal
+    /// ([`terminal_settlement_state`]) paths, which also record rather than adopt
+    /// a different key for an already-pinned leaf.
+    pub fn pin_leaf_key_from_receive(
+        &mut self,
+        node_id: NodeId,
+        ledger: LedgerPubKey,
+    ) -> LeafPinOutcome {
+        match self.pinned_leaf_key(&node_id) {
+            Some(existing) if existing == ledger => {
+                // An out-of-band sighting of the pinned key confirms it.
+                self.set_leaf_key(node_id, ledger, PinTrust::Confirmed);
+                LeafPinOutcome::AlreadyPinned
+            }
+            Some(existing) => {
+                let change = LeafKeyChangeV1 {
+                    node_id: node_id.clone(),
+                    pinned: existing,
+                    presented: ledger,
+                };
+                self.record_leaf_key_change(node_id, existing, ledger);
+                LeafPinOutcome::Conflict(Box::new(change))
+            }
+            None => {
+                self.set_leaf_key(node_id, ledger, PinTrust::Confirmed);
+                LeafPinOutcome::Pinned
+            }
+        }
+    }
+
+    /// Adopt the *presented* key of a recorded change for a leaf `node_id`.
+    ///
+    /// Explicit user action for a legitimate leaf rotation: installs the recorded
+    /// presented key as [`PinTrust::Confirmed`] and clears the change. Returns
+    /// the adopted key, or `None` when there is no recorded change for that node.
+    /// The routing pin has its own
+    /// [`LedgerStateV1::accept_pinned_ledger_change`].
+    pub fn accept_leaf_key_change(&mut self, node_id: &NodeId) -> Option<LedgerPubKey> {
+        let presented = self.leaf_key_change(node_id)?.presented;
+        self.set_leaf_key(node_id.clone(), presented, PinTrust::Confirmed);
+        self.clear_leaf_key_changes(node_id);
+        Some(presented)
+    }
+
+    /// Adopt the *presented* key of a recorded change for the routing leaf
+    /// `parent`, replacing [`Self::pinned_ledger`] and marking it `confirmed`.
+    ///
+    /// Returns the adopted key, or `None` when there is no recorded change for
+    /// that node.
+    pub fn accept_pinned_ledger_change(&mut self, parent: &NodeId) -> Option<LedgerPubKey> {
+        let presented = self.leaf_key_change(parent)?.presented;
+        self.pinned_ledger = Some(presented);
+        self.pinned_ledger_trust = PinTrust::Confirmed;
+        self.clear_leaf_key_changes(parent);
+        Some(presented)
     }
 
     /// The pinned ledger key for `node_id`, if any (regardless of trust).
@@ -2047,6 +2135,82 @@ mod tests {
             Some(PinTrust::Confirmed),
             "an explicit pin must not be downgraded by a matching proof"
         );
+    }
+
+    /// A receive-URI re-pin that presents a different key must record a change
+    /// and retain the existing pin (never silently adopt it); first-time pinning
+    /// and a matching re-pin are unchanged, and the explicit accept path adopts
+    /// the presented key.
+    #[test]
+    fn receive_uri_repin_records_change_and_does_not_adopt() {
+        let pinned = ledger(1);
+        let other = ledger(2);
+        let leaf = node("leaf-a");
+        let mut state = LedgerStateV1::new();
+
+        // First-time pinning installs an out-of-band `Confirmed` pin (unchanged).
+        assert_eq!(
+            state.pin_leaf_key_from_receive(leaf.clone(), pinned.public()),
+            LeafPinOutcome::Pinned
+        );
+        assert_eq!(state.pinned_leaf_trust(&leaf), Some(PinTrust::Confirmed));
+
+        // A different presented key is recorded, never adopted.
+        match state.pin_leaf_key_from_receive(leaf.clone(), other.public()) {
+            LeafPinOutcome::Conflict(change) => {
+                assert_eq!(change.node_id, leaf);
+                assert_eq!(change.pinned, pinned.public());
+                assert_eq!(change.presented, other.public());
+            }
+            outcome => panic!("expected conflict, got {outcome:?}"),
+        }
+        assert_eq!(
+            state.pinned_leaf_key(&leaf),
+            Some(pinned.public()),
+            "the existing pin is retained"
+        );
+        assert_eq!(
+            state.leaf_key_change(&leaf).map(|change| change.presented),
+            Some(other.public())
+        );
+
+        // A matching re-pin confirms in place (no change, no downgrade).
+        assert_eq!(
+            state.pin_leaf_key_from_receive(leaf.clone(), pinned.public()),
+            LeafPinOutcome::AlreadyPinned
+        );
+        assert_eq!(state.pinned_leaf_trust(&leaf), Some(PinTrust::Confirmed));
+
+        // Explicit accept adopts the presented key, confirmed, and clears it.
+        assert_eq!(state.accept_leaf_key_change(&leaf), Some(other.public()));
+        assert_eq!(state.pinned_leaf_key(&leaf), Some(other.public()));
+        assert_eq!(state.pinned_leaf_trust(&leaf), Some(PinTrust::Confirmed));
+        assert!(state.leaf_key_change(&leaf).is_none());
+        // Nothing left to accept.
+        assert_eq!(state.accept_leaf_key_change(&leaf), None);
+    }
+
+    /// The explicit accept path also covers a routing-leaf pin change.
+    #[test]
+    fn accept_pinned_ledger_change_adopts_presented_key() {
+        let pinned = ledger(1);
+        let other = ledger(2);
+        let parent = node("parent");
+        let mut state = LedgerStateV1::new();
+        state.pinned_ledger = Some(pinned.public());
+        state.pinned_ledger_trust = PinTrust::Unconfirmed;
+        // A different receipt key for the pinned routing leaf is recorded.
+        let receipt = receipt_for(&other, &parent, &node("n1"));
+        assert!(verify_receipt(&mut state, &receipt, "n1", &parent).is_err());
+
+        assert_eq!(
+            state.accept_pinned_ledger_change(&parent),
+            Some(other.public())
+        );
+        assert_eq!(state.pinned_ledger, Some(other.public()));
+        assert_eq!(state.pinned_ledger_trust, PinTrust::Confirmed);
+        assert!(state.leaf_key_change(&parent).is_none());
+        assert_eq!(state.accept_pinned_ledger_change(&parent), None);
     }
 
     #[test]

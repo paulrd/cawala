@@ -61,7 +61,7 @@ use crate::dto::{
     PaymentOutcome, SnapshotDto, parse_operator_hex, parse_request_id_hex, reject_code_str,
 };
 use crate::eth_identity::UserIdentitySlot;
-use crate::ledger_state::{LEDGER_STATE_VERSION, LedgerStateV1};
+use crate::ledger_state::{LEDGER_STATE_VERSION, LeafPinOutcome, LedgerStateV1};
 use crate::state::{LOCAL_STATE_VERSION, LocalStateV1, ParentLink, Transition};
 
 /// WASM entry point, called once when the module is instantiated.
@@ -2039,18 +2039,34 @@ impl ClientNode {
     ///
     /// `node_id` is the URI's `ln` (the payee's parent leaf node id) and
     /// `ledger_hex` is the URI's `lk` (that leaf's 64-hex ledger public key).
-    /// Once pinned, a terminal proof for this leaf must verify under exactly
-    /// that key; a mismatch is reported as an `"unverified"` settlement, never
-    /// as success. The pin is stored in the secret-free ledger state, so it
-    /// survives [`ClientNode::export_ledger_state`] round trips.
+    ///
+    /// Fail-closed against an existing pin: a first-time key is pinned
+    /// `confirmed` (a receive URI is an explicit out-of-band channel) and a
+    /// presented key that already matches is (re)confirmed, but a *different*
+    /// key presented for an already-pinned leaf is recorded as a
+    /// [`crate::ledger_state::LeafKeyChangeV1`] and **not adopted** — the
+    /// existing pin stays in force, and this returns an error so the caller
+    /// aborts the send (matching the routing/terminal paths). Use
+    /// [`ClientNode::accept_pin_change`] to adopt the presented key after
+    /// verifying the rotation out-of-band. The pin is stored in the secret-free
+    /// ledger state, so it survives [`ClientNode::export_ledger_state`] round
+    /// trips.
     pub fn pin_payee_leaf(&self, node_id: String, ledger_hex: String) -> Result<(), JsError> {
         let endpoint: EndpointId = node_id.parse().map_err(to_js_err)?;
         let node = cawala_ledger::NodeId::from(endpoint.to_string());
         let key = dto::parse_ledger_hex(&ledger_hex).map_err(to_js_err)?;
-        self.ledger
+        let outcome = self
+            .ledger
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .pin_leaf_key(node, key);
+            .pin_leaf_key_from_receive(node, key);
+        if let LeafPinOutcome::Conflict(change) = outcome {
+            return Err(JsError::new(&format!(
+                "payee leaf key changed: existing pin {} retained; presented key {} not adopted \
+                 (verify the change out-of-band, then accept it explicitly)",
+                change.pinned, change.presented
+            )));
+        }
         Ok(())
     }
 
@@ -2348,6 +2364,43 @@ impl ClientNode {
         confirmed |= ledger.confirm_leaf_pin(&target);
         if !confirmed {
             return Err(JsError::new("no pin to confirm for that node"));
+        }
+        Ok(())
+    }
+
+    /// Explicitly adopt a recorded pin change for `node_id`.
+    ///
+    /// Where [`ClientNode::confirm_pin`] keeps the existing pinned key (it never
+    /// adopts a presented change), this adopts the *presented* key: for the
+    /// routing leaf pin it replaces `pinned_ledger`; for any other leaf it
+    /// replaces that leaf's pin. The new pin is `confirmed` and the recorded
+    /// change is cleared. The updated state is persisted by the caller through
+    /// [`ClientNode::export_ledger_state`], so the decision survives a reload.
+    /// Returns an error when no change is recorded for `node_id` (nothing to
+    /// accept).
+    pub fn accept_pin_change(&self, node_id: String) -> Result<(), JsError> {
+        let target = cawala_ledger::NodeId::from(node_id);
+        // The routing ledger pin has no node id of its own; it belongs to the
+        // current parent leaf.
+        let parent = {
+            let state = self.control.lock_state();
+            state
+                .record
+                .parent
+                .as_ref()
+                .map(|link| cawala_ledger::NodeId::from(link.node_id.as_str().to_string()))
+        };
+        let mut ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut accepted = false;
+        if parent.as_ref() == Some(&target) {
+            accepted |= ledger.accept_pinned_ledger_change(&target).is_some();
+        }
+        accepted |= ledger.accept_leaf_key_change(&target).is_some();
+        if !accepted {
+            return Err(JsError::new("no pin change to accept for that node"));
         }
         Ok(())
     }

@@ -335,20 +335,15 @@
     + simplified nav, P5 docs consolidation (R2).
   - Shipped as **one lockstep release** (the format/routed changes do not
     interoperate with the old wasm/web).
-  - **Portable-client refactor base (R1 / R1b / R2 / R3) is delivered on
-    `refactor/portable-client` and merged to `main`** (PR #2, `8ccab19`); the
-    follow-ups (F1 R1b client handshake, F2 node integration tests, F3 identity
-    bundle v2, F4 anchor rotation, F5 passkey lock, F6 fail-closed pinning) are
-    delivered on `refactor/portable-client-followups` (not yet merged). Wire:
-    control format 9, reply 6, ledger payload v4, browser ledger state v5. This
-    is the next lockstep release.
+  - **Portable-client refactor (R1 / R1b / R2 / R3) is delivered and merged to
+    `main`** (base PR #2 `8ccab19`; follow-ups F1-F6 `523cef9`); the F6 pinning
+    follow-ups (F7) are delivered on `main` too. Wire: control format 9, reply 6,
+    ledger payload v4, browser ledger state v5. This is the next lockstep
+    release.
   - Deferred / settled backlog: control version negotiation (single lockstep
     codebase); no `OctAddr` depth cap; foster-parent recovery cut; moved
     pointers rejected; signed topology/registry distribution rejected; browser
-    create-child deferred (provisioning stays invite/CLI); leaf-key pinning
-    follow-ups (a receive-URI re-pin replaces a leaf pin without recording a
-    change; the boot preservation of an unreadable blob is boot-scoped only;
-    only the routing-leaf pin has a confirm action in the trust card).
+    create-child deferred (provisioning stays invite/CLI).
 
 # Administration Refactor Requirements (R1-R9 intent)
   1. **R1 - all admin is tree-routed.** Every admin exchange (`AdminQuery`,

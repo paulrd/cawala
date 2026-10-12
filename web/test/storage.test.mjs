@@ -8,6 +8,7 @@ import {
   STORAGE_CLASSIFICATION,
   classifyStorageKey,
   readScopedBlob,
+  writeScopedBlob,
   restoreBlobs,
 } from '../src/lib/storage.js';
 
@@ -45,6 +46,17 @@ test('state/ledger blobs (scoped and legacy) are best-effort cache', () => {
   assert.equal(classifyStorageKey(`${STORAGE_KEYS.STATE}:abc123`), STORAGE_CLASS.BEST_EFFORT_CACHE);
   assert.equal(classifyStorageKey(STORAGE_KEYS.LEDGER), STORAGE_CLASS.BEST_EFFORT_CACHE);
   assert.equal(classifyStorageKey(`${STORAGE_KEYS.LEDGER}:abc123`), STORAGE_CLASS.BEST_EFFORT_CACHE);
+});
+
+test('the ledger quarantine backup is authoritative-local', () => {
+  assert.equal(
+    classifyStorageKey(STORAGE_KEYS.LEDGER_BACKUP),
+    STORAGE_CLASS.AUTHORITATIVE_LOCAL,
+  );
+  assert.equal(
+    classifyStorageKey(`${STORAGE_KEYS.LEDGER_BACKUP}:abc123`),
+    STORAGE_CLASS.AUTHORITATIVE_LOCAL,
+  );
 });
 
 test('recovery / admin-policy / value-pending are non-authoritative local', () => {
@@ -119,6 +131,57 @@ test('readScopedBlob tolerates a throwing storage', () => {
     null,
   );
   assert.deepEqual(warnings, ['read']);
+});
+
+// ── writeScopedBlob (quarantine) ─────────────────────────────────────────────
+
+test('writeScopedBlob writes an identity-scoped base64 blob', () => {
+  const store = new MemoryStorage();
+  const bytes = new Uint8Array([1, 2, 3, 4]);
+  assert.equal(writeScopedBlob(STORAGE_KEYS.LEDGER_BACKUP, 'node-a', bytes, { store }), true);
+  assert.equal(
+    store.getItem(`${STORAGE_KEYS.LEDGER_BACKUP}:node-a`),
+    Buffer.from(bytes).toString('base64'),
+  );
+});
+
+test('writeScopedBlob never throws and reports failure', () => {
+  const throwing = {
+    setItem() {
+      throw new Error('quota');
+    },
+  };
+  const warnings = [];
+  assert.equal(
+    writeScopedBlob(STORAGE_KEYS.LEDGER_BACKUP, 'node-a', new Uint8Array([1]), {
+      store: throwing,
+      onWarn: (kind) => warnings.push(kind),
+    }),
+    false,
+  );
+  assert.deepEqual(warnings, ['write']);
+  // Nothing to write is a clean false, too.
+  assert.equal(
+    writeScopedBlob(STORAGE_KEYS.LEDGER_BACKUP, 'node-a', new Uint8Array([]), { store: throwing }),
+    false,
+  );
+});
+
+test('a quarantined backup survives an overwrite of the live ledger blob', () => {
+  const store = new MemoryStorage();
+  const original = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+  assert.equal(writeScopedBlob(STORAGE_KEYS.LEDGER_BACKUP, 'node-a', original, { store }), true);
+  // The live blob is later overwritten with a fresh export...
+  assert.equal(
+    writeScopedBlob(STORAGE_KEYS.LEDGER, 'node-a', new Uint8Array([2]), { store }),
+    true,
+  );
+  // ...while the quarantine backup (a different key) keeps the original bytes.
+  assert.equal(
+    new TextDecoder().decode(readScopedBlob(STORAGE_KEYS.LEDGER_BACKUP, 'node-a', { store })),
+    new TextDecoder().decode(original),
+  );
+  assert.equal(store.getItem(`${STORAGE_KEYS.LEDGER}:node-a`), Buffer.from([2]).toString('base64'));
 });
 
 // ── restoreBlobs (boot resilience) ───────────────────────────────────────────
