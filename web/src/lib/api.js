@@ -73,8 +73,12 @@ import * as userIdentity from './userIdentity.js';
 // `userIdentityState` store in sync after every mutation, so components read
 // the store and only call these on user actions. Address derivation and the
 // derived secret now run the REAL wasm secp256k1 engine, injected into the
-// facade after `initApi` loads wasm (`_wasmIdentityBackend` below). The
-// passkey wrap stays deferred (`PASSKEY_BACKEND_READY === false`).
+// facade after `initApi` loads wasm (`_wasmIdentityBackend` below).
+//
+// Passkey unlock is an OPTIONAL lock (WebAuthn PRF key-wrap,
+// `PASSKEY_BACKEND_READY === true`): enrolling removes the plaintext secret
+// from storage and from the live node; a passkey unlock installs it for the
+// session and re-applies it to the node. See `getPasskeyStatus()`.
 //
 // CREATE/RESTORE also do two wasm-side things here (this module owns the
 // ClientNode lifecycle and `cawala.identity.v1`):
@@ -91,6 +95,7 @@ import * as userIdentity from './userIdentity.js';
 export const {
   InvalidMnemonicError,
   PasskeyUnavailableError,
+  PasskeyUnsupportedError,
   IdentityBackendUnavailableError,
   MNEMONIC_ERRORS,
 } = userIdentity;
@@ -106,6 +111,19 @@ export function refreshUserIdentity() {
 /** Whether passkey unlock could work in this context (secure context + WebAuthn). */
 export function isPasskeyAvailable() {
   return userIdentity.isPasskeyAvailable();
+}
+
+/**
+ * The passkey-lock status:
+ * `{ available, prfSupported, enrolled, locked }`.
+ * `prfSupported` is `null` until determined; `locked` is `enrolled` while the
+ * secret is not currently installed (a passkey unlock or mnemonic restore is
+ * needed).
+ *
+ * @returns {{ available: boolean, prfSupported: boolean|null, enrolled: boolean, locked: boolean }}
+ */
+export function getPasskeyStatus() {
+  return userIdentity.getPasskeyStatus();
 }
 
 /**
@@ -186,35 +204,43 @@ export function hasPasskey() {
 }
 
 /**
- * Set up biometric unlock (WebAuthn PRF key-wrap of the mnemonic).
- * Throws `PasskeyUnavailableError` outside a secure context and
- * `IdentityBackendUnavailableError` until the crypto engine lands.
+ * Set up biometric unlock (WebAuthn PRF key-wrap of the derived secp256k1
+ * secret). Enrolling removes the plaintext secret from storage and clears it
+ * from the live node (the lock engages immediately — a passkey unlock is then
+ * required). Throws `PasskeyUnavailableError` outside a secure context and
+ * `PasskeyUnsupportedError` when PRF is unavailable.
  * @returns {Promise<object>} The status view.
  */
 export async function enrollPasskey() {
   const status = await userIdentity.enrollPasskey();
   refreshUserIdentity();
+  _syncUserIdentityToNode();
   return status;
 }
 
 /**
- * Unlock with the enrolled passkey. Same error classes as `enrollPasskey`,
- * plus a not-enrolled message.
+ * Unlock with the enrolled passkey: unwrap the secret for this session and
+ * re-apply it to the live node. Same error classes as `enrollPasskey`, plus a
+ * not-enrolled message and a failed-assertion error. A failure changes nothing.
  * @returns {Promise<object>} The status view.
  */
 export async function unlockWithPasskey() {
   const status = await userIdentity.unlockWithPasskey();
   refreshUserIdentity();
+  _syncUserIdentityToNode();
   return status;
 }
 
 /**
- * Remove the enrolled passkey (the recovery phrase is unaffected).
+ * Remove the enrolled passkey while unlocked: the plaintext secret returns to
+ * seamless storage, the live node keeps it, and the recovery phrase is
+ * unaffected.
  * @returns {Promise<object>} The status view.
  */
 export async function removePasskey() {
   const status = await userIdentity.removePasskey();
   refreshUserIdentity();
+  _syncUserIdentityToNode();
   return status;
 }
 
@@ -300,6 +326,7 @@ async function _reactivateTransportIdentity() {
   }
   _ethRegisteredFor = null;
   _ethRegistration = null;
+  _resetNodeCapabilities();
   _lastControlEvent = null;
   _trustEstablished = false;
   try {
@@ -382,9 +409,9 @@ async function _persistDerivedTransportSeed(mnemonic, passphrase = '') {
 }
 
 /**
- * Feed the persisted derived secp256k1 secret back into a node so it signs V4
- * orders and can register its anchor. No-op when the node or secret is absent.
- * Never throws.
+ * Feed the currently installed derived secp256k1 secret back into a node so it
+ * signs V4 orders and can register its anchor. No-op when the node or secret is
+ * absent (which is the locked case). Never throws.
  *
  * @param {object|null} node
  * @returns {boolean} Whether the identity was applied.
@@ -406,6 +433,25 @@ function _applyStoredUserIdentity(node) {
     _warnOnce('user-identity-set', '[api] could not set the user identity from the stored secret', err);
     return false;
   }
+}
+
+/**
+ * Reflect the current passkey lock state onto the live node: install the secret
+ * when it is available (seamless storage or a just-completed unlock), otherwise
+ * clear the node's in-memory identity so a locked device cannot sign. The
+ * transport key is never touched. Never throws.
+ *
+ * @returns {boolean} Whether an identity is now installed on the node.
+ */
+function _syncUserIdentityToNode() {
+  if (!_clientNode) return false;
+  if (_applyStoredUserIdentity(_clientNode)) return true;
+  try {
+    _clientNode.clear_user_identity?.();
+  } catch (err) {
+    _warnOnce('user-identity-clear', '[api] could not clear the live user identity while locked', err);
+  }
+  return false;
 }
 
 // ── Internal state ────────────────────────────────────────────
@@ -471,6 +517,13 @@ let _trustEstablished = false;
 let _ethRegisteredFor = null;
 /** @type {{ status: string, address: string|null, trigger: string, at: number, error: string|null }|null} */
 let _ethRegistration = null;
+
+// R1b node-client API capabilities handshake. `_nodeCapabilities` is the last
+// successful result (`null` until the handshake completes and whenever it is
+// unavailable), mirrored into `apiCapabilities` for the UI. Reset on teardown /
+// re-spawn so a stale parent's capabilities never gate the next session.
+/** @type {{ available: boolean, clientApiVersion: number|null, features: number, supportsEthIdentity: boolean }|null} */
+let _nodeCapabilities = null;
 
 // JS-side in-flight payment map keyed by order hash hex, for UI status.
 const _pendingSends = new Map();
@@ -564,6 +617,7 @@ export async function __bootRealNodeForTest(wasm) {
       _trustEstablished = false;
       _ethRegisteredFor = null;
       _ethRegistration = null;
+      _resetNodeCapabilities();
       _identitySource = 'memory';
       _memorySeed = null;
       _spawnedSeedHex = null;
@@ -820,12 +874,14 @@ async function _spawnRealNode() {
   });
 
   // Trust anchors (pinned_ledger / pinned_leaf_keys) live inside the ledger
-  // blob. Trust is established ONLY when that blob actually imported AND at
-  // least one anchor was restored from it. A corrupt or version-bumped blob
-  // leaves `ledgerImported === false` (its `import_ledger_state` threw), so a
-  // later receipt must never be silently treated as TOFU-established even
-  // though the bytes were present. Fail-closed; see `getTrustState()`.
-  _trustEstablished = restoreResult.ledgerImported && _hasRestoredAnchors(node);
+  // blob. Trust is established ONLY when that blob actually imported AND the
+  // restored routing pin is *confirmed* (a TOFU fallback pin is `unconfirmed`
+  // and does not count). A corrupt or version-bumped blob leaves
+  // `ledgerImported === false` (its `import_ledger_state` threw), so a later
+  // receipt must never be silently treated as TOFU-established even though the
+  // bytes were present. Fail-closed; see `getTrustState()`. An older client
+  // build without `pin_status()` falls back to the restored-anchor heuristic.
+  _trustEstablished = restoreResult.ledgerImported && _pinTrustConfirmed(node);
 
   // Rebuild the UI activity list from the restored state (persisted value
   // notices + terminal settlement records) so past activity survives a reload.
@@ -871,6 +927,9 @@ async function _spawnRealNode() {
   _syncAdministeredNode();
   // (Re)verify the persisted balance as soon as an address is known.
   _requestBalanceIfJoined();
+  // R1b: learn the parent's node-client API capabilities before any optional
+  // ETH-identity action, so registration is gated on the advertised feature.
+  await _fetchNodeCapabilities();
   // Already joined on load + an identity exists → register the ETH anchor
   // (quietly; `getEthRegistrationStatus()` carries the outcome).
   void _maybeRegisterEthAddress('boot');
@@ -1658,6 +1717,7 @@ function _drainControlEvents() {
         parentChanged = true;
         // A later re-join must register the ETH anchor again.
         _ethRegisteredFor = null;
+        _resetNodeCapabilities();
       }
       ev.free?.();
       drained = true;
@@ -1678,8 +1738,9 @@ function _drainControlEvents() {
   // A fresh approval means an address now exists: verify its balance.
   if (accepted) {
     _requestBalanceIfJoined();
-    // Now joined: register the user's ETH anchor with the parent (once).
-    void _maybeRegisterEthAddress('join');
+    // Now joined: handshake for capabilities, then register the user's ETH
+    // anchor with the parent (once), gated on the advertised feature.
+    void _handshakeAndMaybeRegisterEth('join');
   }
 }
 
@@ -1688,6 +1749,97 @@ function _drainControlEvents() {
  */
 export function getLastControlEvent() {
   return _lastControlEvent ? { ..._lastControlEvent } : null;
+}
+
+// ── R1b node capabilities handshake (control variant 23) ──────
+
+/**
+ * The last successful node-capabilities handshake, as a plain object, or null
+ * when it has not completed (an old node, a transport failure, or a client that
+ * is not joined). `supportsEthIdentity` is the gate for ETH-identity actions.
+ *
+ * @returns {{ available: boolean, clientApiVersion: number|null, features: number, supportsEthIdentity: boolean }|null}
+ */
+export function getNodeCapabilities() {
+  return _nodeCapabilities ? { ..._nodeCapabilities } : null;
+}
+
+/**
+ * Clear the cached capabilities and mirror "unavailable" into the store.
+ */
+function _resetNodeCapabilities() {
+  _nodeCapabilities = null;
+  _applyNodeCapabilities(null);
+}
+
+/**
+ * Mirror a capabilities result (or null) into `apiCapabilities`.
+ * @param {{ available: boolean, clientApiVersion: number|null, features: number, supportsEthIdentity: boolean }|null} caps
+ */
+function _applyNodeCapabilities(caps) {
+  apiCapabilities.nodeCapabilitiesAvailable = !!(caps && caps.available);
+  apiCapabilities.nodeClientApiVersion = caps && caps.available ? caps.clientApiVersion : null;
+  apiCapabilities.nodeSupportsEthIdentity = !!(caps && caps.supportsEthIdentity);
+}
+
+/**
+ * Ask the direct parent for its node-client API capabilities (R1b handshake).
+ *
+ * Graceful by construction: the wasm `node_capabilities()` never rejects on an
+ * old node / decode failure / transport error, and this wrapper also tolerates
+ * a wasm build without the method. On any failure the store is set to
+ * "unavailable" and no error surfaces. Returns the mapped result, or null when
+ * unavailable.
+ *
+ * @returns {Promise<{ available: boolean, clientApiVersion: number|null, features: number, supportsEthIdentity: boolean }|null>}
+ */
+async function _fetchNodeCapabilities() {
+  const node = _clientNode;
+  if (_useMock || !node) return null;
+  // A stale NodeId would ask the parent on behalf of the pre-identity leaf;
+  // skip until the live node is re-activated.
+  if (_transportIdentityIsStale()) return null;
+  if (typeof node.node_capabilities !== 'function') {
+    _resetNodeCapabilities();
+    return null;
+  }
+  let dto = null;
+  try {
+    dto = await node.node_capabilities();
+  } catch (err) {
+    _warnOnce('node-capabilities', '[api] node capabilities handshake failed', err);
+    _resetNodeCapabilities();
+    return null;
+  }
+  try {
+    if (!dto.available) {
+      // An old node / decode failure: treat as unavailable so the legacy
+      // best-effort ETH path still runs (no feature gate).
+      _resetNodeCapabilities();
+      return null;
+    }
+    const mapped = {
+      available: true,
+      clientApiVersion: Number(dto.client_api_version),
+      features: Number(dto.features ?? 0),
+      supportsEthIdentity: !!dto.supports_eth_identity,
+    };
+    _nodeCapabilities = mapped;
+    _applyNodeCapabilities(mapped);
+    return mapped;
+  } finally {
+    dto.free?.();
+  }
+}
+
+/**
+ * Handshake then (conditionally) register the ETH anchor. Used on the join path
+ * where the approval is drained synchronously by the poller.
+ * @param {'boot'|'join'} trigger
+ */
+async function _handshakeAndMaybeRegisterEth(trigger) {
+  await _fetchNodeCapabilities();
+  await _maybeRegisterEthAddress(trigger);
 }
 
 // ── ETH anchor registration (control variant 24) ──────────────
@@ -1749,6 +1901,22 @@ async function _maybeRegisterEthAddress(trigger) {
   if (_ethRegisteredFor === key) return;
   _ethRegisteredFor = key;
 
+  // R1b gating: when the capabilities handshake completed and the node does
+  // NOT advertise `NODE_FEATURE_ETH_IDENTITY`, skip registration rather than
+  // send control variant 24 the node would reject. When capabilities are
+  // unavailable (`_nodeCapabilities == null` — an old node/wasm build or a
+  // transient failure) keep the legacy best-effort attempt so nothing regresses.
+  if (_nodeCapabilities && !_nodeCapabilities.supportsEthIdentity) {
+    _ethRegistration = {
+      status: 'unsupported',
+      address: ethAddress,
+      trigger,
+      at: Date.now(),
+      error: null,
+    };
+    return;
+  }
+
   try {
     const bucket = await node.register_eth_address();
     _ethRegistration = {
@@ -1782,6 +1950,9 @@ async function _maybeRegisterEthAddress(trigger) {
 function _surfaceEthRegistration(outcome) {
   if (outcome.trigger !== 'join') return;
   const status = outcome.status;
+  // The node advertised no ETH-identity feature: degrading is expected, not an
+  // error, so stay silent (the outcome is recorded for `getEthRegistrationStatus`).
+  if (status === 'unsupported') return;
   if (status === 'accepted') {
     showToast('Account address registered with the network.', 'ok');
   } else if (status.startsWith('rejected')) {
@@ -1796,6 +1967,131 @@ function _surfaceEthRegistration(outcome) {
   } else {
     showToast('Account address registration returned an unexpected reply.', 'warn', 6000);
   }
+}
+
+/**
+ * Rotate this device's ETH account identity to a new recovery phrase,
+ * authorized by the **incumbent** identity.
+ *
+ * Derives the new address + secp256k1 secret from `newMnemonic` (validated
+ * first; nothing is persisted until the parent accepts), asks the live node to
+ * send an incumbent-authorized `RegisterEthAddress` rotation proof, and on
+ * `"accepted"` persists the NEW derived secret + address and republishes the
+ * reactive identity store. The incumbent record is left untouched on a
+ * definitive rejection; a persistent transport error is thrown before any
+ * persistence.
+ *
+ * The node's rotation commit is **idempotent** (Addendum C §8): it resends the
+ * identical signed frame (same nonce) after a lost reply/timeout and reconciles
+ * a `Replay` reply as "already applied". Such a reconciled rotation is reported
+ * as the ordinary `"accepted"` bucket, so the persistence below is identical
+ * whether the parent answered on the first attempt or an earlier attempt had
+ * already landed. This is what stops a lost reply from leaving the device on
+ * the incumbent while the parent anchor moved — which would fail-close the next
+ * boot's re-registration as `Unauthorized`.
+ *
+ * Never touches the transport seed: the NodeId stays the same, only the ETH
+ * anchor moves.
+ *
+ * @param {string} newMnemonic The new recovery phrase.
+ * @param {string} [passphrase=''] Optional BIP-39 passphrase for the new phrase.
+ * @returns {Promise<{ status: string, address: string, previousAddress: string, error: string|null }>}
+ *   `status` is the node reply bucket (`accepted` / `rejected:<code>` /
+ *   `unexpected`) or `unsupported` when the node advertises no ETH-identity
+ *   feature (nothing is sent). `accepted` includes a replay reconciled by the
+ *   idempotent resend.
+ * @throws {Error|InvalidMnemonicError} On no live client, no incumbent
+ *   identity, an invalid new phrase, or a persistent transport failure. Nothing
+ *   is persisted in any of these cases.
+ */
+export async function rotateUserEthIdentity(newMnemonic, passphrase = '') {
+  const node = _requireNode();
+  if (typeof node.rotate_eth_address !== 'function') {
+    throw new Error('This client build cannot rotate the account identity.');
+  }
+  const current = userIdentity.getUserIdentity();
+  if (!current.established || !current.address) {
+    throw new Error('There is no account identity on this device to rotate.');
+  }
+  // A stale transport identity must not rotate an anchor under a NodeId that is
+  // about to change; registration refuses for the same reason.
+  if (_transportIdentityIsStale()) {
+    throw new Error('The account key is still being activated; reload and try again.');
+  }
+
+  // Validate + derive the new identity now. This persists nothing, so a
+  // rejection or transport failure leaves the incumbent in place.
+  const { address: newAddress, secretHex, secretBytes } =
+    await userIdentity.deriveIdentityAddressAndSecret(newMnemonic, passphrase);
+
+  if (newAddress.toLowerCase() === current.address.toLowerCase()) {
+    throw new Error('That phrase already controls this account; nothing to rotate.');
+  }
+
+  // R1b gating: an old node (capabilities available but no ETH feature) cannot
+  // accept variant 24. Report honestly without sending. Unavailable
+  // capabilities keep the legacy best-effort attempt.
+  if (_nodeCapabilities && !_nodeCapabilities.supportsEthIdentity) {
+    return {
+      status: 'unsupported',
+      address: current.address,
+      previousAddress: current.address,
+      error: null,
+    };
+  }
+
+  let bucket;
+  try {
+    bucket = await node.rotate_eth_address(secretBytes);
+  } catch (err) {
+    // Transport/join/identity failure: the incumbent is untouched.
+    _ethRegistration = {
+      status: 'error',
+      address: current.address,
+      trigger: 'rotate',
+      at: Date.now(),
+      error: err?.message || String(err),
+    };
+    throw err;
+  }
+
+  const status = String(bucket ?? 'unexpected');
+  if (status !== 'accepted') {
+    // The parent refused (or the reply was unexpected): keep the incumbent.
+    _ethRegistration = {
+      status,
+      address: current.address,
+      trigger: 'rotate',
+      at: Date.now(),
+      error: null,
+    };
+    return {
+      status,
+      address: current.address,
+      previousAddress: current.address,
+      error: null,
+    };
+  }
+
+  // Accepted: the parent's anchor and the live node's in-memory key already
+  // moved. Persist the NEW derived secret + address; the incumbent session
+  // registration key is unchanged (parent + assigned address), so the poller
+  // will not re-register against the now-rotated anchor.
+  userIdentity.adoptIdentity({ address: newAddress, secretHex });
+  refreshUserIdentity();
+  _ethRegistration = {
+    status,
+    address: newAddress,
+    trigger: 'rotate',
+    at: Date.now(),
+    error: null,
+  };
+  return {
+    status,
+    address: newAddress,
+    previousAddress: current.address,
+    error: null,
+  };
 }
 
 // ── Ledger-event poller ───────────────────────────────────────
@@ -2216,6 +2512,70 @@ function _readPinnedLeafKeys(node = _clientNode) {
 }
 
 /**
+ * The explicit pin-trust status (`pin_status()`), or `null` when this client
+ * build has no such getter (an older wasm). Frees every wasm handle it creates.
+ *
+ * @param {object|null} [node]
+ * @returns {{ status: string, ledgerPin: string|null, ledgerTrust: string|null, leafPins: Array<{nodeId:string,ledger:string,trust:string}>, changes: Array<{nodeId:string,pinned:string,presented:string}> }|null}
+ */
+function _readPinStatus(node = _clientNode) {
+  if (!node || typeof node.pin_status !== 'function') return null;
+  let dto;
+  try {
+    dto = node.pin_status();
+  } catch (err) {
+    _warnOnce('pin-status', '[api] pin_status read failed', err);
+    return null;
+  }
+  if (!dto) return null;
+  try {
+    const leafPins = dto.leaf_pins ?? [];
+    const changes = dto.changes ?? [];
+    return {
+      status: dto.status,
+      ledgerPin: dto.ledger_pin ?? null,
+      ledgerTrust: dto.ledger_trust ?? null,
+      leafPins: leafPins.map((entry) => {
+        try {
+          return { nodeId: entry.node_id, ledger: entry.ledger, trust: entry.trust };
+        } finally {
+          entry.free?.();
+        }
+      }),
+      changes: changes.map((change) => {
+        try {
+          return {
+            nodeId: change.node_id,
+            pinned: change.pinned,
+            presented: change.presented,
+          };
+        } finally {
+          change.free?.();
+        }
+      }),
+    };
+  } finally {
+    dto.free?.();
+  }
+}
+
+/**
+ * Whether the live node reports a *confirmed* routing-leaf pin with no pending
+ * pin change (the fail-closed meaning of "trust established"). This mirrors the
+ * `established` rule in {@link getTrustState} exactly: a confirmed pin that
+ * still has a recorded change is NOT established. Falls back to the legacy
+ * `/restored-anchors/` heuristic when the client build has no `pin_status()`.
+ *
+ * @param {object} node
+ * @returns {boolean}
+ */
+function _pinTrustConfirmed(node) {
+  const pin = _readPinStatus(node);
+  if (pin) return pin.ledgerTrust === 'confirmed' && pin.changes.length === 0;
+  return _hasRestoredAnchors(node);
+}
+
+/**
  * The in-flight outbound join request, as a plain object, or null.
  * @param {object|null} [node]
  * @returns {object|null}
@@ -2313,47 +2673,110 @@ export function getClientStateInfo() {
 }
 
 /**
- * Whether TOFU trust anchors were restored from the persisted ledger cache at
- * boot. False on a fresh origin (no cache): trust is not established.
+ * Whether the routing-leaf pin is *confirmed* (the fail-closed meaning of trust
+ * established). False on a fresh origin and for a TOFU-unconfirmed pin.
  * @returns {boolean}
  */
 export function isTrustEstablished() {
-  return _trustEstablished;
+  return getTrustState().established;
 }
 
 /**
- * The trust-anchor surface. `established` is whether pins were restored from
- * the persisted cache; `needsReestablish` is the complement in live mode.
+ * The trust-anchor surface.
+ *
+ * `established` is true ONLY when the routing leaf's pin is explicitly
+ * `confirmed` and no pin change is pending — a trust-on-first-use pin is
+ * `unconfirmed` and never counts. `status` is the aggregate pin status
+ * (`none`/`unconfirmed`/`confirmed`/`changed`); `changes` lists detected pin
+ * changes (a different key presented for a pinned leaf, never adopted);
+ * `ledgerPinNode` is the node id to pass to {@link confirmPin} to confirm the
+ * routing pin.
  *
  * Fail-closed: when `needsReestablish` is true the UI must not present a pin as
- * TOFU-established, even if one appears in-session. Preventing the wasm layer
- * from auto-pinning in the first place needs a node change (follow-up).
+ * established. An older client build without `pin_status()` degrades to the
+ * restored-anchor heuristic.
  *
- * @returns {{ established: boolean, needsReestablish: boolean, pinnedLedger: string|null, pinnedLeafKeys: Array<{ nodeId: string, ledger: string }>, mock: boolean }}
+ * @returns {{ established: boolean, needsReestablish: boolean, status: string, ledgerTrust: 'unconfirmed'|'confirmed'|null, ledgerPinNode: string|null, pinnedLedger: string|null, pinnedLeafKeys: Array<{ nodeId: string, ledger: string }>, changes: Array<{ nodeId: string, pinned: string, presented: string }>, mock: boolean }}
  */
 export function getTrustState() {
   if (_useMock || !_clientNode) {
     return {
       established: false,
       needsReestablish: false,
+      status: 'none',
+      ledgerTrust: null,
+      ledgerPinNode: null,
       pinnedLedger: null,
       pinnedLeafKeys: [],
+      changes: [],
       mock: true,
     };
   }
   let pinnedLedger = null;
+  let parent = null;
   try {
-    pinnedLedger = _readLedgerStatus(_clientNode).pinnedLedger;
+    const status = _readLedgerStatus(_clientNode);
+    pinnedLedger = status.pinnedLedger;
+    parent = status.parent;
   } catch (err) {
     _warnOnce('trust-ledger', '[api] trust state ledger read failed', err);
   }
+  const pin = _readPinStatus(_clientNode);
+  if (pin) {
+    const ledgerTrust = pin.ledgerTrust ?? null;
+    const established = ledgerTrust === 'confirmed' && pin.changes.length === 0;
+    return {
+      established,
+      needsReestablish: !established,
+      status: pin.status,
+      ledgerTrust,
+      ledgerPinNode: parent,
+      pinnedLedger: pin.ledgerPin ?? pinnedLedger,
+      pinnedLeafKeys: pin.leafPins.map((entry) => ({ nodeId: entry.nodeId, ledger: entry.ledger })),
+      changes: pin.changes,
+      mock: false,
+    };
+  }
+  // Legacy fallback (a client build without `pin_status()`): a restored anchor
+  // is the best available signal, and an in-session pin reads as unconfirmed.
   return {
     established: _trustEstablished,
     needsReestablish: !_trustEstablished,
+    status: _trustEstablished ? 'confirmed' : pinnedLedger ? 'unconfirmed' : 'none',
+    ledgerTrust: _trustEstablished ? 'confirmed' : pinnedLedger ? 'unconfirmed' : null,
+    ledgerPinNode: parent,
     pinnedLedger,
     pinnedLeafKeys: _readPinnedLeafKeys(_clientNode),
+    changes: [],
     mock: false,
   };
+}
+
+/**
+ * Explicitly confirm the pin for `nodeId` (a payee leaf node id, or the current
+ * parent's node id for the routing leaf pin — see `getTrustState().ledgerPinNode`).
+ *
+ * Confirmation keeps the existing pinned key (it never adopts a presented pin
+ * change), marks it `confirmed`, and clears any recorded change for that node.
+ * The updated ledger state is re-exported, so the confirmation survives a
+ * reload. Returns the refreshed trust state.
+ *
+ * @param {string} nodeId
+ * @returns {object}
+ */
+export function confirmPin(nodeId) {
+  const node = _requireNode();
+  if (typeof node.confirm_pin !== 'function') {
+    throw new Error('This client build cannot confirm pins.');
+  }
+  if (nodeId == null || String(nodeId).length === 0) {
+    throw new Error('A pin subject node id is required.');
+  }
+  node.confirm_pin(String(nodeId));
+  _trustEstablished = _pinTrustConfirmed(node);
+  _persistLedgerState();
+  _syncLedgerStoreFromStatus();
+  return getTrustState();
 }
 
 /**
@@ -2479,6 +2902,7 @@ export function destroyClient() {
   }
   _pendingSends.clear();
   _ethRegisteredFor = null;
+  _resetNodeCapabilities();
   _spawnedSeedHex = null;
   _releaseIdentityLock();
 }
@@ -2508,6 +2932,7 @@ function _teardownClient() {
     _clientNode = null;
   }
   _ethRegisteredFor = null;
+  _resetNodeCapabilities();
   _releaseIdentityLock();
   _memorySeed = null;
   _identitySource = 'memory';
@@ -2577,8 +3002,10 @@ function _removeLegacyBlobs() {
 }
 
 /**
- * Encrypt and serialize the current identity (seed + opaque state/ledger blobs)
- * into a passphrase-protected, portable bundle string.
+ * Encrypt and serialize the current identity into a passphrase-protected,
+ * portable bundle string. The bundle carries the transport seed, the R3 user
+ * identity's derived secp256k1 secret + EIP-55 address (when one exists), and
+ * the opaque state/ledger blobs.
  *
  * Requires a live client and a stored seed. Does not mutate any state.
  *
@@ -2592,6 +3019,25 @@ export async function exportIdentityBundle(passphrase) {
     throw new Error('No identity to export. This device has no stored account key.');
   }
   const nodeId = node.endpoint_id();
+
+  // Carry the R3 ETH identity so the same address/secret is restored on import.
+  // Absent on a transport-only install: the bundle then restores seed + blobs.
+  let ethSecretHex = null;
+  let ethAddress = null;
+  try {
+    const secret = userIdentity.getIdentitySecretBytes();
+    const address = userIdentity.getEthAddress();
+    if (secret && address) {
+      ethSecretHex = _bytesToHex(secret);
+      ethAddress = address;
+    }
+  } catch (err) {
+    _warnOnce(
+      'export-user-identity',
+      '[api] could not read the user identity; exporting the transport identity only',
+      err,
+    );
+  }
 
   let stateB64 = null;
   let ledgerB64 = null;
@@ -2610,6 +3056,8 @@ export async function exportIdentityBundle(passphrase) {
 
   const bundle = await idb.encryptIdentityBundle({
     seedHex,
+    ethSecretHex,
+    ethAddress,
     stateB64,
     ledgerB64,
     nodeId,
@@ -2634,7 +3082,11 @@ export function inspectIdentityBundle(text) {
  * Decrypt and install an identity bundle, replacing any current identity.
  *
  * Tears the live client down, writes the recovered seed to `cawala.identity.v1`
- * and the recovered state/ledger blobs under the bundle's `nodeId` keys. Does
+ * and the recovered state/ledger blobs under the bundle's `nodeId` keys. When
+ * the bundle carries an R3 ETH identity (v2 with a user identity), the derived
+ * secp256k1 secret + address are written to `cawala.user-identity.v1` so the
+ * reloaded node re-keys and can sign V4 orders. A legacy v1 bundle restores
+ * the transport seed + blobs and clears any ETH identity on this device. Does
  * NOT reload; the caller reloads so `initApi()` restores the new identity.
  *
  * JS cannot derive the endpoint id from an Ed25519 seed without the wasm
@@ -2643,7 +3095,7 @@ export function inspectIdentityBundle(text) {
  *
  * @param {string} text
  * @param {string} passphrase
- * @returns {Promise<{ nodeId: string }>}
+ * @returns {Promise<{ nodeId: string, ethAddress: string|null }>}
  */
 export async function importIdentityBundle(text, passphrase) {
   const bundle = idb.parseIdentityBundle(text);
@@ -2670,7 +3122,29 @@ export async function importIdentityBundle(text, passphrase) {
   _writeScopedB64(LEDGER_KEY, nodeId, decrypted.ledgerB64);
   _removeLegacyBlobs();
 
-  return { nodeId };
+  // Restore (or clear) the R3 ETH identity so the reloaded node signs as the
+  // imported user. A v1 bundle carries neither field — adopt nothing and drop
+  // any stale ETH identity rather than pairing it with the imported transport.
+  const hasEth = decrypted.ethSecretHex != null && decrypted.ethAddress != null;
+  if (hasEth) {
+    try {
+      userIdentity.adoptIdentity({
+        address: decrypted.ethAddress,
+        secretHex: decrypted.ethSecretHex,
+      });
+    } catch (err) {
+      _warnOnce(
+        'identity-import-user-identity',
+        '[api] could not restore the imported user identity',
+        err,
+      );
+    }
+  } else {
+    userIdentity.clearUserIdentity();
+  }
+  refreshUserIdentity();
+
+  return { nodeId, ethAddress: hasEth ? decrypted.ethAddress : null };
 }
 
 /**

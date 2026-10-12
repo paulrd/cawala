@@ -544,6 +544,78 @@ pub(crate) async fn exchange_control(
     .map_err(|_| wasm_bindgen::JsError::new("control request timed out"))?
 }
 
+/// Attempt budget for an idempotent control commit: the initial send plus up
+/// to two resends of the identical frame. Each attempt is bounded by
+/// [`CONTROL_TIMEOUT_SECS`], so the whole commit stays well under the frame's
+/// `CONTROL_REQUEST_TTL_SECS` expiry.
+pub(crate) const CONTROL_COMMIT_ATTEMPTS: usize = 3;
+
+/// The reconciled outcome of an idempotent control commit.
+///
+/// Rotation is a single control exchange (Addendum C §8): if the parent applies
+/// the request but the reply is lost, or the tab dies between the parent commit
+/// and the local persist, the local and parent anchors would silently diverge.
+/// This enum is the *decision*, detached from the transport, so the ambiguous →
+/// resend → `Replay`-means-applied policy is native-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitOutcome {
+    /// The parent applied the request, or replied `Replay` to this request's
+    /// unique nonce, which proves an earlier (lost-reply) attempt applied it.
+    Applied,
+    /// The parent definitively refused; returned as-is and never retried.
+    Rejected(RejectCode),
+    /// A structurally impossible reply; returned as-is and never retried.
+    Unexpected,
+}
+
+/// Run an idempotent control commit, resending the **identical** `signed` frame
+/// on an ambiguous transport failure and reconciling a `Replay` as applied.
+///
+/// `send` performs one exchange of the frame the caller built. The caller must
+/// build the frame **once**, outside the loop, and close over it: this helper
+/// only re-invokes `send`, so every attempt is byte-identical and the nonce (and
+/// signature) never change.
+///
+/// - `Ok(Accepted)` → [`CommitOutcome::Applied`].
+/// - `Ok(Rejected(Replay))` → [`CommitOutcome::Applied`]: the node's replay
+///   guard marks a request before dispatching it, so a `Replay` for a nonce
+///   unique to this request can only mean an earlier attempt already landed.
+/// - `Ok(Rejected(code))` for any other `code` → [`CommitOutcome::Rejected`],
+///   returned without a retry (a definitive refusal is terminal).
+/// - `Ok(<other reply>)` → [`CommitOutcome::Unexpected`], no retry.
+/// - `Err(_)` (transport/timeout) → ambiguous: resend, up to `max_attempts`
+///   total; if the last attempt also fails, the error is surfaced so the caller
+///   keeps the incumbent state.
+pub(crate) async fn commit_control_idempotent<F, Fut, E>(
+    mut send: F,
+    max_attempts: usize,
+) -> Result<CommitOutcome, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<ControlReply, E>>,
+{
+    let max_attempts = max_attempts.max(1);
+    let mut attempts = 0usize;
+    loop {
+        attempts += 1;
+        match send().await {
+            Ok(ControlReply::Accepted) => return Ok(CommitOutcome::Applied),
+            Ok(ControlReply::Rejected(RejectCode::Replay)) => {
+                return Ok(CommitOutcome::Applied);
+            }
+            Ok(ControlReply::Rejected(code)) => return Ok(CommitOutcome::Rejected(code)),
+            Ok(_) => return Ok(CommitOutcome::Unexpected),
+            Err(err) => {
+                if attempts >= max_attempts {
+                    return Err(err);
+                }
+                // Ambiguous: the reply was lost or the parent was unreachable.
+                // Resend the identical signed frame; do not rebuild it.
+            }
+        }
+    }
+}
+
 /// Build an **own-operator-signed** control request.
 ///
 /// The browser signs with the operator key derived from its own endpoint seed:
@@ -2133,5 +2205,112 @@ mod tests {
             events.front().expect("detached event queued").kind(),
             "detached"
         );
+    }
+
+    // ── Idempotent control commit (rotation reconciliation, Addendum C §8) ──
+
+    /// An ambiguous first attempt (a lost reply) is resent with the **identical**
+    /// frame, and the resulting `Replay` — proof this request's unique nonce was
+    /// already applied — is reconciled as accepted.
+    #[tokio::test]
+    async fn idempotent_commit_resends_then_treats_replay_as_applied() {
+        let frame = own_intent("browser", &operator(1));
+        let attempts = std::cell::Cell::new(0u32);
+        let seen_nonces = std::cell::RefCell::new(Vec::new());
+        let outcome = commit_control_idempotent(
+            || {
+                attempts.set(attempts.get() + 1);
+                seen_nonces.borrow_mut().push(frame.nonce);
+                let first = attempts.get() == 1;
+                async move {
+                    if first {
+                        // Ambiguous: no reply, so the parent may or may not have
+                        // applied the frame.
+                        Err(7u8)
+                    } else {
+                        // Applied on the earlier attempt; the replay guard proves
+                        // it.
+                        Ok::<ControlReply, u8>(ControlReply::Rejected(RejectCode::Replay))
+                    }
+                }
+            },
+            CONTROL_COMMIT_ATTEMPTS,
+        )
+        .await
+        .expect("a replay is reconciled, not surfaced as an error");
+        assert_eq!(outcome, CommitOutcome::Applied);
+        assert_eq!(attempts.get(), 2, "exactly one resend after the ambiguity");
+        // The exact same frame (hence nonce) is resent, never rebuilt.
+        assert_eq!(seen_nonces.borrow().as_slice(), &[frame.nonce, frame.nonce]);
+    }
+
+    /// A `Replay` on the very first attempt is already-applied, not a failure.
+    #[tokio::test]
+    async fn idempotent_commit_treats_an_immediate_replay_as_applied() {
+        let frame = own_intent("browser", &operator(1));
+        let attempts = std::cell::Cell::new(0u32);
+        let outcome = commit_control_idempotent(
+            || {
+                attempts.set(attempts.get() + 1);
+                let _ = &frame;
+                async { Ok::<ControlReply, u8>(ControlReply::Rejected(RejectCode::Replay)) }
+            },
+            CONTROL_COMMIT_ATTEMPTS,
+        )
+        .await
+        .expect("a replay is an accepted outcome");
+        assert_eq!(outcome, CommitOutcome::Applied);
+        assert_eq!(attempts.get(), 1);
+    }
+
+    /// A definitive rejection is terminal: it is returned as-is and never retried.
+    #[tokio::test]
+    async fn idempotent_commit_returns_definitive_rejection_without_retry() {
+        let attempts = std::cell::Cell::new(0u32);
+        let outcome = commit_control_idempotent(
+            || {
+                attempts.set(attempts.get() + 1);
+                async { Ok::<ControlReply, u8>(ControlReply::Rejected(RejectCode::Unauthorized)) }
+            },
+            CONTROL_COMMIT_ATTEMPTS,
+        )
+        .await
+        .expect("a refusal is an Ok outcome");
+        assert_eq!(outcome, CommitOutcome::Rejected(RejectCode::Unauthorized));
+        assert_eq!(attempts.get(), 1, "a definitive refusal is not retried");
+    }
+
+    /// A structurally impossible reply is passed through without a retry.
+    #[tokio::test]
+    async fn idempotent_commit_passes_through_unexpected_replies() {
+        let attempts = std::cell::Cell::new(0u32);
+        let outcome = commit_control_idempotent(
+            || {
+                attempts.set(attempts.get() + 1);
+                async { Ok::<ControlReply, u8>(ControlReply::Pending) }
+            },
+            CONTROL_COMMIT_ATTEMPTS,
+        )
+        .await
+        .expect("an unexpected reply is an Ok outcome");
+        assert_eq!(outcome, CommitOutcome::Unexpected);
+        assert_eq!(attempts.get(), 1);
+    }
+
+    /// Persistent ambiguity exhausts the bounded retry budget and surfaces the
+    /// error, so the caller preserves the incumbent identity.
+    #[tokio::test]
+    async fn idempotent_commit_gives_up_after_the_bounded_retries() {
+        let attempts = std::cell::Cell::new(0u32);
+        let outcome: Result<CommitOutcome, u8> = commit_control_idempotent(
+            || {
+                attempts.set(attempts.get() + 1);
+                async { Err(9u8) }
+            },
+            CONTROL_COMMIT_ATTEMPTS,
+        )
+        .await;
+        assert_eq!(outcome, Err(9));
+        assert_eq!(attempts.get(), CONTROL_COMMIT_ATTEMPTS as u32);
     }
 }

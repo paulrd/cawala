@@ -1,35 +1,58 @@
 /**
- * Cawala — portable identity bundle (increment 1, client-side only).
+ * Cawala — portable identity bundle (increment 2, client-side only).
  *
  * A logged-in user leaf owns a 32-byte Ed25519 seed (stored by `api.js` as hex
- * in `localStorage['cawala.identity.v1']`). This module wraps that seed — plus
- * the optional opaque postcard state/ledger blobs — in a passphrase-encrypted,
- * JSON-serializable bundle that can be moved to another device.
+ * in `localStorage['cawala.identity.v1']`) AND an R3 user identity: a
+ * secp256k1 key derived from a BIP-39 mnemonic (EIP-55 address, stored — never
+ * the mnemonic — as `localStorage['cawala.user-identity.v1']`). This module
+ * wraps the transport seed, the optional derived secp256k1 secret + address,
+ * and the optional opaque postcard state/ledger blobs in a
+ * passphrase-encrypted, JSON-serializable bundle that can be moved to another
+ * device.
  *
  * Crypto: WebCrypto only (`globalThis.crypto.subtle`), works in browsers and in
  * Node 24. PBKDF2-SHA-256 derives a 256-bit AES-GCM key; a fresh 16-byte salt
  * and 12-byte IV are generated per export. The bundle's cleartext `nodeId` is
  * bound into the ciphertext via AES-GCM additional authenticated data (AAD),
- * so tampering with it fails decryption.
+ * so tampering with it fails decryption. v2 keeps the exact v1 KDF/AEAD/AAD;
+ * it only widens the encrypted payload.
+ *
+ * Versioning:
+ *   - v1 (legacy) encrypted `{ seedHex, stateB64, ledgerB64 }` only — no R3
+ *     ETH identity. Still decryptable; importing one restores the transport
+ *     seed + blobs and leaves no ETH identity.
+ *   - v2 adds the derived secp256k1 `ethSecretHex` + denormalized `ethAddress`
+ *     to the encrypted payload so import restores the same ETH identity. The
+ *     fields are omitted entirely when no R3 identity exists, which makes the
+ *     v2-without-identity payload byte-identical to the v1 payload.
  *
  * Pure ESM, no DOM, no dependencies.
  */
 
-export const IDENTITY_BUNDLE_VERSION = 1;
+export const IDENTITY_BUNDLE_VERSION = 2;
+/** The legacy v1 bundle shape (transport seed + blobs only), still accepted. */
+export const LEGACY_IDENTITY_BUNDLE_VERSION = 1;
 export const PBKDF2_ITERATIONS = 600_000;
 
 const KDF_NAME = 'PBKDF2-SHA-256';
 const AEAD_NAME = 'AES-256-GCM';
 const AAD_PREFIX = 'cawala.identity.bundle.v1:';
 const HEX64 = /^[0-9a-f]{64}$/i;
+const ETH_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+/** Bundle versions this build can decrypt. */
+const SUPPORTED_BUNDLE_VERSIONS = [LEGACY_IDENTITY_BUNDLE_VERSION, IDENTITY_BUNDLE_VERSION];
 
 // ── Public API ────────────────────────────────────────────────
 
 /**
- * Encrypt an identity bundle.
+ * Encrypt an identity bundle (always the current v2 shape).
  *
  * @param {object} input
  * @param {string} input.seedHex 32-byte Ed25519 seed as 64 hex chars.
+ * @param {string|null} [input.ethSecretHex] Derived secp256k1 secret (64 hex),
+ *   or null when this device has no R3 user identity.
+ * @param {string|null} [input.ethAddress] EIP-55 checksummed address for
+ *   display (case preserved), or null when there is no R3 identity.
  * @param {string|null} [input.stateB64] Opaque exported state blob (base64).
  * @param {string|null} [input.ledgerB64] Opaque exported ledger blob (base64).
  * @param {string} input.nodeId Endpoint id / operator key as 64 hex chars.
@@ -38,6 +61,8 @@ const HEX64 = /^[0-9a-f]{64}$/i;
  */
 export async function encryptIdentityBundle({
   seedHex,
+  ethSecretHex = null,
+  ethAddress = null,
   stateB64 = null,
   ledgerB64 = null,
   nodeId,
@@ -45,19 +70,26 @@ export async function encryptIdentityBundle({
 }) {
   const normalizedSeed = _requireHex64(seedHex, 'seedHex must be exactly 64 hex characters');
   const normalizedNode = _requireHex64(nodeId, 'nodeId must be exactly 64 hex characters');
+  const eth = _normalizeEthIdentity(ethSecretHex, ethAddress);
   _requirePassphrase(passphrase);
 
   const salt = _randomBytes(16);
   const iv = _randomBytes(12);
   const key = await _deriveKey(passphrase, salt, PBKDF2_ITERATIONS);
 
-  const plaintext = _utf8Encode(
-    JSON.stringify({
-      seedHex: normalizedSeed,
-      stateB64: typeof stateB64 === 'string' ? stateB64 : null,
-      ledgerB64: typeof ledgerB64 === 'string' ? ledgerB64 : null,
-    }),
-  );
+  const payload = {
+    seedHex: normalizedSeed,
+    stateB64: typeof stateB64 === 'string' ? stateB64 : null,
+    ledgerB64: typeof ledgerB64 === 'string' ? ledgerB64 : null,
+  };
+  // Omit the ETH fields entirely when absent: this keeps the no-identity
+  // payload identical to the legacy v1 shape.
+  if (eth.secretHex != null) {
+    payload.ethSecretHex = eth.secretHex;
+    payload.ethAddress = eth.address;
+  }
+
+  const plaintext = _utf8Encode(JSON.stringify(payload));
 
   const ciphertext = await globalThis.crypto.subtle.encrypt(
     { name: 'AES-GCM', iv, additionalData: _aad(normalizedNode) },
@@ -82,11 +114,11 @@ export async function encryptIdentityBundle({
 }
 
 /**
- * Decrypt an identity bundle.
+ * Decrypt an identity bundle (v1 or v2).
  *
  * @param {object} bundle
  * @param {string} passphrase
- * @returns {Promise<{ version: number, nodeId: string, seedHex: string, stateB64: string|null, ledgerB64: string|null }>}
+ * @returns {Promise<{ version: number, nodeId: string, seedHex: string, ethSecretHex: string|null, ethAddress: string|null, stateB64: string|null, ledgerB64: string|null }>}
  */
 export async function decryptIdentityBundle(bundle, passphrase) {
   _requirePassphrase(passphrase);
@@ -118,11 +150,15 @@ export async function decryptIdentityBundle(bundle, passphrase) {
   if (typeof seedHex !== 'string' || !HEX64.test(seedHex)) {
     throw new Error('Malformed identity bundle');
   }
+  // A v1 bundle has neither field; a v2 bundle has both or neither.
+  const eth = _normalizeEthIdentity(payload?.ethSecretHex, payload?.ethAddress);
 
   return {
     version: meta.version,
     nodeId: meta.nodeId,
     seedHex: seedHex.toLowerCase(),
+    ethSecretHex: eth.secretHex,
+    ethAddress: eth.address,
     stateB64: typeof payload.stateB64 === 'string' ? payload.stateB64 : null,
     ledgerB64: typeof payload.ledgerB64 === 'string' ? payload.ledgerB64 : null,
   };
@@ -142,7 +178,7 @@ export function inspectIdentityBundle(bundle) {
   if (bundle.v == null) {
     throw new Error('Malformed identity bundle');
   }
-  if (bundle.v !== IDENTITY_BUNDLE_VERSION) {
+  if (!SUPPORTED_BUNDLE_VERSIONS.includes(bundle.v)) {
     throw new Error('Unsupported identity bundle version');
   }
   if (typeof bundle.nodeId !== 'string' || !HEX64.test(bundle.nodeId)) {
@@ -242,6 +278,36 @@ function _requireHex64(hex, message) {
     throw new Error(message);
   }
   return hex.toLowerCase();
+}
+
+/**
+ * Normalize the optional R3 ETH identity carried in the encrypted payload.
+ * Both fields must be present together; absence of both yields nulls (a v1
+ * bundle, or a v2 bundle exported from a device without an R3 identity).
+ * The address case is preserved because EIP-55 checksumming is significant.
+ *
+ * @param {unknown} secretHex
+ * @param {unknown} address
+ * @returns {{ secretHex: string|null, address: string|null }}
+ * @throws {Error} When only one field is present or a field is malformed.
+ */
+function _normalizeEthIdentity(secretHex, address) {
+  const hasSecret = secretHex != null && secretHex !== '';
+  const hasAddress = address != null && address !== '';
+  if (!hasSecret && !hasAddress) {
+    return { secretHex: null, address: null };
+  }
+  if (
+    !hasSecret ||
+    !hasAddress ||
+    typeof secretHex !== 'string' ||
+    !HEX64.test(secretHex) ||
+    typeof address !== 'string' ||
+    !ETH_ADDRESS.test(address)
+  ) {
+    throw new Error('Malformed identity bundle');
+  }
+  return { secretHex: secretHex.toLowerCase(), address };
 }
 
 /**

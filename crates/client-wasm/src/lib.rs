@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 
 use cawala_control::{
     AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminMoveChild, AdminRedeliverJoin,
-    AdminValueRequest, CONTROL_ALPN, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply,
-    ControlRequest, DesignationChange, ExitRequest, Invite, JoinRequest, NodeId,
+    AdminValueRequest, CONTROL_ALPN, CONTROL_REQUEST_TTL_SECS, Capabilities, ChildKind,
+    ControlReply, ControlRequest, DesignationChange, ExitRequest, Invite, JoinRequest, NodeId,
     OperatorSecretKey, RegisterEthAddress, RejectCode, SignedControl,
 };
 use cawala_msg::{
@@ -35,6 +35,7 @@ use cawala_msg::{
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{EndpointAddr, EndpointId};
+use k256::ecdsa::SigningKey;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tracing::info;
@@ -49,9 +50,10 @@ pub mod ledger_state;
 pub mod state;
 
 use crate::control::{
-    AncestorCache, AncestorEntry, ControlHandler, JOIN_TTL_SECONDS, ROUTED_REPLY_TIMEOUT_SECS,
-    SharedControl, ancestor_walk_step, build_routed_control, exchange_control, invite_endpoint_addr,
-    prepare_admin_exchange, routed_request_envelope, verify_routed_reply_bytes,
+    AncestorCache, AncestorEntry, CONTROL_COMMIT_ATTEMPTS, CommitOutcome, ControlHandler,
+    JOIN_TTL_SECONDS, ROUTED_REPLY_TIMEOUT_SECS, SharedControl, ancestor_walk_step,
+    build_routed_control, commit_control_idempotent, exchange_control, invite_endpoint_addr,
+    prepare_admin_exchange, routed_request_envelope, sign_own_control, verify_routed_reply_bytes,
 };
 use crate::dto::{
     AdminActionDto, AdminLedgerSnapshotDto, AdminSnapshotDto, AdminTargetDto, AdminValueAppliedDto,
@@ -1845,6 +1847,165 @@ impl ClientNode {
         })
     }
 
+    /// Rotate this leaf's Ethereum anchor to `new_secret`'s address,
+    /// authorized by the **incumbent** (currently set) identity.
+    ///
+    /// `new_secret` is the raw 32-byte secp256k1 secret the new identity should
+    /// use (in the app, the derived secret of a new BIP-39 phrase). The
+    /// incumbent key — the identity currently installed via
+    /// [`ClientNode::set_user_identity`] / [`ClientNode::set_user_identity_from_secret`] —
+    /// signs `eth_rotation_digest(node_id, incumbent_addr, new_addr)` and the
+    /// resulting `EthProof` (`old_address: Some(incumbent)`) rides control
+    /// variant 24 `RegisterEthAddress { address: new_addr, proof }` to the
+    /// parent, exactly like [`ClientNode::register_eth_address`]. The parent
+    /// accepts it only when the signature recovers to its recorded incumbent
+    /// anchor, so a transport-key-only holder cannot swap the anchor.
+    ///
+    /// On `"accepted"` (or a reconciled replay, see below), the in-memory user
+    /// identity is **replaced** with the new key (ready to sign V4 orders under
+    /// the new address); on a definitive rejection the incumbent is left
+    /// untouched. Returns the reply bucket
+    /// (`"accepted"` / `"rejected:<code>"` / `"unexpected"`). A missing
+    /// identity, a missing join, or a persistent unreachable parent is a JS
+    /// error, as is a malformed `new_secret`.
+    ///
+    /// # Idempotency (Addendum C §8)
+    ///
+    /// The signed frame is built **once** and resent unchanged on an ambiguous
+    /// transport failure (timeout/lost reply), so its nonce stays identical
+    /// across attempts. A `Replay` reply to that unique nonce proves an earlier
+    /// attempt already applied the rotation, so it is treated exactly like an
+    /// `Accepted` reply: the slot is swapped and `"accepted"` is returned. This
+    /// closes the divergence window where the parent anchor moved but the reply
+    /// was lost, which would otherwise fail-close the next boot's
+    /// re-registration as `Unauthorized`. Only a definitive `Rejected(code)` is
+    /// returned as-is, leaving the incumbent in place.
+    pub async fn rotate_eth_address(&self, new_secret: &[u8]) -> Result<String, JsError> {
+        let new_key = crate::eth_identity::signing_key_from_bytes(new_secret).map_err(to_js_err)?;
+        self.rotate_eth_address_with_key(new_key).await
+    }
+
+    /// Mnemonic convenience over [`ClientNode::rotate_eth_address`]: derive the
+    /// new key at the standard `m/44'/60'/0'/0/0` path (optional BIP-39
+    /// passphrase) and rotate the anchor to its address, authorized by the
+    /// incumbent identity.
+    pub async fn rotate_eth_address_from_mnemonic(
+        &self,
+        mnemonic: &str,
+        passphrase: Option<String>,
+    ) -> Result<String, JsError> {
+        let new_key = crate::eth_identity::derive_signing_key(
+            mnemonic,
+            passphrase.as_deref(),
+            crate::eth_identity::DEFAULT_ACCOUNT_INDEX,
+        )
+        .map_err(to_js_err)?;
+        self.rotate_eth_address_with_key(new_key).await
+    }
+
+    /// Shared rotation path: build the incumbent-authorized proof once, sign the
+    /// control variant 24 frame once, then commit it idempotently against the
+    /// direct parent, swapping the in-memory identity only on a reconciled
+    /// acceptance (a definitive rejection leaves the incumbent in place).
+    async fn rotate_eth_address_with_key(&self, new_key: SigningKey) -> Result<String, JsError> {
+        let operator = self
+            .control
+            .operator
+            .clone()
+            .ok_or_else(|| JsError::new("client has no control identity; use spawn_control"))?;
+        let (_self_addr, parent) = self.joined_context()?;
+        let node_id = self.control.node_id().to_string();
+        let new_address = crate::eth_identity::address_from_signing_key(&new_key);
+
+        // The incumbent identity (currently in the slot) signs the rotation
+        // challenge. Erroring here means there is nothing to rotate from.
+        let (_incumbent, proof) = self
+            .user_identity
+            .rotation(&node_id, &new_address)
+            .map_err(to_js_err)?
+            .ok_or_else(|| JsError::new("no user identity set; call set_user_identity"))?;
+
+        // Build the signed frame ONCE. Its nonce is unique to this rotation and
+        // every resend must be byte-identical: rebuilding would mint a fresh
+        // nonce, which would both defeat the node's replay guard as an
+        // idempotency key and make a `Replay` reply ambiguous instead of proof
+        // that our earlier attempt already landed.
+        let mut nonce_bytes = [0u8; 8];
+        getrandom::fill(&mut nonce_bytes).map_err(to_js_err)?;
+        let signed = SignedControl::authorize(
+            NodeId::from(node_id),
+            &operator,
+            u64::from_le_bytes(nonce_bytes),
+            now_unix_seconds().saturating_add(CONTROL_REQUEST_TTL_SECS),
+            ControlRequest::RegisterEthAddress(RegisterEthAddress {
+                address: new_address,
+                proof,
+            }),
+        )
+        .map_err(to_js_err)?;
+
+        // Direct to the parent, exactly like the join/leave exchange; the parent
+        // is the sole holder of this leaf's `ChildEntry`.
+        let target: EndpointId = parent.node_id.as_str().parse().map_err(to_js_err)?;
+        let endpoint = self.router.endpoint();
+        let target_addr = EndpointAddr::from(target);
+        // The frame is built once above; the closure closes over it so every
+        // resend is byte-identical.
+        let (signed_ref, target_ref) = (&signed, &target_addr);
+        let outcome = commit_control_idempotent(
+            move || async move { exchange_control(endpoint, target_ref.clone(), signed_ref).await },
+            CONTROL_COMMIT_ATTEMPTS,
+        )
+        .await
+        .map_err(|_| JsError::new("rotate eth address: parent unreachable"))?;
+
+        match outcome {
+            CommitOutcome::Applied => {
+                // The parent's anchor moved (or provably already had on a
+                // reconciled replay); adopt the new key so V4 orders and any
+                // future rotation sign with the new identity.
+                self.user_identity.set_from_key(new_key);
+                Ok("accepted".to_string())
+            }
+            CommitOutcome::Rejected(code) => Ok(format!("rejected:{}", reject_code_str(code))),
+            CommitOutcome::Unexpected => Ok("unexpected".to_string()),
+        }
+    }
+
+    /// Perform the R1b node-client API `Capabilities` handshake with the direct
+    /// parent.
+    ///
+    /// Sends control variant 23
+    /// `Capabilities { client_api_version: CLIENT_API_VERSION }` directly to the
+    /// parent (the same direct exchange as [`ClientNode::register_eth_address`])
+    /// and maps reply discriminant 9 to a [`dto::NodeCapabilitiesDto`].
+    ///
+    /// This **never errors**: an **old node** that cannot decode variant 23, an
+    /// unexpected reply, a transport failure/timeout, a client with no control
+    /// identity, or a not-yet-joined client all yield the graceful "capabilities
+    /// unavailable" DTO (`available === false`), never a hang or a panic.
+    /// Callers gate ETH-identity actions on
+    /// [`dto::NodeCapabilitiesDto::supports_eth_identity`].
+    pub async fn node_capabilities(&self) -> dto::NodeCapabilitiesDto {
+        let Some(operator) = self.control.operator.clone() else {
+            return dto::NodeCapabilitiesDto::unavailable();
+        };
+        let Ok((_self_addr, parent)) = self.joined_context() else {
+            return dto::NodeCapabilitiesDto::unavailable();
+        };
+        let node_id = self.control.node_id().to_string();
+        let Ok(signed) = sign_own_control(&node_id, &operator, capabilities_request()) else {
+            return dto::NodeCapabilitiesDto::unavailable();
+        };
+        let Ok(target) = parent.node_id.as_str().parse::<EndpointId>() else {
+            return dto::NodeCapabilitiesDto::unavailable();
+        };
+        let reply = exchange_control(self.router.endpoint(), EndpointAddr::from(target), &signed)
+            .await
+            .map_err(|_| ());
+        dto::NodeCapabilitiesDto::from_exchange(reply)
+    }
+
     /// This client's payment receive URI:
     /// `cawala://pay?to=<EndpointId>&addr=<OctAddr>`.
     ///
@@ -2138,8 +2299,57 @@ impl ClientNode {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pinned_leaf_keys
             .iter()
-            .map(|(node, ledger)| dto::PinnedLeafKeyDto::new(node, *ledger))
+            .map(|entry| dto::PinnedLeafKeyDto::new(&entry.node_id, entry.ledger))
             .collect()
+    }
+
+    /// The explicit trust status of every pinned leaf key: whether each pin is
+    /// `unconfirmed` (TOFU) or `confirmed`, plus any recorded pin change.
+    ///
+    /// A pin is never *established* trust by itself: the web derives
+    /// `trustEstablished` from [`dto::PinStatusDto`] (a `confirmed` routing pin
+    /// with no pending change), never from a mere pin's presence.
+    pub fn pin_status(&self) -> dto::PinStatusDto {
+        let ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        dto::PinStatusDto::from_state(&ledger)
+    }
+
+    /// Explicitly confirm the pin for `node_id` (a leaf node id or the current
+    /// parent's leaf node id for the routing ledger pin).
+    ///
+    /// Confirmation keeps the existing pinned key — it never adopts a presented
+    /// change — flips its trust to `confirmed`, and clears any recorded change
+    /// for that node. The updated state is persisted by the caller through
+    /// [`ClientNode::export_ledger_state`], so the confirmation survives a
+    /// reload. Returns an error when no pin exists for `node_id`.
+    pub fn confirm_pin(&self, node_id: String) -> Result<(), JsError> {
+        let target = cawala_ledger::NodeId::from(node_id);
+        // The routing ledger pin has no node id of its own; it belongs to the
+        // current parent leaf.
+        let parent = {
+            let state = self.control.lock_state();
+            state
+                .record
+                .parent
+                .as_ref()
+                .map(|link| cawala_ledger::NodeId::from(link.node_id.as_str().to_string()))
+        };
+        let mut ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut confirmed = false;
+        if parent.as_ref() == Some(&target) {
+            confirmed |= ledger.confirm_pinned_ledger(&target);
+        }
+        confirmed |= ledger.confirm_leaf_pin(&target);
+        if !confirmed {
+            return Err(JsError::new("no pin to confirm for that node"));
+        }
+        Ok(())
     }
 
     /// Export the ledger state as postcard bytes.
@@ -2344,6 +2554,18 @@ pub(crate) fn designation_request(child: &str, designate: bool) -> Result<Contro
     })
 }
 
+/// Build the R1b `Capabilities` handshake request advertising this client's
+/// node-client API version.
+///
+/// Separated from the wasm method so the variant mapping is native-testable: a
+/// frontend must advertise [`dto::CLIENT_API_VERSION`] (never an unversioned
+/// zero), and the request must encode as control variant 23.
+pub(crate) fn capabilities_request() -> ControlRequest {
+    ControlRequest::Capabilities(Capabilities {
+        client_api_version: dto::CLIENT_API_VERSION,
+    })
+}
+
 /// Map an admin reply rejection to a JS error carrying the stable code string.
 fn admin_rejected(code: RejectCode) -> JsError {
     JsError::new(&format!(
@@ -2530,5 +2752,32 @@ mod tests {
 
         // A non-endpoint child id is refused before any request is built.
         assert!(designation_request("not-a-node", true).is_err());
+    }
+
+    /// The R1b handshake builds control variant 23 and advertises this client's
+    /// API version — the append-only discriminant older nodes reject.
+    #[test]
+    fn capabilities_request_builds_variant_23() {
+        let request = capabilities_request();
+        assert_eq!(
+            request,
+            ControlRequest::Capabilities(Capabilities {
+                client_api_version: dto::CLIENT_API_VERSION,
+            })
+        );
+        // Postcard encodes the enum discriminant positionally: variant 23.
+        let bytes = postcard::to_allocvec(&request).expect("capabilities encodes");
+        assert_eq!(bytes[0], 23, "capabilities must be control variant 23");
+    }
+
+    /// The handshake is signed by this browser's own operator key (the same
+    /// path `register_eth_address` uses), so the parent can authenticate it.
+    #[test]
+    fn capabilities_handshake_is_self_signed() {
+        let operator = OperatorSecretKey::from_bytes([7u8; 32]);
+        let signed =
+            sign_own_control("node-abc", &operator, capabilities_request()).expect("signs");
+        assert_eq!(signed.request, capabilities_request());
+        assert_eq!(signed.origin.as_str(), "node-abc");
     }
 }

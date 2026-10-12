@@ -111,6 +111,27 @@ impl UserIdentity {
         })
     }
 
+    /// Build the **rotation** ETH proof for `node_id`: the **incumbent** key
+    /// (this identity) signs [`eth_rotation_digest`], which binds the incumbent
+    /// address and `new_address`. `old_address` names the incumbent so the node
+    /// verifies the proof against the old key (Addendum C §3).
+    ///
+    /// The new key must never sign this challenge: a proof signed by the new
+    /// (non-incumbent) key is rejected by the node, which is exactly what stops
+    /// an operator-key-only thief from swapping the anchor.
+    pub(crate) fn rotation_proof(
+        &self,
+        node_id: &str,
+        new_address: &[u8; 20],
+    ) -> Result<EthProof, EthError> {
+        let digest = eth_rotation_digest(node_id, &self.address, new_address);
+        let signature = sign_digest(&self.key, &digest)?;
+        Ok(EthProof {
+            signature,
+            old_address: Some(self.address),
+        })
+    }
+
     /// The raw 32-byte secp256k1 secret, as a fixed array so the caller can own
     /// and zeroize its copy.
     ///
@@ -200,6 +221,33 @@ impl UserIdentitySlot {
                 .map(|proof| Some((identity.address_array(), proof))),
             None => Ok(None),
         }
+    }
+
+    /// Build the rotation `(incumbent_address, proof)` when an identity is set.
+    ///
+    /// The currently stored (incumbent) identity authorizes the move of the
+    /// anchor to `new_address`; the caller derives `new_address` from the new
+    /// secret and replaces the slot with [`UserIdentitySlot::set_from_key`]
+    /// **only after** the parent accepts. `None` when no identity is set.
+    pub(crate) fn rotation(
+        &self,
+        node_id: &str,
+        new_address: &[u8; 20],
+    ) -> Result<Option<([u8; 20], EthProof)>, EthError> {
+        match self.lock().as_ref() {
+            Some(identity) => identity
+                .rotation_proof(node_id, new_address)
+                .map(|proof| Some((identity.address_array(), proof))),
+            None => Ok(None),
+        }
+    }
+
+    /// Replace the stored identity with `key` (post-acceptance rotation swap).
+    ///
+    /// The replaced scalar is dropped and therefore zeroized by `k256`'s
+    /// `ZeroizeOnDrop`. Call this only after the parent confirms the rotation.
+    pub(crate) fn set_from_key(&self, key: SigningKey) {
+        *self.lock() = Some(UserIdentity::from_signing_key(key));
     }
 
     /// Lock the slot, recovering from poisoning.
@@ -640,6 +688,66 @@ mod tests {
             a,
             transport_seed_from_mnemonic(ETH_TEST_MNEMONIC, None).expect("derive")
         );
+    }
+
+    #[test]
+    fn rotation_proof_is_signed_by_the_incumbent_and_swaps_on_acceptance() {
+        let slot = UserIdentitySlot::default();
+        slot.set_from_mnemonic(ETH_TEST_MNEMONIC, None)
+            .expect("identity derives");
+        let incumbent = slot.address().expect("identity set");
+        assert_eq!(incumbent, "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+
+        // The new key material (in the app: another mnemonic's derived secret).
+        let new_key = signing_key_from_bytes(&[0x22; 32]).expect("valid scalar");
+        let new_address = address_from_signing_key(&new_key);
+        let node_id = "node-x";
+
+        // Without identity the rotation is a clean `None`, never a panic.
+        assert!(
+            UserIdentitySlot::default()
+                .rotation(node_id, &new_address)
+                .expect("no identity")
+                .is_none()
+        );
+
+        // The proof is built (and therefore signed) by the INCUMBENT key.
+        let (proof_incumbent, proof) = slot
+            .rotation(node_id, &new_address)
+            .expect("sign")
+            .expect("identity set");
+        assert_eq!(checksum_address(&proof_incumbent), incumbent);
+        assert_eq!(proof.old_address, Some(proof_incumbent));
+        assert_eq!(
+            proof.verify_rotation(node_id, &proof_incumbent, &new_address),
+            Ok(())
+        );
+
+        // A proof signed by the NEW (non-incumbent) key over the same challenge
+        // is rejected: the client must always sign with the incumbent.
+        let digest = eth_rotation_digest(node_id, &proof_incumbent, &new_address);
+        let swap = EthProof {
+            signature: sign_digest(&new_key, &digest).expect("sign"),
+            old_address: Some(proof_incumbent),
+        };
+        assert!(matches!(
+            swap.verify_rotation(node_id, &proof_incumbent, &new_address),
+            Err(EthError::AddressMismatch { .. })
+        ));
+
+        // Only after the parent accepts does the app call `set_from_key`; then the
+        // slot holds the new address and a fresh registration proof matches it.
+        slot.set_from_key(new_key);
+        assert_eq!(
+            slot.address().as_deref(),
+            Some(checksum_address(&new_address).as_str())
+        );
+        let (address, registration) = slot
+            .registration(node_id)
+            .expect("sign")
+            .expect("identity set");
+        assert_eq!(address, new_address);
+        assert_eq!(registration.verify_registration(node_id, &new_address), Ok(()));
     }
 
     #[test]

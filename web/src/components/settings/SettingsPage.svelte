@@ -18,6 +18,7 @@
     getCapabilities,
     getClientStateInfo,
     getTrustState,
+    confirmPin,
     exportIdentityBundle,
     inspectIdentityBundle,
     importIdentityBundle,
@@ -46,6 +47,23 @@
     void ledgerState.trustEstablished;
     return getTrustState();
   });
+
+  // Explicit confirmation of the routing leaf pin. Reuses the existing card;
+  // the button flips an unconfirmed TOFU pin to confirmed and persists it.
+  let confirmPinBusy = $state(false);
+  async function handleConfirmPin() {
+    const subject = trust.ledgerPinNode;
+    if (confirmPinBusy || !subject) return;
+    confirmPinBusy = true;
+    try {
+      confirmPin(subject);
+      showToast('Leaf ledger key confirmed.', 'ok');
+    } catch (err) {
+      showToast(err?.message || 'Could not confirm the leaf ledger key.', 'danger');
+    } finally {
+      confirmPinBusy = false;
+    }
+  }
 
   // ── Export state ──────────────────────────────────────────
   let exportPassphrase = $state('');
@@ -233,17 +251,47 @@
             {trust.pinnedLedger}
           </code>
         </div>
+
+        {#if trust.changes.length > 0}
+          <div class="warn-box">
+            <span class="warn-icon">!</span>
+            <span>
+              Pin change detected: a different ledger key was presented for
+              {trust.changes[0].nodeId}. The existing pin is still in force and the
+              new key was <strong>not</strong> adopted. Verify the change out-of-band
+              before relying on payments to or from this leaf.
+            </span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">Pinned key</span>
+            <code class="text-sm" style="word-break: break-all; font-family: var(--mono);">{trust.changes[0].pinned}</code>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">Presented key</span>
+            <code class="text-sm" style="word-break: break-all; font-family: var(--mono);">{trust.changes[0].presented}</code>
+          </div>
+        {/if}
+
         {#if trust.established}
           <p class="muted text-sm" style="margin-top: var(--sp-1);">
-            This is the leaf's ledger public key, pinned on first use (TOFU). Your balance and payment receipts are verified against this key.
+            This is the leaf's ledger public key, pinned on first use (TOFU) and explicitly
+            confirmed. Your balance and payment receipts are verified against this key.
           </p>
         {:else}
           <p class="text-sm" style="margin-top: var(--sp-1); color: var(--warn);">
-            Trust not established: no leaf ledger key was restored from this origin's local
-            cache, so this pin was accepted on first use in this session without a previously
-            trusted copy. If you moved this identity to a new device or host, re-establish
-            trust before relying on payment verification.
+            Trust not established: this leaf ledger key is a trust-on-first-use pin (or was not
+            restored from a previously trusted copy), so it has <strong>not</strong> been
+            confirmed. Verify it out-of-band before relying on payment verification, then
+            confirm it.
           </p>
+          <button
+            type="button"
+            class="btn btn--primary"
+            disabled={confirmPinBusy || !trust.ledgerPinNode}
+            onclick={handleConfirmPin}
+          >
+            {#if confirmPinBusy}Confirming...{:else}Confirm this leaf key{/if}
+          </button>
         {/if}
       </div>
     </Card>

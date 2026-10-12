@@ -71,6 +71,7 @@ const {
   isPasskeyAvailable,
   getUserIdentity,
   getEthAddress,
+  getPasskeyStatus,
   generateMnemonic,
   validateMnemonic,
   previewIdentity,
@@ -82,11 +83,13 @@ const {
   removePasskey,
   refreshUserIdentity,
   wipeIdentity,
+  rotateUserEthIdentity,
   __bootRealNodeForTest,
   getEthRegistrationStatus,
   isMockMode,
   InvalidMnemonicError,
   PasskeyUnavailableError,
+  PasskeyUnsupportedError,
   IdentityBackendUnavailableError,
   MNEMONIC_ERRORS,
 } = await import('../src/lib/api.js');
@@ -102,6 +105,7 @@ const {
   USER_IDENTITY_VERSION,
   setIdentityBackend,
   getIdentitySecretBytes,
+  __resetPasskeyStateForTest,
 } = await import('../src/lib/userIdentity.js');
 
 // Inject the mock before any derivation-dependent test runs.
@@ -115,9 +119,9 @@ function hex(bytes) {
   return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-test('the real crypto backend is connected; passkeys remain deferred', () => {
+test('the real crypto backend and the WebAuthn PRF key-wrap backend are connected', () => {
   assert.equal(USER_IDENTITY_BACKEND_READY, true);
-  assert.equal(PASSKEY_BACKEND_READY, false);
+  assert.equal(PASSKEY_BACKEND_READY, true);
 });
 
 test('fresh device: no identity, passkeys unavailable outside a secure context', () => {
@@ -294,6 +298,7 @@ test('wipeIdentity clears the record, the stored secret and the published view',
 function makeJoinedBootWasm(opts = {}) {
   const applied = [];
   const registered = [];
+  const rotated = [];
   const node = {
     endpoint_id: () => 'boot-node',
     import_state() {},
@@ -307,6 +312,11 @@ function makeJoinedBootWasm(opts = {}) {
     async register_eth_address() {
       registered.push(true);
       return opts.registerReply ?? 'accepted';
+    },
+    async rotate_eth_address(secret) {
+      rotated.push(Uint8Array.from(secret));
+      if (opts.rotateThrows) throw new Error(opts.rotateThrows);
+      return opts.rotateReply ?? 'accepted';
     },
     ledger_status: () => ({
       address: '0.3.1',
@@ -343,7 +353,7 @@ function makeJoinedBootWasm(opts = {}) {
     ClientNode: { spawn_control: async () => node },
     generate_secret_key: () => new Uint8Array(32),
   };
-  return { wasm, node, applied, registered };
+  return { wasm, node, applied, registered, rotated };
 }
 
 test('reload: the stored derived secret is pushed to the node and the anchor registers', async () => {
@@ -389,6 +399,151 @@ test('reload: a rejected registration is recorded, not thrown', async () => {
   }
 });
 
+// ── ETH anchor rotation (control variant 24, incumbent-authorized) ─────────
+
+/** A second valid BIP-39 vector, distinct from GOOD_12 (official test seed). */
+const NEW_12 =
+  'legal winner thank year wave sausage worth useful legal winner thank yellow';
+
+test('rotateUserEthIdentity: the incumbent authorizes the move and the new secret is persisted', async () => {
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+  const incumbentAddress = getEthAddress();
+  const incumbentSecretHex = hex(getIdentitySecretBytes());
+
+  const expectedNewAddress = await mockBackend.deriveAddress(NEW_12, '');
+  const expectedNewSecret = await mockBackend.secretBytes(NEW_12, '');
+
+  const { wasm, rotated } = makeJoinedBootWasm();
+  const { stop } = await __bootRealNodeForTest(wasm);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const result = await rotateUserEthIdentity(NEW_12);
+    assert.equal(result.status, 'accepted');
+    assert.equal(result.previousAddress, incumbentAddress);
+    assert.equal(result.address, expectedNewAddress);
+
+    // The wasm node is handed the NEW derived secret; it builds the
+    // incumbent-authorized rotation proof internally.
+    assert.equal(rotated.length, 1, 'rotate_eth_address called once');
+    assert.deepEqual(rotated[0], Uint8Array.from(expectedNewSecret));
+
+    // Persisted: the new address + secret replace the incumbent.
+    assert.equal(getEthAddress(), expectedNewAddress);
+    assert.equal(hex(getIdentitySecretBytes()), hex(expectedNewSecret));
+    assert.notEqual(getEthAddress(), incumbentAddress);
+    assert.notEqual(hex(getIdentitySecretBytes()), incumbentSecretHex);
+    assert.equal(userIdentityState.address, expectedNewAddress, 'reactive store republished');
+  } finally {
+    stop();
+  }
+});
+
+test('rotateUserEthIdentity: a rotation the client reconciled as already-applied persists the new secret', async () => {
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+  const incumbentAddress = getEthAddress();
+
+  const expectedNewAddress = await mockBackend.deriveAddress(NEW_12, '');
+  const expectedNewSecret = await mockBackend.secretBytes(NEW_12, '');
+
+  // The wasm client owns the idempotent commit: it resends the identical frame
+  // after a lost reply and treats a `Replay` as already-applied, reporting that
+  // reconciled outcome as the ordinary `accepted` bucket. The web layer must
+  // persist exactly as on a first-attempt acceptance — this is what stops a
+  // lost reply from leaving the device on the incumbent while the parent anchor
+  // moved.
+  const { wasm } = makeJoinedBootWasm({ rotateReply: 'accepted' });
+  const { stop } = await __bootRealNodeForTest(wasm);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const result = await rotateUserEthIdentity(NEW_12);
+    assert.equal(result.status, 'accepted');
+    assert.equal(result.previousAddress, incumbentAddress);
+    assert.equal(result.address, expectedNewAddress);
+    assert.equal(getEthAddress(), expectedNewAddress, 'reconciled acceptance persists the new address');
+    assert.equal(
+      hex(getIdentitySecretBytes()),
+      hex(expectedNewSecret),
+      'reconciled acceptance persists the new secret',
+    );
+    assert.equal(userIdentityState.address, expectedNewAddress, 'reactive store republished');
+  } finally {
+    stop();
+  }
+});
+
+test('rotateUserEthIdentity: a parent rejection leaves the incumbent identity unchanged', async () => {
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+  const incumbentAddress = getEthAddress();
+  const incumbentSecretHex = hex(getIdentitySecretBytes());
+
+  const { wasm, rotated } = makeJoinedBootWasm({ rotateReply: 'rejected:unauthorized' });
+  const { stop } = await __bootRealNodeForTest(wasm);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const result = await rotateUserEthIdentity(NEW_12);
+    assert.equal(result.status, 'rejected:unauthorized');
+    assert.equal(result.address, incumbentAddress);
+    assert.equal(rotated.length, 1, 'the node was asked to rotate');
+    assert.equal(getEthAddress(), incumbentAddress, 'incumbent address kept');
+    assert.equal(hex(getIdentitySecretBytes()), incumbentSecretHex, 'incumbent secret kept');
+  } finally {
+    stop();
+  }
+});
+
+test('rotateUserEthIdentity: a transport failure leaves the incumbent identity unchanged', async () => {
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+  const incumbentAddress = getEthAddress();
+  const incumbentSecretHex = hex(getIdentitySecretBytes());
+
+  const { wasm } = makeJoinedBootWasm({ rotateThrows: 'rotate eth address: parent unreachable' });
+  const { stop } = await __bootRealNodeForTest(wasm);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await assert.rejects(
+      () => rotateUserEthIdentity(NEW_12),
+      /parent unreachable/,
+      'the transport error propagates',
+    );
+    assert.equal(getEthAddress(), incumbentAddress, 'incumbent address kept');
+    assert.equal(hex(getIdentitySecretBytes()), incumbentSecretHex, 'incumbent secret kept');
+  } finally {
+    stop();
+  }
+});
+
+test('rotateUserEthIdentity: an invalid new phrase sends nothing and persists nothing', async () => {
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+  const incumbentAddress = getEthAddress();
+  const incumbentSecretHex = hex(getIdentitySecretBytes());
+
+  const { wasm, rotated } = makeJoinedBootWasm();
+  const { stop } = await __bootRealNodeForTest(wasm);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await assert.rejects(
+      () => rotateUserEthIdentity('not a phrase'),
+      (err) => err instanceof InvalidMnemonicError,
+      'the invalid phrase is rejected',
+    );
+    assert.equal(rotated.length, 0, 'no rotation request was sent');
+    assert.equal(getEthAddress(), incumbentAddress);
+    assert.equal(hex(getIdentitySecretBytes()), incumbentSecretHex);
+  } finally {
+    stop();
+  }
+});
+
 test('boot: a failed boot leaves mock mode and never registers the anchor', async () => {
   await clearViaRemove();
   await restoreIdentity(GOOD_12);
@@ -420,7 +575,7 @@ test('boot: a failed boot leaves mock mode and never registers the anchor', asyn
   assert.equal(registered.length, 0, 'no ETH anchor registration on a failed boot');
 });
 
-// ── Passkey (still deferred) ───────────────────────────────────────────────
+// ── Passkey lock (WebAuthn PRF key-wrap) ───────────────────────────────────
 
 /** A window mock at a specific origin (all four fields the predicate reads). */
 function windowAtOrigin(protocol, hostname, isSecureContext) {
@@ -474,55 +629,354 @@ test('isPasskeyAvailable gates on the origin, not isSecureContext (file:// stays
   assert.equal(isPasskeyAvailable(), false, 'default mock window stays hidden');
 });
 
+/**
+ * Install a WebAuthn mock: a `PublicKeyCredential` on `window` and a
+ * `navigator.credentials` container. The PRF result is deterministic so the
+ * wrapped secret can be unwrapped in a later assertion.
+ */
+function installPasskeyMock({
+  prfOutput = new Uint8Array(32).fill(7),
+  prfEnabled = true,
+  prfResultsAtCreate = true,
+  getReturnsWrongPrf = false,
+  getThrows = null,
+  clientCapabilitiesPrf = undefined,
+} = {}) {
+  const state = { createCalls: 0, getCalls: 0, createId: null, lastAllowCredentials: null };
+  let credentialCounter = 0;
+
+  const PublicKeyCredential = function PublicKeyCredential() {};
+  if (clientCapabilitiesPrf !== undefined) {
+    PublicKeyCredential.getClientCapabilities = async () => ({ prf: clientCapabilitiesPrf });
+  }
+
+  const credentials = {
+    async create() {
+      credentialCounter += 1;
+      state.createCalls += 1;
+      const rawId = new Uint8Array(16).fill(credentialCounter);
+      state.createId = rawId;
+      return {
+        type: 'public-key',
+        id: `credential-${credentialCounter}`,
+        rawId: rawId.buffer,
+        getClientExtensionResults: () => ({
+          prf: prfResultsAtCreate
+            ? { enabled: prfEnabled, results: prfEnabled ? { first: prfOutput } : undefined }
+            : { enabled: prfEnabled },
+        }),
+      };
+    },
+    async get({ publicKey }) {
+      state.getCalls += 1;
+      state.lastAllowCredentials = publicKey.allowCredentials;
+      if (getThrows) throw new Error(getThrows);
+      return {
+        type: 'public-key',
+        id: 'credential-1',
+        rawId: (state.createId ?? new Uint8Array(16)).buffer,
+        getClientExtensionResults: () => ({
+          prf: prfEnabled
+            ? {
+                enabled: true,
+                results: {
+                  first: getReturnsWrongPrf ? new Uint8Array(32).fill(200) : prfOutput,
+                },
+              }
+            : { enabled: false },
+        }),
+      };
+    },
+  };
+
+  return { state, PublicKeyCredential, credentials };
+}
+
+/** Point the global window/navigator at a secure origin with a WebAuthn mock. */
+function useSecurePasskeyContext(mock) {
+  const previousWindow = globalThis.window;
+  const previousNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  globalThis.window = {
+    localStorage: memory,
+    isSecureContext: true,
+    PublicKeyCredential: mock.PublicKeyCredential,
+    location: { protocol: 'https:', hostname: 'example.com' },
+  };
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { credentials: mock.credentials },
+    configurable: true,
+    writable: true,
+  });
+  return () => {
+    globalThis.window = previousWindow;
+    if (previousNavigator) Object.defineProperty(globalThis, 'navigator', previousNavigator);
+    else delete globalThis.navigator;
+  };
+}
+
 test('passkey: unavailable contexts hide it, enroll/unlock stay honest', async () => {
-  // Established identity from the previous test.
+  __resetPasskeyStateForTest();
   assert.equal(await hasPasskey(), false);
   await assert.rejects(() => enrollPasskey(), (err) => err instanceof PasskeyUnavailableError);
   await assert.rejects(() => unlockWithPasskey(), (err) => err instanceof PasskeyUnavailableError);
 
-  // A secure-context https origin with WebAuthn flips feature detection on…
+  // A secure origin with WebAuthn flips feature detection on; PRF stays
+  // undetermined until the first credential is created.
   const previousWindow = globalThis.window;
-  globalThis.window = {
-    ...previousWindow,
-    isSecureContext: true,
-    PublicKeyCredential: function PublicKeyCredential() {},
-    location: { protocol: 'https:', hostname: 'example.com' },
-  };
+  globalThis.window = windowAtOrigin('https:', 'example.com', true);
   try {
     assert.equal(isPasskeyAvailable(), true);
-
-    // …but the PRF wrap backend is not connected, so enroll says so plainly
-    // and nothing is recorded as enrolled.
-    await assert.rejects(
-      () => enrollPasskey(),
-      (err) => err instanceof IdentityBackendUnavailableError && /crypto update/.test(err.message),
-    );
-    assert.equal(getUserIdentity().passkeyEnrolled, false);
-
-    // Unlock before enrollment: clear "not set up" state, not a fake success.
-    await assert.rejects(
-      () => unlockWithPasskey(),
-      (err) => err instanceof PasskeyUnavailableError && /No passkey is set up/.test(err.message),
-    );
-
-    // Removal is a plain local state change and never fails.
-    const afterRemove = await removePasskey();
-    assert.equal(afterRemove.passkeyEnrolled, false);
-    assert.equal(afterRemove.established, true);
+    const status = getPasskeyStatus();
+    assert.equal(status.available, true);
+    assert.equal(status.prfSupported, null, 'PRF undetermined before first use');
+    assert.equal(status.enrolled, false);
+    assert.equal(status.locked, false);
   } finally {
     globalThis.window = previousWindow;
   }
   assert.equal(isPasskeyAvailable(), false);
 });
 
+test('passkey lock: enroll locks, unlock installs, remove goes seamless', async () => {
+  __resetPasskeyStateForTest();
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+  const plaintext = getIdentitySecretBytes();
+  assert.ok(plaintext, 'plaintext secret present before enrollment');
+
+  const mock = installPasskeyMock();
+  const restoreCtx = useSecurePasskeyContext(mock);
+  try {
+    assert.deepEqual(getPasskeyStatus(), {
+      available: true,
+      prfSupported: null,
+      enrolled: false,
+      locked: false,
+    });
+
+    const enrolled = await enrollPasskey();
+    assert.equal(enrolled.established, true);
+    assert.equal(enrolled.passkeyEnrolled, true);
+
+    // Enroll locks on: plaintext gone, wrap persisted.
+    let status = getPasskeyStatus();
+    assert.deepEqual(status, { available: true, prfSupported: true, enrolled: true, locked: true });
+    assert.equal(getIdentitySecretBytes(), null, 'plaintext secret is gone while locked');
+    const raw = memory.getItem(STORAGE_KEYS.USER_IDENTITY);
+    assert.equal(raw.includes(hex(plaintext)), false, 'plaintext secret absent from storage');
+    const record = JSON.parse(raw);
+    assert.equal(record.v, USER_IDENTITY_VERSION);
+    assert.equal(record.secret, null);
+    assert.ok(record.passkey, 'wrap stored');
+    assert.equal(typeof record.passkey.credentialId, 'string');
+    assert.equal(typeof record.passkey.salt, 'string');
+    assert.equal(typeof record.passkey.iv, 'string');
+    assert.equal(typeof record.passkey.ct, 'string');
+    assert.equal('passkeyEnrolled' in record, false, 'legacy boolean dropped');
+
+    // Unlock installs the exact secret for the session; the wrap is retained
+    // (a reload re-locks) and the plaintext is not persisted again.
+    const unlocked = await unlockWithPasskey();
+    assert.equal(unlocked.passkeyEnrolled, true);
+    status = getPasskeyStatus();
+    assert.deepEqual(status, { available: true, prfSupported: true, enrolled: true, locked: false });
+    assert.deepEqual(getIdentitySecretBytes(), plaintext, 'unlock restores the exact secret');
+    const stillWrapped = JSON.parse(memory.getItem(STORAGE_KEYS.USER_IDENTITY));
+    assert.equal(stillWrapped.secret, null, 'unlock does not persist the plaintext again');
+    assert.ok(stillWrapped.passkey, 'wrap retained across sessions');
+
+    // Remove goes seamless: plaintext persisted, wrap cleared.
+    const removed = await removePasskey();
+    assert.equal(removed.passkeyEnrolled, false);
+    status = getPasskeyStatus();
+    assert.deepEqual(status, { available: true, prfSupported: true, enrolled: false, locked: false });
+    const finalRecord = JSON.parse(memory.getItem(STORAGE_KEYS.USER_IDENTITY));
+    assert.equal(finalRecord.passkey, null);
+    assert.equal(finalRecord.secret, hex(plaintext));
+  } finally {
+    restoreCtx();
+    __resetPasskeyStateForTest();
+  }
+});
+
+test('passkey lock: a reload re-locks, and a fresh unlock unwraps from storage', async () => {
+  __resetPasskeyStateForTest();
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+  const plaintext = getIdentitySecretBytes();
+
+  const mock = installPasskeyMock();
+  const firstCtx = useSecurePasskeyContext(mock);
+  try {
+    await enrollPasskey();
+  } finally {
+    firstCtx();
+  }
+
+  // Drop the in-memory session (as a page reload would) but keep the wrap.
+  __resetPasskeyStateForTest();
+  assert.equal(getIdentitySecretBytes(), null, 'locked again after a reload');
+  assert.equal(getPasskeyStatus().locked, true);
+
+  const secondCtx = useSecurePasskeyContext(mock);
+  try {
+    await unlockWithPasskey();
+    assert.deepEqual(getIdentitySecretBytes(), plaintext, 'reload unlock repopulates the session');
+    assert.equal(getPasskeyStatus().locked, false);
+  } finally {
+    secondCtx();
+    __resetPasskeyStateForTest();
+  }
+});
+
+test('passkey lock: a wrong PRF output fails the unwrap and changes nothing', async () => {
+  __resetPasskeyStateForTest();
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+
+  const mock = installPasskeyMock({ getReturnsWrongPrf: true });
+  const restoreCtx = useSecurePasskeyContext(mock);
+  try {
+    await enrollPasskey();
+    const before = memory.getItem(STORAGE_KEYS.USER_IDENTITY);
+    assert.equal(getPasskeyStatus().locked, true);
+
+    await assert.rejects(() => unlockWithPasskey(), /did not match/);
+    assert.equal(getPasskeyStatus().locked, true, 'still locked');
+    assert.equal(getIdentitySecretBytes(), null);
+    assert.equal(memory.getItem(STORAGE_KEYS.USER_IDENTITY), before, 'record untouched');
+  } finally {
+    restoreCtx();
+    __resetPasskeyStateForTest();
+  }
+});
+
+test('passkey lock: a rejected assertion (user cancel) is a no-op', async () => {
+  __resetPasskeyStateForTest();
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+
+  const mock = installPasskeyMock({ getThrows: 'user cancelled' });
+  const restoreCtx = useSecurePasskeyContext(mock);
+  try {
+    await enrollPasskey();
+    await assert.rejects(() => unlockWithPasskey(), /user cancelled/);
+    assert.equal(getPasskeyStatus().locked, true);
+    assert.equal(getIdentitySecretBytes(), null);
+  } finally {
+    restoreCtx();
+    __resetPasskeyStateForTest();
+  }
+});
+
+test('passkey lock: unsupported PRF reports prfSupported:false and refuses enrollment', async () => {
+  __resetPasskeyStateForTest();
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+  const plaintext = getIdentitySecretBytes();
+
+  const mock = installPasskeyMock({ prfEnabled: false });
+  const restoreCtx = useSecurePasskeyContext(mock);
+  try {
+    await assert.rejects(() => enrollPasskey(), PasskeyUnsupportedError);
+    const status = getPasskeyStatus();
+    assert.equal(status.prfSupported, false);
+    assert.equal(status.enrolled, false);
+    assert.equal(status.locked, false);
+    // No weaker gate-only lock: the plaintext secret is untouched.
+    assert.deepEqual(getIdentitySecretBytes(), plaintext);
+    const record = JSON.parse(memory.getItem(STORAGE_KEYS.USER_IDENTITY));
+    assert.equal(record.passkey, null);
+    assert.equal(record.secret, hex(plaintext));
+  } finally {
+    restoreCtx();
+    __resetPasskeyStateForTest();
+  }
+});
+
+test('passkey lock: getClientCapabilities prf:false short-circuits enrollment', async () => {
+  __resetPasskeyStateForTest();
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+  const plaintext = getIdentitySecretBytes();
+
+  const mock = installPasskeyMock({ clientCapabilitiesPrf: false });
+  const restoreCtx = useSecurePasskeyContext(mock);
+  try {
+    await assert.rejects(() => enrollPasskey(), PasskeyUnsupportedError);
+    assert.equal(getPasskeyStatus().prfSupported, false);
+    assert.equal(mock.state.createCalls, 0, 'no credential created when PRF is known unsupported');
+    assert.deepEqual(getIdentitySecretBytes(), plaintext);
+  } finally {
+    restoreCtx();
+    __resetPasskeyStateForTest();
+  }
+});
+
+test('passkey lock: a locked boot never installs the secret on the node', async () => {
+  __resetPasskeyStateForTest();
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+
+  const mock = installPasskeyMock();
+  const restoreCtx = useSecurePasskeyContext(mock);
+  try {
+    await enrollPasskey();
+    assert.equal(getPasskeyStatus().locked, true);
+
+    // Boot the fake node while locked: `getIdentitySecretBytes()` is null, so
+    // the stored secret must not reach the node.
+    const { wasm, applied } = makeJoinedBootWasm();
+    const boot = await __bootRealNodeForTest(wasm);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.equal(applied.length, 0, 'locked boot does not install the secret');
+    } finally {
+      boot.stop();
+    }
+  } finally {
+    restoreCtx();
+    __resetPasskeyStateForTest();
+  }
+});
+
+test('passkey lock: unlocking re-applies the secret to a live node', async () => {
+  __resetPasskeyStateForTest();
+  await clearViaRemove();
+  await restoreIdentity(GOOD_12);
+  const plaintext = getIdentitySecretBytes();
+
+  const mock = installPasskeyMock();
+  const restoreCtx = useSecurePasskeyContext(mock);
+  try {
+    await enrollPasskey();
+
+    const { wasm, applied } = makeJoinedBootWasm();
+    const boot = await __bootRealNodeForTest(wasm);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.equal(applied.length, 0, 'locked boot installs nothing');
+
+      await unlockWithPasskey();
+      assert.deepEqual(applied[applied.length - 1], plaintext, 'unlock re-applies the secret');
+    } finally {
+      boot.stop();
+    }
+  } finally {
+    restoreCtx();
+    __resetPasskeyStateForTest();
+  }
+});
+
 test('hasPasskey stays false on insecure contexts even if a record claims enrollment', async () => {
-  // Force the record's flag on directly through the stored JSON.
+  // Force a wrap onto the record directly through the stored JSON.
   const raw = JSON.parse(memory.getItem(STORAGE_KEYS.USER_IDENTITY));
-  raw.passkeyEnrolled = true;
+  raw.passkey = { credentialId: 'x', salt: 's', iv: 'i', ct: 'c' };
   memory.setItem(STORAGE_KEYS.USER_IDENTITY, JSON.stringify(raw));
+  assert.equal(getUserIdentity().passkeyEnrolled, true, 'record reports enrollment');
   assert.equal(await hasPasskey(), false, 'feature detection gates the flag');
-  // Clean the flag back off for later tests.
-  raw.passkeyEnrolled = false;
+  // Clean the wrap back off for later tests.
+  raw.passkey = null;
   memory.setItem(STORAGE_KEYS.USER_IDENTITY, JSON.stringify(raw));
 });
 

@@ -10,27 +10,36 @@
 //!
 //! A [`BalanceReceiptV1`] is only trusted after
 //! [`verify_balance_attestation`] accepts it under a pinned ledger key. The pin
-//! is installed from the authenticated `JoinApproval.parent_ledger` on join, and
-//! cleared when the parent changes (detach/leave); when no pin is present, the
-//! first verified receipt is **trust-on-first-use** pinned as a fallback
-//! ([`LedgerStateV1::pinned_ledger`]). Every later receipt must be signed by
-//! that same ledger or it is rejected without touching any state. v1 does not
-//! attempt to chain `prev_commitment_hash`; each receipt stands alone against
-//! the pinned key.
+//! is installed from the authenticated `JoinApproval.parent_ledger` on join
+//! (which [`LedgerStateV1::rebind_parent`] records as **confirmed**), and
+//! cleared when the parent changes (detach/leave). When no pin is present, the
+//! first verified receipt is **trust-on-first-use** pinned as a fallback, but
+//! recorded as **unconfirmed** ([`PinTrust::Unconfirmed`]): it may verify the
+//! in-flight proof, yet it must not be treated as established trust until the
+//! caller explicitly confirms it ([`LedgerStateV1::confirm_pinned_ledger`]).
+//! Every later receipt must be signed by the pinned ledger or it is rejected
+//! without touching any state (and the mismatch is recorded, never adopted).
+//! v1 does not attempt to chain `prev_commitment_hash`; each receipt stands
+//! alone against the pinned key.
 //!
 //! An `Applied`/`Duplicate` settlement is only trusted after its terminal
 //! [`EntryProofV1`] verifies against the pending order and a pinned leaf ledger
-//! key. Leaf keys are pinned trust-on-first-use in
-//! [`LedgerStateV1::pinned_leaf_keys`], or out-of-band from a receive URI; a
-//! missing or failed proof is recorded as [`SettlementStateV1::Unverified`]
-//! and is never reported as a completed payment.
+//! key. Leaf keys are pinned **unconfirmed** trust-on-first-use in
+//! [`LedgerStateV1::pinned_leaf_keys`], or **confirmed** out-of-band from an
+//! explicit receive-URI pin; a missing or failed proof is recorded as
+//! [`SettlementStateV1::Unverified`] and is never reported as a completed
+//! payment. A *different* key presented for an already-pinned leaf is recorded
+//! as a [`LeafKeyChangeV1`] and never silently adopted; the caller must act
+//! explicitly ([`LedgerStateV1::confirm_leaf_pin`] keeps the existing pin).
 //!
 //! # Bounds
 //!
 //! `pending` is a bounded ring of at most [`MAX_PENDING_ORDERS`] in-flight
-//! orders, `activity` at most [`MAX_ACTIVITY_ENTRIES`] entries, and
-//! `pinned_leaf_keys` at most [`MAX_PINNED_LEAF_KEYS`] pins; all evict the
-//! oldest entry when over capacity. Decoding never silently truncates:
+//! orders, `activity` at most [`MAX_ACTIVITY_ENTRIES`] entries,
+//! `pinned_leaf_keys` at most [`MAX_PINNED_LEAF_KEYS`] pins, and
+//! `leaf_key_changes` at most [`MAX_LEAF_KEY_CHANGES`] detected changes; all
+//! evict the oldest entry when over capacity. Decoding never silently
+//! truncates:
 //! [`LedgerStateV1::from_bytes`] rejects an over-long vector outright, and the
 //! wire-controlled attestation and terminal-entry proof lengths are capped at
 //! [`MAX_ATTESTATION_PROOF`] and [`MAX_ENTRY_PROOF`] before any Merkle
@@ -54,11 +63,13 @@ use serde::{Deserialize, Serialize};
 /// mini-registry and the per-order payee/leaf binding the browser needs to
 /// verify a terminal inclusion proof. v4 enriches each
 /// [`SettlementRecordV1`] with `amount`/`counterparty`/`entry_seq` so a reload
-/// can reconstruct a useful settlement entry (and the activity/settlement lists
-/// become visible to JS). A version bump discards previously persisted state on
-/// import by design: the TOFU ledger pin, verified balance, activity, and
-/// pending orders are not migrated across versions.
-pub const LEDGER_STATE_VERSION: u8 = 4;
+/// can reconstruct a useful settlement entry. v5 makes trust explicit: each pin
+/// carries a [`PinTrust`] (`unconfirmed` TOFU vs. explicitly `confirmed`) and
+/// the bounded `leaf_key_changes` list records a *different* key presented for
+/// an already-pinned leaf (never silently adopted). A version bump discards
+/// previously persisted state on import by design: the TOFU ledger pin, verified
+/// balance, activity, and pending orders are not migrated across versions.
+pub const LEDGER_STATE_VERSION: u8 = 5;
 
 /// Maximum number of in-flight orders retained; older ones are evicted.
 pub const MAX_PENDING_ORDERS: usize = 32;
@@ -72,6 +83,9 @@ pub const MAX_ACTIVITY_ENTRIES: usize = 200;
 
 /// Maximum number of pinned leaf ledger keys retained; older pins are evicted.
 pub const MAX_PINNED_LEAF_KEYS: usize = 128;
+
+/// Maximum number of detected pin changes retained; older changes are evicted.
+pub const MAX_LEAF_KEY_CHANGES: usize = 32;
 
 /// Maximum accepted length of a balance-attestation Merkle proof.
 ///
@@ -235,6 +249,56 @@ pub fn settlement_state_failed_at(state: &SettlementStateV1) -> Option<&NodeId> 
     }
 }
 
+/// How much a persisted pin is trusted.
+///
+/// A pin is never *established* trust by itself: only [`PinTrust::Confirmed`]
+/// (an out-of-band receive-URI key or an explicit
+/// [`LedgerStateV1::confirm_leaf_pin`] / [`LedgerStateV1::confirm_pinned_ledger`])
+/// counts. A [`PinTrust::Unconfirmed`] pin is a trust-on-first-use fallback:
+/// it still verifies the in-flight proof, but the UI must present it as
+/// needing an explicit confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PinTrust {
+    /// Installed by trust-on-first-use; not yet explicitly confirmed.
+    Unconfirmed,
+    /// Explicitly confirmed by the user (or installed out-of-band).
+    Confirmed,
+}
+
+/// A pinned leaf ledger key with its explicit trust status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedLeafKeyV1 {
+    /// The leaf node id the pin is for.
+    pub node_id: NodeId,
+    /// The ledger key its terminal inclusion proofs must verify under.
+    pub ledger: LedgerPubKey,
+    /// Whether this pin is explicitly confirmed or still TOFU-unconfirmed.
+    pub trust: PinTrust,
+}
+
+/// A *different* ledger key presented for an already-pinned leaf.
+///
+/// Recorded (never silently adopted) when a terminal proof or balance receipt
+/// carries a key other than the pinned one. The existing pin is retained; the
+/// change is surfaced so the caller can act explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeafKeyChangeV1 {
+    /// The leaf node id whose pinned key differs.
+    pub node_id: NodeId,
+    /// The key currently pinned and still in force.
+    pub pinned: LedgerPubKey,
+    /// The different key that was presented and rejected.
+    pub presented: LedgerPubKey,
+}
+
+/// Stable JS string for a [`PinTrust`].
+pub fn pin_trust_str(trust: PinTrust) -> &'static str {
+    match trust {
+        PinTrust::Unconfirmed => "unconfirmed",
+        PinTrust::Confirmed => "confirmed",
+    }
+}
+
 /// The versioned, postcard-serializable ledger state blob.
 ///
 /// This is exactly what [`crate::ClientNode::export_ledger_state`] emits and
@@ -245,9 +309,14 @@ pub struct LedgerStateV1 {
     /// [`LEDGER_STATE_VERSION`].
     pub version: u8,
     /// The current parent leaf's ledger key: installed from the authenticated
-    /// `JoinApproval.parent_ledger` on join (or the first verified receipt as a
-    /// trust-on-first-use fallback), and cleared when the parent changes.
+    /// `JoinApproval.parent_ledger` on join (recorded as [`PinTrust::Confirmed`]),
+    /// or the first verified receipt as a trust-on-first-use fallback
+    /// (recorded as [`PinTrust::Unconfirmed`]), and cleared when the parent
+    /// changes.
     pub pinned_ledger: Option<LedgerPubKey>,
+    /// The trust status of [`Self::pinned_ledger`]. Meaningful only while a pin
+    /// is present; a TOFU fallback pin starts [`PinTrust::Unconfirmed`].
+    pub pinned_ledger_trust: PinTrust,
     /// The last cryptographically verified balance, if any.
     pub balance: Option<VerifiedBalanceV1>,
     /// Bounded activity log, oldest first.
@@ -259,9 +328,15 @@ pub struct LedgerStateV1 {
     /// Bounded mini key registry for leaf ledger keys, oldest first.
     ///
     /// Maps a leaf node id to the ledger key its terminal proofs must verify
-    /// under. Entries are installed by TOFU on the first verified terminal
-    /// proof, or out-of-band from a receive URI.
-    pub pinned_leaf_keys: Vec<(NodeId, LedgerPubKey)>,
+    /// under, plus its explicit trust status. Entries are installed unconfirmed
+    /// by TOFU on the first verified terminal proof, or confirmed out-of-band
+    /// from a receive URI.
+    pub pinned_leaf_keys: Vec<PinnedLeafKeyV1>,
+    /// Bounded list of detected pin changes, oldest first.
+    ///
+    /// A *different* key presented for an already-pinned leaf is recorded here
+    /// and never silently adopted; the existing pin stays in force.
+    pub leaf_key_changes: Vec<LeafKeyChangeV1>,
 }
 
 impl Default for LedgerStateV1 {
@@ -269,11 +344,13 @@ impl Default for LedgerStateV1 {
         LedgerStateV1 {
             version: LEDGER_STATE_VERSION,
             pinned_ledger: None,
+            pinned_ledger_trust: PinTrust::Unconfirmed,
             balance: None,
             activity: Vec::new(),
             pending: Vec::new(),
             settlements: Vec::new(),
             pinned_leaf_keys: Vec::new(),
+            leaf_key_changes: Vec::new(),
         }
     }
 }
@@ -443,6 +520,12 @@ impl LedgerStateV1 {
                 state.pinned_leaf_keys.len()
             ));
         }
+        if state.leaf_key_changes.len() > MAX_LEAF_KEY_CHANGES {
+            return Err(format!(
+                "ledger state has {} leaf key changes (max {MAX_LEAF_KEY_CHANGES})",
+                state.leaf_key_changes.len()
+            ));
+        }
         Ok(state)
     }
 
@@ -486,28 +569,139 @@ impl LedgerStateV1 {
     }
 
     /// Pin (or replace) the ledger key expected for a leaf node's terminal
-    /// proofs, evicting the oldest beyond [`MAX_PINNED_LEAF_KEYS`].
+    /// proofs, recorded as [`PinTrust::Confirmed`].
+    ///
+    /// This is the explicit/out-of-band path (a receive-URI pin); evicts the
+    /// oldest beyond [`MAX_PINNED_LEAF_KEYS`].
     pub fn pin_leaf_key(&mut self, node_id: NodeId, ledger: LedgerPubKey) {
+        self.set_leaf_key(node_id, ledger, PinTrust::Confirmed);
+    }
+
+    /// Pin a leaf ledger key from a first verified terminal proof as
+    /// [`PinTrust::Unconfirmed`] (trust-on-first-use).
+    ///
+    /// The pin still verifies the in-flight proof, but must not count as
+    /// established trust until [`LedgerStateV1::confirm_leaf_pin`] is called.
+    pub fn pin_leaf_key_unconfirmed(&mut self, node_id: NodeId, ledger: LedgerPubKey) {
+        self.set_leaf_key(node_id, ledger, PinTrust::Unconfirmed);
+    }
+
+    /// Insert or replace one leaf pin while preserving its position.
+    fn set_leaf_key(&mut self, node_id: NodeId, ledger: LedgerPubKey, trust: PinTrust) {
         if let Some(existing) = self
             .pinned_leaf_keys
             .iter_mut()
-            .find(|(id, _)| id == &node_id)
+            .find(|entry| entry.node_id == node_id)
         {
-            existing.1 = ledger;
+            existing.ledger = ledger;
+            existing.trust = trust;
             return;
         }
-        self.pinned_leaf_keys.push((node_id, ledger));
+        self.pinned_leaf_keys.push(PinnedLeafKeyV1 {
+            node_id,
+            ledger,
+            trust,
+        });
         while self.pinned_leaf_keys.len() > MAX_PINNED_LEAF_KEYS {
             self.pinned_leaf_keys.remove(0);
         }
     }
 
-    /// The pinned ledger key for `node_id`, if any.
+    /// The pinned ledger key for `node_id`, if any (regardless of trust).
     pub fn pinned_leaf_key(&self, node_id: &NodeId) -> Option<LedgerPubKey> {
         self.pinned_leaf_keys
             .iter()
-            .find(|(id, _)| id == node_id)
-            .map(|(_, key)| *key)
+            .find(|entry| &entry.node_id == node_id)
+            .map(|entry| entry.ledger)
+    }
+
+    /// The persistence entry for a pinned leaf, if any.
+    pub fn pinned_leaf_entry(&self, node_id: &NodeId) -> Option<&PinnedLeafKeyV1> {
+        self.pinned_leaf_keys
+            .iter()
+            .find(|entry| &entry.node_id == node_id)
+    }
+
+    /// The trust status of the pin for `node_id`, if any.
+    pub fn pinned_leaf_trust(&self, node_id: &NodeId) -> Option<PinTrust> {
+        self.pinned_leaf_entry(node_id).map(|entry| entry.trust)
+    }
+
+    /// Confirm the currently-pinned ledger key for `node_id` (or a leaf pin).
+    ///
+    /// Confirming keeps the existing pinned key (it never adopts a presented
+    /// change) and clears any recorded change for that node. Returns whether a
+    /// pin existed and is now confirmed.
+    pub fn confirm_leaf_pin(&mut self, node_id: &NodeId) -> bool {
+        let confirmed = match self
+            .pinned_leaf_keys
+            .iter_mut()
+            .find(|entry| &entry.node_id == node_id)
+        {
+            Some(entry) => {
+                entry.trust = PinTrust::Confirmed;
+                true
+            }
+            None => false,
+        };
+        self.clear_leaf_key_changes(node_id);
+        confirmed
+    }
+
+    /// Confirm the routing leaf ledger pin ([`Self::pinned_ledger`]).
+    ///
+    /// `parent` is the parent leaf's node id, used only to clear any recorded
+    /// change for it. Returns whether a routing pin existed (and is now
+    /// confirmed).
+    pub fn confirm_pinned_ledger(&mut self, parent: &NodeId) -> bool {
+        let present = self.pinned_ledger.is_some();
+        if present {
+            self.pinned_ledger_trust = PinTrust::Confirmed;
+        }
+        self.clear_leaf_key_changes(parent);
+        present
+    }
+
+    /// Record (never adopt) a *different* key presented for an already-pinned
+    /// leaf, replacing any prior change for the same node.
+    ///
+    /// Evicts the oldest beyond [`MAX_LEAF_KEY_CHANGES`].
+    pub fn record_leaf_key_change(
+        &mut self,
+        node_id: NodeId,
+        pinned: LedgerPubKey,
+        presented: LedgerPubKey,
+    ) {
+        if let Some(existing) = self
+            .leaf_key_changes
+            .iter_mut()
+            .find(|change| change.node_id == node_id)
+        {
+            existing.pinned = pinned;
+            existing.presented = presented;
+            return;
+        }
+        self.leaf_key_changes.push(LeafKeyChangeV1 {
+            node_id,
+            pinned,
+            presented,
+        });
+        while self.leaf_key_changes.len() > MAX_LEAF_KEY_CHANGES {
+            self.leaf_key_changes.remove(0);
+        }
+    }
+
+    /// Drop any recorded pin change for `node_id`.
+    pub fn clear_leaf_key_changes(&mut self, node_id: &NodeId) {
+        self.leaf_key_changes
+            .retain(|change| &change.node_id != node_id);
+    }
+
+    /// The recorded pin change for `node_id`, if any.
+    pub fn leaf_key_change(&self, node_id: &NodeId) -> Option<&LeafKeyChangeV1> {
+        self.leaf_key_changes
+            .iter()
+            .find(|change| &change.node_id == node_id)
     }
 
     /// Re-pin the parent ledger key to a newly approved parent and drop the
@@ -524,6 +718,9 @@ impl LedgerStateV1 {
     /// (leaf-scoped, not parent-scoped) are retained.
     pub fn rebind_parent(&mut self, ledger: LedgerPubKey) {
         self.pinned_ledger = Some(ledger);
+        // The key comes from an authenticated `JoinApproval.parent_ledger`, so
+        // it is explicitly trusted (confirmed), not a TOFU fallback.
+        self.pinned_ledger_trust = PinTrust::Confirmed;
         self.balance = None;
         self.pending.clear();
     }
@@ -536,6 +733,7 @@ impl LedgerStateV1 {
     /// and `pinned_leaf_keys` are retained.
     pub fn clear_parent_binding(&mut self) {
         self.pinned_ledger = None;
+        self.pinned_ledger_trust = PinTrust::Unconfirmed;
         self.balance = None;
         self.pending.clear();
     }
@@ -655,6 +853,9 @@ pub fn verify_receipt(
     match state.pinned_ledger {
         Some(pinned) => {
             if pinned != receipt_key {
+                // A different ledger key for an already-pinned routing leaf is
+                // recorded, never adopted: the existing pin stays in force.
+                state.record_leaf_key_change(expected_parent.clone(), pinned, receipt_key);
                 return Err("ledger_key_mismatch".to_string());
             }
             verify_balance_attestation(&receipt.attestation, &receipt.commitment, &pinned)
@@ -662,11 +863,16 @@ pub fn verify_receipt(
             Ok(verified(receipt))
         }
         None => {
+            // Trust-on-first-use fallback: record the pin as unconfirmed so it
+            // verifies the in-flight proof but does not count as established
+            // trust.
             state.pinned_ledger = Some(receipt_key);
+            state.pinned_ledger_trust = PinTrust::Unconfirmed;
             if let Err(err) =
                 verify_balance_attestation(&receipt.attestation, &receipt.commitment, &receipt_key)
             {
                 state.pinned_ledger = None;
+                state.pinned_ledger_trust = PinTrust::Unconfirmed;
                 return Err(format!("attestation_invalid: {err}"));
             }
             Ok(verified(receipt))
@@ -892,9 +1098,10 @@ fn verify_settlement_proof(
 /// The terminal settlement state for an `Applied`/`Duplicate` result.
 ///
 /// Requires and verifies the terminal inclusion proof. On success it installs
-/// (or confirms) the leaf key pin and returns the `success` state; on a missing
-/// or rejected proof it returns [`SettlementStateV1::Unverified`] and installs
-/// nothing.
+/// the leaf key pin as [`PinTrust::Unconfirmed`] (or preserves an existing pin,
+/// keeping its confirmation); on a missing or rejected proof it returns
+/// [`SettlementStateV1::Unverified`], installs nothing, and records a
+/// [`LeafKeyChangeV1`] when a different key was presented for a pinned leaf.
 fn terminal_settlement_state(
     state: &mut LedgerStateV1,
     pending: &PendingOrderV1,
@@ -908,10 +1115,21 @@ fn terminal_settlement_state(
         };
     };
     if let Err(reason) = verify_settlement_proof(state, pending, order_hash, proof) {
+        // Surface (never adopt) a different key presented for a pinned leaf.
+        if let Some(ledger) = proof.signer.ledger
+            && let Some(pinned) = state.pinned_leaf_key(&proof.signer.node_id)
+            && pinned != ledger
+        {
+            state.record_leaf_key_change(proof.signer.node_id.clone(), pinned, ledger);
+        }
         return SettlementStateV1::Unverified { reason };
     }
-    if let Some(ledger) = proof.signer.ledger {
-        state.pin_leaf_key(proof.signer.node_id.clone(), ledger);
+    // TOFU-pin the leaf key as unconfirmed on first use; an existing matching
+    // pin is preserved (with its confirmation).
+    if let Some(ledger) = proof.signer.ledger
+        && state.pinned_leaf_key(&proof.signer.node_id).is_none()
+    {
+        state.pin_leaf_key_unconfirmed(proof.signer.node_id.clone(), ledger);
     }
     success
 }
@@ -1506,10 +1724,24 @@ mod tests {
         // An over-long vector is rejected on import rather than truncated.
         let mut over = LedgerStateV1::new();
         for i in 0..=MAX_PINNED_LEAF_KEYS {
-            over.pinned_leaf_keys
-                .push((node(&format!("l{i}")), ledger(1).public()));
+            over.pinned_leaf_keys.push(PinnedLeafKeyV1 {
+                node_id: node(&format!("l{i}")),
+                ledger: ledger(1).public(),
+                trust: PinTrust::Confirmed,
+            });
         }
         assert!(LedgerStateV1::from_bytes(&over.to_bytes()).is_err());
+
+        // Likewise the detected-change ring is bounded.
+        let mut over_changes = LedgerStateV1::new();
+        for i in 0..=MAX_LEAF_KEY_CHANGES {
+            over_changes.leaf_key_changes.push(LeafKeyChangeV1 {
+                node_id: node(&format!("c{i}")),
+                pinned: ledger(1).public(),
+                presented: ledger(2).public(),
+            });
+        }
+        assert!(LedgerStateV1::from_bytes(&over_changes.to_bytes()).is_err());
     }
 
     #[test]
@@ -1628,9 +1860,193 @@ mod tests {
 
         let verified = verify_receipt(&mut state, &receipt, "n1", &parent).unwrap();
         assert_eq!(state.pinned_ledger, Some(key.public()));
+        assert_eq!(
+            state.pinned_ledger_trust,
+            PinTrust::Unconfirmed,
+            "a TOFU fallback pin is unconfirmed, never established trust"
+        );
         assert_eq!(verified.height, 3);
         assert_eq!(verified.amount, 0);
         assert_eq!(verified.state_root, receipt.commitment.commitment.state_root);
+    }
+
+    #[test]
+    fn tofu_pin_is_unconfirmed_until_confirmed_and_survives_reload() {
+        let key = ledger(1);
+        let parent = node("parent");
+        let receipt = receipt_for(&key, &parent, &node("n1"));
+        let mut state = LedgerStateV1::new();
+        verify_receipt(&mut state, &receipt, "n1", &parent).unwrap();
+        assert_eq!(state.pinned_ledger_trust, PinTrust::Unconfirmed);
+
+        // An unconfirmed pin round-trips as unconfirmed.
+        let back = LedgerStateV1::from_bytes(&state.to_bytes()).unwrap();
+        assert_eq!(back.pinned_ledger_trust, PinTrust::Unconfirmed);
+
+        // Confirming flips it, and the confirmation persists across a reload.
+        assert!(state.confirm_pinned_ledger(&parent));
+        assert_eq!(state.pinned_ledger_trust, PinTrust::Confirmed);
+        let restored = LedgerStateV1::from_bytes(&state.to_bytes()).unwrap();
+        assert_eq!(restored.pinned_ledger_trust, PinTrust::Confirmed);
+    }
+
+    #[test]
+    fn routing_pin_change_is_recorded_not_adopted() {
+        let pinned = ledger(1);
+        let other = ledger(2);
+        let parent = node("parent");
+        let mut state = LedgerStateV1::new();
+        state.pinned_ledger = Some(pinned.public());
+        state.pinned_ledger_trust = PinTrust::Unconfirmed;
+
+        let receipt = receipt_for(&other, &parent, &node("n1"));
+        assert_eq!(
+            verify_receipt(&mut state, &receipt, "n1", &parent),
+            Err("ledger_key_mismatch".to_string())
+        );
+        assert_eq!(
+            state.pinned_ledger,
+            Some(pinned.public()),
+            "a different key must not replace the existing pin"
+        );
+        let change = state
+            .leaf_key_change(&parent)
+            .expect("the change is recorded");
+        assert_eq!(change.pinned, pinned.public());
+        assert_eq!(change.presented, other.public());
+
+        // Confirming keeps the existing key, marks it confirmed, and clears the
+        // change.
+        assert!(state.confirm_pinned_ledger(&parent));
+        assert_eq!(state.pinned_ledger_trust, PinTrust::Confirmed);
+        assert!(state.leaf_key_change(&parent).is_none());
+    }
+
+    #[test]
+    fn first_verified_proof_pins_leaf_unconfirmed_and_change_is_recorded() {
+        let pinned = ledger(1);
+        let changed = ledger(2);
+        let parent = node("parent");
+        let payee = "0.2.4";
+        let payee_leaf = "0.2";
+
+        // First proof TOFU-pins leaf-a as unconfirmed.
+        let order_a = pending_order(1);
+        let hash_a = order_a.hash();
+        let proof_a = direct_terminal_proof(&pinned, "leaf-a", payee_leaf, &order_a);
+        let mut state = LedgerStateV1::new();
+        push_pending_direct(&mut state, order_a, payee, None);
+        let app = apply_settlement_result(
+            &mut state,
+            &settlement_result_v3(
+                hash_a,
+                SettlementStatusV2::Applied {
+                    entry_seq: 7,
+                    entry_hash: Hash::from_bytes([0x55; 32]),
+                },
+                Some(proof_a),
+            ),
+            "n1",
+            &parent,
+            0,
+        )
+        .unwrap();
+        assert_eq!(app.status, "applied");
+        assert_eq!(
+            state.pinned_leaf_trust(&node("leaf-a")),
+            Some(PinTrust::Unconfirmed),
+            "a TOFU leaf pin is unconfirmed, not established trust"
+        );
+
+        // A different key for the same leaf is recorded, never adopted.
+        let order_b = pending_order(2);
+        let hash_b = order_b.hash();
+        let proof_b = direct_terminal_proof(&changed, "leaf-a", payee_leaf, &order_b);
+        push_pending_direct(&mut state, order_b, payee, None);
+        let app = apply_settlement_result(
+            &mut state,
+            &settlement_result_v3(
+                hash_b,
+                SettlementStatusV2::Applied {
+                    entry_seq: 8,
+                    entry_hash: Hash::from_bytes([0x66; 32]),
+                },
+                Some(proof_b),
+            ),
+            "n1",
+            &parent,
+            0,
+        )
+        .unwrap();
+        assert_eq!(app.status, "unverified");
+        assert!(
+            app.reason
+                .as_deref()
+                .unwrap()
+                .contains("pinned leaf key mismatch")
+        );
+        assert_eq!(
+            state.pinned_leaf_key(&node("leaf-a")),
+            Some(pinned.public()),
+            "the existing pin is retained"
+        );
+        let change = state
+            .leaf_key_change(&node("leaf-a"))
+            .expect("the change is recorded");
+        assert_eq!(change.pinned, pinned.public());
+        assert_eq!(change.presented, changed.public());
+
+        // Confirming keeps the existing pinned key and clears the change.
+        assert!(state.confirm_leaf_pin(&node("leaf-a")));
+        assert_eq!(
+            state.pinned_leaf_trust(&node("leaf-a")),
+            Some(PinTrust::Confirmed)
+        );
+        assert!(state.leaf_key_change(&node("leaf-a")).is_none());
+        // A node with no pin cannot be confirmed.
+        assert!(!state.confirm_leaf_pin(&node("absent")));
+    }
+
+    /// An explicit receive-URI pin is trusted (`confirmed`) out-of-band, so a
+    /// matching proof keeps it confirmed rather than downgrading it to TOFU.
+    #[test]
+    fn explicit_receive_uri_pin_is_confirmed_and_preserved() {
+        let key = ledger(1);
+        let parent = node("parent");
+        let payee = "0.2.4";
+        let payee_leaf = "0.2";
+        let order = pending_order(1);
+        let hash = order.hash();
+        let proof = direct_terminal_proof(&key, "leaf-a", payee_leaf, &order);
+
+        let mut state = LedgerStateV1::new();
+        state.pin_leaf_key(node("leaf-a"), key.public());
+        assert_eq!(
+            state.pinned_leaf_trust(&node("leaf-a")),
+            Some(PinTrust::Confirmed)
+        );
+        push_pending_direct(&mut state, order, payee, None);
+        let app = apply_settlement_result(
+            &mut state,
+            &settlement_result_v3(
+                hash,
+                SettlementStatusV2::Applied {
+                    entry_seq: 7,
+                    entry_hash: Hash::from_bytes([0x55; 32]),
+                },
+                Some(proof),
+            ),
+            "n1",
+            &parent,
+            0,
+        )
+        .unwrap();
+        assert_eq!(app.status, "applied");
+        assert_eq!(
+            state.pinned_leaf_trust(&node("leaf-a")),
+            Some(PinTrust::Confirmed),
+            "an explicit pin must not be downgraded by a matching proof"
+        );
     }
 
     #[test]
