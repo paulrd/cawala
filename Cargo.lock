@@ -369,6 +369,7 @@ dependencies = [
 name = "cawala-eth"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "cawala-ledger",
  "cawala-proto",
  "coins-bip32",

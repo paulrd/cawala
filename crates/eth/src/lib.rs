@@ -52,6 +52,16 @@ pub const HARDENED: u32 = 0x8000_0000;
 /// Default account index (`m/44'/60'/0'/0/0`).
 pub const DEFAULT_ACCOUNT_INDEX: u32 = 0;
 
+/// BLAKE3 derive-key context for the browser **transport** (Ed25519) seed.
+///
+/// One BIP-39 mnemonic restores both the user's ETH identity and the browser's
+/// iroh NodeId / operator key (Addendum B/C §6). The transport seed is
+/// domain-separated from the BIP-39/BIP-44 secp256k1 material, so the
+/// `seed == NodeId == operator` invariant is preserved without leaking the ETH
+/// scalar derivation. Protocol-frozen: changing it re-keys every browser.
+#[cfg(feature = "bip39")]
+pub const TRANSPORT_DERIVE_CONTEXT: &str = "cawala-transport/ed25519/v1";
+
 /// Cawala network/chain id used as the EIP-712 domain `chainId`.
 ///
 /// ASCII `"cawala"` (`0x636177616c61`): a memorable, chain-id-sized constant.
@@ -206,6 +216,26 @@ pub fn mnemonic_to_seed(
     parsed
         .to_seed(passphrase)
         .map_err(|err| EthError::InvalidMnemonic(err.to_string()))
+}
+
+/// Derive the deterministic 32-byte Ed25519 **transport** seed for a browser
+/// from a BIP-39 mnemonic and optional passphrase.
+///
+/// This is `BLAKE3::derive_key("cawala-transport/ed25519/v1", BIP39-seed)`: a
+/// domain-separated expansion of the same BIP-39 seed that roots the ETH
+/// identity, so one mnemonic restores both (Addendum B/C §6). The result is a
+/// valid Ed25519 seed by construction (an arbitrary 32-byte string); it is
+/// deliberately **distinct** from the BIP-44 secp256k1 scalar material.
+///
+/// The seed is not secret-by-itself beyond the mnemonic, but it is key
+/// material: the caller owns zeroization.
+#[cfg(feature = "bip39")]
+pub fn transport_seed_from_mnemonic(
+    mnemonic: &str,
+    passphrase: Option<&str>,
+) -> Result<[u8; 32], EthError> {
+    let seed = mnemonic_to_seed(mnemonic, passphrase)?;
+    Ok(blake3::derive_key(TRANSPORT_DERIVE_CONTEXT, &*seed))
 }
 
 /// Derive the secp256k1 signing key at `m/44'/60'/0'/0/{index}`.
@@ -1073,6 +1103,54 @@ mod tests {
         let bad = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon";
         assert!(matches!(
             mnemonic_to_seed(bad, None),
+            Err(EthError::InvalidMnemonic(_))
+        ));
+    }
+
+    #[cfg(feature = "bip39")]
+    #[test]
+    fn transport_seed_is_deterministic() {
+        let a = transport_seed_from_mnemonic(TREZOR_MNEMONIC, None).expect("derive");
+        let b = transport_seed_from_mnemonic(TREZOR_MNEMONIC, None).expect("derive");
+        assert_eq!(a, b);
+
+        let with_pass =
+            transport_seed_from_mnemonic(TREZOR_MNEMONIC, Some("TREZOR")).expect("derive");
+        assert_ne!(a, with_pass, "the BIP-39 passphrase must change the seed");
+
+        let other = transport_seed_from_mnemonic(ETH_TEST_MNEMONIC, None).expect("derive");
+        assert_ne!(a, other, "different mnemonics derive different seeds");
+    }
+
+    #[cfg(feature = "bip39")]
+    #[test]
+    fn transport_seed_is_distinct_from_secp256k1_material() {
+        let transport = transport_seed_from_mnemonic(TREZOR_MNEMONIC, None).expect("derive");
+        let bip39_seed = mnemonic_to_seed(TREZOR_MNEMONIC, None).expect("seed");
+
+        // Not a prefix of (or equal to) the raw BIP-39 seed.
+        assert_ne!(transport.as_slice(), &bip39_seed[..32]);
+        let mut tagged = Vec::with_capacity(64);
+        tagged.extend_from_slice(&transport);
+        assert_ne!(tagged.as_slice(), bip39_seed.as_slice());
+
+        // Not the BIP-44 secp256k1 scalar either.
+        let key = derive_signing_key(TREZOR_MNEMONIC, None, 0).expect("derive");
+        assert_ne!(transport.as_slice(), key.to_bytes().as_slice());
+
+        // The derive-key context is load-bearing: a different context differs.
+        assert_ne!(
+            transport,
+            blake3::derive_key("cawala-transport/ed25519/v2", &*bip39_seed)
+        );
+    }
+
+    #[cfg(feature = "bip39")]
+    #[test]
+    fn transport_seed_rejects_bad_mnemonic() {
+        let bad = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon";
+        assert!(matches!(
+            transport_seed_from_mnemonic(bad, None),
             Err(EthError::InvalidMnemonic(_))
         ));
     }

@@ -27,14 +27,20 @@
 // Re-export the shared implementation so `cawala_client::eth_identity::*`
 // resolves exactly as before (behavior and API unchanged).
 pub use cawala_eth::{
-    DEFAULT_ACCOUNT_INDEX, EthError, HARDENED, address_from_signing_key,
-    address_from_uncompressed_public_key, address_from_verifying_key, bytes_to_hex_lower,
-    checksum_address, derive_signing_key, eip712_digest, eip712_hash_struct, eth_derivation_path,
-    is_high_s, keccak256, mnemonic_to_seed, recover_address, sign_digest, signing_key_from_bytes,
-    uncompressed_public_key,
+    DEFAULT_ACCOUNT_INDEX, EthError, HARDENED, TRANSPORT_DERIVE_CONTEXT,
+    address_from_signing_key, address_from_uncompressed_public_key, address_from_verifying_key,
+    bytes_to_hex_lower, checksum_address, derive_signing_key, eip712_digest, eip712_hash_struct,
+    eth_derivation_path, eth_registration_digest, eth_rotation_digest, is_high_s, keccak256,
+    mnemonic_to_seed, order_digest, recover_address, sign_digest, signing_key_from_bytes,
+    transport_seed_from_mnemonic, uncompressed_public_key,
 };
 
+use std::sync::Mutex;
+
+use cawala_eth::{EthIdentity, EthProof};
+use cawala_ledger::PaymentOrder;
 use k256::ecdsa::SigningKey;
+use proto::OctAddr;
 use wasm_bindgen::prelude::wasm_bindgen;
 
 /// A wasm-bindgen handle holding the user's secp256k1 secret **inside wasm**.
@@ -53,6 +59,126 @@ impl UserIdentity {
         let address = address_from_signing_key(&key);
         UserIdentity { key, address }
     }
+
+    /// Native-testable mnemonic constructor returning an [`EthError`] instead of
+    /// a JS error. The wasm [`UserIdentity::from_mnemonic`] delegates here.
+    fn from_mnemonic_inner(
+        mnemonic: &str,
+        passphrase: Option<&str>,
+        index: u32,
+    ) -> Result<Self, EthError> {
+        let key = derive_signing_key(mnemonic, passphrase, index)?;
+        Ok(UserIdentity::from_signing_key(key))
+    }
+
+    /// Raw 20 address bytes (no checksum casing).
+    pub(crate) fn address_array(&self) -> [u8; 20] {
+        self.address
+    }
+
+    /// Build the ETH identity for one payment `order`: `address` plus the
+    /// canonical EIP-712 signature over
+    /// `order_digest(order, payee_addr)` (Addendum C §2).
+    ///
+    /// Returns a plain [`EthError`] (no JS error) so this path is
+    /// native-testable; the wasm boundary converts.
+    pub(crate) fn sign_order(
+        &self,
+        order: &PaymentOrder,
+        payee_addr: &OctAddr,
+    ) -> Result<EthIdentity, EthError> {
+        let digest = order_digest(order, payee_addr);
+        let signature = sign_digest(&self.key, &digest)?;
+        Ok(EthIdentity {
+            address: self.address,
+            signature,
+        })
+    }
+
+    /// Build the fresh **registration** ETH proof for `node_id`: a signature
+    /// over [`eth_registration_digest`] verified against this identity's
+    /// address (proof of control). `old_address` is always `None`; rotation is
+    /// a separate flow.
+    pub(crate) fn registration_proof(&self, node_id: &str) -> Result<EthProof, EthError> {
+        let digest = eth_registration_digest(node_id, &self.address);
+        let signature = sign_digest(&self.key, &digest)?;
+        Ok(EthProof {
+            signature,
+            old_address: None,
+        })
+    }
+}
+
+/// A slot holding an optional user ETH identity, owned by
+/// [`crate::ClientNode`].
+///
+/// Kept as a named type so the set/clear/read and sign semantics are
+/// native-testable without constructing a networked client. All methods return
+/// [`EthError`] (never a JS error), so this type is safe to exercise in native
+/// tests where the wasm-bindgen intrinsics are not linked.
+pub(crate) struct UserIdentitySlot(Mutex<Option<UserIdentity>>);
+
+impl Default for UserIdentitySlot {
+    fn default() -> Self {
+        UserIdentitySlot(Mutex::new(None))
+    }
+}
+
+impl UserIdentitySlot {
+    /// Derive and store the user identity from a BIP-39 mnemonic (index `0`).
+    pub(crate) fn set_from_mnemonic(
+        &self,
+        mnemonic: &str,
+        passphrase: Option<&str>,
+    ) -> Result<(), EthError> {
+        let identity = UserIdentity::from_mnemonic_inner(mnemonic, passphrase, DEFAULT_ACCOUNT_INDEX)?;
+        *self.lock() = Some(identity);
+        Ok(())
+    }
+
+    /// Drop the stored identity, reverting the client to the legacy V2 path.
+    pub(crate) fn clear(&self) {
+        *self.lock() = None;
+    }
+
+    /// The EIP-55 checksummed address, or `None` when no identity is set.
+    pub(crate) fn address(&self) -> Option<String> {
+        self.lock()
+            .as_ref()
+            .map(|identity| checksum_address(&identity.address_array()))
+    }
+
+    /// Build the V4 ETH identity for `order` when an identity is set.
+    pub(crate) fn sign_order(
+        &self,
+        order: &PaymentOrder,
+        payee_addr: &OctAddr,
+    ) -> Result<Option<EthIdentity>, EthError> {
+        match self.lock().as_ref() {
+            Some(identity) => identity.sign_order(order, payee_addr).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Build the registration `(address, proof)` when an identity is set.
+    pub(crate) fn registration(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<([u8; 20], EthProof)>, EthError> {
+        match self.lock().as_ref() {
+            Some(identity) => identity
+                .registration_proof(node_id)
+                .map(|proof| Some((identity.address_array(), proof))),
+            None => Ok(None),
+        }
+    }
+
+    /// Lock the slot, recovering from poisoning.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<UserIdentity>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 #[wasm_bindgen]
@@ -68,9 +194,8 @@ impl UserIdentity {
         index: Option<u32>,
     ) -> Result<UserIdentity, wasm_bindgen::JsError> {
         let index = index.unwrap_or(DEFAULT_ACCOUNT_INDEX);
-        let key =
-            derive_signing_key(mnemonic, passphrase.as_deref(), index).map_err(crate::to_js_err)?;
-        Ok(UserIdentity::from_signing_key(key))
+        UserIdentity::from_mnemonic_inner(mnemonic, passphrase.as_deref(), index)
+            .map_err(crate::to_js_err)
     }
 
     /// Restore an identity from a raw 32-byte secp256k1 secret (bundle
@@ -397,5 +522,66 @@ mod tests {
             checksum_address(&address),
             "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
         );
+    }
+
+    #[test]
+    fn transport_seed_re_exports_shared_derivation() {
+        // The shared helper is re-exported here and stays deterministic.
+        let a = transport_seed_from_mnemonic(TREZOR_MNEMONIC, None).expect("derive");
+        let b = transport_seed_from_mnemonic(TREZOR_MNEMONIC, None).expect("derive");
+        assert_eq!(a, b);
+        assert_ne!(
+            a,
+            transport_seed_from_mnemonic(ETH_TEST_MNEMONIC, None).expect("derive")
+        );
+    }
+
+    #[test]
+    fn user_identity_slot_set_clear_and_sign() {
+        use cawala_ledger::{Amount, NodeId};
+
+        let order = PaymentOrder {
+            from: NodeId::from("alice"),
+            to: NodeId::from("bob"),
+            amount: Amount::new(7),
+            nonce: 5,
+            expiry: 100,
+        };
+        let payee: OctAddr = "0.2.4".parse().expect("valid octal address");
+
+        let slot = UserIdentitySlot::default();
+        assert!(slot.address().is_none());
+        assert!(slot.sign_order(&order, &payee).expect("no identity").is_none());
+        assert!(slot.registration("node-x").expect("no identity").is_none());
+
+        slot.set_from_mnemonic(ETH_TEST_MNEMONIC, None)
+            .expect("identity derives");
+        assert_eq!(
+            slot.address().as_deref(),
+            Some("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
+        );
+
+        // V4 ETH identity recovers to the store's address over the order digest.
+        let eth = slot
+            .sign_order(&order, &payee)
+            .expect("sign")
+            .expect("identity set");
+        let digest = order_digest(&order, &payee);
+        assert_eq!(eth.recovered_address(&digest), Ok(eth.address));
+        assert_eq!(eth.verify_for(&digest), Ok(()));
+
+        // Registration proof verifies against eth_registration_digest.
+        let (address, proof) = slot
+            .registration("node-x")
+            .expect("sign")
+            .expect("identity set");
+        assert_eq!(address, eth.address);
+        assert_eq!(proof.verify_registration("node-x", &address), Ok(()));
+        assert!(proof.verify_registration("node-y", &address).is_err());
+
+        // Clear reverts to the no-identity path.
+        slot.clear();
+        assert!(slot.address().is_none());
+        assert!(slot.sign_order(&order, &payee).expect("cleared").is_none());
     }
 }

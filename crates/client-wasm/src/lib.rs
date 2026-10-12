@@ -25,12 +25,12 @@ use cawala_control::{
     AdminDetachChild, AdminJoinApprove, AdminJoinReject, AdminMoveChild, AdminRedeliverJoin,
     AdminValueRequest, CONTROL_ALPN, CONTROL_REQUEST_TTL_SECS, ChildKind, ControlReply,
     ControlRequest, DesignationChange, ExitRequest, Invite, JoinRequest, NodeId,
-    OperatorSecretKey, RejectCode, SignedControl,
+    OperatorSecretKey, RegisterEthAddress, RejectCode, SignedControl,
 };
 use cawala_msg::{
     Ack, AckStatus, BalanceQueryV1, Envelope, LedgerPayloadV1, LedgerPayloadV2, LedgerPayloadV3,
-    MSG_LEDGER_V1, MsgError, MsgId, OctAddr, OrderV2, PeerRef, RejectReason, Seen, SeenConfig,
-    SeenSet, VersionedLedgerPayload, decode_versioned,
+    LedgerPayloadV4, MSG_LEDGER_V1, MsgError, MsgId, OctAddr, OrderV2, OrderV4, PeerRef,
+    RejectReason, Seen, SeenConfig, SeenSet, VersionedLedgerPayload, decode_versioned,
 };
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -58,6 +58,7 @@ use crate::dto::{
     ControlEventDto, JoinOutcome, JoinStatus, LeaveOutcome, LedgerEventDto, LedgerStatusDto,
     PaymentOutcome, SnapshotDto, parse_operator_hex, parse_request_id_hex, reject_code_str,
 };
+use crate::eth_identity::UserIdentitySlot;
 use crate::ledger_state::{LEDGER_STATE_VERSION, LedgerStateV1};
 use crate::state::{LOCAL_STATE_VERSION, LocalStateV1, ParentLink, Transition};
 
@@ -90,6 +91,30 @@ pub fn generate_secret_key() -> Result<Vec<u8>, JsError> {
     let mut bytes = vec![0u8; 32];
     getrandom::fill(&mut bytes).map_err(to_js_err)?;
     Ok(bytes)
+}
+
+/// Derive the deterministic 32-byte Ed25519 transport seed for a browser from a
+/// BIP-39 mnemonic and optional BIP-39 passphrase.
+///
+/// This is the mnemonic-derived replacement for [`generate_secret_key`]
+/// (Addendum B/C §6): the same mnemonic that roots the user's ETH identity also
+/// restores this browser's iroh NodeId / operator key, on any host. It is
+/// BLAKE3 derive-key under the domain-separated context
+/// `"cawala-transport/ed25519/v1"` over the BIP-39 seed, so the transport seed
+/// is distinct from the BIP-44 secp256k1 material.
+///
+/// Hand the returned bytes to
+/// [`ClientNode::spawn_control`](ClientNode::spawn_control); the caller owns
+/// persisting/zeroizing them. A per-install policy decision ("only derive when
+/// no stored seed exists") lives above this primitive.
+#[wasm_bindgen(js_name = transportSeedFromMnemonic)]
+pub fn transport_seed_from_mnemonic(
+    mnemonic: &str,
+    passphrase: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    crate::eth_identity::transport_seed_from_mnemonic(mnemonic, passphrase.as_deref())
+        .map(|seed| seed.to_vec())
+        .map_err(to_js_err)
 }
 
 /// Current time as unix seconds, via [`web_time::SystemTime`] so it works on
@@ -562,6 +587,13 @@ pub struct ClientNode {
     /// can re-pin the parent ledger synchronously, before any balance request
     /// races the stale pin.
     ledger: Arc<Mutex<LedgerStateV1>>,
+    /// The optional user ETH identity (R3).
+    ///
+    /// Set by [`ClientNode::set_user_identity`] and cleared by
+    /// [`ClientNode::clear_user_identity`]. The secp256k1 key never leaves wasm.
+    /// When set, [`ClientNode::send_payment`] emits a `LedgerPayloadV4` carrying
+    /// the user's EIP-712 signature; when unset, the legacy V2 path is used.
+    user_identity: UserIdentitySlot,
 }
 
 #[wasm_bindgen]
@@ -589,6 +621,7 @@ impl ClientNode {
             control_rx: None,
             control,
             ledger: Arc::new(Mutex::new(LedgerStateV1::new())),
+            user_identity: UserIdentitySlot::default(),
         })
     }
 
@@ -620,6 +653,7 @@ impl ClientNode {
             control_rx: None,
             control,
             ledger: Arc::new(Mutex::new(LedgerStateV1::new())),
+            user_identity: UserIdentitySlot::default(),
         })
     }
 
@@ -681,6 +715,7 @@ impl ClientNode {
             control_rx: Some(tokio::sync::Mutex::new(control_rx)),
             control,
             ledger,
+            user_identity: UserIdentitySlot::default(),
         })
     }
 
@@ -1595,6 +1630,12 @@ impl ClientNode {
     /// [`ClientNode::try_recv_ledger_event`] as an `"order_result"` event whose
     /// `status` is `applied`/`duplicate`/`partial`/`rejected` (`partial` carries
     /// the failing hop).
+    ///
+    /// When a user ETH identity is set ([`ClientNode::set_user_identity`]), the
+    /// order is sent as a `LedgerPayloadV4` carrying the user's EIP-712
+    /// signature over `order_digest(order, payee_addr)`; otherwise the legacy
+    /// `LedgerPayloadV2` path is used unchanged. An anchored sender MUST use V4
+    /// (the parent rejects V1/V2 from it), so set the identity before paying.
     pub async fn send_payment(
         &self,
         to: String,
@@ -1638,6 +1679,11 @@ impl ClientNode {
         let payer_leaf = self_addr.parent() == payee_addr.parent();
 
         // Persist before dialing so a result racing the ack can still match.
+        //
+        // The pending blob deliberately does NOT store the ETH signature
+        // (Addendum C §7): k256 signing is RFC6979-deterministic, so an
+        // identical signature is regenerated from the unlocked key at retry. The
+        // blob version is therefore unchanged.
         self.ledger
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1650,16 +1696,34 @@ impl ClientNode {
                 None,
             );
 
-        // v2: the leaf decides same-leaf `Direct` vs a depth-1 settlement from
-        // the payee address.
-        let payload = LedgerPayloadV2::Order(OrderV2 {
-            order,
-            auth,
-            payee_addr,
-        });
-        let ack = self
-            .send_ledger_payload_v2(self_addr, &parent, payload)
-            .await?;
+        // With a user ETH identity set, the order rides v4: it carries the
+        // payee address plus the user's EIP-712 signature. Without one, the
+        // legacy v2 path is byte-for-byte unchanged.
+        let ack = match self
+            .user_identity
+            .sign_order(&order, &payee_addr)
+            .map_err(to_js_err)?
+        {
+            Some(eth) => {
+                let payload = LedgerPayloadV4::Order(OrderV4 {
+                    order,
+                    auth,
+                    payee_addr,
+                    eth,
+                });
+                self.send_ledger_payload_v4(self_addr, &parent, payload)
+                    .await?
+            }
+            None => {
+                let payload = LedgerPayloadV2::Order(OrderV2 {
+                    order,
+                    auth,
+                    payee_addr,
+                });
+                self.send_ledger_payload_v2(self_addr, &parent, payload)
+                    .await?
+            }
+        };
         Ok(PaymentOutcome::new(
             order_hash.to_hex(),
             ack.status_str().to_string(),
@@ -1670,6 +1734,93 @@ impl ClientNode {
     pub fn user_address(&self) -> Option<String> {
         let state = self.control.lock_state();
         state.record.address.as_ref().map(|addr| addr.to_string())
+    }
+
+    /// Derive and store the user's Ethereum identity from a BIP-39 mnemonic.
+    ///
+    /// `passphrase` is the optional BIP-39 passphrase. The account index is the
+    /// fixed default `m/44'/60'/0'/0/0` (single-account v1). The secp256k1
+    /// secret stays inside wasm; only the address and signatures ever leave.
+    ///
+    /// While an identity is set, [`ClientNode::send_payment`] emits a
+    /// `LedgerPayloadV4` with the user's EIP-712 signature. This does not by
+    /// itself anchor the address at the parent; call
+    /// [`ClientNode::register_eth_address`] once joined to do that.
+    pub fn set_user_identity(
+        &self,
+        mnemonic: &str,
+        passphrase: Option<String>,
+    ) -> Result<(), JsError> {
+        self.user_identity
+            .set_from_mnemonic(mnemonic, passphrase.as_deref())
+            .map_err(to_js_err)
+    }
+
+    /// The stored user ETH address (EIP-55 checksummed), or `None` when no
+    /// identity is set.
+    pub fn user_eth_address(&self) -> Option<String> {
+        self.user_identity.address()
+    }
+
+    /// Forget the stored user ETH identity, reverting [`ClientNode::send_payment`]
+    /// to the legacy V2 path. Key material is dropped (zeroized).
+    pub fn clear_user_identity(&self) {
+        self.user_identity.clear();
+    }
+
+    /// Register this leaf's Ethereum anchor with its direct parent.
+    ///
+    /// Requires a joined client and a user identity set via
+    /// [`ClientNode::set_user_identity`]. Builds control variant 24
+    /// `RegisterEthAddress { address, proof }`, where `proof` is the user's
+    /// **fresh-registration** signature over
+    /// `eth_registration_digest(node_id, address)` (`old_address: None`),
+    /// Ed25519-signs that request with this browser's operator key, and sends it
+    /// directly to the parent. The parent records `address` as the leaf's
+    /// write-once anchor (proof of control). Rotating an already-anchored
+    /// address is an Ethereum-authorized flow that is not yet wired here; a
+    /// second call against an existing anchor is refused by the parent.
+    ///
+    /// Returns the reply bucket: `"accepted"` (the parent applied it),
+    /// `"rejected:<code>"`, or `"unexpected"` (a structurally impossible reply).
+    /// A transport error/timeout (unreachable parent) is a JS error. Missing
+    /// identity or a missing join is also an error.
+    pub async fn register_eth_address(&self) -> Result<String, JsError> {
+        let operator = self
+            .control
+            .operator
+            .clone()
+            .ok_or_else(|| JsError::new("client has no control identity; use spawn_control"))?;
+        let (_self_addr, parent) = self.joined_context()?;
+        let node_id = self.control.node_id().to_string();
+        let (address, proof) = self
+            .user_identity
+            .registration(&node_id)
+            .map_err(to_js_err)?
+            .ok_or_else(|| JsError::new("no user identity set; call set_user_identity"))?;
+
+        let mut nonce_bytes = [0u8; 8];
+        getrandom::fill(&mut nonce_bytes).map_err(to_js_err)?;
+        let signed = SignedControl::authorize(
+            NodeId::from(node_id),
+            &operator,
+            u64::from_le_bytes(nonce_bytes),
+            now_unix_seconds().saturating_add(CONTROL_REQUEST_TTL_SECS),
+            ControlRequest::RegisterEthAddress(RegisterEthAddress { address, proof }),
+        )
+        .map_err(to_js_err)?;
+
+        // Direct to the parent, exactly like the join/leave exchange; the
+        // parent is the sole holder of this leaf's `ChildEntry`.
+        let target: EndpointId = parent.node_id.as_str().parse().map_err(to_js_err)?;
+        let reply = exchange_control(self.router.endpoint(), EndpointAddr::from(target), &signed)
+            .await
+            .map_err(|_| JsError::new("register eth address: parent unreachable"))?;
+        Ok(match reply {
+            ControlReply::Accepted => "accepted".to_string(),
+            ControlReply::Rejected(code) => format!("rejected:{}", reject_code_str(code)),
+            _ => "unexpected".to_string(),
+        })
     }
 
     /// This client's payment receive URI:
@@ -1777,6 +1928,12 @@ impl ClientNode {
                 }
                 VersionedLedgerPayload::V3(LedgerPayloadV3::OrderResult(result)) => {
                     self.apply_settlement_result_v3_event(&result)
+                }
+                // v4 is order-only (browser -> leaf): the browser never receives
+                // one, so a decoded v4 frame is rejected without mutating state.
+                VersionedLedgerPayload::V4(_) => {
+                    tracing::warn!("unexpected inbound v4 ledger payload");
+                    LedgerEventDto::invalid("unexpected_payload")
                 }
                 _ => {
                     tracing::warn!("unexpected inbound ledger payload");
@@ -2021,6 +2178,18 @@ impl ClientNode {
         self_addr: OctAddr,
         parent: &ParentLink,
         payload: LedgerPayloadV2,
+    ) -> Result<Ack, JsError> {
+        let bytes = payload.to_bytes().map_err(to_js_err)?;
+        self.send_ledger_bytes(self_addr, parent, bytes).await
+    }
+
+    /// Frame a v4 `payload` as a `MSG_LEDGER_V1` envelope addressed to the
+    /// routing leaf (the parent) and exchange it for an [`Ack`].
+    async fn send_ledger_payload_v4(
+        &self,
+        self_addr: OctAddr,
+        parent: &ParentLink,
+        payload: LedgerPayloadV4,
     ) -> Result<Ack, JsError> {
         let bytes = payload.to_bytes().map_err(to_js_err)?;
         self.send_ledger_bytes(self_addr, parent, bytes).await
