@@ -1,7 +1,7 @@
 {
   "name": "Cawala",
   "short_name": "Cawala",
-  "description": "Cawala M0 debug harness — browser wasm client pinging Rust nodes over the iroh relay",
+  "description": "Cawala — identity-portable browser client: join a node, hold an account, and settle payments over Iroh",
   "start_url": ".",
   "display": "standalone",
   "background_color": "#f5f6f8",

@@ -9,6 +9,16 @@ name: Deploy web app to GitHub Pages
 on:
   push:
     branches: [main]
+    # Only redeploy when the built artifact could change: the web sources and
+    # the Rust crates compiled into the wasm. Docs/plan edits no longer trigger
+    # a full Rust + wasm-bindgen + Vite build.
+    paths:
+      - 'web/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 permissions:
