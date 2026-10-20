@@ -185,6 +185,15 @@ export const ROUTES = {
 };
 
 /**
+ * Page titles for routes that are not in the nav, so the top bar can name them
+ * without duplicating `NAV_ITEMS`. Nav routes keep their `NAV_ITEMS` label.
+ */
+export const PAGE_TITLES = {
+  [ROUTES.MY_ACCOUNT]: 'My Account',
+  [ROUTES.IDENTITY]: 'Account identity',
+};
+
+/**
  * Navigation items for sidebar / mobile nav, in display order.
  *
  * `when: 'unjoined'` marks the Join entry: it only exists while this browser

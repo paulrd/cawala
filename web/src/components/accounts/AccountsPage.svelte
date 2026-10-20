@@ -180,7 +180,10 @@
       totalAssets - totalLiability,
   );
   let hasRows = $derived(nodeState.accounts.length > 0);
-  let balanceReady = $derived(ledgerState.balance != null);
+  // The verified balance belongs to this browser, not to the selected target.
+  // An ancestor's page must fall through to that node's own books instead of
+  // showing the leaf's balance.
+  let balanceReady = $derived(view.isSelf && ledgerState.balance != null);
   let truncated = $derived(Boolean(nodeState.accountsTruncated));
 
   let emptyMessage = $derived.by(() => {
