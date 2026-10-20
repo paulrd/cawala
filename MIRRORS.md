@@ -11,9 +11,12 @@ the format for a machine-readable list served at
 > the **same** account on any origin/host, so a mirror no longer forces an
 > export/import. Only the service worker and the best-effort local cache
 > (`cawala.state.v1:<nodeId>`, `cawala.ledger.v1:<nodeId>`) stay origin-scoped;
-> derived secrets are persisted per-device and the phrase itself is never stored.
-> (`Settings → Identity Portability` still exports the legacy transport-seed
-> bundle for moving an existing install.)
+> the node is the source of truth and rebuilds account/ledger/admin state on the
+> new origin (the user re-joins with a fresh invite). Derived secrets are
+> persisted per-device and the phrase itself is never stored. (`Settings →
+> Identity Portability` exports the encrypted identity bundle — v2, which also
+> carries the local join/ledger state — when you want to move an install as-is
+> instead of re-joining.)
 
 ## Why mirrors
 

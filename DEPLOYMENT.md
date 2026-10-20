@@ -6,13 +6,22 @@ canonical operator is never the only path to the app.
 
 ## Constraints that drive the design
 
-1. **Origin stability for the service worker and local cache.** The
-   service-worker scope and the best-effort cache blobs (`cawala.state.v1:<nodeId>`,
-   `cawala.ledger.v1:<nodeId>`) remain **origin-scoped**. Identity itself is now
-   **mnemonic-derived and portable** (R3): the same BIP-39 mnemonic restores the
-   user's ETH account *and* the transport NodeId on any host, so a new hostname
-   does **not** force an identity export/import. Same-origin failover (Layer 2)
-   still preserves the SW and cache.
+1. **State is a best-effort cache; identity is portable.** Since the
+   portable-client refactor (R1) the browser holds no authoritative
+   account/ledger/admin state: `cawala.state.v1:<nodeId>` and
+   `cawala.ledger.v1:<nodeId>` are re-derivable caches, so a **fresh origin
+   boots with empty local state** and revalidates balance, height, topology and
+   the admin views from the node. What stays local, and does not follow the user
+   to another host, is the per-origin service-worker/cache scope, the TOFU
+   leaf-key *trust decision*, the quarantined ledger backup, and the in-flight
+   value journal. Identity is mnemonic-derived and portable (R3): the same
+   BIP-39 mnemonic restores the user's ETH account *and* the transport NodeId on
+   any host, so a new hostname does **not** force an identity export/import —
+   the user re-joins that leaf with a fresh invite (queued for operator
+   approval; the node keeps the child, its address/slot and its ledger). To move
+   an install byte-for-byte instead, export/import the encrypted identity
+   bundle, which also carries the local join/ledger state. Same-origin failover
+   (Layer 2) still preserves the SW and cache.
 2. **Custom response headers.** CSP, HSTS, and cache-control are required.
    GitHub Pages cannot set response headers; the host must honor `_headers`,
    `netlify.toml` `[[headers]]`, or `vercel.json`.
@@ -44,18 +53,23 @@ Static Assets     S3+CloudFront) same cert   community domains, IPFS
   what makes mirrors possible.
 - **Layer 1 — canonical origin.** One stable hostname (`cawala.ca`) carrying the
   service worker and local cache, on a header-capable managed host. (Identity is
-  portable by mnemonic, so it is no longer tied to the origin.)
+  portable by mnemonic and account/ledger state is re-derivable from the node,
+  so the cache is only a convenience — but the local leaf-key trust decisions
+  are origin-scoped, so returning here preserves them while a new mirror
+  re-establishes them.)
 - **Layer 2 — same-origin failover.** A health-checked second origin that also
   serves `cawala.ca` with a valid cert and the same headers. Removes the *host*
   as a SPOF while keeping the origin.
 - **Layer 3 — independent mirrors.** Content-addressed IPFS and community-hosted
-  copies on their own domains. Different origins, but identity is now portable:
-  a user restores the same account by entering their mnemonic on any mirror. They
-  remove any single host or pinner as a SPOF.
+  copies on their own domains. Different origins, but identity is portable: a
+  user restores the same account and NodeId by entering their mnemonic, and the
+  fresh origin rebuilds account/ledger/admin state from the node. They remove
+  any single host or pinner as a SPOF.
 
 **Same-origin redundancy preserves the service worker and local cache;
 different-origin mirrors protect availability. Identity rides the mnemonic, not
-the origin.** You want both.
+the origin — and a cache miss on a new origin is now a cache miss, not data
+loss.** You want both.
 
 ## Self-host in 5 minutes
 
@@ -275,11 +289,16 @@ reject rollbacks. Format and template: `MIRRORS.md`.
   2. **Mnemonic restore** — the user's ETH identity *and* transport NodeId are
      derived from their BIP-39 mnemonic, so entering it on any mirror restores
      the account (the old "different origin = separate identity" limitation is
-     gone). Derived secrets are persisted per-device; the mnemonic is never
-     stored.
+     gone). Account/ledger/admin state is re-derived from the node; only the
+     local TOFU leaf-key decisions and the quarantined ledger backup stay on the
+     old origin (trust is re-confirmed after re-joining, or carried over with an
+     identity-bundle import). Derived secrets are persisted per-device; the
+     mnemonic is never stored.
 - **The protocol doesn't depend on the web app.** Nodes are independent; the app
-  is a stateless client except for local identity. If the canonical origin
-  vanished, the network keeps running and users can load any mirror.
+  is a stateless client except for local authoritative state (identity, TOFU
+  pins, the quarantine backup, and the in-flight value journal). If the
+  canonical origin vanished, the network keeps running and users can load any
+  mirror.
 
 ## Containers (Docker) — optional
 
@@ -293,7 +312,8 @@ itself. Where it can help:
 - **Local preview** of the production build with real headers (`npm run build`
   then serve `dist/`, not `vite preview`).
 
-It does **not** help with: origin-scoped service-worker/cache scope, custom-header
+It does **not** help with: per-origin service-worker/cache scope (a cache miss
+on a new origin is harmless now — the node re-supplies state), custom-header
 support beyond what your web server already does, or the relay architecture. Keep
 it to the failover/mirror role; the managed primary (Cloudflare) remains simpler.
 
