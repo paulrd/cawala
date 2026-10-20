@@ -55,35 +55,57 @@ export function balanceDisplay(amount) {
 }
 
 /**
+ * Coerce a timestamp into a `Date`.
+ *
+ * Callers pass three shapes: `Date`, a parseable string, or a bare epoch
+ * number. Numbers arrive as both epoch **milliseconds** (`Date.now()`, e.g. the
+ * admin probe and the policy acknowledgement) and unix **seconds** (node
+ * records store `date_joined` in seconds). Anything below 1e11 is far below
+ * any plausible millisecond timestamp (1973), so it is treated as seconds.
+ *
+ * @param {string|number|Date} value
+ * @returns {Date}
+ */
+function toDate(value) {
+  if (value instanceof Date) return value;
+  if (typeof value === 'number') {
+    return new Date(value < 1e11 ? value * 1000 : value);
+  }
+  return new Date(value);
+}
+
+/**
  * Format a date to a short locale string.
- * @param {string|Date} date
+ * @param {string|number|Date} date
  * @returns {string}
  */
 export function formatDate(date) {
   if (!date) return '\u2014';
-  const d = typeof date === 'string' ? new Date(date) : date;
-  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  return toDate(date).toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
 }
 
 /**
  * Format a timestamp to time-only (HH:MM:SS).
- * @param {string|Date} date
+ * @param {string|number|Date} date
  * @returns {string}
  */
 export function formatTime(date) {
   if (!date) return '';
-  const d = typeof date === 'string' ? new Date(date) : date;
-  return d.toLocaleTimeString('en-US', { hour12: false });
+  return toDate(date).toLocaleTimeString('en-US', { hour12: false });
 }
 
 /**
  * Format a relative "time ago" string.
- * @param {string|Date} date
+ * @param {string|number|Date} date
  * @returns {string}
  */
 export function timeAgo(date) {
   if (!date) return '';
-  const d = typeof date === 'string' ? new Date(date) : date;
+  const d = toDate(date);
   const now = Date.now();
   const diffMs = now - d.getTime();
   const diffSec = Math.floor(diffMs / 1000);
