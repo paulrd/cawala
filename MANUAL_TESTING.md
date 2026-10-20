@@ -489,8 +489,8 @@ relays).
 > **Known-stale:** `web/scripts/smoke-admin.mjs` predates the designation model.
 > It calls wasm exports that no longer exist (`set_admin_key`,
 > `admin_public_key`) and the removed `control admin grant|revoke --key`
-> commands, so it fails immediately. Use the manual admin flow in §5, or
-> extend the script to the routed `query`/`approve`/`designate`/`revoke` API.
+> commands, so it fails immediately. Use the manual admin flow in §5; rewriting
+> it against the routed admin API is tracked in `HANDOFF.md` → Open items.
 
 ---
 

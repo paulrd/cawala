@@ -150,6 +150,22 @@ On `main`, next: the optional backlog in "Open items" below (notably the final
   quarantined under `cawala.ledger.backup.v1:<nodeId>` before the first
   overwrite; the Settings trust card lists every pending change with keep/adopt
   actions.
+- **`web/scripts/smoke-admin.mjs` is stale — rewrite it against the routed admin
+  API.** It predates the administration refactor: it calls the removed wasm
+  exports `set_admin_key` / `admin_public_key` and the removed
+  `control admin grant|revoke --key` commands, so it fails immediately (it is
+  marked "Known-stale" in `MANUAL_TESTING.md` §7). Target shape: bootstrap the
+  first administrator with `control admin add <browser-id>`, then drive the wasm
+  admin surface directly — `admin_targets()` (the ancestor chain stops at the
+  first undesignated hop), `admin_query()` (children, designated set, pending
+  joins), `admin_designate` / `admin_revoke`, `admin_approve_join` /
+  `admin_reject_join`, `admin_move_child` / `admin_detach_child`, and
+  `admin_issue` / `admin_burn` — and assert a non-designated browser is refused
+  (`unauthorized`) and that a revoked administrator loses access. Like the other
+  smoke scripts it is network-dependent (`SMOKE_ADMIN_REQUIRE_NETWORK=1`,
+  `CAWALA_NODE_BIN`) and should print `SKIP:` on a genuinely unreachable N0
+  path. Note the web admin **lock gate** is a UI-layer concern (`api.js`), not
+  wasm, so it stays in the manual checklist rather than the script.
 
 ## Verify
 
