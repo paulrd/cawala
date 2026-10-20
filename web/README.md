@@ -204,13 +204,19 @@ genuinely unreachable; set `SMOKE_*_REQUIRE_NETWORK=1` to hard-fail instead.
 
 ```sh
 cd web
-node scripts/smoke.mjs            # spawn-only wasm endpoint
+node scripts/smoke.mjs            # spawn-only wasm endpoint (pings with a target arg)
 node scripts/smoke-tabs.mjs       # tab-to-tab ping
 node scripts/smoke-join.mjs       # join + reject
 node scripts/smoke-payment.mjs    # same-leaf payment
 node scripts/smoke-crossleaf.mjs  # LCA cross-leaf settlement
-node scripts/smoke-admin.mjs      # tree-routed admin (query/approve/designate/revoke)
 ```
+
+`smoke-admin.mjs` is currently **stale**: it predates the designation model and
+calls wasm exports (`set_admin_key`, `admin_public_key`) and
+`control admin grant|revoke --key` commands that no longer exist, so it fails
+immediately. Rewriting it against the routed admin API is a recorded backlog
+item (`HANDOFF.md` → Open items); use the manual admin checklist in
+`MANUAL_TESTING.md` §5 meanwhile.
 
 ## Layout
 

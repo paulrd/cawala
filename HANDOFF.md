@@ -54,8 +54,9 @@ node lists the children (node *or* leaf) allowed to administer it; there is **no
 priority list, TTL, lease, epoch, or automatic failover**, and browsers have no
 automatic authority. All admin is tree-routed; routed
 `AdminDesignate`/`AdminRevoke` let a current administrator change the set, and
-local CLI `control admin add|remove|list` always works. Wire: control format 8
-(accept 7|8), routed control 2, reply 5. Web admin is behind a
+local CLI `control admin add|remove|list` always works. Wire at the time:
+control format 8 (accept 7|8), routed control 2, reply 5 — since superseded by
+the portable-client release (**control 9**, **reply 6**). Web admin is behind a
 policy-acknowledged lock with ancestor-chain up/down.
 
 On `main`, next: the optional backlog in "Open items" below (notably the final
@@ -190,15 +191,17 @@ On `main`, next: the optional backlog in "Open items" below (notably the final
   specialist lanes **serially** — one cargo process at a time. Workspace-wide runs
   need `CARGO_BUILD_JOBS=1`; targeted crate/test suites are fine at 2.
 - `.slim/clonedeps/repos/` holds pinned read-only iroh source.
-- **Hard breaks** — recreate `node-data` and rebuild the wasm bundle when they
-  change: **control format 8** (mint 8; accept 7|8), **routed control 2**,
-  **reply version 5**, ledger (entry/signed) format 4, node on-disk ledger meta
-  format 3, settlement payload 3, browser ledger payload 3.
+- **Hard breaks** — recreate the test data dirs and rebuild the wasm bundle when
+  one changes. Current on `main`: **control format 9** (mint 9; accept 7|8|9),
+  **routed control 2**, routed reply 1, **control reply 6** (`Capabilities` =
+  discriminant 9), ledger (entry/signed) format 4, node on-disk ledger meta
+  format 3, settlement payload 3, browser ledger payload **v4** (v2 fallback),
+  browser ledger state **v5**, browser local state 1, user-identity record 3,
+  identity bundle 2. The pre-portable-client release was control 8 (accept
+  7|8) / reply 5 / browser ledger payload 3 / browser ledger state 4, so a
+  mixed node+browser pair across those versions does not interoperate.
   `ROUTED_CONTROL_VERSION=2` drops the carried grant; there is no `admins.json`
   (replaced by `admin_state.json`).
-  On current `main` these are **control 9** (accept 7|8|9), **reply 6**, browser
-  ledger payload **v4**, and browser ledger state **v5** — a lockstep break
-  relative to the pre-refactor `main`.
 - `web/src/wasm/` is gitignored; run `npm run build:wasm` after any
   `crates/client-wasm` change or the JS/wasm arity can desync.
 - Control-plane local state under `<data-dir>`: `admin_state.json`,
